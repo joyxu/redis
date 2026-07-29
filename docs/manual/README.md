@@ -12,7 +12,6 @@ HPC-Redis 的核心特点：
 - **SVE2 / SVE 向量化计算**：在支持 SVE 的鲲鹏处理器上，向量搬运与相似度计算使用 `svld1_f32` 等 SVE 指令（`ld1w`），相较 `memcpy` 在远端 UB 内存场景获得显著吞吐提升。
 - **客户端 SDK**：提供 C 语言静态库 `libvemb_v16_client.a` 与动态库 `libvemb_v16_client.so`，封装 HELLO/WELCOME 握手、请求/响应帧序列化、多端点一致性哈希路由与拓扑重试，业务侧链接 SDK 即可访问向量快速路径。
 
-> 本文档集仅描述**集成版 `redis-server`**（VEMB V16 内嵌进 Redis 主进程的形态）与**客户端 SDK** 的安装、使用与维护方法。
 
 ## 能力支持与规格
 
@@ -26,14 +25,16 @@ HPC-Redis 的核心特点：
 | 删除 | `VREM` | 从集合中删除指定元素（幂等） | 支持 |
 
 
-### 客户端 SDK 交付物
+### 客户端 SDK 接入
 
-| 交付物 | 路径 | 说明 |
-| --- | --- | --- |
-| 公开头文件 | `clients/c/build/include/vemb_v16_client_sdk.h` | 扁平化后的 SDK 公开 API，业务代码只需 `#include` 此文件。 |
-| 静态库 | `clients/c/build/libvemb_v16_client.a` | 推荐链接方式，被吸收进业务 binary，部署单一可执行文件即可。 |
-| 动态库 | `clients/c/build/libvemb_v16_client.so` | 可选链接方式，运行时需保证 `LD_LIBRARY_PATH` 或 `rpath` 能定位到 `.so`。 |
-| 示例代码 | `clients/c/example.c` | 单端点 VADD / VEMB / VSIM 端到端示例，可独立编译运行。 |
+提供 C 语言静态库 `libvemb_v16_client.a` 与动态库 `libvemb_v16_client.so`，封装 HELLO/WELCOME 握手、请求/响应帧序列化、多端点一致性哈希路由与拓扑重试。业务侧链接 SDK 后即可通过 `vemb_v16_client_sdk.h` 中声明的 API 访问向量快速路径。
+
+| 链接方式 | 说明 |
+| --- | --- |
+| 静态链接（推荐） | 链接 `libvemb_v16_client.a`，SDK 被吸收进业务 binary，部署单一可执行文件。 |
+| 动态链接 | 链接 `libvemb_v16_client.so`，运行时需 `LD_LIBRARY_PATH` 或 `rpath` 定位。 |
+
+> 示例代码见 `clients/c/example.c`（单端点 VADD / VEMB / VSIM 端到端）。
 
 ### 配置与调优能力
 

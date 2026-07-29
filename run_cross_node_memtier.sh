@@ -9,7 +9,7 @@ set -e
 
 HW01="${HW01:-HW01}"
 HW02="${HW02:-HW03}"
-SERVER_HOST="${SERVER_HOST:-192.168.90.111}"
+SERVER_HOST="${SERVER_HOST:-192.168.1.111}"
 SERVER_PORT="${SERVER_PORT:-6379}"
 CODE_DIR="/root/gqs/codespace/UnifiedBus"
 MEMTIER_DIR="$CODE_DIR/memtier_benchmark"
@@ -283,6 +283,8 @@ VEMB_OPS=()
 VSIM_OPS=()
 VEMB_LAT=()
 VSIM_LAT=()
+VEMB_P50=()
+VSIM_P50=()
 VEMB_P99=()
 VSIM_P99=()
 VEMB_P999=()
@@ -438,24 +440,27 @@ for threads in "${THREADS_LIST[@]}"; do
             kb=$(echo "$totals" | awk '{print $9}')
         fi
         avg=$(echo "$totals" | awk '{print $5}')
+        p50=$(echo "$totals" | awk '{print $6}')
         p99=$(echo "$totals" | awk '{print $7}')
         p999=$(echo "$totals" | awk '{print $8}')
 
         if [ "$mode" = "vemb" ]; then
             VEMB_OPS+=("$ops")
             VEMB_LAT+=("$avg")
+            VEMB_P50+=("$p50")
             VEMB_P99+=("$p99")
             VEMB_P999+=("$p999")
             VEMB_KB+=("$kb")
         else
             VSIM_OPS+=("$ops")
             VSIM_LAT+=("$avg")
+            VSIM_P50+=("$p50")
             VSIM_P99+=("$p99")
             VSIM_P999+=("$p999")
             VSIM_KB+=("$kb")
         fi
 
-        log "  $mode t$threads: ops/sec=$ops avg_lat=$avg p99=$p99 p99.9=$p999 KB/sec=$kb"
+        log "  $mode t$threads: ops/sec=$ops avg_lat=$avg p50=$p50 p99=$p99 p99.9=$p999 KB/sec=$kb"
     done
 
     cores=$(awk "BEGIN{ if(\"${J0:-}\"==\"\" || \"${J1:-}\"==\"\") print \"NA\"; else printf \"%.2f\", (${J1:-0}-${J0:-0})/100.0/${BENCH_TIME} }")
@@ -503,12 +508,12 @@ fi
 
 log "=== Results Summary ==="
 {
-    printf "%-8s %-6s %14s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
-        "mode" "t" "ops/sec" "avg_lat" "p99_lat" "p99.9_lat" "KB/sec" "run_time(s)" "cores" "NIC_util%" "base_MB" "peak_MB" "avg_MB"
+    printf "%-8s %-6s %14s %12s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
+        "mode" "t" "ops/sec" "avg_lat" "p50_lat" "p99_lat" "p99.9_lat" "KB/sec" "run_time(s)" "cores" "NIC_util%" "base_MB" "peak_MB" "avg_MB"
     for i in "${!THREAD_VAL[@]}"; do
-        printf "%-8s %-6s %14s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
+        printf "%-8s %-6s %14s %12s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
             "VEMB" "${THREAD_VAL[$i]}" \
-            "${VEMB_OPS[$i]:-N/A}" "${VEMB_LAT[$i]:-N/A}" "${VEMB_P99[$i]:-N/A}" "${VEMB_P999[$i]:-N/A}" "${VEMB_KB[$i]:-N/A}" "${RUN_SEC[$i]:-N/A}" \
+            "${VEMB_OPS[$i]:-N/A}" "${VEMB_LAT[$i]:-N/A}" "${VEMB_P50[$i]:-N/A}" "${VEMB_P99[$i]:-N/A}" "${VEMB_P999[$i]:-N/A}" "${VEMB_KB[$i]:-N/A}" "${RUN_SEC[$i]:-N/A}" \
             "${CORES[$i]:-N/A}" "${NIC_UTIL[$i]:-N/A}" "${MEM_BASE_MB[$i]:-N/A}" "${MEM_PEAK_MB[$i]:-N/A}" "${MEM_AVG_MB[$i]:-N/A}"
     done
 } | tee "$SUMMARY_FILE"

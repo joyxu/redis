@@ -18,7 +18,7 @@ HPC-Redis 是在原生 Redis 基础上集成了 VEMB V16 向量快速路径、UB
 适用于快速验证、压测脚本场景。VEMB V16 相关参数均以 `--vemb-v16-*` 前缀透传：
 
 ```bash
-numactl -N 0 -l taskset -c 0-95 ./src/redis-server \
+taskset -c 0-95 ./src/redis-server \
   --port 6379 \
   --bind 0.0.0.0 --protected-mode no \
   --vemb-v16-enabled yes \
@@ -41,7 +41,7 @@ numactl -N 0 -l taskset -c 0-95 ./src/redis-server \
 
 ### 通过配置文件启动 redis-server
 
-适用于长期运行、需要可重复部署的场景。将上述参数写入 `redis.conf`（去掉 `--` 前缀），再用 `redis-server` 加载：
+适用于长期运行、需要可重复部署的场景。将上述参数写入 `redis.conf`，再用 `redis-server` 加载：
 
 ```bash
 ./src/redis-server /path/to/redis.conf
@@ -228,7 +228,7 @@ warm_regions:
 
 ## 使用 VEMB V16 客户端 SDK
 
-`clients/c/vemb_v16_client_sdk.{c,h}` 提供 VEMB V16 协议的客户端 API，业务侧通过链接 SDK 调用 `vemb_v16_client_*` 系列函数访问向量快速路径（`VADD` 写入、`VEMB` 读取、`VSIM` 相似度、`VREM` 删除）。本节提供的仅是使用示例代码，使用过程中请根据实际业务需求进行配置修改。
+`clients/c/vemb_v16_client_sdk.{c,h}` 提供 VEMB V16 协议的客户端 API，业务侧通过链接 SDK 调用 `vemb_v16_client_*` 系列函数访问向量快速路径（`VADD` 写入、`VEMB` 读取、`VSIM` 相似度、`VREM` 删除）。
 
 ### 调用前提
 
@@ -567,7 +567,7 @@ HPC-Redis 涉及的日志信息如下表所示。
 
 | 目录 | 文件名 | 文件内容说明 |
 | --- | --- | --- |
-| `logfile` 指定目录 / 默认 stdout | `redis-<port>.log` | Redis 主进程日志，受 `loglevel` 控制。**注意**：VEMB V16 线程产生的 `LL_VERBOSE` 级别日志会被 `serverLog` 宏静默丢弃，无论 `--loglevel` 如何设置。如需查看 VEMB 详细日志，请用 `loglevel debug`（注意会带来性能下降）。 |
+| `logfile` 指定目录 / 默认 stdout | `redis-<port>.log` | Redis 主进程日志，受 `loglevel` 控制。**注意**：如需查看 VEMB 详细日志，请用 `loglevel debug`（会带来性能下降）。 |
 | `/var/log/` / 自定义 | `dmesg` / `syslog` | UB.MEM 设备驱动与内核态日志。通过 `dmesg -T | grep obmm` 查询设备层错误。 |
 | 进程 cwd | `redis-<pid>.resp` / 嗅探日志 | VEMB V16 嗅探路径与 RESP 路径的诊断输出，仅在 `loglevel debug` 下落盘。 |
 

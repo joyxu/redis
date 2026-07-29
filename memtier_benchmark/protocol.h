@@ -227,6 +227,12 @@ protected:
     uint8_t *m_vsim_req_template;   /* pre-built VSIM request template (hdr + req) */
     size_t m_vsim_req_template_size;
 
+    /* VSIM_KEY_KEY mode: when true, GET sends VSIM_KEY_KEY with key1+key2 */
+    bool m_vsim_key_key_mode;
+    char m_key2_prefix[64];
+    int  m_key2_prefix_len;
+    uint64_t m_key2_rng;
+
     /* VREM mode: when true, SET sends VREM instead of VADD (delete by key) */
     bool m_vrem_mode;
     uint64_t m_topology_epoch;
@@ -239,6 +245,7 @@ public:
     virtual abstract_protocol* clone(void);
 
     void set_vsim_mode(bool enable);
+    void set_vsim_key_key_mode(bool enable);
     void set_vrem_mode(bool enable);
     void set_handle_mode(bool enable);
     void set_topology_epoch(uint64_t topology_epoch);

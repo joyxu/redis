@@ -1312,6 +1312,7 @@ vemb_v16_protocol::vemb_v16_protocol(uint32_t dim, uint32_t max_vectors)
       m_warm_mapped_addr(NULL), m_warm_region_bytes(0),
       m_vsim_mode(false), m_vsim_query_vector(NULL),
       m_vsim_req_template(NULL), m_vsim_req_template_size(0),
+      m_vsim_key_key_mode(false), m_key2_prefix_len(0), m_key2_rng(42),
       m_vrem_mode(false), m_topology_epoch(0), m_next_request_flags(0)
 {
 }
@@ -1382,6 +1383,12 @@ void vemb_v16_protocol::set_vsim_mode(bool enable)
     }
 }
 
+void vemb_v16_protocol::set_vsim_key_key_mode(bool enable)
+{
+    m_vsim_key_key_mode = enable;
+    /* VSIM_KEY_KEY builds requests dynamically per-key, no template needed */
+}
+
 void vemb_v16_protocol::set_vrem_mode(bool enable)
 {
     m_vrem_mode = enable;
@@ -1434,6 +1441,7 @@ abstract_protocol* vemb_v16_protocol::clone(void)
     vemb_v16_protocol *p = new vemb_v16_protocol(m_dim, m_max_vectors);
     p->set_handle_mode(m_handle_mode);
     p->set_vsim_mode(m_vsim_mode);
+    p->set_vsim_key_key_mode(m_vsim_key_key_mode);
     p->set_vrem_mode(m_vrem_mode);
     p->set_topology_epoch(m_topology_epoch);
     return p;
@@ -1725,6 +1733,7 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
         ? (uint32_t)key_len : VEMB_V16_MAX_KEY_LEN - 1;
 
     if (m_vsim_mode && m_vsim_req_template && m_vsim_req_template_size > 0) {
+        // ... existing VSIM_INLINE template path ...
         if (evbuffer_expand(m_write_buf, m_vsim_req_template_size) != 0)
             return -1;
 
@@ -1750,6 +1759,73 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
         vec[0].iov_len = m_vsim_req_template_size;
         evbuffer_commit_space(m_write_buf, vec, 1);
         return (int)m_vsim_req_template_size;
+    }
+
+    if (m_vsim_key_key_mode) {
+        /* VSIM_KEY_KEY: key1 from memtier, key2 random from same prefix */
+        /* extract prefix from key1 (e.g. "item:42" → prefix "item:") */
+        int prefix_len = actual_key_len;
+        const char *ks = key;
+        while (prefix_len > 0 && ks[prefix_len-1] >= '0' && ks[prefix_len-1] <= '9')
+            prefix_len--;
+        if (prefix_len == 0 || prefix_len >= VEMB_V16_MAX_KEY_LEN - 16)
+            return -1;
+
+        /* generate random key2 */
+        m_key2_rng = m_key2_rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t key2_num = 1 + (m_key2_rng % 100000);
+        char key2_buf[VEMB_V16_MAX_KEY_LEN];
+        int key2_len = snprintf(key2_buf, sizeof(key2_buf), "%.*s%llu",
+                                prefix_len, ks, (unsigned long long)key2_num);
+        if (key2_len <= 0 || key2_len >= VEMB_V16_MAX_KEY_LEN)
+            return -1;
+
+        /* build VSIM_KEY_KEY frame */
+        vemb_v16_req_t req = {0};
+        req.op = VEMB_V16_OP_VSIM_KEY_KEY;
+        req.flags = m_next_request_flags;
+        m_next_request_flags = 0;
+        req.req_id = m_req_id++;
+        req.channel_id = m_channel_id;
+        req.topology_epoch = m_topology_epoch;
+        req.key_len = actual_key_len;
+        memcpy(req.key, key, actual_key_len);
+        req.key2_len = (uint32_t)key2_len;
+        memcpy(req.key2, key2_buf, key2_len);
+        req.dim = m_dim;
+        req.vector_bytes = m_dim * sizeof(float);
+        req.key_hash = vemb_v16_xxh3_64_str(req.key, req.key_len);
+        req.key2_hash = vemb_v16_xxh3_64_str(req.key2, req.key2_len);
+
+        size_t payload_len = vemb_v16_req_encoded_len(&req);
+        if (payload_len == 0) return -1;
+
+        size_t total = sizeof(vemb_v16_net_hdr_t) + payload_len;
+        if (evbuffer_expand(m_write_buf, total) != 0)
+            return -1;
+
+        struct evbuffer_iovec vec[1];
+        if (evbuffer_reserve_space(m_write_buf, total, vec, 1) < 1)
+            return -1;
+
+        size_t payload_len_actual = 0;
+        if (vemb_v16_req_encode((uint8_t *)vec[0].iov_base + sizeof(vemb_v16_net_hdr_t),
+                                vec[0].iov_len - sizeof(vemb_v16_net_hdr_t),
+                                &req, &payload_len_actual) != 0)
+            return -1;
+
+        vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)vec[0].iov_base;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->magic = VEMB_V16_MAGIC;
+        hdr->version = VEMB_V16_VERSION;
+        hdr->type = VEMB_V16_NET_REQUEST;
+        hdr->payload_len = (uint32_t)payload_len_actual;
+        hdr->channel_id = m_channel_id;
+        hdr->req_id = req.req_id;
+
+        vec[0].iov_len = sizeof(*hdr) + payload_len_actual;
+        evbuffer_commit_space(m_write_buf, vec, 1);
+        return (int)vec[0].iov_len;
     }
 
     uint32_t payload_len = (uint32_t)vemb_v16_req_handle_len();

@@ -14,7 +14,7 @@
 JUMP="${JUMP:-HW01}"
 SERVER="${SERVER:-HW01}"
 CLIENT="${CLIENT:-HW03}"
-SERVER_HOST="${SERVER_HOST:-192.168.90.111}"
+SERVER_HOST="${SERVER_HOST:-192.168.1.111}"
 SERVER_PORT="${SERVER_PORT:-7001}"
 CODE_DIR="${CODE_DIR:-/root/gqs/codespace/redis-8.6.3}"
 MEMTIER_DIR="${MEMTIER_DIR:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin}"

@@ -2,7 +2,7 @@
 
 ## 简介
 
-本章节通过一个最小化的端到端流程，帮助用户在 快速完成 HPC-Redis 的启动与向量操作验证。涵盖两个验证路径：
+本章节通过一个最小化的端到端流程，帮助用户快速完成 HPC-Redis 的启动与向量操作验证。涵盖两个验证路径：
 
 - **路径 A（RESP 路径）**：使用 `redis-cli` 内置的 VEMB V16 兼容路径发送 `VADD` / `VEMB` / `VSIM` 命令。
 - **路径 B（SDK 路径）**：使用客户端 SDK 编写一个 C 程序，通过 VEMB V16 二进制协议完成向量写入与读取。
@@ -19,10 +19,10 @@
 
 ## 启动 HPC-Redis 服务
 
-1. 启动集成版 `redis-server`（启用 VEMB V16，绑定 NUMA 0，server 占用核心 0-95）。
+1. 启动集成版 `redis-server`。
 
    ```bash
-   numactl -N 0 -l taskset -c 0-95 ./src/redis-server \
+   taskset -c 0-95 ./src/redis-server \
      --port 6379 \
      --bind 0.0.0.0 --protected-mode no \
      --vemb-v16-enabled yes \
@@ -66,7 +66,7 @@
 
 ## 使用 redis-cli 快速验证向量操作
 
-`redis-cli` 内置 VEMB V16 快速路径：当命令行带 `--vemb-v16-dim` 参数时，`VADD` / `VEMB` / `VSIM` / `VREM` 命令会自动走 VEMB V16 二进制协议（而非 RESP 文本协议）。
+`redis-cli` 内置 VEMB V16 快速路径：当命令行带 `--vemb-v16-dim` 参数时，`VADD` / `VEMB` / `VSIM` / `VREM` 命令会自动走 VEMB V16 二进制协议。
 
 1. 写入向量（VADD）。
 
@@ -108,7 +108,7 @@
 3. 计算相似度（VSIM）。
 
    ```bash
-   # 向量以单 argv 形式传入（用引号包裹让 shell 不拆分）
+   # 向量以单 argv 形式传入
    ./output/src/redis-cli -p 6379 --vemb-v16-dim 300 \
        VSIM myset elem1 "$(seq 1 300 | tr '\n' ' ')"
    ```

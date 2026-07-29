@@ -109,6 +109,7 @@ struct benchmark_config {
     uint32_t vemb_v16_dim;
     bool     vemb_v16_handle;
     bool     vemb_v16_vsim;
+    bool     vemb_v16_vsim_key_key;
     bool     vemb_v16_vrem;
     const char *vemb_v16_endpoints;
     bool     vemb_v16_client_topology;

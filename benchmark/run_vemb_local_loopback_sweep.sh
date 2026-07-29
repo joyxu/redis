@@ -26,12 +26,13 @@
 #   transport=TCP 127.0.0.1, VEMB RAW=1 (INT8 量化直传)
 #
 # 命令对照 (参考 hpc_redis_v{sim,add,rem}_max_tput.sh / redis_baseline_v{sim,add,rem}_max_tput.sh):
-#   OP_TYPE | hpc memtier                                    | baseline memtier (RESP3)
-#   --------+------------------------------------------------+-----------------------------------------------
-#   VEMB    | --protocol vemb_v16 --ratio=0:1 R:R item:     | --command="VEMB myset ELE __key__ raw" item: R
-#   VSIM    | --protocol vemb_v16 --vemb-v16-vsim R:R item:  | --command="VSIM myset ELE __key__" R item:
-#   VADD    | --protocol vemb_v16 --ratio=1:0 S:S item:      | --command="VADD myset VALUES $DIM $VEC __key__" S item:
-#   VREM    | --protocol vemb_v16 --vemb-v16-vrem 1:0 S:S item: | --command="VREM myset __key__" S item:
+#   OP_TYPE   | hpc memtier                                       | baseline memtier (RESP3)
+#   ----------+---------------------------------------------------+-----------------------------------------------
+#   VEMB      | --protocol vemb_v16 --ratio=0:1 R:R item:        | --command="VEMB myset __key__ raw" item: R
+#   VSIM      | --protocol vemb_v16 --vemb-v16-vsim R:R item:     | --command="VSIM myset VALUES $DIM $FIXED_VECTOR COUNT 1" R item:
+#   VSIM_2KEY | --protocol vemb_v16 --vemb-v16-vsim-key-key R:R   | --command="VEMB myset __key__ raw" R:R item: (2 fetches, no client cosine)
+#   VADD      | --protocol vemb_v16 --ratio=1:0 S:S item:         | --command="VADD myset VALUES $DIM $FIXED_VECTOR __key__" S item:
+#   VREM      | --protocol vemb_v16 --vemb-v16-vrem 1:0 S:S item: | --command="VREM myset __key__" S item:
 #
 # 编译口径 (服务器一致):
 #   cd /root/gqs/codespace/redis-8.6.3 && \
@@ -51,8 +52,8 @@ DATA_DIR=${DATA_DIR:-/tmp/redis-loopback-sweep}
 # === OP_TYPE ===
 OP_TYPE=${OP_TYPE:-VEMB}
 case "$OP_TYPE" in
-    VEMB|VSIM|VADD|VREM) ;;
-    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
+    VEMB|VSIM|VSIM_2KEY|VADD|VREM) ;;
+    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VSIM_2KEY/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
 esac
 
 # === 测试参数 ===
@@ -262,6 +263,7 @@ run_one_config() {
         case "$OP_TYPE" in
             VEMB) ;;
             VSIM) op_flag="--vemb-v16-vsim" ;;
+            VSIM_2KEY) op_flag="--vemb-v16-vsim-key-key" ;;
             VADD) ratio="--ratio=1:0"; kp="S:S" ;;
             VREM) op_flag="--vemb-v16-vrem"; ratio="--ratio=1:0"; kp="S:S" ;;
         esac
@@ -282,8 +284,9 @@ run_one_config() {
         #   VREM: VREM myset __key__          S       (单 myset 删除)
         local cmd kp
         case "$OP_TYPE" in
-            VEMB) cmd="VEMB myset ELE __key__ raw";                        kp="R" ;;
-            VSIM) cmd="VSIM myset ELE __key__";                              kp="R" ;;
+            VEMB) cmd="VEMB myset __key__ raw";                              kp="R" ;;
+            VSIM) cmd="VSIM myset VALUES $DIM $FIXED_VECTOR COUNT 1";        kp="R" ;;
+            VSIM_2KEY) cmd="VEMB myset __key__ raw";                         kp="R" ;;  # 1 VEMB/op, ×2 for 2-key compare
             VADD) cmd="VADD myset VALUES $DIM $FIXED_VECTOR __key__";        kp="S" ;;
             VREM) cmd="VREM myset __key__";                                  kp="S" ;;
         esac
@@ -309,10 +312,17 @@ run_one_config() {
             else            printf "0 NA NA NA NA"
         }'
     )
+    # VSIM_2KEY baseline: 1 memtier op = 1× VEMB raw, need 2× for 2-key compare
+    # => TSV writes ÷2 so it's directly comparable to hpc VSIM_KEY_KEY (per-2-key ops/sec)
+    local ops_note=""
+    if [ "$OP_TYPE" = "VSIM_2KEY" ] && [ "$server_type" = "baseline" ]; then
+        ops_note=" (÷2, 2-key equiv)"
+        ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
+    fi
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
-    log "    => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
-    rm -f "$raw"  # TSV 已经记录, raw log 可删
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
+    rm -f "$raw"
 }
 
 # ============================================================================

@@ -15,8 +15,8 @@ set -euo pipefail
 # ============================================================================
 # 网络拓扑
 # ============================================================================
-NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
-NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
+NODE0_HOST="${NODE0_HOST:-192.168.1.111}"
+NODE1_HOST="${NODE1_HOST:-192.168.1.112}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"

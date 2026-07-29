@@ -13,6 +13,7 @@
 # 用法 (在 SERVER 上执行):
 #   OP_TYPE=VEMB bash benchmark/run_vemb_cross_node_sweep.sh
 #   OP_TYPE=VSIM bash benchmark/run_vemb_cross_node_sweep.sh
+#   OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_cross_node_sweep.sh
 #   OP_TYPE=VADD bash benchmark/run_vemb_cross_node_sweep.sh
 #   OP_TYPE=VREM bash benchmark/run_vemb_cross_node_sweep.sh
 #   TEST_TIME=10 OP_TYPE=VSIM bash ...                       # smoke
@@ -20,12 +21,13 @@
 #   TS="64" CS="4" PS="32" OP_TYPE=VEMB bash ...             # 单档
 #
 # 命令对照 (跟 run_vemb_local_loopback_sweep.sh 完全一致):
-#   OP_TYPE | hpc memtier (VEMB V16)                       | baseline memtier (RESP3)
-#   --------+------------------------------------------------+-----------------------------------------------
-#   VEMB    | --protocol vemb_v16 --ratio=0:1 R:R item:     | --command="VEMB myset ELE __key__ raw" item: R
-#   VSIM    | --protocol vemb_v16 --vemb-v16-vsim R:R item: | --command="VSIM myset ELE __key__" item: R
-#   VADD    | --protocol vemb_v16 --ratio=1:0 S:S item:     | --command="VADD myset VALUES $DIM $VEC __key__" item: S
-#   VREM    | --protocol vemb_v16 --vemb-v16-vrem 1:0 S:S   | --command="VREM myset __key__" item: S
+#   OP_TYPE   | hpc memtier (VEMB V16)                    | baseline memtier (RESP3)
+#   ----------+-------------------------------------------+-----------------------------------------------
+#   VEMB      | --vemb-v16 --ratio=0:1 R:R item:          | --command="VEMB myset __key__ raw" item: R
+#   VSIM      | --vemb-v16-vsim R:R item:                 | --command="VSIM myset VALUES \$dim \$FIXED_VECTOR COUNT 1" R item:
+#   VSIM_2KEY | --vemb-v16-vsim-key-key --ratio=0:1 R:R   | --command="VEMB myset __key__ raw" R:R item:
+#   VADD      | --ratio=1:0 S:S item:                     | --command="VADD myset VALUES \$dim \$fixed_vec __key__" S item:
+#   VREM      | --vemb-v16-vrem 1:0 S:S                   | --command="VREM myset __key__" S item:
 # ============================================================================
 set -uo pipefail
 
@@ -52,8 +54,8 @@ DATA_DIR=${DATA_DIR:-/tmp/redis-cross-sweep}
 # === OP_TYPE ===
 OP_TYPE=${OP_TYPE:-VEMB}
 case "$OP_TYPE" in
-    VEMB|VSIM|VADD|VREM) ;;
-    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
+    VEMB|VSIM|VSIM_2KEY|VADD|VREM) ;;
+    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VSIM_2KEY/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
 esac
 
 # === 测试参数 ===
@@ -247,13 +249,19 @@ case "$op_type" in
         if [ "$is_hpc" = "1" ]; then
             cmd+=(--protocol vemb_v16 --vemb-v16-dim "$dim" --ratio=0:1 --key-pattern=R:R)
         else
-            cmd+=(--protocol=resp3 --command="VEMB myset ELE __key__ raw" --command-key-pattern=R)
+            cmd+=(--protocol=resp3 --command="VEMB myset __key__ raw" --command-key-pattern=R)
         fi ;;
     VSIM)
         if [ "$is_hpc" = "1" ]; then
             cmd+=(--protocol vemb_v16 --vemb-v16-dim "$dim" --vemb-v16-vsim --ratio=0:1 --key-pattern=R:R)
         else
-            cmd+=(--protocol=resp3 --command="VSIM myset ELE __key__" --command-key-pattern=R)
+            cmd+=(--protocol=resp3 --command="VSIM myset VALUES $dim $FIXED_VECTOR COUNT 1" --command-key-pattern=R)
+        fi ;;
+    VSIM_2KEY)
+        if [ "$is_hpc" = "1" ]; then
+            cmd+=(--protocol vemb_v16 --vemb-v16-dim "$dim" --vemb-v16-vsim-key-key --ratio=0:1 --key-pattern=R:R)
+        else
+            cmd+=(--protocol=resp3 --command="VEMB myset __key__ raw" --command-key-pattern=R)
         fi ;;
     VADD)
         if [ "$is_hpc" = "1" ]; then
@@ -334,9 +342,15 @@ run_one_config() {
         }'
     )
 
+    # VSIM_2KEY baseline: 1 memtier op = 1× VEMB raw, need 2× for 2-key compare
+    local ops_note=""
+    if [ "$OP_TYPE" = "VSIM_2KEY" ] && [ "$server_type" = "baseline" ]; then
+        ops_note=" (÷2, 2-key equiv)"
+        ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
+    fi
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" "$nic_util" >> "$TSV"
-    log "    => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%"
     rm -f "$raw_local"
     ssh "$CLIENT" "rm -f $raw_remote" 2>/dev/null
 }

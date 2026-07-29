@@ -13,7 +13,7 @@ set -e
 
 HW01="${HW01:-HW01}"
 HW02="${HW02:-HW03}"
-SERVER_HOST="${SERVER_HOST:-192.168.90.111}"
+SERVER_HOST="${SERVER_HOST:-192.168.1.111}"
 SERVER_PORT="${SERVER_PORT:-6379}"
 CODE_DIR="/root/gqs/codespace/UnifiedBus"
 MEMTIER_DIR="$CODE_DIR/memtier_benchmark"
