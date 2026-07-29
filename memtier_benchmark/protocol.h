@@ -232,6 +232,8 @@ protected:
     char m_key2_prefix[64];
     int  m_key2_prefix_len;
     uint64_t m_key2_rng;
+    unsigned long long m_key2_min;
+    unsigned long long m_key2_max;
 
     /* VREM mode: when true, SET sends VREM instead of VADD (delete by key) */
     bool m_vrem_mode;
@@ -246,6 +248,8 @@ public:
 
     void set_vsim_mode(bool enable);
     void set_vsim_key_key_mode(bool enable);
+    void set_vsim_key_key_range(unsigned long long key_min,
+                                unsigned long long key_max);
     void set_vrem_mode(bool enable);
     void set_handle_mode(bool enable);
     void set_topology_epoch(uint64_t topology_epoch);

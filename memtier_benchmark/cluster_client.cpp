@@ -922,7 +922,8 @@ int vemb_v16_multi_client::connect(void)
         if (!vemb_parse_endpoint(m_endpoint_ptrs[i], host, sizeof(host), &port))
             return -1;
 
-        shard_connection* sc = create_shard_connection(main_sc->get_protocol());
+        abstract_protocol *clone_p = main_sc->get_protocol()->clone();
+        shard_connection* sc = create_shard_connection(clone_p);
         if (!connect_shard_connection(sc, host, port)) {
             return -1;
         }

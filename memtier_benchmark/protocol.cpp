@@ -1313,6 +1313,7 @@ vemb_v16_protocol::vemb_v16_protocol(uint32_t dim, uint32_t max_vectors)
       m_vsim_mode(false), m_vsim_query_vector(NULL),
       m_vsim_req_template(NULL), m_vsim_req_template_size(0),
       m_vsim_key_key_mode(false), m_key2_prefix_len(0), m_key2_rng(42),
+      m_key2_min(0), m_key2_max(100000),
       m_vrem_mode(false), m_topology_epoch(0), m_next_request_flags(0)
 {
 }
@@ -1389,6 +1390,13 @@ void vemb_v16_protocol::set_vsim_key_key_mode(bool enable)
     /* VSIM_KEY_KEY builds requests dynamically per-key, no template needed */
 }
 
+void vemb_v16_protocol::set_vsim_key_key_range(unsigned long long key_min,
+                                                unsigned long long key_max)
+{
+    m_key2_min = key_min;
+    m_key2_max = key_max;
+}
+
 void vemb_v16_protocol::set_vrem_mode(bool enable)
 {
     m_vrem_mode = enable;
@@ -1442,6 +1450,7 @@ abstract_protocol* vemb_v16_protocol::clone(void)
     p->set_handle_mode(m_handle_mode);
     p->set_vsim_mode(m_vsim_mode);
     p->set_vsim_key_key_mode(m_vsim_key_key_mode);
+    p->set_vsim_key_key_range(m_key2_min, m_key2_max);
     p->set_vrem_mode(m_vrem_mode);
     p->set_topology_epoch(m_topology_epoch);
     return p;
@@ -1771,9 +1780,10 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
         if (prefix_len == 0 || prefix_len >= VEMB_V16_MAX_KEY_LEN - 16)
             return -1;
 
-        /* generate random key2 */
+        /* generate random key2 within [key_min, key_max] */
         m_key2_rng = m_key2_rng * 6364136223846793005ULL + 1442695040888963407ULL;
-        uint64_t key2_num = 1 + (m_key2_rng % 100000);
+        unsigned long long range = m_key2_max - m_key2_min + 1;
+        uint64_t key2_num = m_key2_min + (m_key2_rng % range);
         char key2_buf[VEMB_V16_MAX_KEY_LEN];
         int key2_len = snprintf(key2_buf, sizeof(key2_buf), "%.*s%llu",
                                 prefix_len, ks, (unsigned long long)key2_num);

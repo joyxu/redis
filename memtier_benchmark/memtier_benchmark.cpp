@@ -1176,7 +1176,11 @@ struct cg_thread {
             if (m_config->vemb_v16_dim > 0) vp->set_dim(m_config->vemb_v16_dim);
             if (m_config->vemb_v16_handle) vp->set_handle_mode(true);
             if (m_config->vemb_v16_vsim) vp->set_vsim_mode(true);
-            if (m_config->vemb_v16_vsim_key_key) vp->set_vsim_key_key_mode(true);
+            if (m_config->vemb_v16_vsim_key_key) {
+                vp->set_vsim_key_key_mode(true);
+                vp->set_vsim_key_key_range(m_config->key_minimum,
+                                           m_config->key_maximum);
+            }
             if (m_config->vemb_v16_vrem) vp->set_vrem_mode(true);
         }
 
