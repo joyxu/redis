@@ -134,6 +134,10 @@ vemb_v16_bench: vemb_v16_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_clie
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"
 
+vemb_v16_aeron_ring_ut: vemb_v16_aeron_ring_ut.c ../src/vemb_v16_protocol.h ../src/vemb_v16_client_ring.h ../src/vemb_v16_cacheline.h
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../src -o $@ $<
+	./$@
+
 vemb_v16_slow_client_bench: vemb_v16_slow_client_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"

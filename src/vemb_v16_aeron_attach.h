@@ -24,10 +24,14 @@
  *     int32_t  status;             0 = OK, -1 = rejected
  *     uint64_t channel_id;         server-assigned channel id
  *     uint32_t ring_size_slots;    256
- *     uint32_t shmdev_path_len;    bytes in shmdev_path (incl. NUL)
- *     char     shmdev_path[256];   server-side path, e.g. "/dev/obmm_shmdev1"
- *     uint64_t req_ring_off;       byte offset of req_ring within shmdev
- *     uint64_t resp_ring_off;      byte offset of resp_ring within shmdev
+ *     uint32_t request_shmdev_path_len;
+ *     char     request_shmdev_path[256];
+ *     uint64_t req_ring_off;       byte offset within request path
+ *     uint32_t response_shmdev_path_len;
+ *     char     response_shmdev_path[256];
+ *     uint64_t resp_ring_off;      byte offset within response path
+ *     uint32_t req_backend_type;
+ *     uint32_t resp_backend_type;
  *     uint32_t req_slot_size;      actual slot size server allocated
  *     uint32_t resp_slot_size;
  *     uint32_t warm_region_count;  0 = no warm region advertised
@@ -64,10 +68,14 @@ typedef struct {
     int32_t  status;
     uint64_t channel_id;
     uint32_t ring_size_slots;
-    uint32_t shmdev_path_len;
-    char     shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    uint32_t request_shmdev_path_len;
+    char     request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     uint64_t req_ring_off;
+    uint32_t response_shmdev_path_len;
+    char     response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     uint64_t resp_ring_off;
+    uint32_t req_backend_type;
+    uint32_t resp_backend_type;
     uint32_t req_slot_size;
     uint32_t resp_slot_size;
     /* Warm region advertisement (cross-node read path). When

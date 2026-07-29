@@ -38,6 +38,15 @@ static int wait_response(vemb_v16_aeron_channel_t *ch, uint32_t req_id,
     return -1;
 }
 
+static int publish_req(vemb_v16_aeron_channel_t *ch,
+                       const vemb_v16_req_t *req) {
+    uint8_t wire[VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
+    size_t wire_len = 0;
+    if (vemb_v16_req_encode(wire, sizeof(wire), req, &wire_len) != 0)
+        return -1;
+    return vemb_v16_aeron_publish_request(ch, wire, (uint32_t)wire_len);
+}
+
 static int compare_double(const void *a, const void *b) {
     double da = *(const double *)a;
     double db = *(const double *)b;
@@ -82,8 +91,7 @@ int main(int argc, char **argv) {
     build_req(req, VEMB_V16_OP_VADD, 1, vemb_v16_aeron_channel_id(ch),
               key, dim);
     memcpy(req->vector, vector, dim * sizeof(*vector));
-    if (vemb_v16_aeron_publish_request(ch, req,
-                                       (uint32_t)vemb_v16_req_inline_len(req->vector_bytes)) != 0 ||
+    if (publish_req(ch, req) != 0 ||
         wait_response(ch, 1, &resp) != 0 || resp.status != VEMB_V16_STATUS_OK) {
         fprintf(stderr, "VADD failed warm_path=%u req_path=%u status=%u\n",
                 warm_path, req_path, resp.status);
@@ -97,8 +105,7 @@ int main(int argc, char **argv) {
         build_req(req, VEMB_V16_OP_VEMB_HANDLE, req_id,
                   vemb_v16_aeron_channel_id(ch), key, dim);
         uint64_t start = now_ns();
-        if (vemb_v16_aeron_publish_request(ch, req,
-                                           (uint32_t)vemb_v16_req_handle_len()) != 0 ||
+        if (publish_req(ch, req) != 0 ||
             wait_response(ch, req_id, &resp) != 0 ||
             resp.status != VEMB_V16_STATUS_OK) {
             fprintf(stderr, "GET failed warm_path=%u req_path=%u id=%u status=%u\n",

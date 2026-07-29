@@ -63,6 +63,8 @@ int main(int argc, char **argv) {
     const char *aeron_control = "tcp";
     const char *uds_path = "/tmp/vemb_v16.sock";
     const char *aeron_ub_path = VEMB_V16_DEFAULT_AERON_UB_PATH;
+    const char *aeron_response_ub_path =
+        VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH;
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
     int reset_warm_regions = 0;
@@ -90,6 +92,9 @@ int main(int argc, char **argv) {
             tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--aeron-ub-path") && i + 1 < argc) {
             aeron_ub_path = argv[++i];
+        } else if (!strcmp(argv[i], "--aeron-response-ub-path") &&
+                   i + 1 < argc) {
+            aeron_response_ub_path = argv[++i];
         } else if (!strcmp(argv[i], "--proxy-io-threads") && i + 1 < argc) {
             proxy_io_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--supernode-workers") && i + 1 < argc) {
@@ -124,7 +129,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--aeron-ub-path PATH] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+        printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--aeron-ub-path PATH] [--aeron-response-ub-path PATH] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -226,6 +231,13 @@ int main(int argc, char **argv) {
     if (vemb_v16_proxy_set_aeron_ub_path(g_proxy, aeron_ub_path) != 0) {
         serverLog(LL_WARNING, "failed to configure Aeron UB path: %s",
                   aeron_ub_path);
+        goto cleanup;
+    }
+    if (vemb_v16_proxy_set_aeron_response_ub_path(
+            g_proxy, aeron_response_ub_path) != 0) {
+        serverLog(LL_WARNING,
+                  "failed to configure Aeron response UB path: %s",
+                  aeron_response_ub_path);
         goto cleanup;
     }
     if (vemb_v16_proxy_set_supernode_workers(g_proxy, supernode_workers) != 0) {

@@ -297,24 +297,35 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
     }
     close(fd);
 
-    if (resp.shmdev_path_len == 0 ||
-        resp.shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+    if (resp.request_shmdev_path_len == 0 ||
+        resp.request_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.response_shmdev_path_len == 0 ||
+        resp.response_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
         resp.req_slot_size == 0 ||
         resp.resp_slot_size == 0 ||
-        resp.ring_size_slots != VEMB_V16_CLIENT_RING_SIZE) {
+        resp.ring_size_slots != VEMB_V16_CLIENT_RING_SIZE ||
+        resp.request_shmdev_path[0] == '\0' ||
+        resp.response_shmdev_path[0] == '\0') {
         return -1;
     }
 
-    char client_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char client_request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char client_response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     if (remote_path) {
-        if (map_remote_ub_path(resp.shmdev_path,
-                               client_shmdev_path,
-                               sizeof(client_shmdev_path)) != 0)
+        if (map_remote_ub_path(resp.request_shmdev_path,
+                               client_request_shmdev_path,
+                               sizeof(client_request_shmdev_path)) != 0 ||
+            map_remote_ub_path(resp.response_shmdev_path,
+                               client_response_shmdev_path,
+                               sizeof(client_response_shmdev_path)) != 0)
             return -1;
     } else {
-        strncpy(client_shmdev_path, resp.shmdev_path,
-                sizeof(client_shmdev_path) - 1);
-        client_shmdev_path[sizeof(client_shmdev_path) - 1] = '\0';
+        strncpy(client_request_shmdev_path, resp.request_shmdev_path,
+                sizeof(client_request_shmdev_path) - 1);
+        client_request_shmdev_path[sizeof(client_request_shmdev_path) - 1] = '\0';
+        strncpy(client_response_shmdev_path, resp.response_shmdev_path,
+                sizeof(client_response_shmdev_path) - 1);
+        client_response_shmdev_path[sizeof(client_response_shmdev_path) - 1] = '\0';
     }
 
     memset(desc, 0, sizeof(*desc));
@@ -328,12 +339,12 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
     snprintf(desc->request_ring_name,
              sizeof(desc->request_ring_name),
              "%s@off%llu",
-             client_shmdev_path,
+             client_request_shmdev_path,
              (unsigned long long)resp.req_ring_off);
     snprintf(desc->response_ring_name,
              sizeof(desc->response_ring_name),
              "%s@off%llu",
-             client_shmdev_path,
+             client_response_shmdev_path,
              (unsigned long long)resp.resp_ring_off);
     if (resp.warm_region_count > 1 ||
         (resp.warm_region_count != 0 &&
@@ -363,9 +374,6 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
         strncpy(desc->warm_regions[0].path,
                 client_warm_path,
                 sizeof(desc->warm_regions[0].path) - 1);
-    }
-    if (resp.shmdev_path[0] == '\0') {
-        return -1;
     }
     return 0;
 }
@@ -976,9 +984,14 @@ static void prepare_req_key2(vemb_v16_req_t *req, const char *key2) {
 
 static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, size_t len,
                     uint64_t *publish_spins, uint32_t timeout_ms) {
+    uint8_t wire[VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
+    size_t wire_len = 0;
+    if (vemb_v16_req_encode(wire, sizeof(wire), req, &wire_len) != 0)
+        return -1;
     uint64_t spins = 0;
     uint64_t start = now_ns();
-    while (vemb_v16_client_publish(ring, req, (uint32_t)len) != 0) {
+    (void)len;
+    while (vemb_v16_client_publish(ring, wire, (uint32_t)wire_len) != 0) {
         spins++;
         if ((spins & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (publish_spins) *publish_spins += spins;
@@ -992,10 +1005,11 @@ static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, siz
 
 static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
                      uint64_t *empty_polls, uint32_t timeout_ms) {
+    uint8_t wire[VEMB_V16_AERON_RESP_WIRE_MAX_LEN];
     int got;
     uint64_t polls = 0;
     uint64_t start = now_ns();
-    while ((got = vemb_v16_client_poll(ring, resp, sizeof(*resp))) <= 0) {
+    while ((got = vemb_v16_client_poll(ring, wire, sizeof(wire))) <= 0) {
         polls++;
         if ((polls & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (empty_polls) *empty_polls += polls;
@@ -1004,7 +1018,7 @@ static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
         __asm__ volatile("" ::: "memory");
     }
     if (empty_polls) *empty_polls += polls;
-    return got == (int)sizeof(*resp) ? 0 : -1;
+    return vemb_v16_resp_decode(resp, wire, (size_t)got);
 }
 
 static int send_channel_req(bench_node_channel_t *node,

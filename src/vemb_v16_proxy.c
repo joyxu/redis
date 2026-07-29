@@ -103,6 +103,10 @@ const char *vemb_v16_proxy_aeron_ub_path(vemb_v16_proxy_t *proxy) {
     return proxy->aeron_ub_path;
 }
 
+const char *vemb_v16_proxy_aeron_response_ub_path(vemb_v16_proxy_t *proxy) {
+    return proxy->aeron_response_ub_path;
+}
+
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy) {
     return proxy->tcp_host;
 }
@@ -1649,16 +1653,18 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         return -1;
     }
     if (transport_type == VEMB_V16_TRANSPORT_AERON) {
-        char ub_path[256];
+        char request_ub_path[256], response_ub_path[256];
         uint64_t req_off = 0, resp_off = 0;
         void *req_ring = NULL, *resp_ring = NULL;
         size_t req_bytes = 0, resp_bytes = 0;
         if (vemb_v16_storage_alloc_aeron_channel(
                 proxy->aeron_ub_path,
+                proxy->aeron_response_ub_path,
                 proxy->request_ring_slot_size,
                 proxy->response_ring_slot_size,
                 VEMB_V16_CLIENT_RING_SIZE,
-                ub_path,
+                request_ub_path,
+                response_ub_path,
                 &req_off,
                 &resp_off,
                 &req_ring,
@@ -1676,9 +1682,9 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         ch->request_ring_bytes = req_bytes;
         ch->response_ring_bytes = resp_bytes;
         snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
-                 "%s@off%llu", ub_path, (unsigned long long)req_off);
+                 "%s@off%llu", request_ub_path, (unsigned long long)req_off);
         snprintf(ch->response_ring_name, sizeof(ch->response_ring_name),
-                 "%s@off%llu", ub_path, (unsigned long long)resp_off);
+                 "%s@off%llu", response_ub_path, (unsigned long long)resp_off);
     }
 
     ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
@@ -1752,7 +1758,8 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
 int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
                                              void *req_ring, void *resp_ring,
                                              uint32_t req_slot, uint32_t resp_slot,
-                                             const char *shmdev_path,
+                                             const char *req_path,
+                                             const char *resp_path,
                                              uint64_t req_off, uint64_t resp_off,
                                              uint64_t *out_channel_id) {
     /* Slot hunt - same logic as alloc_channel_common. We can't easily
@@ -1802,9 +1809,9 @@ int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
     ch->request_ring_bytes  = vemb_v16_client_ring_bytes(req_slot);
     ch->response_ring_bytes = vemb_v16_client_ring_bytes(resp_slot);
     snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
-             "%s@off%llu", shmdev_path, (unsigned long long)req_off);
+             "%s@off%llu", req_path, (unsigned long long)req_off);
     snprintf(ch->response_ring_name, sizeof(ch->response_ring_name),
-             "%s@off%llu", shmdev_path, (unsigned long long)resp_off);
+             "%s@off%llu", resp_path, (unsigned long long)resp_off);
 
     ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
         .worker_id = ch->index,
@@ -1843,7 +1850,7 @@ int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
               "vemb_v16 cross-node channel allocated: idx=%u cid=%llu shmdev=%s "
               "req_off=%llu resp_off=%llu",
               ch->index, (unsigned long long)ch->channel_id,
-              shmdev_path, (unsigned long long)req_off,
+              req_path, (unsigned long long)req_off,
               (unsigned long long)resp_off);
     return 0;
 }
@@ -3364,8 +3371,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     proxy->vector_dim = vector_dim;
     proxy->vector_stride = vector_dim * sizeof(float);
     proxy->request_ring_slot_size =
-        (uint32_t)vemb_v16_req_inline_len(proxy->vector_stride);
-    proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
+        vemb_v16_aeron_req_slot_size(vector_dim);
+    proxy->response_ring_slot_size = vemb_v16_aeron_resp_slot_size();
     proxy->max_vectors = max_vectors;
     proxy->listen_fd = -1;
     proxy->inject_pipe_rd = -1;
@@ -3375,6 +3382,9 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     strncpy(proxy->aeron_ub_path,
             VEMB_V16_DEFAULT_AERON_UB_PATH,
             sizeof(proxy->aeron_ub_path) - 1);
+    strncpy(proxy->aeron_response_ub_path,
+            VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH,
+            sizeof(proxy->aeron_response_ub_path) - 1);
     atomic_init(&proxy->running, 0);
     atomic_init(&proxy->next_channel_id, 1);
     atomic_init(&proxy->next_channel_index, 0);
@@ -3457,6 +3467,19 @@ int vemb_v16_proxy_set_aeron_ub_path(vemb_v16_proxy_t *proxy,
         return -1;
     strncpy(proxy->aeron_ub_path, ub_path, sizeof(proxy->aeron_ub_path) - 1);
     proxy->aeron_ub_path[sizeof(proxy->aeron_ub_path) - 1] = '\0';
+    return 0;
+}
+
+int vemb_v16_proxy_set_aeron_response_ub_path(vemb_v16_proxy_t *proxy,
+                                              const char *ub_path) {
+    assert(proxy != NULL);
+    if (!ub_path || !ub_path[0] ||
+        strlen(ub_path) >= sizeof(proxy->aeron_response_ub_path))
+        return -1;
+    strncpy(proxy->aeron_response_ub_path, ub_path,
+            sizeof(proxy->aeron_response_ub_path) - 1);
+    proxy->aeron_response_ub_path[
+        sizeof(proxy->aeron_response_ub_path) - 1] = '\0';
     return 0;
 }
 

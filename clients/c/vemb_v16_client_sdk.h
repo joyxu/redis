@@ -461,6 +461,13 @@ uint32_t vemb_v16_aeron_poll_response_batch(vemb_v16_aeron_channel_t *ch,
                                             uint32_t max_len,
                                             uint32_t max_count);
 
+/* Same as vemb_v16_aeron_poll_response_batch(), with the compact Aeron wire
+ * length returned for every decoded response. `slots` still receives one
+ * vemb_v16_resp_t at each `max_len` stride. */
+uint32_t vemb_v16_aeron_poll_response_batch_ex(
+    vemb_v16_aeron_channel_t *ch, void *slots, uint32_t *wire_lens,
+    uint32_t max_len, uint32_t max_count);
+
 /* Open the warm region referenced by this channel's server-provided
  * channel_desc (mmap of /dev/obmm_shmdev* or POSIX SHM). Required before
  * vemb_v16_aeron_read_vector() can dereference VEMB_HANDLE offsets.

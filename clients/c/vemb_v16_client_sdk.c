@@ -2507,20 +2507,24 @@ static int vemb_v16_aeron_tcp_alloc(int fd, uint32_t dim,
                VEMB_V16_AERON_ATTACHED_MAGIC,
                VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0 ||
         resp.status != 0 ||
-        resp.shmdev_path_len == 0 ||
-        resp.shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.request_shmdev_path_len == 0 ||
+        resp.request_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.response_shmdev_path_len == 0 ||
+        resp.response_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
         resp.req_slot_size == 0 ||
         resp.resp_slot_size == 0 ||
         resp.ring_size_slots != VEMB_V16_CLIENT_RING_SIZE ||
-        resp.shmdev_path[0] == '\0') {
+        resp.request_shmdev_path[0] == '\0' ||
+        resp.response_shmdev_path[0] == '\0') {
         return -1;
     }
 
     fprintf(stderr,
-            "[sdk] aeron attach resp: path=%s req_off=%llu resp_off=%llu "
+            "[sdk] aeron attach resp: req_path=%s resp_path=%s req_off=%llu resp_off=%llu "
             "warm_count=%u warm_id=%u warm_backend=%u warm_bytes=%llu "
             "warm_offset=%llu warm_path=%s\n",
-            resp.shmdev_path,
+            resp.request_shmdev_path,
+            resp.response_shmdev_path,
             (unsigned long long)resp.req_ring_off,
             (unsigned long long)resp.resp_ring_off,
             resp.warm_region_count,
@@ -2541,12 +2545,12 @@ static int vemb_v16_aeron_tcp_alloc(int fd, uint32_t dim,
     snprintf(desc->request_ring_name,
              sizeof(desc->request_ring_name),
              "%s@off%llu",
-             resp.shmdev_path,
+             resp.request_shmdev_path,
              (unsigned long long)resp.req_ring_off);
     snprintf(desc->response_ring_name,
              sizeof(desc->response_ring_name),
              "%s@off%llu",
-             resp.shmdev_path,
+             resp.response_shmdev_path,
              (unsigned long long)resp.resp_ring_off);
     if (resp.warm_region_count > 1 ||
         (resp.warm_region_count != 0 &&
@@ -2832,10 +2836,24 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
     }
     close(fd);  /* TCP is handshake-only; data goes over shmdev */
 
-    char client_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
-    if (vemb_v16_aeron_map_remote_ub_path(resp.shmdev_path,
-                                          client_shmdev_path,
-                                          sizeof(client_shmdev_path)) != 0) {
+    if (resp.request_shmdev_path_len == 0 ||
+        resp.request_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.response_shmdev_path_len == 0 ||
+        resp.response_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.request_shmdev_path[0] == '\0' ||
+        resp.response_shmdev_path[0] == '\0' ||
+        resp.req_backend_type != VEMB_V16_REGION_UB ||
+        resp.resp_backend_type != VEMB_V16_REGION_UB) {
+        return NULL;
+    }
+    char client_request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char client_response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    if (vemb_v16_aeron_map_remote_ub_path(
+            resp.request_shmdev_path, client_request_shmdev_path,
+            sizeof(client_request_shmdev_path)) != 0 ||
+        vemb_v16_aeron_map_remote_ub_path(
+            resp.response_shmdev_path, client_response_shmdev_path,
+            sizeof(client_response_shmdev_path)) != 0) {
         return NULL;
     }
 
@@ -2851,14 +2869,14 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
     ch->desc.request_ring_slot_size  = resp.req_slot_size;
     ch->desc.response_ring_slot_size = resp.resp_slot_size;
 
-    if (vemb_v16_aeron_ring_open_shmdev(client_shmdev_path,
+    if (vemb_v16_aeron_ring_open_shmdev(client_request_shmdev_path,
                                         resp.req_ring_off,
                                         resp.req_slot_size,
                                         1,
                                         &ch->req_ring) != 0) {
         free(ch); return NULL;
     }
-    if (vemb_v16_aeron_ring_open_shmdev(client_shmdev_path,
+    if (vemb_v16_aeron_ring_open_shmdev(client_response_shmdev_path,
                                         resp.resp_ring_off,
                                         resp.resp_slot_size,
                                         1,
@@ -2886,8 +2904,9 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
         ch->desc.warm_regions[0].path[sizeof(ch->desc.warm_regions[0].path) - 1] = 0;
     }
 
-    fprintf(stderr, "[sdk] cross-node ch ok: cid=%llu shmdev=%s req_off=%llu resp_off=%llu req_slot=%u resp_slot=%u\n",
-            (unsigned long long)ch->desc.channel_id, resp.shmdev_path,
+    fprintf(stderr, "[sdk] cross-node ch ok: cid=%llu req_path=%s resp_path=%s req_off=%llu resp_off=%llu req_slot=%u resp_slot=%u\n",
+            (unsigned long long)ch->desc.channel_id,
+            resp.request_shmdev_path, resp.response_shmdev_path,
             (unsigned long long)resp.req_ring_off,
             (unsigned long long)resp.resp_ring_off,
             resp.req_slot_size, resp.resp_slot_size);
@@ -2974,18 +2993,48 @@ int vemb_v16_aeron_publish_request_batch(vemb_v16_aeron_channel_t *ch,
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
                                  void *buf, uint32_t max_len) {
     if (!ch) return -3;
-    return vemb_v16_client_poll(ch->resp_ring, buf, max_len);
+    if (!buf || max_len < sizeof(vemb_v16_resp_t)) return -2;
+    uint8_t wire[VEMB_V16_AERON_RESP_WIRE_MAX_LEN];
+    int got = vemb_v16_client_poll(ch->resp_ring, wire, sizeof(wire));
+    if (got <= 0) return got;
+    vemb_v16_resp_t decoded;
+    if (vemb_v16_resp_decode(&decoded, wire, (size_t)got) != 0)
+        return -1;
+    memcpy(buf, &decoded, sizeof(decoded));
+    return (int)sizeof(decoded);
+}
+
+uint32_t vemb_v16_aeron_poll_response_batch_ex(
+    vemb_v16_aeron_channel_t *ch, void *slots, uint32_t *wire_lens,
+    uint32_t max_len, uint32_t max_count) {
+    if (!ch || !slots || max_len < sizeof(vemb_v16_resp_t) ||
+        max_count == 0) return 0;
+    uint32_t local_lens[VEMB_V16_CLIENT_RING_SIZE];
+    uint32_t *lengths = wire_lens ? wire_lens : local_lens;
+    if (max_count > VEMB_V16_CLIENT_RING_SIZE)
+        max_count = VEMB_V16_CLIENT_RING_SIZE;
+    uint32_t got = vemb_v16_client_poll_batch_lengths(
+        ch->resp_ring, slots, lengths, max_len, max_count);
+    for (uint32_t i = 0; i < got; i++) {
+        uint8_t *dst = (uint8_t *)slots + (size_t)i * max_len;
+        vemb_v16_resp_t decoded;
+        if (vemb_v16_resp_decode(&decoded, dst, lengths[i]) == 0) {
+            memcpy(dst, &decoded, sizeof(decoded));
+        } else {
+            memset(&decoded, 0, sizeof(decoded));
+            decoded.status = VEMB_V16_STATUS_ERR;
+            memcpy(dst, &decoded, sizeof(decoded));
+        }
+    }
+    return got;
 }
 
 uint32_t vemb_v16_aeron_poll_response_batch(vemb_v16_aeron_channel_t *ch,
                                             void *slots,
                                             uint32_t max_len,
                                             uint32_t max_count) {
-    if (!ch || !slots || max_len == 0 || max_count == 0) return 0;
-    return vemb_v16_client_poll_batch(ch->resp_ring,
-                                      slots,
-                                      max_len,
-                                      max_count);
+    return vemb_v16_aeron_poll_response_batch_ex(ch, slots, NULL,
+                                                 max_len, max_count);
 }
 
 /* Helper: open and mmap a single warm region by path. */

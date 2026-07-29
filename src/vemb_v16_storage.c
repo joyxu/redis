@@ -5054,17 +5054,17 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
  * overflow silently produces 0 and mmap fails. */
 #define VEMB_V16_SHMDEV_CROSS_NODE_BYTES (8ull << 30)
 
-static struct {
-    pthread_mutex_t lock;
+typedef struct {
     int      inited;
     int      fd;
     void    *base;
     size_t   size;
     size_t   bump;  /* next free byte offset */
     char     path[256];
-} g_shmdev_pool = {
-    .lock = PTHREAD_MUTEX_INITIALIZER,
-};
+} vemb_v16_shmdev_pool_t;
+
+static pthread_mutex_t g_shmdev_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static vemb_v16_shmdev_pool_t g_shmdev_pools[2];
 
 static int open_ub_path_spec(const char *path_spec,
                              char selected[256]) {
@@ -5109,8 +5109,9 @@ static int open_ub_path_spec(const char *path_spec,
     return -1;
 }
 
-static int shmdev_pool_init(const char *path_spec) {
-    if (g_shmdev_pool.inited) return 0;
+static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
+                            const char *path_spec) {
+    if (pool->inited) return 0;
     char selected_path[256];
     int fd = open_ub_path_spec(path_spec, selected_path);
     if (fd < 0) {
@@ -5129,23 +5130,47 @@ static int shmdev_pool_init(const char *path_spec) {
         close(fd);
         return -2;
     }
-    g_shmdev_pool.fd   = fd;
-    g_shmdev_pool.base = p;
-    g_shmdev_pool.size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
-    g_shmdev_pool.bump = 0;
-    strncpy(g_shmdev_pool.path, selected_path, sizeof(g_shmdev_pool.path) - 1);
-    g_shmdev_pool.path[sizeof(g_shmdev_pool.path) - 1] = '\0';
-    g_shmdev_pool.inited = 1;
+    pool->fd   = fd;
+    pool->base = p;
+    pool->size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
+    pool->bump = 0;
+    strncpy(pool->path, selected_path, sizeof(pool->path) - 1);
+    pool->path[sizeof(pool->path) - 1] = '\0';
+    pool->inited = 1;
     serverLog(LL_NOTICE, "aeron ub pool ready: configured=%s selected=%s size=%zu",
-              path_spec, g_shmdev_pool.path, g_shmdev_pool.size);
+              path_spec, pool->path, pool->size);
     return 0;
 }
 
-int vemb_v16_storage_alloc_aeron_channel(const char *ub_path,
+static int shmdev_pool_reserve(vemb_v16_shmdev_pool_t *pool,
+                               const char *path_spec,
+                               size_t bytes,
+                               uint64_t *out_off,
+                               void **out_mapping,
+                               size_t *out_bytes,
+                               char out_path[256]) {
+    if (shmdev_pool_init(pool, path_spec) != 0)
+        return -2;
+    size_t aligned = vemb_v16_align_up_size(bytes, 4096u);
+    if (pool->bump + aligned > pool->size)
+        return -1;
+    size_t off = pool->bump;
+    pool->bump += aligned;
+    *out_off = (uint64_t)off;
+    *out_mapping = (uint8_t *)pool->base + off;
+    *out_bytes = bytes;
+    strncpy(out_path, pool->path, 255);
+    out_path[255] = '\0';
+    return 0;
+}
+
+int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
+                                         const char *response_ub_path,
                                          uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
-                                         char out_shmdev_path[256],
+                                         char out_request_shmdev_path[256],
+                                         char out_response_shmdev_path[256],
                                          uint64_t *out_req_off,
                                          uint64_t *out_resp_off,
                                          void **out_req_mapping,
@@ -5162,39 +5187,36 @@ int vemb_v16_storage_alloc_aeron_channel(const char *ub_path,
     size_t req_bytes  = vemb_v16_client_ring_bytes(req_slot_size);
     size_t resp_bytes = vemb_v16_client_ring_bytes(resp_slot_size);
 
-    pthread_mutex_lock(&g_shmdev_pool.lock);
-    if (shmdev_pool_init(ub_path) != 0) {
-        pthread_mutex_unlock(&g_shmdev_pool.lock);
-        return -2;
-    }
-    size_t aligned_req  = (req_bytes  + 4095u) & ~4095u;
-    size_t aligned_resp = (resp_bytes + 4095u) & ~4095u;
-    if (g_shmdev_pool.bump + aligned_req + aligned_resp > g_shmdev_pool.size) {
-        pthread_mutex_unlock(&g_shmdev_pool.lock);
-        return -1;  /* pool exhausted */
-    }
-    size_t req_off  = g_shmdev_pool.bump;
-    size_t resp_off = req_off + aligned_req;
-    g_shmdev_pool.bump = resp_off + aligned_resp;
-    pthread_mutex_unlock(&g_shmdev_pool.lock);
+    if (!request_ub_path || !request_ub_path[0] ||
+        !response_ub_path || !response_ub_path[0] ||
+        !out_request_shmdev_path || !out_response_shmdev_path)
+        return -1;
 
-    void *req_map  = (uint8_t *)g_shmdev_pool.base + req_off;
-    void *resp_map = (uint8_t *)g_shmdev_pool.base + resp_off;
+    pthread_mutex_lock(&g_shmdev_pool_lock);
+    vemb_v16_shmdev_pool_t *req_pool = &g_shmdev_pools[0];
+    vemb_v16_shmdev_pool_t *resp_pool =
+        strcmp(request_ub_path, response_ub_path) == 0 ?
+            req_pool : &g_shmdev_pools[1];
+    int rc = shmdev_pool_reserve(req_pool, request_ub_path, req_bytes,
+                                 out_req_off, out_req_mapping, out_req_bytes,
+                                 out_request_shmdev_path);
+    if (rc == 0)
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path, resp_bytes,
+                                 out_resp_off, out_resp_mapping, out_resp_bytes,
+                                 out_response_shmdev_path);
+    pthread_mutex_unlock(&g_shmdev_pool_lock);
+    if (rc != 0)
+        return rc;
+
+    void *req_map  = *out_req_mapping;
+    void *resp_map = *out_resp_mapping;
     memset(req_map,  0, req_bytes);
     memset(resp_map, 0, resp_bytes);
 
-    /* init each ring header — slots_off points right after the header */
+    /* Initialize each ring header and its 64B-aligned slot layout. */
     vemb_v16_client_ring_init((vemb_v16_client_ring_t *)req_map,  req_slot_size);
     vemb_v16_client_ring_init((vemb_v16_client_ring_t *)resp_map, resp_slot_size);
 
-    strncpy(out_shmdev_path, g_shmdev_pool.path, 255);
-    out_shmdev_path[255] = 0;
-    *out_req_off     = (uint64_t)req_off;
-    *out_resp_off    = (uint64_t)resp_off;
-    *out_req_mapping  = req_map;
-    *out_resp_mapping = resp_map;
-    *out_req_bytes   = req_bytes;
-    *out_resp_bytes  = resp_bytes;
     return 0;
 }
 

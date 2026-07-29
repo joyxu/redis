@@ -297,22 +297,22 @@ sve_operation_stats_t *vemb_v16_storage_sve_stats(vemb_v16_storage_ctx_t *storag
 void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
                                         vemb_v16_channel_desc_t *desc);
 
-/* Allocate two adjacent ring regions in a free UB shmdev for cross-node
- * aeron transport. Returns:
- *   0  on success — fills out_shmdev_path, out_req_off, out_resp_off
+/* Allocate request and response ring regions from independent UB paths for
+ * cross-node aeron transport. Returns:
+ *   0  on success — fills both paths and offsets
  *  -1  no free shmdev slot
  *  -2  shmdev open/mmap failed
  * Caller must NOT munmap the returned regions until channel close (the
  * server's proxy holds the mapping for the channel lifetime).
  *
- * Layout within a shmdev:
- *   [req_ring bytes][resp_ring bytes]
  * Both rings are zero-initialized by this call. */
-int vemb_v16_storage_alloc_aeron_channel(const char *ub_path,
+int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
+                                         const char *response_ub_path,
                                          uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
-                                         char out_shmdev_path[256],
+                                         char out_request_shmdev_path[256],
+                                         char out_response_shmdev_path[256],
                                          uint64_t *out_req_off,
                                          uint64_t *out_resp_off,
                                          void **out_req_mapping,

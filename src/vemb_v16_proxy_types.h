@@ -87,6 +87,7 @@ struct vemb_v16_proxy {
     char uds_path[108];
     char tcp_host[64];
     char aeron_ub_path[256];
+    char aeron_response_ub_path[256];
     uint32_t vector_dim;
     uint32_t vector_stride;
     uint32_t request_ring_slot_size;

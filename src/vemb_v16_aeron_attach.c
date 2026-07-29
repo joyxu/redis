@@ -38,16 +38,14 @@ static int read_full(int fd, void *buf, size_t n) {
     return 0;
 }
 
-/* Default slot sizing — mirrors local-aeron path (proxy.c:3344-3346):
- * req slot fits VEMB_INLINE (header + dim*4 vector bytes), resp slot
- * fits the fixed response struct. */
+/* Default slot sizing matches the compact Aeron wire frames. */
 static uint32_t default_req_slot_size(uint32_t dim) {
-    return (uint32_t)vemb_v16_req_inline_len(dim * sizeof(float));
+    return vemb_v16_aeron_req_slot_size(dim);
 }
 
 static uint32_t default_resp_slot_size(uint32_t dim) {
     (void)dim;
-    return (uint32_t)sizeof(vemb_v16_resp_t);
+    return vemb_v16_aeron_resp_slot_size();
 }
 
 int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
@@ -75,19 +73,26 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
         return -1;
     }
 
-    uint32_t req_slot  = req.req_slot_size  ?: default_req_slot_size(req.dim);
-    uint32_t resp_slot = req.resp_slot_size ?: default_resp_slot_size(req.dim);
+    uint32_t req_slot = req.req_slot_size ? req.req_slot_size :
+        default_req_slot_size(req.dim);
+    uint32_t resp_slot = req.resp_slot_size ? req.resp_slot_size :
+        default_resp_slot_size(req.dim);
+    req_slot = vemb_v16_client_ring_aligned_slot_size(req_slot);
+    resp_slot = vemb_v16_client_ring_aligned_slot_size(resp_slot);
 
     /* Allocate shmdev ring pair (server-local view). */
-    char server_shmdev_path[256];
+    char server_request_shmdev_path[256];
+    char server_response_shmdev_path[256];
     uint64_t req_off = 0, resp_off = 0;
     void *req_map = NULL, *resp_map = NULL;
     size_t req_bytes = 0, resp_bytes = 0;
     if (vemb_v16_storage_alloc_aeron_channel(
                                              vemb_v16_proxy_aeron_ub_path(proxy),
+                                             vemb_v16_proxy_aeron_response_ub_path(proxy),
                                              req_slot, resp_slot,
                                              VEMB_V16_CLIENT_RING_SIZE,
-                                             server_shmdev_path,
+                                             server_request_shmdev_path,
+                                             server_response_shmdev_path,
                                              &req_off, &resp_off,
                                              &req_map, &resp_map,
                                              &req_bytes, &resp_bytes) != 0) {
@@ -106,7 +111,8 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
     if (vemb_v16_proxy_attach_cross_node_channel(proxy,
                                                  req_map, resp_map,
                                                  req_slot, resp_slot,
-                                                 server_shmdev_path,
+                                                 server_request_shmdev_path,
+                                                 server_response_shmdev_path,
                                                  req_off, resp_off,
                                                  &channel_id) != 0) {
         vemb_v16_storage_free_aeron_channel(req_map, req_bytes,
@@ -129,13 +135,18 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
     resp.status          = 0;
     resp.channel_id      = channel_id;
     resp.ring_size_slots = VEMB_V16_CLIENT_RING_SIZE;
-    /* Return server-side paths. A remote client maps these paths to its
-     * local UB view after ATTACH; the server must not encode a deployment
-     * specific client device into the warm-region manifest. */
-    resp.shmdev_path_len = (uint32_t)strnlen(server_shmdev_path, 255) + 1u;
-    strncpy(resp.shmdev_path, server_shmdev_path, 255);
-    resp.req_ring_off    = req_off;
-    resp.resp_ring_off   = resp_off;
+    /* Return independent server-side paths. A remote client maps each path
+     * to its local UB view after ATTACH. */
+    resp.request_shmdev_path_len =
+        (uint32_t)strnlen(server_request_shmdev_path, 255) + 1u;
+    strncpy(resp.request_shmdev_path, server_request_shmdev_path, 255);
+    resp.req_ring_off = req_off;
+    resp.response_shmdev_path_len =
+        (uint32_t)strnlen(server_response_shmdev_path, 255) + 1u;
+    strncpy(resp.response_shmdev_path, server_response_shmdev_path, 255);
+    resp.resp_ring_off = resp_off;
+    resp.req_backend_type = VEMB_V16_REGION_UB;
+    resp.resp_backend_type = VEMB_V16_REGION_UB;
     resp.req_slot_size   = req_slot;
     resp.resp_slot_size  = resp_slot;
     /* Advertise the server-side warm region path. The remote client maps it
@@ -153,7 +164,7 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
               "server_shmdev=%s req_off=%llu resp_off=%llu "
               "warm_count=%u warm_path=%s",
               (unsigned long long)channel_id, req.dim, req_slot, resp_slot,
-              server_shmdev_path,
+              server_request_shmdev_path,
               (unsigned long long)req_off, (unsigned long long)resp_off,
               resp.warm_region_count,
               resp.warm_region_count ? resp.warm_path : "(none)");

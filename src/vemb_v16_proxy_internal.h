@@ -41,6 +41,7 @@ void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_aeron_ub_path(vemb_v16_proxy_t *proxy);
+const char *vemb_v16_proxy_aeron_response_ub_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);
 uint32_t vemb_v16_proxy_data_transport(vemb_v16_proxy_t *proxy);
@@ -101,16 +102,16 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
  *   resp_ring   - already-mmaped shmdev resp ring
  *   req_slot    - req ring slot size
  *   resp_slot   - resp ring slot size
- *   shmdev_path - shmdev path (logged for diagnostics)
- *   req_off     - byte offset of req_ring within shmdev (logged)
- *   resp_off    - byte offset of resp_ring within shmdev (logged)
+ *   req_path/resp_path - paths (logged for diagnostics)
+ *   req_off/resp_off  - byte offsets within their respective paths
  *   out_channel_id - receives the assigned channel id
  * Returns 0 on success. The proxy adopts the ring mappings (does NOT
  * munmap them - caller's storage layer owns that). */
 int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
                                              void *req_ring, void *resp_ring,
                                              uint32_t req_slot, uint32_t resp_slot,
-                                             const char *shmdev_path,
+                                             const char *req_path,
+                                             const char *resp_path,
                                              uint64_t req_off, uint64_t resp_off,
                                              uint64_t *out_channel_id);
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy,

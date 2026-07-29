@@ -222,6 +222,7 @@ static int account_response(worker_arg *w,
                             uint32_t ch,
                             uint32_t pipeline,
                             const vemb_v16_resp_t *resp,
+                            uint32_t wire_bytes,
                             float *vec_scratch,
                             aeron_debug_counters *debug) {
     if (w->pending_count[ch] == 0)
@@ -254,7 +255,7 @@ static int account_response(worker_arg *w,
     struct timeval now;
     gettimeofday(&now, NULL);
     unsigned int latency_usec = (unsigned int)ts_diff(pe->sent_time, now);
-    unsigned int bytes_rx = (unsigned int)sizeof(*resp);
+    unsigned int bytes_rx = wire_bytes;
     if (pe->is_set) {
         w->stats->update_set_op(&now, bytes_rx, pe->bytes_tx, latency_usec);
     } else {
@@ -302,9 +303,11 @@ static void *worker_main(void *arg) {
     unsigned long long budget = w->budget;  /* 0 = unlimited (--test-time) */
     uint32_t next_ch = 0;
     vemb_v16_req_t req_batch[AERON_BATCH_SIZE];
+    uint8_t req_wire[AERON_BATCH_SIZE][VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
     const void *req_ptrs[AERON_BATCH_SIZE];
     uint32_t req_lens[AERON_BATCH_SIZE];
     vemb_v16_resp_t resp_batch[AERON_BATCH_SIZE];
+    uint32_t resp_wire_lens[AERON_BATCH_SIZE];
     /* Scratch buffer for VEMB_HANDLE dereference — large enough for any
      * dim up to VEMB_V16_MAX_DIM. Lives on the worker stack. */
     float vec_scratch[VEMB_V16_MAX_DIM];
@@ -345,13 +348,19 @@ static void *worker_main(void *arg) {
                 unsigned long long key_index = w->obj_gen->get_key_index(iter);
                 w->obj_gen->generate_key(key_index);
                 uint32_t actual_key_len = 0;
-                size_t req_len = build_req(w, op_idx + i, op,
-                                           w->obj_gen->get_key(),
-                                           w->obj_gen->get_key_len(),
-                                           &req_batch[i], &actual_key_len);
+                (void)build_req(w, op_idx + i, op,
+                                 w->obj_gen->get_key(),
+                                 w->obj_gen->get_key_len(),
+                                 &req_batch[i], &actual_key_len);
                 req_batch[i].channel_id =
                     vemb_v16_aeron_channel_id(w->channels[ch]);
-                req_ptrs[i] = &req_batch[i];
+                size_t req_len = 0;
+                if (vemb_v16_req_encode(req_wire[i], sizeof(req_wire[i]),
+                                        &req_batch[i], &req_len) != 0) {
+                    req_lens[i] = 0;
+                    continue;
+                }
+                req_ptrs[i] = req_wire[i];
                 req_lens[i] = (uint32_t)req_len;
             }
 
@@ -382,9 +391,9 @@ static void *worker_main(void *arg) {
         int polled_any = 0;
         for (uint32_t ch = 0; ch < n_ch; ch++) {
             if (w->pending_count[ch] == 0) continue;
-            uint32_t got = vemb_v16_aeron_poll_response_batch(
-                w->channels[ch], resp_batch, sizeof(resp_batch[0]),
-                AERON_BATCH_SIZE);
+            uint32_t got = vemb_v16_aeron_poll_response_batch_ex(
+                w->channels[ch], resp_batch, resp_wire_lens,
+                sizeof(resp_batch[0]), AERON_BATCH_SIZE);
             if (got == 0) {
                 debug_poll_zero++;
                 continue;
@@ -392,7 +401,8 @@ static void *worker_main(void *arg) {
             debug_poll_got += got;
             for (uint32_t i = 0; i < got; i++)
                 polled_any |= account_response(w, ch, pipeline,
-                                               &resp_batch[i], vec_scratch,
+                                               &resp_batch[i], resp_wire_lens[i],
+                                               vec_scratch,
                                                &debug);
         }
 
@@ -424,9 +434,9 @@ static void *worker_main(void *arg) {
 
             for (uint32_t ch = 0; ch < n_ch; ch++) {
                 if (w->pending_count[ch] == 0) continue;
-                uint32_t got = vemb_v16_aeron_poll_response_batch(
-                    w->channels[ch], resp_batch, sizeof(resp_batch[0]),
-                    AERON_BATCH_SIZE);
+                uint32_t got = vemb_v16_aeron_poll_response_batch_ex(
+                    w->channels[ch], resp_batch, resp_wire_lens,
+                    sizeof(resp_batch[0]), AERON_BATCH_SIZE);
                 if (got == 0) {
                     debug_poll_zero++;
                     continue;
@@ -434,7 +444,7 @@ static void *worker_main(void *arg) {
                 debug_poll_got += got;
                 for (uint32_t i = 0; i < got; i++)
                     account_response(w, ch, pipeline, &resp_batch[i],
-                                     vec_scratch, &debug);
+                                     resp_wire_lens[i], vec_scratch, &debug);
             }
             struct timespec ts = {0, 500};
             nanosleep(&ts, NULL);

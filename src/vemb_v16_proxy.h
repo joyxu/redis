@@ -23,6 +23,8 @@ int vemb_v16_proxy_enable_aeron_tcp_control(vemb_v16_proxy_t *proxy,
 int vemb_v16_proxy_enable_aeron_tcp_inject_only(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_set_aeron_ub_path(vemb_v16_proxy_t *proxy,
                                      const char *ub_path);
+int vemb_v16_proxy_set_aeron_response_ub_path(vemb_v16_proxy_t *proxy,
+                                              const char *ub_path);
 uint32_t vemb_v16_proxy_data_transport(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp_inject_only(vemb_v16_proxy_t *proxy);

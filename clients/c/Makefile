@@ -63,6 +63,7 @@ PUBLIC_HEADERS := \
 	$(INC_DIR)/vemb_v16_client_sdk.h \
 	$(INC_DIR)/macro.h \
 	$(INC_DIR)/vemb_v16_protocol.h \
+	$(INC_DIR)/vemb_v16_cacheline.h \
 	$(INC_DIR)/vemb_v16_net.h \
 	$(INC_DIR)/vemb_v16_client_topology.h \
 	$(INC_DIR)/vemb_v16_topology.h \
@@ -123,6 +124,10 @@ $(INC_DIR)/macro.h: $(INTERNAL_DIR)/macro.h
 	cp $< $@
 
 $(INC_DIR)/vemb_v16_protocol.h: $(SRC_DIR)/vemb_v16_protocol.h
+	@mkdir -p $(INC_DIR)
+	cp $< $@
+
+$(INC_DIR)/vemb_v16_cacheline.h: $(SRC_DIR)/vemb_v16_cacheline.h
 	@mkdir -p $(INC_DIR)
 	cp $< $@
 

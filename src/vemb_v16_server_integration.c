@@ -109,6 +109,18 @@ int vemb_v16_server_integration_init(void) {
         server.vemb_v16_proxy = NULL;
         return -1;
     }
+    if (vemb_v16_proxy_set_aeron_response_ub_path(
+            server.vemb_v16_proxy,
+            server.vemb_v16_aeron_response_ub_path &&
+            server.vemb_v16_aeron_response_ub_path[0] ?
+                server.vemb_v16_aeron_response_ub_path :
+                VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16_proxy_set_aeron_response_ub_path failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
     g_vemb_storage = storage;
 
     if (server.vemb_v16_supernode_workers > 0) {

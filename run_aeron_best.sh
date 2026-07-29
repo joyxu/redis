@@ -42,6 +42,7 @@ PIO=${PIO:-8}
 SNW=${SNW:-8}
 AERON_CONTROL=${AERON_CONTROL:-tcp}
 AERON_UB_PATH=${AERON_UB_PATH:-/dev/obmm_shmdev1}
+AERON_RESPONSE_UB_PATH=${AERON_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}
 AERON_TRANSPORT=${AERON_TRANSPORT:-aeron}
 SERVER_TRANSPORT=${SERVER_TRANSPORT:-$AERON_TRANSPORT}
 if [ "$SERVER_TRANSPORT" = "tcp" ]; then
@@ -85,7 +86,7 @@ mkdir -p "$RAWDIR"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 collect_ub_paths() {
-    UB_PATHS=("$AERON_UB_PATH")
+    UB_PATHS=("$AERON_UB_PATH" "$AERON_RESPONSE_UB_PATH")
     [ -r "$MANIFEST" ] || return 0
 
     while IFS= read -r path; do
@@ -180,6 +181,7 @@ if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
         --vemb-v16-transport "$SERVER_TRANSPORT" \
         --vemb-v16-aeron-control "$AERON_CONTROL" \
         --vemb-v16-aeron-ub-path "$AERON_UB_PATH" \
+        --vemb-v16-aeron-response-ub-path "$AERON_RESPONSE_UB_PATH" \
         --vemb-v16-proxy-io-threads $PIO \
         --vemb-v16-supernode-workers $SNW \
         --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
