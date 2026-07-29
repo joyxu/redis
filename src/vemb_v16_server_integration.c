@@ -23,6 +23,11 @@ int vemb_v16_cross_node_aeron_enabled(void) {
     return server.vemb_v16_cross_node_aeron_enabled;
 }
 
+static int vemb_v16_aeron_tcp_control_enabled(void) {
+    return server.vemb_v16_aeron_control &&
+           !strcmp(server.vemb_v16_aeron_control, "tcp");
+}
+
 #include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -93,6 +98,17 @@ int vemb_v16_server_integration_init(void) {
         vemb_v16_storage_ctx_destroy(storage);
         return -1;
     }
+    if (vemb_v16_proxy_set_aeron_ub_path(
+            server.vemb_v16_proxy,
+            server.vemb_v16_aeron_ub_path &&
+            server.vemb_v16_aeron_ub_path[0] ?
+                server.vemb_v16_aeron_ub_path :
+                VEMB_V16_DEFAULT_AERON_UB_PATH) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_proxy_set_aeron_ub_path failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
     g_vemb_storage = storage;
 
     if (server.vemb_v16_supernode_workers > 0) {
@@ -119,42 +135,42 @@ int vemb_v16_server_integration_init(void) {
         }
     }
 
-    /* Transport selection.  Default is "sniff" — UDS listener for direct
-     * VEMB V16 SHM clients + Redis-port sniff (fd inject) for VEMB frames
-     * arriving on port 6379.  "aeron" enables only the UDS listener for a
-     * pure SHM/Aeron datapath (no sniff on Redis ports). */
+    /* Transport selection. Aeron TCP control is received by Redis' existing
+     * TCP accept loop and handed to the proxy after ATTACH sniffing, so the
+     * proxy must not bind a second listener on the Redis port. */
     const char *vemb_transport =
         (server.vemb_v16_transport && server.vemb_v16_transport[0])
             ? server.vemb_v16_transport : "sniff";
 
-    /* Enable Aeron/UDS listener so direct VEMB V16 clients can connect to
-     * /tmp/vemb_v16.sock.  In sniff mode this coexists with inject — the
-     * proxy main loop drains both the UDS accept queue and the inject pipe
-     * each iteration. */
-    if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
-        serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
-        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
-        server.vemb_v16_proxy = NULL;
-        return -1;
-    }
-    serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
-
-    /* Enable inject pipe so Redis accept path can hand off VEMB connections.
-     * Sniff rides the Redis accept loop on every listening fd (port, TLS,
-     * bind) and steals fds whose first bytes match the VEMB magic.  Skipped
-     * in pure "aeron" mode where clients must connect to the UDS socket
-     * directly. */
-    if (strcmp(vemb_transport, "aeron") != 0) {
-        if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
-            serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
+    if (!strcmp(vemb_transport, "aeron")) {
+        int control_rc = vemb_v16_aeron_tcp_control_enabled() ?
+            vemb_v16_proxy_enable_aeron_tcp_inject_only(server.vemb_v16_proxy) :
+            vemb_v16_proxy_enable_uds(server.vemb_v16_proxy);
+        if (control_rc != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 aeron control setup failed: control=%s",
+                      server.vemb_v16_aeron_control ?
+                          server.vemb_v16_aeron_control : "(null)");
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
             server.vemb_v16_proxy = NULL;
             return -1;
         }
-        serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
-                  vemb_transport);
+        serverLog(LL_NOTICE, "VEMB V16 Aeron control enabled: %s ub_path=%s",
+                  vemb_v16_aeron_tcp_control_enabled() ? "tcp/redis-listener" :
+                      VEMB_V16_UDS_PATH,
+                  server.vemb_v16_aeron_ub_path ?
+                      server.vemb_v16_aeron_ub_path :
+                      VEMB_V16_DEFAULT_AERON_UB_PATH);
     } else {
-        serverLog(LL_NOTICE, "VEMB V16 transport=aeron: TCP sniff accepts control frames; data clients use UDS/UB rings");
+        if (vemb_v16_proxy_enable_tcp_inject_only(server.vemb_v16_proxy) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16_proxy_enable_tcp_inject_only failed");
+            vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+            server.vemb_v16_proxy = NULL;
+            return -1;
+        }
+        serverLog(LL_NOTICE,
+                  "VEMB V16 TCP data path enabled through Redis listening ports");
     }
 
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
@@ -211,7 +227,10 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     /* Cross-node aeron is opt-in via --vemb-v16-cross-node-aeron yes.
      * When disabled, never peek for the ATTACH magic — falls through
      * to the normal VEMB/RESP sniff path (pre-cross-node behavior). */
-    if (!server.vemb_v16_cross_node_aeron_enabled) return 0;
+    if (!vemb_v16_aeron_tcp_control_enabled() ||
+        !server.vemb_v16_transport ||
+        strcmp(server.vemb_v16_transport, "aeron") != 0)
+        return 0;
 
     /* Peek 24 bytes without consuming. If not yet available, brief poll
      * — cross-node ATTACH is a control-plane op (channel setup, once per
@@ -403,7 +422,9 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
              * RESP here would silently swallow the ATTACH.
              * Skipped when cross-node aeron is disabled (pre-cross-node
              * behavior: anything non-VEMB_V16_MAGIC falls through to RESP). */
-            if (server.vemb_v16_cross_node_aeron_enabled &&
+            if (vemb_v16_aeron_tcp_control_enabled() &&
+                server.vemb_v16_transport &&
+                !strcmp(server.vemb_v16_transport, "aeron") &&
                 memcmp(buf, VEMB_V16_AERON_ATTACH_MAGIC, 4) == 0) {
                 if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)
                     return 2;

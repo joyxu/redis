@@ -1250,7 +1250,7 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
             exit(1);
         }
         if (strcmp(mode, "aeron") == 0 && endpoint[0] != '\0') {
-            fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (UDS is local-only)\n");
+            fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (use aeron-cross-node)\n");
             exit(1);
         }
         vemb_v16_aeron_set_transport(mode, endpoint);

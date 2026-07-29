@@ -308,7 +308,8 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
  * Layout within a shmdev:
  *   [req_ring bytes][resp_ring bytes]
  * Both rings are zero-initialized by this call. */
-int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
+int vemb_v16_storage_alloc_aeron_channel(const char *ub_path,
+                                         uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
                                          char out_shmdev_path[256],
@@ -542,11 +543,11 @@ int vemb_v16_storage_migration_write_blocked_info(
     tlc_core_key_migration_info_t *info,
     vemb_v16_migration_outbox_stats_t *outbox_stats);
 
-/* Cross-node ATTACH support: return first local manifest region that has
- * a non-empty client_path, or NULL if none configured. The returned
- * pointer is valid for the storage's lifetime (do not free). */
+/* Aeron ATTACH support: return the first local warm region using its
+ * server-side path. Local clients may mmap SHM or UB directly; remote
+ * clients accept only UB and map it to their local UB view. */
 const vemb_v16_manifest_region_t *
-vemb_v16_storage_first_local_region_with_client_path(
+vemb_v16_storage_first_local_region(
     const vemb_v16_storage_ctx_t *storage);
 
 #endif

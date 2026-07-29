@@ -29,6 +29,7 @@ ARCH_FLAGS ?= -DUSE_ARM_SVE -march=armv8.2-a+sve
 else
 ARCH_FLAGS ?=
 endif
+ARCH_FLAGS += -DVEMB_V16_CLIENT_RING_USE_SVE
 
 # ---- paths (absolute, so `make -C` works from anywhere) ----
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))

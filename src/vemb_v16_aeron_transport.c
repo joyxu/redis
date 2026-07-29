@@ -10,13 +10,11 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-/// UDS + SHM/Aeron transport implementation.
+/// TCP/UB Aeron transport implementation.
 
 int vemb_v16_aeron_listen(vemb_v16_proxy_t *proxy,
                           int backlog,
@@ -48,41 +46,6 @@ int vemb_v16_aeron_listen(vemb_v16_proxy_t *proxy,
     return 0;
 }
 
-/// UB/SHM control plane: create the per-channel client request/response rings.
-int vemb_v16_aeron_create_shared_ring(const char *name,
-                                      uint32_t slot_size,
-                                      vemb_v16_client_ring_t **ring,
-                                      size_t *ring_bytes) {
-    shm_unlink(name);
-    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
-    int fd = shm_open(name, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) return -1;
-    if (ftruncate(fd, (off_t)bytes) != 0) {
-        close(fd);
-        shm_unlink(name);
-        return -1;
-    }
-    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                     MAP_SHARED, fd, 0);
-    close(fd);
-    if (ptr == MAP_FAILED) {
-        shm_unlink(name);
-        return -1;
-    }
-    memset(ptr, 0, bytes);
-    vemb_v16_client_ring_init(ptr, slot_size);
-    *ring = ptr;
-    if (ring_bytes) *ring_bytes = bytes;
-    return 0;
-}
-
-void vemb_v16_aeron_destroy_shared_ring(const char *name,
-                                        vemb_v16_client_ring_t *ring,
-                                        size_t ring_bytes) {
-    if (ring) munmap(ring, ring_bytes);
-    if (name && name[0]) shm_unlink(name);
-}
-
 static int read_full(int fd, void *buf, size_t n) {
     size_t done = 0;
     while (done < n) {
@@ -107,25 +70,23 @@ static int write_full(int fd, const void *buf, size_t n) {
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
-    const void *slots[PROXY_REQUEST_BATCH];
-    const vemb_v16_req_t *reqs[PROXY_REQUEST_BATCH];
-
-    uint32_t req_count = vemb_v16_client_peek_batch(request_ring,
-                                                    slots,
+    vemb_v16_req_t reqs[PROXY_REQUEST_BATCH];
+    const vemb_v16_req_t *req_ptrs[PROXY_REQUEST_BATCH];
+    uint32_t req_count = vemb_v16_client_poll_batch(request_ring,
+                                                    reqs,
+                                                    sizeof(reqs[0]),
                                                     PROXY_REQUEST_BATCH);
     if (req_count == 0)
         return 0;
 
-    for (uint32_t i = 0; i < req_count; i++) {
-        reqs[i] = (const vemb_v16_req_t *)slots[i];
-    }
-    int req_len = (int)vemb_v16_channel_request_slot_size(ch);
+    for (uint32_t i = 0; i < req_count; i++)
+        req_ptrs[i] = &reqs[i];
+    int req_len = (int)sizeof(reqs[0]);
     vemb_v16_proxy_handle_request_ptr_batch(ch,
-                                            reqs,
+                                            req_ptrs,
                                             req_len,
                                             req_count,
                                             proxy_io_worker_id);
-    vemb_v16_client_consume_batch(request_ring, req_count);
     return (int)req_count;
 }
 

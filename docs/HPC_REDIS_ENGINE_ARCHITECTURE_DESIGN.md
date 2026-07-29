@@ -446,16 +446,39 @@ Proxy I/O worker
 
 | 配比 | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `1:1` | 1,021,403.10 | 7.807 | 7.967 | 1.66 | 接入和执行都只有一个并行单元 |
-| `1:20` | 236,231.32 | 35.071 | 36.607 | 0.61 | SuperNode 有空闲能力，但单个 Proxy 限制了入口和结果回写 |
-| `20:20` | 11,711,294.81 | 0.703 | 0.703 | 20.65 | 两侧并行度匹配，达到当前测试配置的高位 |
-| `21:21` | 11,771,274.05 | 0.703 | 0.863 | 21.10 | 吞吐略高于 `20:20`，继续增加线程的收益已明显变小 |
+| `1:1` | 760,194.41 | 8.895 | 40.703 | 1.34 | 接入和执行都只有一个并行单元，排队和尾延迟明显 |
+| `1:20` | 236,225.84 | 35.071 | 36.095 | 0.61 | SuperNode 有空闲能力，但单个 Proxy 限制入口和结果回写 |
+| `20:20` | 11,340,021.09 | 0.727 | 1.047 | 20.92 | 两侧并行度匹配，进入 payload 和网络栈热点主导区间 |
+| `21:21` | 11,197,954.81 | 0.727 | 0.951 | 21.35 | 增加一对 worker 没有继续提升吞吐，CPU 略有增加 |
 
-结果表明，单侧 worker 过少会成为端到端瓶颈：`1:20` 并没有因为执行线程更多而获得收益，反而受限于单个 Proxy 的请求接入、完成结果回收和响应写回；当两侧并行度匹配时，吞吐达到约 `11.7M QPS`，p50/p99 延迟约为亚毫秒级。相较于 `1:1`，`20:20` 的吞吐提升约 `11.5` 倍，p50 延迟下降约 `91.0%`，p99 延迟下降约 `91.2%`，说明多线程并行执行和接入/执行解耦共同扩大了系统处理能力。由此可见，解耦的价值不是简单增加线程，而是让接入、执行和回写可以分别扩展并保持流水化。
+这组配比实验清楚地显示，性能瓶颈首先位于请求接入侧，其次才是执行侧。`1:20` 的吞吐只有 `236K ops/sec`，比 `1:1` 低约 `68.9%`，p50 升至 `35.071 ms`；增加 SuperNode worker 并没有改善结果，因为单个 Proxy 仍限制了 socket 读取、任务发布、completion 回收和响应回写。将两侧同时扩展到 `20:20` 后，吞吐达到 `11.34M ops/sec`，约为 `1:1` 的 `14.9` 倍，p50 降至 `0.727 ms`，说明接入、执行和回写已形成有效并行流水。继续增加到 `21:21` 时，吞吐下降约 `1.25%`，CPU 却由 `20.92` 增至 `21.35`，表明当前负载下有效并行度已接近上限，新增 worker 带来的调度与同步成本开始抵消并行收益。
 
-对 21:21 配置的性能采样表明，热点主要集中在“批量取回完成结果”和“批量写回 TCP 响应”，而请求分派和 TLC 定位占比较小。这说明当接入和执行能力达到平衡后，瓶颈会从线程调度和数据定位转移到结果回写、网络栈和 payload 发送；后续优化应继续减少完成结果处理和响应发送的固定成本。
+以下火焰图热点对比表按本轮 `redis-server` server-only 火焰图 collapsed 栈统计，占比为该函数独占的 `cycles` 事件权重除以总权重；编译器生成的 `constprop`、`lto_priv` 后缀在表中省略。对包含读写系统调用的调用链，统一归并到 `read`/`recv`/`writev` 边界，不继续解释边界以下的内核实现。采样使用 `perf record -F 99 -g -e cycles -p <redis-server-pid>`，因此 SVG 仍同时保留用户态和内核态调用链。
 
-`20:20` 与 `21:21` 接近，说明继续增加执行线程已经不能带来同等收益，系统进入响应回写和网络处理主导的阶段。后续应结合 `4.3` 的批量调度、响应聚合和回压设计继续优化，而不是继续无条件增加 worker 数量。
+#### 火焰图热点对比
+
+下表将四组 server-only 火焰图中出现的主要热点统一列出。列方向为 `Proxy I/O worker : SuperNode worker` 实验配比，行方向为热点函数；单元格为该函数独占的 `cycles` 事件权重百分比。火焰图链接放在对应配比的表头中：[`1:1`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_1_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_1_t64_c4_30s.svg)、[`1:20`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_20_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_20_t64_c4_30s.svg)、[`20:20`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers20_20_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers20_20_t64_c4_30s.svg)、[`21:21`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_t64_c4_30s.svg)。编译器生成的 `constprop`、`lto_priv` 后缀在表中省略；对包含读写系统调用的调用链，统计统一归并到 `read`/`recv`/`writev` 边界，不继续解释边界以下的内核实现。
+
+| 热点函数 | [`1:1`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_1_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_1_t64_c4_30s.svg) | [`1:20`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_20_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers1_20_t64_c4_30s.svg) | [`20:20`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers20_20_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers20_20_t64_c4_30s.svg) | [`21:21`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_t64_c4_30s.svg) |
+| --- | ---: | ---: | ---: | ---: |
+| `drain_shard_queues` | 21.86% | — | — | — |
+| `writev` | 16.02% | 93.02% | 31.48% | 32.46% |
+| `recv` | 15.69% | 1.97% | 21.52% | 21.41% |
+| `vemb_v16_proxy_handle_request_ptr_batch_internal` | 7.67% | — | — | — |
+| `drain_job_return_queues` | 4.98% | 0.54% | — | — |
+| `tlc_core_get_warm_location_raw` | 3.45% | — | — | — |
+| `vemb_v16_proxy_run` | — | 0.75% | — | — |
+| `XXH_INLINE_XXH3_64bits` | — | 0.25% | — | — |
+| `tlc_core_copy_warm_location_value` | — | — | 7.50% | 7.63% |
+| `sve_streaming_load_f32` | — | — | 6.32% | 6.20% |
+| `read` | — | — | 4.16% | 4.35% |
+
+`—` 表示该函数未进入对应火焰图的主要热点列表，不等同于 `0%`。结合性能表和上述火焰图，实验结论如下：
+
+1. `1:1` 时，`drain_shard_queues` 占 `21.86%`，`writev`/`recv` 合计 `31.71%`，请求派发、completion 回收和 TLC 定位还占有可见比例。单个执行 worker 的队列排空与单个 Proxy 的接入、派发、回写固定成本叠加，形成串行瓶颈，对应吞吐仅 `760K ops/sec`、p99 为 `40.703 ms`。
+2. `1:20` 时，`writev` 单项占比升至 `93.02%`，而 SuperNode 侧执行函数没有进入主要热点列表。该火焰图直接佐证：系统被单个 Proxy 的响应回写能力限制，增加 SuperNode worker 只能造成执行资源空闲，吞吐因此降至 `236K ops/sec`，p50 升至 `35.071 ms`。
+3. `20:20` 时，`writev`/`recv` 占 `53.00%`，`tlc_core_copy_warm_location_value` 与 `sve_streaming_load_f32` 合计 `13.82%`，说明入口、回写、payload copy 和向量加载都已获得持续工作。瓶颈已从单侧线程不足转为网络读写边界与有效数据路径的共同成本，吞吐提升到 `11.34M ops/sec`，p50 降至 `0.727 ms`。
+4. `21:21` 与 `20:20` 的热点结构几乎不变：`writev`/`recv` 为 `53.87%`，payload copy/SVE load 为 `13.83%`；但吞吐下降约 `1.25%`，CPU 从 `20.92` 增至 `21.35`。这表明增加一对 worker 没有形成新的有效并行度，额外调度和同步成本已经开始抵消收益，当前负载下应优先保持平衡配比并继续优化批量执行、内存局部性和响应聚合。
 
 #### CPU 亲和性实验
 
@@ -467,12 +490,29 @@ Proxy I/O worker
 
 | affinity 模式 | CPU 分配 | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| `interleaved` | Proxy/SuperNode 交叉占用 | 11,137,993.25 | 0.743 | 0.943 | 20.53 | 当前配置下吞吐和尾延迟较优 |
-| `grouped` | 前 `N` 个 CPU 给 Proxy，后 `M` 个 CPU 给 SuperNode | 10,723,054.62 | 0.775 | 1.215 | 25.83 | CPU 消耗更高，吞吐下降 |
+| `interleaved` | Proxy/SuperNode 交叉占用 | 11,284,919.45 | 0.727 | 0.951 | 21.28 | 当前配置下吞吐和 CPU 效率较优 |
+| `grouped` | 前 `N` 个 CPU 给 Proxy，后 `M` 个 CPU 给 SuperNode | 10,554,574.72 | 0.783 | 1.295 | 26.40 | 协调和调度开销更高，吞吐下降 |
 
-在本次配置下，分组模式吞吐较交叉模式下降约 `3.7%`，p99 延迟上升约 `28.8%`，CPU 使用量上升约 `25.8%`。这表明当前请求链路中，Proxy 接入、SuperNode 执行和 Completion Queue 回收之间存在较强的流水协同，交叉布局更有利于保持整体处理平衡；分组布局虽然更容易从拓扑上区分两类线程，但没有因此获得性能收益。该结论只适用于当前 CPU 集合、`21:21` worker 配比和 TCP workload，NUMA、核间距离或 worker 配比变化后仍需重新评估。
+#### 火焰图热点对比
 
-该实验只评价 CPU 调度布局，不改变 Job Queue、Completion Queue、TLC 或 UB Storage 的数据语义；因此结果应与前述 `21:21` worker 配比基线结合分析，不能仅依据单侧 CPU 利用率判断优劣。
+下表将两种 CPU 亲和性布局的 server-only 火焰图统一列出。列方向为实验模型，行方向为热点函数；单元格为该函数独占的 `cycles` 事件权重百分比。对应火焰图为 [`interleaved`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) 和 [`grouped`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity1_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity1_t64_c4_30s.svg)。读写系统调用的调用链统一统计到 `read`/`recv`/`writev` 边界，不解释边界以下的内核函数。
+
+| 热点函数 | [`interleaved`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`grouped`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity1_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity1_t64_c4_30s.svg) |
+| --- | ---: | ---: |
+| `writev` | 32.84% | 23.13% |
+| `recv` | 21.69% | 16.77% |
+| `tlc_core_copy_warm_location_value` | 7.77% | 7.22% |
+| `sve_streaming_load_f32` | 5.72% | 5.57% |
+| `read` | 4.61% | — |
+| `drain_shard_queues` | — | 9.86% |
+
+`—` 表示该函数未进入对应火焰图的主要热点列表，不等同于 `0%`。结合性能表和火焰图，实验结论如下：
+
+1. `interleaved` 的 `writev`/`recv` 合计 `54.53%`，payload copy 与 SVE load 合计 `13.49%`，热点主要分布在请求接入、响应回写和有效数据路径。该布局能保持 Proxy 接入、SuperNode 执行和响应回写之间的流水协同，对应吞吐 `11.28M ops/sec`、p99 `0.951 ms`。
+2. `grouped` 的 `writev`/`recv` 占比下降到 `39.90%`，但 `drain_shard_queues` 升至 `9.86%`，payload copy 与 SVE load 合计为 `12.79%`。这说明减少的读写边界时间没有转化为更多有效数据处理，功能分组引入的队列排空和跨组协调成本占用了收益。
+3. 这一热点变化与性能结果一致：`grouped` 吞吐较 `interleaved` 下降约 `6.5%`，p99 上升约 `36.2%`，CPU 使用量上升约 `24.0%`。因此当前 CPU 集合、`21:21` worker 配比和 TCP workload 下应保留交叉亲和性；该结论不直接外推到不同 NUMA 拓扑、核间距离或 worker 配比。
+
+该实验只评价 CPU 调度布局，不改变 Job Queue、Completion Queue、TLC 或 UB Storage 的数据语义；结果应与前述 `21:21` worker 配比基线结合分析，不能仅依据单侧 CPU 利用率判断优劣。
 
 ### 4.3 优化：数据流 batch 化与 job_ref 轻量调度
 
@@ -504,16 +544,58 @@ Client pipeline 与 server batch 解决的是不同问题。Server batch 决定�
 
 | server batch | client PIPELINE | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1` | `1` | 1,739,809.48 | 0.127 | 0.279 | 12.80 | 内部按单条请求处理，吞吐受固定开销限制 |
-| `1` | `16` | 2,111,807.30 | 1.911 | 2.367 | 14.17 | pipeline 只能部分覆盖等待，无法形成 server batch |
-| `1` | `32` | 2,123,582.55 | 3.807 | 4.447 | 13.96 | pipeline 继续增大后吞吐接近该档上限 |
-| `16` | `16` | 10,423,223.31 | 0.399 | 0.607 | 20.20 | server batch 带来主要吞吐提升 |
-| `16` | `32` | 10,828,725.89 | 0.735 | 1.327 | 22.08 | 更大的 pipeline 继续填充执行面 |
-| `32` | `1` | 1,870,143.12 | 0.119 | 0.255 | 13.06 | 没有足够 outstanding request，batch 无法填满 |
-| `32` | `16` | 10,148,982.41 | 0.407 | 0.631 | 19.94 | batch 和 pipeline 配合后进入千万级 |
-| `32` | `32` | 11,753,098.30 | 0.703 | 0.871 | 21.12 | 当前测试点中的最高吞吐 |
+| `1` | `1` | 1,839,699.81 | 0.119 | 0.263 | 13.18 | 单条处理固定成本高，吞吐最低 |
+| `1` | `16` | 1,851,526.26 | 2.191 | 2.735 | 14.43 | pipeline 只能覆盖等待，server 仍按单条处理 |
+| `1` | `32` | 2,132,848.36 | 3.807 | 4.511 | 15.16 | 吞吐略升但排队加深，尾延迟明显上升 |
+| `16` | `16` | 10,254,321.66 | 0.407 | 0.631 | 20.45 | server batch 摊薄跨队列固定成本 |
+| `16` | `32` | 10,740,516.89 | 0.735 | 1.439 | 23.79 | pipeline 填充更充分，吞吐提升但 p99 上升 |
+| `32` | `1` | 1,962,613.22 | 0.111 | 0.239 | 13.43 | batch 无法填满，仍受在途请求不足限制 |
+| `32` | `16` | 9,928,640.97 | 0.415 | 0.655 | 20.15 | 进入批量执行区间，但低于 `16/32` |
+| `32` | `32` | 11,305,025.35 | 0.727 | 0.951 | 21.38 | normal 测试点最高吞吐 |
 
-这组数据验证了两者的互补关系。固定 pipeline 时，server batch 从 `1` 提升到 `16/32`，吞吐从约 `2M` 提升到 `10M+`，说明批量处理是主要收益来源；固定 server batch 时，pipeline 从 `16` 增加到 `32` 只有在 server batch 已经足够大时才有明显收益。反过来，`server batch=32 + PIPELINE=1` 只有约 `1.87M QPS`，说明仅扩大服务端批量而没有足够的未完成请求，执行面仍无法被填满。当前测试点中，`server batch=32 + PIPELINE=32` 达到约 `11.75M QPS`，但其 p99 已高于较小 pipeline，说明后续需要在吞吐和尾延迟之间选择合适的窗口。
+#### 火焰图产物表
+
+下表单独列出 4.3 每组实验的 server-only 火焰图和 collapsed 文件。所有文件均来自本轮 `perf record -F 99 -g -e cycles -p <redis-server-pid>` 采样；`32/32` normal 因 PID 文件启动竞态使用 retry 目录。
+
+| 场景 | batch/pipeline | SVG 火焰图 | collapsed 数据 |
+| --- | --- | --- | --- |
+| normal | `1/1` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `1/16` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `1/32` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `16/16` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `16/32` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `32/1` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `32/16` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| normal | `32/32` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_retry_32_32/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_retry_32_32/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+| cache, NUM_KEYS=10000 | `32/32` | [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s.svg) | [`collapsed`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s.collapsed.txt) |
+
+#### 火焰图热点函数表
+
+下表与 4.2 采用相同布局：第一列为热点函数，第一行为实验参数；单元格为该函数独占的 `cycles` 事件权重百分比。实验参数表头链接对应的 server-only SVG。为避免混淆，`cache` 对照不并入本表，仍在后文单独说明。
+
+| 热点函数 | [`1/1`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`1/16`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`1/32`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch1_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`16/16`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`16/32`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch16_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`32/1`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe1_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`32/16`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe16_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) | [`32/32`](../perf/host_mt_server_flamegraphs_20260728_retry_32_32/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `writev` | 68.69% | 70.27% | 69.16% | 31.23% | 25.86% | 67.24% | 31.52% | 32.14% |
+| `recv` | 9.22% | 2.95% | — | 24.91% | 22.41% | 9.83% | 25.44% | 21.84% |
+| `read` | 2.70% | 5.93% | 6.12% | — | — | 3.03% | 4.54% | 4.97% |
+| `tlc_core_copy_warm_location_value` | — | 1.38% | 1.50% | 6.99% | 6.53% | — | 6.82% | 7.48% |
+| `sve_streaming_load_f32` | — | — | — | 5.53% | 5.44% | — | 5.40% | 6.01% |
+| `drain_shard_queues` | — | — | — | 4.02% | 6.99% | 2.51% | — | — |
+| `publish_shard_job_batch` | — | — | 1.36% | — | — | — | — | — |
+
+`—` 表示该函数未进入对应火焰图的主要热点列表，不等同于 `0%`。读写调用链统一归并到 `read`/`recv`/`writev` 边界，不展开边界以下的内核函数；无法明确归因的 `[libc.so.6]` 不列入表格。
+
+#### 火焰图热点分析
+
+统一热点表按本轮 server-only 火焰图的 `cycles` 权重统计；读写调用链统一在 `read/recv/writev` 边界停止分析，不展开其后的内核函数，也不计入无法明确归因的 `[libc.so.6]`。每个实验参数均可从表头链接到对应 SVG。
+
+从统一热点表和对应 SVG 可以把优化过程概括为三个阶段：
+
+1. **batch 没有形成时，系统主要在付固定 I/O 成本。** `1/1`、`1/16`、`1/32` 以及 `32/1` 的 `writev` 占比都约为 `67%`--`70%`，而 `recv`/`read` 等入口成本也清晰可见。这里的含义很直观：请求大多以单条形式进入、执行和返回，每条请求都要重复一次队列交接、任务发布、完成回收和响应写出。把 pipeline 从 1 增加到 16 或 32，只是增加了在途请求；当 server `batch=1` 时，服务端仍不能把它们合并处理，所以吞吐最多只有 `2.13M ops/sec`，p99 却升到 `4.511 ms`。反过来，`batch=32,pipeline=1` 也只有 `1.96M ops/sec`，说明服务端有批量容量并不代表实际能收到完整批次。
+2. **batch 和 pipeline 同时有效后，固定成本被摊薄。** `16/16` 和 `16/32` 中，`writev` 降到 `31.23%` 和 `25.86%`，`recv` 升到 `24.91%` 和 `22.41%`，同时 `tlc_core_copy_warm_location_value`、`sve_streaming_load_f32` 和 `drain_shard_queues` 进入主要热点。火焰图的宽度变化说明 CPU 不再主要花在“一条请求一次 I/O 和一次交接”上，而是开始持续处理成批任务和真实 payload；吞吐因此跃升到 `10.25M`--`10.74M ops/sec`。这就是 batch 优化的核心收益：减少每条请求重复发生的固定动作，而不是减少单个向量 copy 的工作量。
+3. **继续增大参数后，收益变成批次填充和等待时间的权衡。** `32/16` 已达到 `9.93M ops/sec`，但低于 `16/32`，说明 pipeline=16 时无法稳定填满 batch=32；`32/32` 达到最高 `11.305M ops/sec`，其 `writev=32.14%`、`recv=21.84%`，TLC copy 为 `7.48%`、SVE load 为 `6.01%`。此时热点已经从单条调度固定成本迁移到网络读写边界、payload 搬运和向量加载，说明 batch 化的主要优化目标已经实现；继续增大 pipeline 主要会增加排队和尾延迟，而不会同比提升吞吐。
+
+因此，当前 normal 场景的最终性能瓶颈不是某个未展开的内核函数，而是**请求响应的网络 I/O 边界与有效数据路径的共同成本**：`writev`/`recv` 仍占 `54%` 左右，TLC payload copy 和 SVE load 约占 `13.5%`。按照本章的采样口径，读写瓶颈只定位到用户态调用的 `read`、`recv`、`writev`，不继续解释其后的内核实现。评审时可以将 `32/32` 理解为当前配置下的平衡点：它用足够大的批次摊薄队列和调度固定成本，同时把 pipeline 控制在能够持续供给 batch 的范围内；再扩大在途窗口，主要代价将体现为排队和 p99，而不是新的吞吐收益。
 
 job pool 的独立消融也必须保持一致口径：关闭复用时，应让每条请求都执行一次分配和释放，而不是继续预分配并循环使用槽位。这样对比得到的才是任务槽位复用减少对象分配、释放和生命周期管理成本的实际收益。
 
@@ -582,16 +664,35 @@ cache 只负责缩短“key -> location”的路径，不负责决定数据是�
 
 #### 实验
 
-远端主机用同一组 TCP inline read 压测参数对比 location cache 开启与关闭后的表现。固定条件为 `NUM_KEYS=100000`、`WORKERS='21:21'`、`TS=64`、`CS=4`、`TEST_TIME=30`，读侧返回完整 inline vector payload。
+远端主机使用相同的 `batch=32`、`PIPELINE=32`、`WORKERS='21:21'`、`TS=64`、`CS=4` 和 `TEST_TIME=30`，对比 normal 的 `NUM_KEYS=100000` 与热点 key 场景的 `NUM_KEYS=10000`。这里的 cache 场景是缩小工作集后的定位/局部性对照，不把它误解为关闭 location cache 的编译消融；读侧返回完整 inline vector payload。
 
-| cache 状态 | ops/sec | hits/sec | p50_ms | p99_ms | cpu_cores | mem_base/peak | 观察 |
+| 场景 | NUM_KEYS | ops/sec | hits/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| enable cache | 11,728,756.31 | 11,728,756.31 | 0.703 | - | 21.05 | 306/402MB | QPS 维持在当前 21:21 主峰附近 |
-| cache off | 11,563,497.76 | 11,563,497.76 | 0.719 | 0.983 | 24.95 | 306/400MB | QPS 基本不降，但 TLC lookup 成本转移到 CPU 热点中 |
+| normal | 100000 | 11,305,025.35 | 11,305,025.35 | 0.727 | 0.951 | 21.38 | 较大工作集基线 |
+| cache / 热点 key | 10000 | 11,318,678.54 | 11,318,678.54 | 0.727 | 0.903 | 19.34 | 吞吐基本持平，CPU 和 p99 更低 |
 
-cache off 的性能采样显示，整体热点仍主要集中在 TCP 收发、response publish 和 inline payload copy，例如 `writev/recv`、内核 TCP path、`vemb_v16_tcp_publish_response_batch` 和 `sve_streaming_load_f32()`。因此，关闭 cache 后 QPS 没有明显下降，并不表示 cache 没有价值，而是说明当前满载配置的首要上限仍在网络回写、Completion Queue、payload snapshot 和 worker 并行调度；cache miss 的额外成本首先表现为 CPU 消耗增加。
+#### 火焰图热点函数表
 
-cache off 后，完整的 warm lookup 路径成为明显的 TLC 成本；在只关闭 cache read、仍保留 cache write 的测试方式下，每次 lookup 还会继续写入一个不会被命中的 cache entry，进一步增加请求 CPU 开销。因此，cache 优化应主要用 `ops/core/sec`、TLC lookup 成本和关键路径占比衡量，而不能只看满载 QPS。这个结果也引出下一节：当 cache miss 或请求需要修改 key 状态时，必须依靠分片控制边界避免所有请求争用一把全局锁。
+下表与 4.2 采用相同布局：第一列为热点函数，第一行为实验参数；单元格为对应 server-only SVG 中该函数的采样权重。火焰图中的函数可能存在父子嵌套，表中百分比不能直接相加；读写调用链只保留用户态的 `read`、`recv`、`writev` 接口，不展开后续内核函数。
+
+| 热点函数 | normal | cache |
+| --- | ---: | ---: |
+| `vemb_v16_tcp_publish_response_batch` | 33.14% | 34.58% |
+| `writev` | 31.48% | 33.58% |
+| `recv` | 21.84% | 22.41% |
+| `read` | 4.96% | 4.90% |
+| `sve_streaming_load_f32` | 6.07% | 3.46% |
+| `drain_shard_queues` | 27.50% | 21.92% |
+| `tlc_core_get_cached_warm_location` | 4.30% | 2.62% |
+
+火焰图路径：normal [`SVG`](../perf/host_mt_server_flamegraphs_20260728_retry_32_32/host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_normal_batch32_pipe32_numkeys100000_workers21_21_affinity0_t64_c4_30s.svg)；cache [`SVG`](../perf/host_mt_server_flamegraphs_20260728_renew/host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s/flame/flamegraph_hpc_redis_server_only_host_mt_server_only_cache_batch32_pipe32_numkeys10000_workers21_21_affinity0_t64_c4_30s.svg)。
+
+从性能数据和两张火焰图可以得到以下结论：
+
+1. 将 `NUM_KEYS` 从 `100000` 缩小到 `10000` 后，吞吐从 `11.305M ops/sec` 小幅升至 `11.319M ops/sec`，基本没有变化；但 CPU 从 `21.38` 降到 `19.34`，约下降 `9.5%`，p99 从 `0.951 ms` 降到 `0.903 ms`。这说明热点工作集更容易被 location cache、key metadata 和处理器缓存复用，主要收益体现为 CPU headroom 和尾延迟，而不是更高的满载 QPS。
+2. 两组的 `writev`/`recv` 仍然占据最宽的用户态 I/O 路径，且 cache 场景的响应发布和 `writev` 占比略高，说明端到端吞吐的首要上限仍是请求接收、响应回写和 completion/payload 处理。location cache 优化不能消除网络传输和 1200B payload 的必要工作，只能减少 key 到 location 的控制面成本。
+3. `tlc_core_get_cached_warm_location` 在 normal 中约占 `4.30%`，cache 场景约占 `2.62%`；同时 `drain_shard_queues` 从 `27.50%` 降到 `21.92%`。这表明缩小工作集后，定位结果更稳定，队列消费和控制面周转压力下降，CPU 可以更集中地完成响应和 payload 路径。`sve_streaming_load_f32` 的占比变化不应单独解读为向量加载变快或变慢，因为火焰图比例是总采样权重中的相对占比。
+4. 因此，4.5 的实验支持 location cache 的设计目标：它的价值是把常态读请求压缩为“小 metadata lookup + slot 校验”，降低控制面和 CPU 周转成本；最终吞吐瓶颈仍在 `read`/`recv`/`writev` 边界、completion 回收和 payload snapshot。cache miss、状态失效、写入、删除和迁移请求仍必须回到完整 key meta 路径，这也为 4.6 的 key meta shard lock 限制了需要进入串行控制面的请求数量。
 
 
 ### 4.6 优化：key meta shard lock
@@ -685,20 +786,46 @@ TLC 里 seqlock 主要落在两个地方。
 TCP 和 Aeron 的成本模型不同，因此 HPC-Redis Server 不强行使用单一返回语义：
 
 - TCP 跨主机路径使用 `VEMB_INLINE` 返回完整 vector payload，确保“读成功”等价于 client 已拿到 300 维向量。
-- Aeron 本机路径使用 handle/mmap 语义，response 只返回 region/offset/bytes，payload 保留在 UB warm region 中。
+- Aeron 路径使用 handle/mmap 语义，response 只返回 region/offset/bytes，payload 保留在可共享的 UB warm region 中。
 
-该设计避免把 handle-only QPS 误当成完整 payload QPS，同时让本机高吞吐路径避开 1200B response payload 回传。性能记录中，TCP mixed inline 代表完整 payload 交付能力，Aeron mixed 代表 handle/mmap 语义下的数据面上限，两者口径清晰可比。
+该设计避免把 handle-only QPS 误当成完整 payload QPS，同时让 Aeron 高吞吐路径避开 1200B response payload 回传。性能记录中，TCP mixed inline 代表完整 payload 交付能力，Aeron mixed 代表 handle/mmap 语义下的数据面上限，两者口径清晰可比。当前实验使用共享映射实现，后续 Aeron transport 可扩展到跨机 channel，并继续保留请求/响应批处理和 handle 交付语义。
 
 benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避免把 TCP handle-only 路径的结果误读为跨主机完整 payload 交付能力。
 
 当前实现的 enable-cache TCP inline 结果作为后续消融和优化测试的 baseline。除非修改了协议、线程模型、cache 读写语义或 payload copy 路径，否则后续实验不需要反复重测同一组基线；新的结果应优先和该行对比 `ops/sec`、`cpu_cores`、`ops/core/sec` 和关键路径热点迁移。
 
-| 模式 | 返回语义 | 代表参数 | ops/sec | hits/sec | p50_ms | p99_ms | cpu_cores | ops/core/sec | 说明 |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| TCP inline baseline | response 携带完整 300 维 payload | `pio=21 snw=21 t64 c4` | 11,728,756.31 | 11,728,756.31 | 0.703 | 0.871 | 21.05 | 557,185 | 当前实现 enable-cache baseline，代表跨主机完整 payload 交付能力 |
-| Aeron handle/mmap | response 只返回 handle，payload 由 client mmap/deref | handle/mmap read | 65,801,998.71 | 65,801,998.71 | 0.095 | 0.199 | 38.57 | 1,706,041 | wire throughput `23.29 GB/sec`，`handle_deref ok=3948148020 fail=0` |
+| 模式 | NUM_KEYS | 代表参数 | ops/sec | avg_lat_ms | p50_ms | p99_ms | cpu_cores | ops/core/sec |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TCP inline baseline | 100000 | `pio=21 snw=21 t64 c4` | 11,728,756.31 | — | 0.703 | 0.871 | 21.05 | 557,185 |
+| Aeron normal | 100000 | `TEST_TIME=3 TS=64 CS=4 PS=32 PIO=21 SNW=21` | 48,085,485.42 | 0.14546 | 0.119 | 1.079 | 39.20 | 1,226,671 |
+| Aeron cache / 热点 key | 10000 | `TEST_TIME=3 TS=64 CS=4 PS=32 PIO=21 SNW=21` | 52,698,357.15 | 0.13499 | 0.103 | 8.255 | 35.60 | 1,480,291 |
+| Aeron cache / 热点 key | 10000 | `TEST_TIME=3 TS=64 CS=4 PS=32 PIO=12 SNW=12` | 47,829,140.94 | 0.16401 | 0.159 | 8.191 | 22.96 | 2,083,151 |
 
-这张表体现了 transport 返回语义分流的性能边界：TCP inline 需要把 1200B payload 放进 response，适合作为真实跨主机完整读 baseline；Aeron 通过 handle/mmap 避免 payload 回包，数据面吞吐和单位 CPU 效率都显著更高，代表本机/UB 直连语义下的上限。
+与 TCP inline baseline 相比，Aeron normal 的吞吐为 `4.10x`，Aeron cache 的吞吐为 `4.49x`；`ops/core` 分别为 TCP 的 `2.20x` 和 `2.66x`。原因不是简单地增加 worker，而是 Aeron 路径绕开了 TCP socket 的协议栈和完整 payload 回写：此前 TCP server-only 火焰图中，`writev` 占 `31.48%`、`recv` 占 `21.84%`，这两个用户态 I/O 接口合计超过一半的主要采样权重，反映出请求接收和 1200B 响应发送的固定成本。Aeron 使用共享内存 ring 传递请求和 handle，client 通过 mmap 读取 payload，server 侧不再为每个响应调用 TCP `writev`，请求入口也不再以 TCP `recv` 作为主要数据通道；对应热点转为 `vemb_v16_aeron_poll_shm_requests`、`vemb_v16_proxy_handle_request_ptr_batch_internal` 和 `vemb_v16_aeron_publish_response_batch`。因此，Aeron 解决的是高吞吐场景下 TCP `writev`/`recv` 协议栈成为瓶颈的问题；后续扩展到跨机 channel 后，仍可沿用这条批量 ring + handle 的优化路径。当前 TCP inline 仅作为完整 payload 跨机交付基线，不能把 handle/mmap 的 QPS 直接当作完整 payload 的跨机交付能力。
+
+#### Aeron 火焰图热点函数表
+
+两组 `21:21` 测试和 `PIO/SNW=12:12` 测试均使用 `perf record -F 99 -g -e cycles -p <redis-server-pid>`，只采样 HPC-Redis `redis-server`，不包含 Aeron client。表中百分比来自对应 server-only SVG 的采样权重；编译器生成的 `constprop`、`lto_priv` 后缀省略。函数可能存在父子嵌套，百分比不能直接相加。
+
+| 热点函数 | normal | cache | PIO/SNW=12:12 |
+| --- | ---: | ---: | ---: |
+| `vemb_v16_aeron_poll_shm_requests` | 26.33% | 27.17% | 32.22% |
+| `vemb_v16_proxy_handle_request_ptr_batch_internal` | 25.74% | 26.41% | 31.58% |
+| `vemb_v16_supernode_handle_vemb_job` | 24.42% | 16.79% | 16.82% |
+| `vemb_v16_tlc_get_handle_stable_read` | 22.51% | 13.50% | 13.60% |
+| `tlc_core_get_warm_location_raw` | 21.81% | 11.60% | 10.93% |
+| `vemb_v16_aeron_publish_response_batch` | 8.21% | 9.49% | 7.71% |
+| `vemb_v16_supernode_flush_completion_batch` | 7.32% | 6.24% | 1.89% |
+| `vemb_v16_publish_completion` | 1.63% | 0.59% | 0.58% |
+| `vemb_v16_aeron_create_shared_ring` | 0.57% | 1.01% | 1.66% |
+
+火焰图和采样数据：normal [`SVG`](../perf/aeron_4_10_flamegraphs_20260728/normal_numkeys100000/flamegraph_hpc_redis_server_only_aeron_aeron_normal_numkeys100000_20260728.svg)、[`summary.tsv`](../perf/aeron_4_10_flamegraphs_20260728/normal_numkeys100000/summary.tsv)、[`collapsed`](../perf/aeron_4_10_flamegraphs_20260728/normal_numkeys100000/flamegraph_hpc_redis_server_only_aeron_aeron_normal_numkeys100000_20260728.collapsed.txt)；cache `21:21` [`SVG`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000/flamegraph_hpc_redis_server_only_aeron_aeron_cache_numkeys10000_20260728.svg)、[`summary.tsv`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000/summary.tsv)、[`collapsed`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000/flamegraph_hpc_redis_server_only_aeron_aeron_cache_numkeys10000_20260728.collapsed.txt)；`12:12` retry2 [`SVG`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000_pio12_snw12_retry2/flamegraph_hpc_redis_server_only_aeron_aeron_cache_numkeys10000_pio12_snw12_retry2_20260728.svg)、[`summary.tsv`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000_pio12_snw12_retry2/summary.tsv)、[`collapsed`](../perf/aeron_4_10_flamegraphs_20260728/cache_numkeys10000_pio12_snw12_retry2/flamegraph_hpc_redis_server_only_aeron_aeron_cache_numkeys10000_pio12_snw12_retry2.collapsed.txt)。
+
+这组测试体现的是 Aeron handle/mmap 路径的数据面上限：响应 ring 只传递 handle，完整向量由 client 从共享 UB warm region 读取，因此热点从 TCP 模式的 `writev`/`recv` 转移到 `vemb_v16_aeron_poll_shm_requests`、Proxy batch、TLC stable-read 和 response publish。将 `NUM_KEYS` 从 `100000` 缩小到 `10000` 后，吞吐从 `48.09M` 升至 `52.70M ops/sec`，CPU 从 `39.20` 降至 `35.60` cores，ops/core 从 `1.23M` 升至 `1.48M`；`tlc_core_get_warm_location_raw`、stable-read 和 SuperNode job 执行的相对占比下降，说明较小工作集降低了定位和执行路径的周转压力。两组 `TEST_TIME=3`，cache 组 p99 为 `8.255 ms`，相对 p50 明显偏高，应视为短时采样下的尾延迟波动，不能据此判断稳定的长时尾延迟特性。
+
+`PIO=12/SNW=12` retry2 实验显示，Aeron 在接近目标吞吐时确实需要更少的 server worker：相比 `21:21`，CPU 使用量从 `35.60` 降到 `22.96` cores，下降约 `35.5%`；吞吐仍保持 `47.83M ops/sec`，只比 `52.70M ops/sec` 低约 `9.2%`；`ops/core` 则从 `1,480,291` 升至 `2,083,151`，提升约 `40.7%`。相对于 TCP baseline，`12:12` Aeron 的吞吐为 `4.08x`，`ops/core` 为 `3.74x`。这说明 Aeron 通过共享内存 ring 和 handle/mmap 绕开 TCP `writev`/`recv` 固定成本后，可以用更少核心维持高吞吐，并获得更高的单核处理效率；但 `21:21` 仍是本轮测试的绝对吞吐峰值，`12:12` 是核心效率与总吞吐之间的折中点。两组测试的 `TEST_TIME=3` 较短，retry2 的 p99 为 `8.191 ms`，尾延迟仍需长时间测试确认。
+
+这张表体现了 transport 返回语义分流的性能边界：TCP inline 需要把 1200B payload 放进 response，适合作为完整 payload 交付 baseline；Aeron 通过 handle/mmap 避免 payload 回包，数据面吞吐和单位 CPU 效率都显著更高，代表共享映射语义下的上限，并为后续跨机 Aeron 扩展保留接口空间。
 
 ## 5 扩容设计
 

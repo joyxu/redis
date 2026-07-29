@@ -121,21 +121,9 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         if (open_or_attach_local_shm(region, path, required_size, &created) != 0)
             return -1;
     } else {
-        /* OBMM import devices (remote memory) reject cacheable mmap with EPERM.
-         * The kernel requires O_SYNC on open() to select noncacheable mapping. */
+        /* Keep UB mappings cacheable and consistent across same-host server
+         * and client views. */
         region->fd = open(path, O_RDWR);
-        if (region->fd < 0 && (errno == EACCES || errno == EPERM)) {
-            int open_errno = errno;
-            region->fd = open(path, O_RDWR | O_SYNC);
-            if (region->fd >= 0) {
-                serverLog(LL_NOTICE,
-                          "vemb_v16 mapped region ub opened with O_SYNC: path=%s request_size=%zu offset=%llu first_error=%s",
-                          path,
-                          requested_size,
-                          (unsigned long long)mmap_offset,
-                          strerror(open_errno));
-            }
-        }
         if (region->fd < 0) {
             serverLog(LL_WARNING,
                       "vemb_v16 mapped region ub open failed: path=%s request_size=%zu offset=%llu error=%s",

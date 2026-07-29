@@ -3,13 +3,6 @@
 
 #include "vemb_v16_proxy_internal.h"
 
-int vemb_v16_aeron_create_shared_ring(const char *name,
-                                      uint32_t slot_size,
-                                      vemb_v16_client_ring_t **ring,
-                                      size_t *ring_bytes);
-void vemb_v16_aeron_destroy_shared_ring(const char *name,
-                                        vemb_v16_client_ring_t *ring,
-                                        size_t ring_bytes);
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id);
 int vemb_v16_aeron_listen(vemb_v16_proxy_t *proxy,

@@ -5027,36 +5027,31 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
 }
 
 /* =====================================================================
- *  Cross-node Aeron shmdev allocation
+ *  Aeron UB ring allocation
  * =====================================================================
  *
- * Simple bump allocator within /dev/obmm_shmdev1. The first call mmaps
- * the whole device (or the first 256 MB); subsequent calls carve out
- * ring pairs from the bump pointer. This is intentionally NOT a general
- * allocator — it serves the cross-node aeron use case where the server
- * process owns shmdev1 for the duration and allocates one ring pair
- * per ATTACH request.
+ * Simple bump allocator within one UB device selected from the configured
+ * path (normally /dev/obmm_shmdev1). A legacy range expression is still
+ * accepted for compatibility, but the default configuration uses one fixed
+ * device. The selected device
+ * is mmapped once and subsequent calls carve out ring pairs from the bump
+ * pointer. This is intentionally NOT a general allocator — it serves the
+ * Aeron channel use case where the proxy owns the device for its lifetime.
  *
  * Concurrency: single mutex. ATTACH requests are rare (per-client, not
  * per-op), so contention is not a concern.
  *
- * Note on shmdev numbering: shmdev1 is *local* physical memory on both
- * HW01 and HW02 (symmetric topology). The server (HW01) writes rings
- * into its local shmdev1; the remote client (HW02) sees them via its
- * shmdev5, which is a UB-mapped view of HW01's shmdev1.
- *
  * ABI note: vemb_v16_client_ring_t has a fixed slot count
- * (VEMB_V16_CLIENT_RING_SIZE = 4096). The ring_slots parameter is
+ * (VEMB_V16_CLIENT_RING_SIZE = 256). The ring_slots parameter is
  * therefore advisory only — actual ring layout is determined by
  * vemb_v16_client_ring_bytes(slot_size). Callers should still pass
- * ring_slots = 4096 for documentation.
+ * ring_slots = VEMB_V16_CLIENT_RING_SIZE for documentation.
  */
 
-#define VEMB_V16_SHMDEV_CROSS_NODE_PATH "/dev/obmm_shmdev1"
-/* Reserve 8 GB for cross-node aeron rings. 4096-slot rings at 1.5 KB
- * slot size = ~6.5 MB per channel pair, so 8 GB supports ~1200 channels
- * (covers T*C up to 1024 = MAX_CHANNELS). Use ull suffix: 32-bit overflow
- * silently produces 0 and mmap fails. */
+/* Reserve 8 GB for cross-node aeron rings. 256-slot rings at a 1.5 KB
+ * request slot size use about 0.2 MB per channel pair; the pool therefore
+ * has ample room for the configured channel limit. Use ull suffix: 32-bit
+ * overflow silently produces 0 and mmap fails. */
 #define VEMB_V16_SHMDEV_CROSS_NODE_BYTES (8ull << 30)
 
 static struct {
@@ -5066,31 +5061,69 @@ static struct {
     void    *base;
     size_t   size;
     size_t   bump;  /* next free byte offset */
+    char     path[256];
 } g_shmdev_pool = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
-static int shmdev_pool_init(void) {
+static int open_ub_path_spec(const char *path_spec,
+                             char selected[256]) {
+    if (!path_spec || !path_spec[0]) return -1;
+
+    int fd = open(path_spec, O_RDWR);
+    if (fd >= 0) {
+        strncpy(selected, path_spec, 255);
+        selected[255] = '\0';
+        return fd;
+    }
+
+    /* Expand the deployment shorthand /dev/obmm_shmdev1-4. */
+    const char *dash = strrchr(path_spec, '-');
+    if (!dash || dash == path_spec || !dash[1]) return -1;
+    const char *digits = dash;
+    while (digits > path_spec && isdigit((unsigned char)digits[-1]))
+        digits--;
+    if (digits == dash) return -1;
+
+    char *end = NULL;
+    unsigned long start = strtoul(digits, &end, 10);
+    if (end != dash || start > 255u) return -1;
+    unsigned long finish = strtoul(dash + 1, &end, 10);
+    if (end == dash + 1 || *end != '\0' || finish < start || finish > 255u)
+        return -1;
+
+    char candidate[256];
+    size_t prefix_len = (size_t)(digits - path_spec);
+    if (prefix_len >= sizeof(candidate)) return -1;
+    for (unsigned long id = start; id <= finish; id++) {
+        int written = snprintf(candidate, sizeof(candidate), "%.*s%lu",
+                           (int)prefix_len, path_spec, id);
+        if (written < 0 || (size_t)written >= sizeof(candidate)) return -1;
+        fd = open(candidate, O_RDWR);
+        if (fd >= 0) {
+            strncpy(selected, candidate, 255);
+            selected[255] = '\0';
+            return fd;
+        }
+    }
+    return -1;
+}
+
+static int shmdev_pool_init(const char *path_spec) {
     if (g_shmdev_pool.inited) return 0;
-    /* shmdev1 is *local* physical memory on this node. Local memory
-     * allows plain O_RDWR mmap but rejects O_SYNC: open(O_SYNC) succeeds
-     * (returns a valid fd), but the subsequent mmap fails with EPERM.
-     * The O_SYNC fallback below only catches open() failure, not mmap
-     * failure, so the prior "O_SYNC first" order permanently broke the
-     * pool. Use plain O_RDWR — that is what every other local-mapping
-     * call site in this file already does. */
-    int fd = open(VEMB_V16_SHMDEV_CROSS_NODE_PATH, O_RDWR);
+    char selected_path[256];
+    int fd = open_ub_path_spec(path_spec, selected_path);
     if (fd < 0) {
-        serverLog(LL_WARNING, "shmdev_pool_init: open %s failed errno=%d (%s)",
-                  VEMB_V16_SHMDEV_CROSS_NODE_PATH, errno, strerror(errno));
+        serverLog(LL_WARNING, "aeron ub pool: no usable path in %s errno=%d (%s)",
+                  path_spec, errno, strerror(errno));
         return -1;
     }
     void *p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
         serverLog(LL_WARNING,
-                  "shmdev_pool_init: mmap %s size=%llu failed errno=%d (%s)",
-                  VEMB_V16_SHMDEV_CROSS_NODE_PATH,
+                  "aeron ub pool: mmap %s size=%llu failed errno=%d (%s)",
+                  selected_path,
                   (unsigned long long)VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                   errno, strerror(errno));
         close(fd);
@@ -5100,11 +5133,16 @@ static int shmdev_pool_init(void) {
     g_shmdev_pool.base = p;
     g_shmdev_pool.size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
     g_shmdev_pool.bump = 0;
+    strncpy(g_shmdev_pool.path, selected_path, sizeof(g_shmdev_pool.path) - 1);
+    g_shmdev_pool.path[sizeof(g_shmdev_pool.path) - 1] = '\0';
     g_shmdev_pool.inited = 1;
+    serverLog(LL_NOTICE, "aeron ub pool ready: configured=%s selected=%s size=%zu",
+              path_spec, g_shmdev_pool.path, g_shmdev_pool.size);
     return 0;
 }
 
-int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
+int vemb_v16_storage_alloc_aeron_channel(const char *ub_path,
+                                         uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
                                          char out_shmdev_path[256],
@@ -5125,7 +5163,7 @@ int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
     size_t resp_bytes = vemb_v16_client_ring_bytes(resp_slot_size);
 
     pthread_mutex_lock(&g_shmdev_pool.lock);
-    if (shmdev_pool_init() != 0) {
+    if (shmdev_pool_init(ub_path) != 0) {
         pthread_mutex_unlock(&g_shmdev_pool.lock);
         return -2;
     }
@@ -5149,7 +5187,7 @@ int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
     vemb_v16_client_ring_init((vemb_v16_client_ring_t *)req_map,  req_slot_size);
     vemb_v16_client_ring_init((vemb_v16_client_ring_t *)resp_map, resp_slot_size);
 
-    strncpy(out_shmdev_path, VEMB_V16_SHMDEV_CROSS_NODE_PATH, 255);
+    strncpy(out_shmdev_path, g_shmdev_pool.path, 255);
     out_shmdev_path[255] = 0;
     *out_req_off     = (uint64_t)req_off;
     *out_resp_off    = (uint64_t)resp_off;
@@ -5170,12 +5208,10 @@ void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
 }
 
 const vemb_v16_manifest_region_t *
-vemb_v16_storage_first_local_region_with_client_path(
+vemb_v16_storage_first_local_region(
     const vemb_v16_storage_ctx_t *storage) {
     if (!storage) return NULL;
-    for (uint32_t i = 0; i < storage->local_manifest_region_count; i++) {
-        if (storage->local_manifest_regions[i].client_path[0] != '\0')
-            return &storage->local_manifest_regions[i];
-    }
+    if (storage->local_manifest_region_count > 0)
+        return &storage->local_manifest_regions[0];
     return NULL;
 }

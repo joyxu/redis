@@ -40,8 +40,10 @@ uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch);
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
+const char *vemb_v16_proxy_aeron_ub_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);
+uint32_t vemb_v16_proxy_data_transport(vemb_v16_proxy_t *proxy);
 
 size_t vemb_v16_tcp_input_pending_bytes(vemb_v16_channel_t *ch);
 size_t vemb_v16_tcp_input_tailroom(vemb_v16_channel_t *ch);

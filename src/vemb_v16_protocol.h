@@ -16,6 +16,7 @@
 #define VEMB_V16_TCP_HOST "127.0.0.1"
 #define VEMB_V16_TCP_PORT 6391
 #define VEMB_V16_SHM_PREFIX "vemb_v16"
+#define VEMB_V16_DEFAULT_AERON_UB_PATH "/dev/obmm_shmdev1"
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
 #ifndef VEMB_V16_MAX_CHANNELS

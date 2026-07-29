@@ -60,7 +60,9 @@ int main(int argc, char **argv) {
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
     const char *transport = "tcp";
+    const char *aeron_control = "tcp";
     const char *uds_path = "/tmp/vemb_v16.sock";
+    const char *aeron_ub_path = VEMB_V16_DEFAULT_AERON_UB_PATH;
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
     int reset_warm_regions = 0;
@@ -75,10 +77,19 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "invalid transport\n");
                 goto cleanup;
             }
+        } else if (!strcmp(argv[i], "--aeron-control") && i + 1 < argc) {
+            aeron_control = argv[++i];
+            if (strcmp(aeron_control, "uds") &&
+                strcmp(aeron_control, "tcp")) {
+                fprintf(stderr, "invalid aeron control plane\n");
+                goto cleanup;
+            }
         } else if (!strcmp(argv[i], "--tcp-host") && i + 1 < argc) {
             tcp_host = argv[++i];
         } else if (!strcmp(argv[i], "--tcp-port") && i + 1 < argc) {
             tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--aeron-ub-path") && i + 1 < argc) {
+            aeron_ub_path = argv[++i];
         } else if (!strcmp(argv[i], "--proxy-io-threads") && i + 1 < argc) {
             proxy_io_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--supernode-workers") && i + 1 < argc) {
@@ -113,7 +124,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--aeron-ub-path PATH] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -148,8 +159,9 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
-              transport, uds_path, tcp_host, tcp_port, proxy_io_threads,
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s aeron_control=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
+              transport, aeron_control, uds_path, tcp_host, tcp_port,
+              proxy_io_threads,
               supernode_workers, dim, max_vectors, vector_region_name,
               warm_regions_manifest ? warm_regions_manifest : "(none)");
 
@@ -211,6 +223,11 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
         goto cleanup;
     }
+    if (vemb_v16_proxy_set_aeron_ub_path(g_proxy, aeron_ub_path) != 0) {
+        serverLog(LL_WARNING, "failed to configure Aeron UB path: %s",
+                  aeron_ub_path);
+        goto cleanup;
+    }
     if (vemb_v16_proxy_set_supernode_workers(g_proxy, supernode_workers) != 0) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 supernode workers");
         goto cleanup;
@@ -220,8 +237,14 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (!strcmp(transport, "aeron")) {
-        if (vemb_v16_proxy_enable_uds(g_proxy) != 0) {
-            serverLog(LL_WARNING, "failed to enable vemb_v16 uds transport");
+        int control_rc = !strcmp(aeron_control, "tcp") ?
+            vemb_v16_proxy_enable_aeron_tcp_control(g_proxy,
+                                                    tcp_host,
+                                                    tcp_port) :
+            vemb_v16_proxy_enable_uds(g_proxy);
+        if (control_rc != 0) {
+            serverLog(LL_WARNING, "failed to enable vemb_v16 aeron control plane: %s",
+                      aeron_control);
             goto cleanup;
         }
     } else {

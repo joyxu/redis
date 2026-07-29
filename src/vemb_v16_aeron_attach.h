@@ -17,14 +17,15 @@
  *     uint32_t dim;                vector dimension (sizes ring slots)
  *     uint32_t req_slot_size;      0 = use server default
  *     uint32_t resp_slot_size;     0 = use server default
+ *     uint32_t flags;              path view flags
  *
  *   Server -> Client:
  *     char     magic[26];          "VEMB_V16_AERON_ATTACHED\0"
  *     int32_t  status;             0 = OK, -1 = rejected
  *     uint64_t channel_id;         server-assigned channel id
- *     uint32_t ring_size_slots;    4096
+ *     uint32_t ring_size_slots;    256
  *     uint32_t shmdev_path_len;    bytes in shmdev_path (incl. NUL)
- *     char     shmdev_path[256];   "/dev/obmm_shmdev5"
+ *     char     shmdev_path[256];   server-side path, e.g. "/dev/obmm_shmdev1"
  *     uint64_t req_ring_off;       byte offset of req_ring within shmdev
  *     uint64_t resp_ring_off;      byte offset of resp_ring within shmdev
  *     uint32_t req_slot_size;      actual slot size server allocated
@@ -35,7 +36,7 @@
  *     uint64_t warm_region_bytes;  size in bytes
  *     uint64_t warm_mmap_offset;   byte offset within shmdev file
  *     uint32_t warm_path_len;      bytes in warm_path (incl. NUL)
- *     char     warm_path[256];     "/dev/obmm_shmdev6" (client-side view)
+ *     char     warm_path[256];     server-side path, e.g. "/dev/obmm_shmdev2"
  *
  * Sniff rule: the first 24 bytes of a new TCP connection decide routing.
  * If they exactly equal VEMB_V16_AERON_ATTACH_MAGIC, the connection is
@@ -43,17 +44,19 @@
  * VEMB V16 RESP / sniff path.
  */
 
-#define VEMB_V16_AERON_ATTACH_MAGIC      "VEMB_V16_AERON_ATTACH\0"      /* 24 bytes */
+#define VEMB_V16_AERON_ATTACH_MAGIC      "VEMB_V16_AERON_ATTACH\0\0\0"  /* first 24 bytes */
 #define VEMB_V16_AERON_ATTACH_MAGIC_LEN  24u
-#define VEMB_V16_AERON_ATTACHED_MAGIC    "VEMB_V16_AERON_ATTACHED\0"    /* 26 bytes */
+#define VEMB_V16_AERON_ATTACHED_MAGIC    "VEMB_V16_AERON_ATTACHED\0\0\0" /* first 26 bytes */
 #define VEMB_V16_AERON_ATTACHED_MAGIC_LEN 26u
 #define VEMB_V16_AERON_SHMDEV_PATH_MAX   256u
+#define VEMB_V16_AERON_ATTACH_F_REMOTE_PATH 0x1u
 
 typedef struct {
     char     magic[VEMB_V16_AERON_ATTACH_MAGIC_LEN];
     uint32_t dim;
     uint32_t req_slot_size;
     uint32_t resp_slot_size;
+    uint32_t flags;
 } vemb_v16_aeron_attach_req_t;
 
 typedef struct {
@@ -68,8 +71,8 @@ typedef struct {
     uint32_t req_slot_size;
     uint32_t resp_slot_size;
     /* Warm region advertisement (cross-node read path). When
-     * warm_region_count > 0, client mmap's warm_path at warm_mmap_offset
-     * to dereference VEMB_HANDLE offsets locally. */
+     * warm_region_count > 0, warm_path is server-side and the client maps
+     * it to its local UB view before mmap'ing it. */
     uint32_t warm_region_count;
     uint32_t warm_region_id;
     uint32_t warm_backend_type;

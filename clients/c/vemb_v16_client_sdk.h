@@ -366,7 +366,7 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
 void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
 
 /* =====================================================================
- *  Aeron transport (UDS control + POSIX SHM SPSC ring)
+ *  Aeron transport (TCP control + UB-backed SPSC ring)
  * =====================================================================
  *
  * Side-channel transport that bypasses TCP/libevent. Each channel is a
@@ -438,12 +438,28 @@ uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch);
 int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
                                    const void *buf, uint32_t len);
 
+/* Non-blocking batch publish into the request ring. `bufs` may contain
+ * variable-length request frames (VADD inline frames and handle frames can
+ * be mixed). The call is all-or-none when the ring lacks capacity. */
+int vemb_v16_aeron_publish_request_batch(vemb_v16_aeron_channel_t *ch,
+                                         const void *const *bufs,
+                                         const uint32_t *lens,
+                                         uint32_t count);
+
 /* Non-blocking poll from the response ring.
  * Returns bytes copied into buf (>0) on success, 0 if empty, -3 if
  * ch is NULL. If max_len exceeds the ring slot size, only slot_size
  * bytes are copied. */
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
                                  void *buf, uint32_t max_len);
+
+/* Non-blocking batch poll from the response ring. Responses are copied to
+ * `slots` with `max_len` bytes reserved per response. Returns the number of
+ * responses copied, or zero when empty/invalid. */
+uint32_t vemb_v16_aeron_poll_response_batch(vemb_v16_aeron_channel_t *ch,
+                                            void *slots,
+                                            uint32_t max_len,
+                                            uint32_t max_count);
 
 /* Open the warm region referenced by this channel's server-provided
  * channel_desc (mmap of /dev/obmm_shmdev* or POSIX SHM). Required before

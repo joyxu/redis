@@ -35,7 +35,8 @@
 
 #include "vemb_v16_protocol.h"
 
-/* Transport mode: "aeron" (UDS+SHM, local) or "aeron-cross-node" (TCP attach + shmdev).
+/* Transport mode: "aeron" (TCP control + local UB ring) or
+ * "aeron-cross-node" (TCP attach + UB ring).
  * Set by main() from --vemb-v16-transport via vemb_v16_aeron_set_transport().
  * Default = "aeron" preserves existing loopback behavior. */
 static std::string g_aeron_transport_mode = "aeron";
@@ -48,7 +49,7 @@ void vemb_v16_aeron_set_transport(const std::string &mode,
 }
 
 extern "C" {
-/* SDK ships the aeron (UDS + SHM SPSC ring) transport as opaque handles.
+/* SDK ships the aeron (TCP control + UB SPSC ring) transport as opaque handles.
  * No C11 <stdatomic.h> dependency leaks into this C++ translation unit. */
 #include "vemb_v16_client_sdk.h"
 }
@@ -68,6 +69,7 @@ struct worker_arg {
     benchmark_config    *cfg;
     object_generator    *obj_gen;
     uint32_t             worker_id;
+    bool                skip_handle_read;
     /* channels — SDK owns the handles; we hold pointers */
     std::vector<vemb_v16_aeron_channel_t *> channels;
     /* ratio bookkeeping for mixed workloads */
@@ -100,6 +102,7 @@ static uint64_t now_ns() {
  * iterators (stateful counters), R/G/Z are stateless distributions. */
 #define AERON_SET_CMD_IDX 0
 #define AERON_GET_CMD_IDX 2
+#define AERON_BATCH_SIZE 32u
 static int obj_iter_type(benchmark_config *cfg, unsigned char index) {
     if (cfg->key_pattern[index] == 'R') return OBJECT_GENERATOR_KEY_RANDOM;
     if (cfg->key_pattern[index] == 'G') return OBJECT_GENERATOR_KEY_GAUSSIAN;
@@ -206,6 +209,85 @@ static int is_set_op(uint8_t op) {
     return op == VEMB_V16_OP_VADD || op == VEMB_V16_OP_VREM;
 }
 
+struct aeron_debug_counters {
+    uint64_t *status_ok;
+    uint64_t *status_notfound;
+    uint64_t *status_err;
+    uint64_t *status_other;
+    uint64_t *handle_deref_ok;
+    uint64_t *handle_deref_fail;
+};
+
+static int account_response(worker_arg *w,
+                            uint32_t ch,
+                            uint32_t pipeline,
+                            const vemb_v16_resp_t *resp,
+                            float *vec_scratch,
+                            aeron_debug_counters *debug) {
+    if (w->pending_count[ch] == 0)
+        return 0;
+
+    uint32_t slot = w->pending_head[ch];
+    pending_op *pe = &w->pending[ch][slot];
+    if (pe->req_id != resp->req_id) {
+        int found = -1;
+        for (uint32_t j = 0; j < w->pending_count[ch]; j++) {
+            uint32_t s2 = (w->pending_head[ch] + j) % pipeline;
+            if (w->pending[ch][s2].req_id == resp->req_id) {
+                found = (int)s2;
+                break;
+            }
+        }
+        if (found < 0)
+            return 0;
+        if (found != (int)slot) {
+            pending_op tmp = w->pending[ch][slot];
+            w->pending[ch][slot] = w->pending[ch][found];
+            w->pending[ch][found] = tmp;
+            pe = &w->pending[ch][slot];
+        }
+    }
+
+    w->pending_head[ch] = (slot + 1) % pipeline;
+    w->pending_count[ch]--;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    unsigned int latency_usec = (unsigned int)ts_diff(pe->sent_time, now);
+    unsigned int bytes_rx = (unsigned int)sizeof(*resp);
+    if (pe->is_set) {
+        w->stats->update_set_op(&now, bytes_rx, pe->bytes_tx, latency_usec);
+    } else {
+        switch (resp->status) {
+            case VEMB_V16_STATUS_OK: (*debug->status_ok)++; break;
+            case VEMB_V16_STATUS_NOT_FOUND: (*debug->status_notfound)++; break;
+            case VEMB_V16_STATUS_ERR: (*debug->status_err)++; break;
+            default: (*debug->status_other)++; break;
+        }
+        unsigned int hits = 0, misses = 0;
+        if (resp->status == VEMB_V16_STATUS_OK) {
+            if (w->skip_handle_read) {
+                hits = 1;
+            } else {
+                int n = vemb_v16_aeron_read_vector(w->channels[ch],
+                                                   resp->region_id,
+                                                   resp->vector_offset,
+                                                   resp->vector_bytes,
+                                                   vec_scratch,
+                                                   sizeof(float) * VEMB_V16_MAX_DIM);
+                if (n > 0) { hits = 1; (*debug->handle_deref_ok)++; }
+                else       { (*debug->handle_deref_fail)++; }
+            }
+        } else if (resp->status == VEMB_V16_STATUS_NOT_FOUND) {
+            misses = 1;
+        }
+        w->stats->update_get_op(&now, bytes_rx, pe->bytes_tx,
+                                latency_usec, hits, misses);
+    }
+    w->ops_done.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 static void *worker_main(void *arg) {
     worker_arg *w = (worker_arg *)arg;
     uint32_t n_ch = (uint32_t)w->channels.size();
@@ -219,8 +301,10 @@ static void *worker_main(void *arg) {
     unsigned long long op_idx = 0;
     unsigned long long budget = w->budget;  /* 0 = unlimited (--test-time) */
     uint32_t next_ch = 0;
-    vemb_v16_req_t req_buf;
-    vemb_v16_resp_t resp_buf;
+    vemb_v16_req_t req_batch[AERON_BATCH_SIZE];
+    const void *req_ptrs[AERON_BATCH_SIZE];
+    uint32_t req_lens[AERON_BATCH_SIZE];
+    vemb_v16_resp_t resp_batch[AERON_BATCH_SIZE];
     /* Scratch buffer for VEMB_HANDLE dereference — large enough for any
      * dim up to VEMB_V16_MAX_DIM. Lives on the worker stack. */
     float vec_scratch[VEMB_V16_MAX_DIM];
@@ -229,6 +313,10 @@ static void *worker_main(void *arg) {
     uint64_t debug_loop_count = 0;
     uint64_t debug_status_ok = 0, debug_status_notfound = 0, debug_status_err = 0, debug_status_other = 0;
     uint64_t debug_handle_deref_ok = 0, debug_handle_deref_fail = 0;
+    aeron_debug_counters debug = {
+        &debug_status_ok, &debug_status_notfound, &debug_status_err,
+        &debug_status_other, &debug_handle_deref_ok, &debug_handle_deref_fail
+    };
 
     while (!w->stop->load(std::memory_order_acquire)) {
         if (budget > 0 && op_idx >= budget) {
@@ -237,130 +325,75 @@ static void *worker_main(void *arg) {
         }
         debug_loop_count++;
 
-        /* ---- publish phase: round-robin channels, fill each to pipeline.
-         * Keep pipeline full so the server-side proxy never sees an empty
-         * req ring (which triggers its 10ms epoll_wait sleep). ---- */
+        /* ---- publish phase: round-robin channels, fill each to pipeline in
+         * one variable-length batch. ---- */
         int published_any = 0;
         for (uint32_t k = 0; k < n_ch; k++) {
             uint32_t ch = (next_ch + k) % n_ch;
-            if (w->pending_count[ch] >= pipeline) continue;
-            if (budget > 0 && op_idx >= budget) break;
+            uint32_t batch_count = pipeline - w->pending_count[ch];
+            if (batch_count > AERON_BATCH_SIZE) batch_count = AERON_BATCH_SIZE;
+            if (budget > 0 && op_idx < budget && budget - op_idx < batch_count)
+                batch_count = (uint32_t)(budget - op_idx);
+            if (batch_count == 0) continue;
             if (w->stop->load(std::memory_order_acquire)) break;
 
-            /* pick op + key */
-            uint8_t op = pick_next_op(w);
-            int iter = is_set_op(op)
-                ? obj_iter_type(w->cfg, AERON_SET_CMD_IDX)
-                : obj_iter_type(w->cfg, AERON_GET_CMD_IDX);
-            unsigned long long key_index = w->obj_gen->get_key_index(iter);
-            w->obj_gen->generate_key(key_index);
+            for (uint32_t i = 0; i < batch_count; i++) {
+                uint8_t op = pick_next_op(w);
+                int iter = is_set_op(op)
+                    ? obj_iter_type(w->cfg, AERON_SET_CMD_IDX)
+                    : obj_iter_type(w->cfg, AERON_GET_CMD_IDX);
+                unsigned long long key_index = w->obj_gen->get_key_index(iter);
+                w->obj_gen->generate_key(key_index);
+                uint32_t actual_key_len = 0;
+                size_t req_len = build_req(w, op_idx + i, op,
+                                           w->obj_gen->get_key(),
+                                           w->obj_gen->get_key_len(),
+                                           &req_batch[i], &actual_key_len);
+                req_batch[i].channel_id =
+                    vemb_v16_aeron_channel_id(w->channels[ch]);
+                req_ptrs[i] = &req_batch[i];
+                req_lens[i] = (uint32_t)req_len;
+            }
 
-            uint32_t actual_key_len = 0;
-            size_t req_len = build_req(w, op_idx, op,
-                                       w->obj_gen->get_key(),
-                                       w->obj_gen->get_key_len(),
-                                       &req_buf, &actual_key_len);
-            req_buf.channel_id = vemb_v16_aeron_channel_id(w->channels[ch]);
-
-            int pub_rc = vemb_v16_aeron_publish_request(w->channels[ch],
-                                                        &req_buf, (uint32_t)req_len);
+            int pub_rc = vemb_v16_aeron_publish_request_batch(
+                w->channels[ch], req_ptrs, req_lens, batch_count);
             if (pub_rc != 0) {
                 debug_publish_fail++;
                 continue;
             }
-            debug_publish_ok++;
-            /* record pending */
-            uint32_t slot = w->pending_tail[ch];
             struct timeval now;
             gettimeofday(&now, NULL);
-            w->pending[ch][slot].req_id = req_buf.req_id;
-            w->pending[ch][slot].is_set = is_set_op(op);
-            w->pending[ch][slot].sent_time = now;
-            w->pending[ch][slot].bytes_tx = (uint32_t)req_len;
-            w->pending_tail[ch] = (slot + 1) % pipeline;
-            w->pending_count[ch]++;
-            op_idx++;
+            for (uint32_t i = 0; i < batch_count; i++) {
+                uint32_t slot = w->pending_tail[ch];
+                w->pending[ch][slot].req_id = req_batch[i].req_id;
+                w->pending[ch][slot].is_set = is_set_op(req_batch[i].op);
+                w->pending[ch][slot].sent_time = now;
+                w->pending[ch][slot].bytes_tx = req_lens[i];
+                w->pending_tail[ch] = (slot + 1) % pipeline;
+                w->pending_count[ch]++;
+                debug_publish_ok++;
+            }
+            op_idx += batch_count;
             published_any = 1;
             next_ch = (ch + 1) % n_ch;
         }
 
-        /* ---- poll phase: take AT MOST ONE response per channel per iter.
-         * Draining all responses in one pass lets the proxy's req ring run
-         * empty between batches and the proxy enters its 10ms sleep — which
-         * becomes the per-op latency. Mirrors vemb_v16_bench's
-         * recv_channel_resp-one-then-publish-one pattern. ---- */
+        /* ---- poll phase: copy a response batch from each channel. ---- */
         int polled_any = 0;
         for (uint32_t ch = 0; ch < n_ch; ch++) {
             if (w->pending_count[ch] == 0) continue;
-            int got = vemb_v16_aeron_poll_response(w->channels[ch],
-                                                    &resp_buf, sizeof(resp_buf));
-            if (got <= 0) {
-                if (got == 0) debug_poll_zero++;
+            uint32_t got = vemb_v16_aeron_poll_response_batch(
+                w->channels[ch], resp_batch, sizeof(resp_batch[0]),
+                AERON_BATCH_SIZE);
+            if (got == 0) {
+                debug_poll_zero++;
                 continue;
             }
-            debug_poll_got++;
-            if (got != (int)sizeof(resp_buf)) continue;
-            if (w->pending_count[ch] == 0) continue;
-
-            uint32_t slot = w->pending_head[ch];
-            pending_op *pe = &w->pending[ch][slot];
-            if (pe->req_id != resp_buf.req_id) {
-                int found = -1;
-                for (uint32_t j = 0; j < w->pending_count[ch]; j++) {
-                    uint32_t s2 = (w->pending_head[ch] + j) % pipeline;
-                    if (w->pending[ch][s2].req_id == resp_buf.req_id) {
-                        found = (int)s2;
-                        break;
-                    }
-                }
-                if (found < 0) continue;
-                if (found != (int)slot) {
-                    pending_op tmp = w->pending[ch][slot];
-                    w->pending[ch][slot] = w->pending[ch][found];
-                    w->pending[ch][found] = tmp;
-                    pe = &w->pending[ch][slot];
-                }
-            }
-            w->pending_head[ch] = (slot + 1) % pipeline;
-            w->pending_count[ch]--;
-
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            unsigned int latency_usec =
-                (unsigned int)ts_diff(pe->sent_time, now);
-            unsigned int bytes_rx = (unsigned int)sizeof(resp_buf);
-            unsigned int bytes_tx = pe->bytes_tx;
-
-            if (pe->is_set) {
-                w->stats->update_set_op(&now, bytes_rx, bytes_tx, latency_usec);
-            } else {
-                switch (resp_buf.status) {
-                    case VEMB_V16_STATUS_OK: debug_status_ok++; break;
-                    case VEMB_V16_STATUS_NOT_FOUND: debug_status_notfound++; break;
-                    case VEMB_V16_STATUS_ERR: debug_status_err++; break;
-                    default: debug_status_other++; break;
-                }
-                /* VEMB_HANDLE: server returned (offset, bytes); dereference
-                 * via the channel's warm-region mapping to read the actual
-                 * vector. Count as a hit only if the dereference succeeds. */
-                unsigned int hits = 0, misses = 0;
-                if (resp_buf.status == VEMB_V16_STATUS_OK) {
-                    int n = vemb_v16_aeron_read_vector(w->channels[ch],
-                                                       resp_buf.region_id,
-                                                       resp_buf.vector_offset,
-                                                       resp_buf.vector_bytes,
-                                                       vec_scratch,
-                                                       sizeof(vec_scratch));
-                    if (n > 0) { hits = 1; debug_handle_deref_ok++; }
-                    else       { debug_handle_deref_fail++; }
-                } else if (resp_buf.status == VEMB_V16_STATUS_NOT_FOUND) {
-                    misses = 1;
-                }
-                w->stats->update_get_op(&now, bytes_rx, bytes_tx,
-                                        latency_usec, hits, misses);
-            }
-            w->ops_done.fetch_add(1, std::memory_order_relaxed);
-            polled_any = 1;
+            debug_poll_got += got;
+            for (uint32_t i = 0; i < got; i++)
+                polled_any |= account_response(w, ch, pipeline,
+                                               &resp_batch[i], vec_scratch,
+                                               &debug);
         }
 
         /* if nothing published and nothing polled, busy-spin with a CPU yield
@@ -391,59 +424,17 @@ static void *worker_main(void *arg) {
 
             for (uint32_t ch = 0; ch < n_ch; ch++) {
                 if (w->pending_count[ch] == 0) continue;
-                int got;
-                while ((got = vemb_v16_aeron_poll_response(w->channels[ch],
-                                                            &resp_buf, sizeof(resp_buf))) > 0) {
-                    if (got != (int)sizeof(resp_buf)) continue;
-                    if (w->pending_count[ch] == 0) break;
-                    uint32_t slot = w->pending_head[ch];
-                    pending_op *pe = &w->pending[ch][slot];
-                    if (pe->req_id != resp_buf.req_id) {
-                        int found = -1;
-                        for (uint32_t j = 0; j < w->pending_count[ch]; j++) {
-                            uint32_t s2 = (w->pending_head[ch] + j) % pipeline;
-                            if (w->pending[ch][s2].req_id == resp_buf.req_id) {
-                                found = (int)s2; break;
-                            }
-                        }
-                        if (found < 0) continue;
-                        if (found != (int)slot) {
-                            pending_op tmp = w->pending[ch][slot];
-                            w->pending[ch][slot] = w->pending[ch][found];
-                            w->pending[ch][found] = tmp;
-                            pe = &w->pending[ch][slot];
-                        }
-                    }
-                    w->pending_head[ch] = (slot + 1) % pipeline;
-                    w->pending_count[ch]--;
-
-                    struct timeval now;
-                    gettimeofday(&now, NULL);
-                    unsigned int latency_usec =
-                        (unsigned int)ts_diff(pe->sent_time, now);
-                    unsigned int bytes_rx = (unsigned int)sizeof(resp_buf);
-                    unsigned int bytes_tx = pe->bytes_tx;
-                    if (pe->is_set) {
-                        w->stats->update_set_op(&now, bytes_rx, bytes_tx, latency_usec);
-                    } else {
-                        unsigned int hits = 0, misses = 0;
-                        if (resp_buf.status == VEMB_V16_STATUS_OK) {
-                            int n = vemb_v16_aeron_read_vector(w->channels[ch],
-                                                               resp_buf.region_id,
-                                                               resp_buf.vector_offset,
-                                                               resp_buf.vector_bytes,
-                                                               vec_scratch,
-                                                               sizeof(vec_scratch));
-                            if (n > 0) { hits = 1; debug_handle_deref_ok++; }
-                            else       { debug_handle_deref_fail++; }
-                        } else if (resp_buf.status == VEMB_V16_STATUS_NOT_FOUND) {
-                            misses = 1;
-                        }
-                        w->stats->update_get_op(&now, bytes_rx, bytes_tx,
-                                                latency_usec, hits, misses);
-                    }
-                    w->ops_done.fetch_add(1, std::memory_order_relaxed);
+                uint32_t got = vemb_v16_aeron_poll_response_batch(
+                    w->channels[ch], resp_batch, sizeof(resp_batch[0]),
+                    AERON_BATCH_SIZE);
+                if (got == 0) {
+                    debug_poll_zero++;
+                    continue;
                 }
+                debug_poll_got += got;
+                for (uint32_t i = 0; i < got; i++)
+                    account_response(w, ch, pipeline, &resp_batch[i],
+                                     vec_scratch, &debug);
             }
             struct timespec ts = {0, 500};
             nanosleep(&ts, NULL);
@@ -476,8 +467,15 @@ static void *worker_main(void *arg) {
 /* ------------------------------------------------------------------ */
 
 run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
+    const char *skip_handle_read_env = getenv("VEMB_AERON_SKIP_HANDLE_READ");
+    bool skip_handle_read = skip_handle_read_env &&
+        (!strcmp(skip_handle_read_env, "1") ||
+         !strcmp(skip_handle_read_env, "yes") ||
+         !strcmp(skip_handle_read_env, "true"));
     fprintf(stderr, "[aeron] side-channel runner start (t=%u c=%u pipeline=%u dim=%u)\n",
             cfg->threads, cfg->clients, cfg->pipeline, cfg->vemb_v16_dim);
+    fprintf(stderr, "[aeron] handle read: %s\n",
+            skip_handle_read ? "skipped (metadata only)" : "enabled");
 
     /* Validate config */
     if (cfg->vemb_v16_dim == 0) {
@@ -485,7 +483,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         exit(1);
     }
     if (cfg->vemb_v16_endpoints && g_aeron_transport_mode != "aeron-cross-node") {
-        benchmark_error_log("[aeron] --vemb-v16-endpoints not supported in aeron mode (single-node UDS only)\n");
+        benchmark_error_log("[aeron] --vemb-v16-endpoints not supported in aeron mode (use --vemb-v16-transport=aeron-cross-node)\n");
         exit(1);
     }
     uint32_t total_channels = cfg->threads * cfg->clients;
@@ -500,20 +498,24 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
     }
 
     char control_endpoint[320];
-    const char *uds_path = VEMB_V16_UDS_PATH;
-    if (cfg->unix_socket && cfg->unix_socket[0]) {
-        uds_path = cfg->unix_socket;
-    } else if (cfg->server && cfg->server[0] && cfg->port != 0) {
+    const char *control_path = NULL;
+    if (cfg->server && cfg->server[0] && cfg->port != 0) {
         snprintf(control_endpoint,
                  sizeof(control_endpoint),
                  "tcp://%s:%u",
                  cfg->server,
                  (unsigned)cfg->port);
-        uds_path = control_endpoint;
+        control_path = control_endpoint;
+    } else {
+        snprintf(control_endpoint, sizeof(control_endpoint),
+                 "tcp://%s:%u", VEMB_V16_TCP_HOST,
+                 (unsigned)VEMB_V16_TCP_PORT);
+        control_path = control_endpoint;
     }
 
     /* Best-effort cleanup of any stale channels from a previous crashed run.
-     * Cross-node mode bypasses UDS entirely (TCP ATTACH + shmdev mmap). */
+     * All Aeron modes use TCP control; ring mappings come from the server's
+     * advertised UB path and offset. */
     bool cross_node = (g_aeron_transport_mode == "aeron-cross-node");
     std::string cn_host;
     uint16_t    cn_port = 0;
@@ -532,8 +534,8 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         }
         fprintf(stderr, "[aeron] cross-node mode: %s:%u\n", cn_host.c_str(), cn_port);
     } else {
-        vemb_v16_aeron_close_all(uds_path);
-        fprintf(stderr, "[aeron] local mode: uds=%s\n", uds_path);
+        vemb_v16_aeron_close_all(control_path);
+        fprintf(stderr, "[aeron] local mode: control=%s\n", control_path);
     }
 
     /* Allocate channels up-front (main thread). Each worker will own
@@ -546,7 +548,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
             all_channels[i] = vemb_v16_aeron_open_remote(cn_host.c_str(), cn_port,
                                                          cfg->vemb_v16_dim);
         } else {
-            all_channels[i] = vemb_v16_aeron_open(uds_path, cfg->vemb_v16_dim);
+            all_channels[i] = vemb_v16_aeron_open(control_path, cfg->vemb_v16_dim);
         }
         if (!all_channels[i]) {
             benchmark_error_log("[aeron] open channel %u failed: %s\n",
@@ -562,9 +564,8 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
          * would only validate that the server returns a handle, not that
          * the handle points to real data.
          *
-         * Cross-node ATTACH resp advertises warm region paths via the
-         * client_path field in the manifest; SDK parses them into
-         * ch->desc.warm_regions[] which this call consumes. */
+         * Cross-node ATTACH returns server-side UB paths; the SDK maps them
+         * to this client's local UB view before this call. */
         if (vemb_v16_aeron_open_warm_region(all_channels[i]) != 0) {
             benchmark_error_log("[aeron] open warm region %u failed: %s\n",
                                 i, strerror(errno));
@@ -602,6 +603,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
          * distinct_client_seed path). */
         workers[i].obj_gen->set_random_seed((int)i + 1);
         workers[i].worker_id = i;
+        workers[i].skip_handle_read = skip_handle_read;
         workers[i].stop = &stop;
         workers[i].done.store(false, std::memory_order_relaxed);
         workers[i].ops_done.store(0, std::memory_order_relaxed);
@@ -656,7 +658,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         merged.merge(*workers[i].stats, iteration++);
     }
 
-    /* Teardown channels — SDK handles ring unmap + UDS notify. */
+    /* Teardown channels — SDK handles UB ring unmap + TCP close notify. */
     for (uint32_t i = 0; i < total_channels; i++) {
         vemb_v16_aeron_close(all_channels[i]);
         all_channels[i] = nullptr;

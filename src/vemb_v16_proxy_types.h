@@ -15,12 +15,21 @@
 /* Forward decl: defined in vemb_v16_proxy.c (non-blocking handshake state machine). */
 struct vemb_v16_handshake_ctx;
 
+typedef struct vemb_v16_aeron_channel_snapshot {
+    uint32_t count;
+    uint32_t indices[];
+} vemb_v16_aeron_channel_snapshot_t;
+
 typedef struct vemb_v16_proxy_io_worker {
     uint32_t worker_id;
     struct vemb_v16_proxy *proxy;
     pthread_t thread;
     vemb_v16_job_pool_t job_pools[VEMB_V16_JOB_POOL_COUNT];
     vemb_v16_mapped_region_t job_pool_slot_regions[VEMB_V16_JOB_POOL_COUNT];
+    _Atomic(vemb_v16_aeron_channel_snapshot_t *) aeron_snapshot;
+    atomic_uint_fast32_t aeron_snapshot_readers;
+    vemb_v16_aeron_channel_snapshot_t *aeron_snapshot_buffers[2];
+    uint32_t aeron_snapshot_capacity;
 #ifdef __linux__
     int notify_fd;
 #endif
@@ -77,6 +86,7 @@ struct vemb_v16_channel {
 struct vemb_v16_proxy {
     char uds_path[108];
     char tcp_host[64];
+    char aeron_ub_path[256];
     uint32_t vector_dim;
     uint32_t vector_stride;
     uint32_t request_ring_slot_size;
@@ -91,6 +101,8 @@ struct vemb_v16_proxy {
     uint16_t tcp_port;
     int uds_enabled;
     int tcp_enabled;
+    int inject_only;
+    uint32_t data_transport_type;
     uint32_t proxy_io_worker_count;
     int proxy_io_pool_started;
     vemb_v16_proxy_io_worker_t proxy_io_workers[VEMB_V16_MAX_CHANNELS];

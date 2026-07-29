@@ -38,9 +38,13 @@ static int endpoint_valid(const vemb_v16_topology_endpoint_t *endpoint,
                endpoint->host[0] != '\0';
     }
     if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-        return endpoint_string_valid(endpoint->uds_path,
-                                     sizeof(endpoint->uds_path)) &&
-               endpoint->uds_path[0] != '\0';
+        if (endpoint->uds_path[0] != '\0')
+            return endpoint_string_valid(endpoint->uds_path,
+                                         sizeof(endpoint->uds_path));
+        return endpoint->tcp_port != 0 &&
+               endpoint_string_valid(endpoint->host,
+                                     sizeof(endpoint->host)) &&
+               endpoint->host[0] != '\0';
     }
     return 0;
 }

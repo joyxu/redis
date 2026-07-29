@@ -1954,6 +1954,8 @@ struct redisServer {
     int vemb_v16_supernode_workers;
     int vemb_v16_proxy_io_threads;
     char *vemb_v16_transport;       /* "sniff" (default) or "aeron" */
+    char *vemb_v16_aeron_control;   /* "tcp" (default) or "uds" */
+    char *vemb_v16_aeron_ub_path;   /* fixed UB device path for Aeron rings */
     int vemb_v16_cross_node_aeron_enabled;  /* cross-node ATTACH + ring ABI + backoff */
     vemb_v16_proxy_t *vemb_v16_proxy;
     pthread_t vemb_v16_proxy_thread;

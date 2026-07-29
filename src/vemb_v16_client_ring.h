@@ -7,6 +7,23 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef VEMB_V16_CLIENT_RING_USE_SVE
+/* Each target supplies its own implementation: src/sve_operation.c for the
+ * server and clients/c/vemb_v16_client_sdk.c for the SDK. */
+void sve_streaming_load_f32(const void *src, void *dst, size_t size);
+static inline void vemb_v16_client_ring_copy(const void *src,
+                                             void *dst,
+                                             size_t size) {
+    sve_streaming_load_f32(src, dst, size);
+}
+#else
+static inline void vemb_v16_client_ring_copy(const void *src,
+                                             void *dst,
+                                             size_t size) {
+    memcpy(dst, src, size);
+}
+#endif
+
 /* Adaptive backoff — 三阶段（参考 aeron_ipc.h::aeron_poll_adaptive）：
  *   spins <  64: 纯 spin，compiler barrier only
  *   spins < 256: spin + ARM yield / x86 pause
@@ -28,8 +45,9 @@ static inline void vemb_v16_client_backoff(uint32_t spins) {
     }
 }
 
-#define VEMB_V16_CLIENT_RING_BITS 12u
-#define VEMB_V16_CLIENT_RING_SIZE (1u << VEMB_V16_CLIENT_RING_BITS)
+#define VEMB_V16_CLIENT_MAX_BATCH_PIPELINE 128u
+#define VEMB_V16_CLIENT_RING_SIZE \
+    (VEMB_V16_CLIENT_MAX_BATCH_PIPELINE * 2u)
 #define VEMB_V16_CLIENT_RING_MASK (VEMB_V16_CLIENT_RING_SIZE - 1u)
 
 typedef struct vemb_v16_client_ring {
@@ -66,9 +84,10 @@ static inline int vemb_v16_client_publish(vemb_v16_client_ring_t *ring,
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
     if (tail - head >= ring->slot_count) return -1;
     uint8_t *slots_base = (uint8_t *)ring + ring->slots_off;
-    memcpy(slots_base + (tail & ring->slot_mask) * ring->slot_size,
-           data,
-           len);
+    vemb_v16_client_ring_copy(
+        data,
+        slots_base + (tail & ring->slot_mask) * ring->slot_size,
+        len);
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
     return 0;
 }
@@ -85,9 +104,35 @@ static inline int vemb_v16_client_publish_batch(vemb_v16_client_ring_t *ring,
     uint8_t *slots_base = (uint8_t *)ring + ring->slots_off;
     const uint8_t *src = slots;
     for (uint32_t i = 0; i < count; i++) {
-        memcpy(slots_base + ((tail + i) & ring->slot_mask) * ring->slot_size,
-               src + (size_t)i * len,
-               len);
+        vemb_v16_client_ring_copy(
+            src + (size_t)i * len,
+            slots_base + ((tail + i) & ring->slot_mask) * ring->slot_size,
+            len);
+    }
+    atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
+    return 0;
+}
+
+/* Publish variable-length frames as one producer transaction. All capacity
+ * is checked before the first slot is copied, so a failed call publishes no
+ * partial batch. */
+static inline int vemb_v16_client_publish_ptr_batch(
+    vemb_v16_client_ring_t *ring,
+    const void *const *data,
+    const uint32_t *lens,
+    uint32_t count) {
+    if (count == 0) return 0;
+    if (!data || !lens) return -2;
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    if (tail - head + count > ring->slot_count) return -1;
+    uint8_t *slots_base = (uint8_t *)ring + ring->slots_off;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!data[i] || lens[i] > ring->slot_size) return -2;
+        vemb_v16_client_ring_copy(
+            data[i],
+            slots_base + ((tail + i) & ring->slot_mask) * ring->slot_size,
+            lens[i]);
     }
     atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
     return 0;
@@ -102,9 +147,10 @@ static inline int vemb_v16_client_poll(vemb_v16_client_ring_t *ring,
     uint32_t len = ring->slot_size;
     if (len > max_len) len = max_len;
     uint8_t *slots_base = (uint8_t *)ring + ring->slots_off;
-    memcpy(data,
-           slots_base + (head & ring->slot_mask) * ring->slot_size,
-           len);
+    vemb_v16_client_ring_copy(
+        slots_base + (head & ring->slot_mask) * ring->slot_size,
+        data,
+        len);
     atomic_store_explicit(&ring->head, head + 1, memory_order_release);
     return (int)len;
 }
@@ -123,9 +169,10 @@ static inline uint32_t vemb_v16_client_poll_batch(vemb_v16_client_ring_t *ring,
     uint8_t *slots_base = (uint8_t *)ring + ring->slots_off;
     uint8_t *dst = slots;
     for (uint32_t i = 0; i < (uint32_t)available; i++) {
-        memcpy(dst + (size_t)i * max_len,
-               slots_base + ((head + i) & ring->slot_mask) * ring->slot_size,
-               len);
+        vemb_v16_client_ring_copy(
+            slots_base + ((head + i) & ring->slot_mask) * ring->slot_size,
+            dst + (size_t)i * max_len,
+            len);
     }
     atomic_store_explicit(&ring->head, head + available, memory_order_release);
     return (uint32_t)available;
