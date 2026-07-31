@@ -309,6 +309,9 @@ run_one_config() {
 
     # === jiffies before ===
     local jb=$(snapshot_jiffies $SERVER_PORT)
+    local jb_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
+    local jb_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
+    local jb_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
 
     # === run memtier on CLIENT ===
     # is_hpc 通过位置参数 ${15} 传给 helper (ssh 不传环境变量)
@@ -323,6 +326,12 @@ run_one_config() {
     # === jiffies after ===
     local ja=$(snapshot_jiffies $SERVER_PORT)
     local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
+    local ja_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
+    local ja_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
 
     # === sar %ifutil 解析 ===
     wait $sar_pid 2>/dev/null || true
@@ -348,9 +357,10 @@ run_one_config() {
         ops_note=" (÷2, 2-key equiv)"
         ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
     fi
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" "$nic_util" >> "$TSV"
-    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
+        "$nic_util" "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%  iowait=$c_iowait si=$c_si hi=$c_hi"
     rm -f "$raw_local"
     ssh "$CLIENT" "rm -f $raw_remote" 2>/dev/null
 }
@@ -376,7 +386,7 @@ log "  ssh ok, memtier ok"
 log "deploying bench helper to $CLIENT..."
 deploy_bench_helper
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\tiowait\tsi\thi\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then

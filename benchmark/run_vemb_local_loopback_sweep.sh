@@ -122,8 +122,13 @@ snapshot_jiffies() {
     echo $total
 }
 
+# system-wide background CPU counters (/proc/stat, units=jiffies)
+snapshot_iowait() { awk '/^cpu /{print $6}' /proc/stat 2>/dev/null; }
+snapshot_si()     { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
+snapshot_hi()     { awk '/^cpu /{print $7}' /proc/stat 2>/dev/null; }
+
 # ----------------------------------------------------------------------------
-wait_port() {
+wait_port(){
     local port=$1 count=0
     while ! $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $port PING 2>/dev/null | grep -q PONG; do
         sleep 0.2
@@ -145,11 +150,17 @@ start_baseline() {
             --dir $DATA_DIR --logfile $DATA_DIR/baseline.log \
             --daemonize yes
     wait_port $PORT || { log "FAIL: baseline server"; exit 1; }
+    sleep 1  # let server fully stabilize before prefill
 }
 
 start_hpc() {
     log "启动 hpc-redis (pio=$HPC_PIO snw=$HPC_SNW)..."
     local max_vec=$((NUM_KEYS + 1000))
+    local tcp_args=""
+    if [ "${HPC_TCP_PORT:-0}" -gt 0 ]; then
+        tcp_args="--vemb-v16-tcp-port $HPC_TCP_PORT --vemb-v16-tcp-host 127.0.0.1"
+        log "  [hpc] TCP mode: VEMB on port $HPC_TCP_PORT (no sniff)"
+    fi
     taskset -c $HPC_SERVER_CPUSET \
         $HPC_DIR/src/redis-server \
             --port $PORT --bind 127.0.0.1 --protected-mode no \
@@ -162,10 +173,12 @@ start_hpc() {
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $MANIFEST \
             --vemb-v16-reset-warm-regions yes \
+            $tcp_args \
             --appendonly no --save '' \
             --dir $DATA_DIR --logfile $DATA_DIR/hpc.log \
             --daemonize yes
     wait_port $PORT || { log "FAIL: hpc server"; exit 1; }
+    sleep 1  # let server fully stabilize before prefill
 }
 
 stop_server() {
@@ -208,14 +221,15 @@ prefill() {
     $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT FLUSHDB >/dev/null 2>&1
 
     if [ "$server_type" = "hpc" ]; then
-        # hpc server: VEMB V16 协议单 conn 写入
-        #   所有 OP 统一 item: prefix, -n=NUM_KEYS
-        #   VSIM/VREM: item: prefix, -n=NUM_KEYS
+        # hpc server: VEMB V16 binary protocol prefill
+        # -n is per-thread with vemb_v16, use --test-time for reliable completion
         local nfill=$((kmax - kmin + 1))
-        # 写死 -t 8 -c 1 并发 (参考 hpc_redis_vrem_max_tput.sh:85)
+        local prefill_sec=$((nfill / 2000 + 10))
+        local hpc_mport=$PORT
+        [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-                -s 127.0.0.1 -p $PORT -t 8 -c 1 -n $nfill \
+                -s 127.0.0.1 -p $hpc_mport -t 8 -c 1 --test-time=$prefill_sec \
                 --ratio=1:0 --key-pattern=S:S --key-prefix=$prefix \
                 --key-minimum=$kmin --key-maximum=$kmax \
                 > "$RAWDIR/${server_type}_${OP_TYPE}_prefill.log" 2>&1
@@ -239,6 +253,10 @@ prefill() {
     else
         local vc=$( $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT VCARD myset 2>/dev/null)
         log "[$server_type] prefill 完成: myset VCARD=$vc"
+        if [ -z "$vc" ] || [ "$vc" -eq 0 ]; then
+            log "FATAL: [$server_type] prefill failed, myset VCARD=$vc"
+            exit 1
+        fi
     fi
 }
 
@@ -253,6 +271,7 @@ run_one_config() {
     log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s"
 
     local jb=$(snapshot_jiffies $PORT)
+    local jb_iowait=$(snapshot_iowait) jb_si=$(snapshot_si) jb_hi=$(snapshot_hi)
     if [ "$server_type" = "hpc" ]; then
         # hpc server: VEMB V16 二进制协议
         #   所有 OP 统一 item: key 范围
@@ -269,9 +288,11 @@ run_one_config() {
         esac
         # VSIM/VADD/VREM 高并发可能 hang, timeout 兜底 (TEST_TIME + 30s); VEMB 也统一走 timeout
         local hpc_timeout=$((TEST_TIME + 30))
+        local hpc_mport=$PORT
+        [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         timeout ${hpc_timeout}s numactl --membind=$NUMA_NODE_CLIENT taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM $op_flag \
-                -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$p \
+                -s 127.0.0.1 -p $hpc_mport -t $t -c $c --pipeline=$p \
                 $ratio --key-pattern=$kp \
                 --key-prefix=$prefix --key-minimum=$kmin --key-maximum=$kmax \
                 --test-time=$TEST_TIME --hide-histogram \
@@ -301,6 +322,10 @@ run_one_config() {
     fi
     local ja=$(snapshot_jiffies $PORT)
     local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_iowait=$(snapshot_iowait) ja_si=$(snapshot_si) ja_hi=$(snapshot_hi)
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
 
     # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)
     local totals ops avg p50 p99 kb
@@ -319,9 +344,10 @@ run_one_config() {
         ops_note=" (÷2, 2-key equiv)"
         ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
     fi
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
-    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
+        "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores iowait=$c_iowait si=$c_si hi=$c_hi"
     rm -f "$raw"
 }
 
@@ -332,7 +358,7 @@ log "=== ${OP_TYPE} 本地回环 sweep (${NCONFIGS} 档 × ${SERVERS_ONLY} serve
 log "TEST_TIME=${TEST_TIME}s/档, DIM=$DIM, TCP 127.0.0.1:$PORT"
 log "DIM=$DIM NUM_KEYS=$NUM_KEYS"
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tiowait\tsi\thi\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then
