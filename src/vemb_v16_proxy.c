@@ -3,6 +3,8 @@
 #include "vemb_v16_hash.h"
 
 #include "cpu_relax.h"
+#include "futex.h"
+#include "monotonic.h"
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_server_integration.h"   /* vemb_v16_cross_node_aeron_enabled() */
 #include "vemb_v16_proxy_types.h"
@@ -52,6 +54,7 @@ int vemb_v16_cross_node_aeron_enabled(void) {
 #define VEMB_V16_READ_JOB_POOL_SLOTS 1024u
 #define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
 #define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
+#define VEMB_V16_SUPERNODE_IDLE_SPIN_NS 5000ULL
 
 static void completion_release_payload(vemb_v16_completion_t *completion) {
     vemb_v16_completion_release_inline_snapshot(completion);
@@ -1132,14 +1135,12 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
     vemb_v16_supernode_pool_worker_t *worker =
         &proxy->supernode_workers[supernode_id];
     int expected = 1;
-    if (worker->job_eventfd >= 0 &&
-        atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
+    if (atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
                                                 &expected,
                                                 0,
                                                 memory_order_acq_rel,
-                                                memory_order_relaxed)) {
-        (void)eventfd_write(worker->job_eventfd, 1);
-    }
+                                                memory_order_relaxed))
+        futex_notify(&worker->job_notify_armed);
 #endif
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
 }
@@ -1172,14 +1173,12 @@ static int publish_shard_job_batch(vemb_v16_channel_t *ch,
     vemb_v16_supernode_pool_worker_t *worker =
         &proxy->supernode_workers[supernode_id];
     int expected = 1;
-    if (worker->job_eventfd >= 0 &&
-        atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
+    if (atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
                                                 &expected,
                                                 0,
                                                 memory_order_acq_rel,
-                                                memory_order_relaxed)) {
-        (void)eventfd_write(worker->job_eventfd, 1);
-    }
+                                                memory_order_relaxed))
+        futex_notify(&worker->job_notify_armed);
 #endif
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
 }
@@ -2073,6 +2072,11 @@ static void aeron_io_tiny_pause(uint32_t idle_rounds) {
 static void *proxy_io_aeron_poll_thread_main(void *arg) {
     vemb_v16_proxy_io_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
+#ifdef __linux__
+    char thread_name[16];
+    snprintf(thread_name, sizeof(thread_name), "vemb-io-%02u", worker->worker_id);
+    (void)pthread_setname_np(pthread_self(), thread_name);
+#endif
     proxy_io_set_affinity(proxy, worker->worker_id);
     serverLog(LL_VERBOSE,
               "vemb_v16 aeron io poll worker started: worker_id=%u",
@@ -3010,16 +3014,13 @@ static void supernode_worker_wait_for_jobs(vemb_v16_supernode_pool_worker_t *wor
         return;
     }
 
-    eventfd_t value = 0;
-    while (eventfd_read(worker->job_eventfd, &value) != 0 &&
-           errno == EINTR) {
-    }
+    futex_wait(&worker->job_notify_armed, 1);
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
 }
 
 static void supernode_worker_wake(vemb_v16_supernode_pool_worker_t *worker) {
-    if (worker->job_eventfd >= 0)
-        (void)eventfd_write(worker->job_eventfd, 1);
+    atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
+    futex_notify(&worker->job_notify_armed);
 }
 #endif
 
@@ -3031,65 +3032,48 @@ static void *supernode_pool_thread_main(void *arg) {
     if (vemb_v16_supernode_scratch_init(&scratch) != 0)
         return NULL;
 #ifdef __linux__
+    char thread_name[16];
+    snprintf(thread_name, sizeof(thread_name), "vemb-sn-%02u", worker->worker_id);
+    (void)pthread_setname_np(pthread_self(), thread_name);
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
+    monotime idle_spin_start;
+    int idle_spinning = 0;
 #endif
 
     supernode_worker_set_affinity(proxy, worker->worker_id);
 
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker started: worker_id=%u",
               worker->worker_id);
-#ifdef __linux__
-    uint32_t idle_rounds = 0;
-#endif
     while (atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
         int did_work = 0;
         if (drain_job_shard_queues(proxy, worker->worker_id, &scratch) > 0)
             did_work = 1;
         if (!did_work) {
 #ifdef __linux__
-            if (proxy->data_transport_type == VEMB_V16_TRANSPORT_AERON) {
-                aeron_io_tiny_pause(idle_rounds);
-                if (idle_rounds != UINT32_MAX)
-                    idle_rounds++;
-            } else {
-                supernode_worker_wait_for_jobs(worker);
+            if (!idle_spinning) {
+                elapsedStartNs(&idle_spin_start);
+                idle_spinning = 1;
             }
+            if (elapsedNs(idle_spin_start) < VEMB_V16_SUPERNODE_IDLE_SPIN_NS) {
+                cpu_relax();
+                continue;
+            }
+            supernode_worker_wait_for_jobs(worker);
+            idle_spinning = 0;
 #else
             cpu_relax();
 #endif
-#ifdef __linux__
         } else {
-            idle_rounds = 0;
-        }
-#else
-        }
+#ifdef __linux__
+            idle_spinning = 0;
 #endif
+        }
     }
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker stopped: worker_id=%u",
               worker->worker_id);
     vemb_v16_supernode_scratch_cleanup(&scratch);
     return NULL;
 }
-
-#ifdef __linux__
-static int supernode_worker_open_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
-    worker->job_eventfd = eventfd(0, EFD_CLOEXEC);
-    if (worker->job_eventfd < 0) {
-        serverLog(LL_WARNING,
-                  "vemb_v16 FATAL: supernode worker eventfd create failed: worker_id=%u errno=%d error=%s",
-                  worker->worker_id, errno, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static void supernode_worker_close_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
-    if (worker->job_eventfd >= 0) {
-        close(worker->job_eventfd);
-        worker->job_eventfd = -1;
-    }
-}
-#endif
 
 static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
@@ -3100,23 +3084,8 @@ static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
             .proxy = proxy,
 #ifdef __linux__
             .job_notify_armed = 0,
-            .job_eventfd = -1,
 #endif
         };
-#ifdef __linux__
-        if (proxy->data_transport_type == VEMB_V16_TRANSPORT_TCP &&
-            supernode_worker_open_eventfd(&proxy->supernode_workers[i]) != 0) {
-            atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
-            for (uint32_t j = 0; j < i; j++)
-                supernode_worker_wake(&proxy->supernode_workers[j]);
-            for (uint32_t j = 0; j < i; j++) {
-                pthread_join(proxy->supernode_workers[j].thread, NULL);
-                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
-            }
-            proxy->supernode_pool_started = 0;
-            return -1;
-        }
-#endif
         if (pthread_create(&proxy->supernode_workers[i].thread,
                            NULL,
                            supernode_pool_thread_main,
@@ -3128,13 +3097,7 @@ static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
 #endif
             for (uint32_t j = 0; j < i; j++) {
                 pthread_join(proxy->supernode_workers[j].thread, NULL);
-#ifdef __linux__
-                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
-#endif
             }
-#ifdef __linux__
-            supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
-#endif
             proxy->supernode_pool_started = 0;
             return -1;
         }
@@ -3153,9 +3116,6 @@ static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
 #endif
     for (uint32_t i = 0; i < proxy->supernode_worker_count; i++) {
         pthread_join(proxy->supernode_workers[i].thread, NULL);
-#ifdef __linux__
-        supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
-#endif
     }
     proxy->supernode_pool_started = 0;
 }

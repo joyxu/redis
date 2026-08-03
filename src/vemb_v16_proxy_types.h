@@ -41,7 +41,6 @@ typedef struct vemb_v16_supernode_pool_worker {
     pthread_t thread;
 #ifdef __linux__
     atomic_int job_notify_armed;
-    int job_eventfd;
 #endif
 } vemb_v16_supernode_pool_worker_t;
 

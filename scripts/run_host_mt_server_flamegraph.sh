@@ -11,9 +11,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-SSH_TARGET="${SSH_TARGET:-root@192.168.90.112}"
+NODE="${NODE:-192.168.90.112}"
 SSH_PORT="${SSH_PORT:-22}"
-REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis_bench}"
+REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
 REMOTE_FLAMEGRAPH_DIR="${REMOTE_FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
 SCENARIO="${SCENARIO:-normal}"
@@ -29,9 +29,10 @@ FLAME_DURATION="${FLAME_DURATION:-20}"
 FREQ="${FREQ:-99}"
 EVENT="${EVENT:-cycles}"
 AFFINITY_MODE="${AFFINITY_MODE:-0}"
+BUILD="${BUILD:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
-LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/host_mt_server_flamegraphs_$RUN_ID}"
+LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/$RUN_ID}"
 
 usage() {
     cat <<'USAGE'
@@ -50,9 +51,10 @@ Important environment variables:
   TEST_TIME=30                workload duration in seconds
   FLAME_DURATION=20           sampling duration; must be less than TEST_TIME
   AFFINITY_MODE=0             0 interleaved, 1 grouped
-  SSH_TARGET=root@192.168.90.112
-  REMOTE_DIR=/root/szz/codespace/hpc-redis_bench
-  LOCAL_ROOT=<repo>/perf/host_mt_server_flamegraphs_<run-id>
+  BUILD=1                     1 rebuild redis-server remotely, 0 reuse it
+  NODE=192.168.90.112           remote IP; SSH user is fixed to root
+  REMOTE_DIR=/root/szz/codespace/hpc-redis
+  LOCAL_ROOT=<repo>/perf/<run-id>
 
 The command runs one group only. Repeat it with different parameters for
 independent, resumable groups.
@@ -79,6 +81,11 @@ case "$WORKERS" in
     *) die "WORKERS must use pio:snw format, for example 21:21" ;;
 esac
 
+case "$BUILD" in
+    0|1) ;;
+    *) die "BUILD must be 0 or 1" ;;
+esac
+
 for value in "$BATCH" "$PIPELINE" "$NUM_KEYS" "$TS" "$CS" "$TEST_TIME" "$FLAME_DURATION"; do
     case "$value" in
         ''|*[!0-9]*) die "numeric parameters must be positive integers" ;;
@@ -90,23 +97,33 @@ done
 PIO="${WORKERS%%:*}"
 SNW="${WORKERS##*:}"
 WORKERS_LABEL="${WORKERS//:/_}"
-LABEL="host_mt_server_only_${SCENARIO}_batch${BATCH}_pipe${PIPELINE}_numkeys${NUM_KEYS}_workers${WORKERS_LABEL}_affinity${AFFINITY_MODE}_t${TS}_c${CS}_${TEST_TIME}s"
-REMOTE_ROOT="/tmp/host_mt_server_flamegraphs_${RUN_ID}"
-REMOTE_GROUP_DIR="$REMOTE_ROOT/$LABEL"
-LOCAL_GROUP_DIR="$LOCAL_ROOT/$LABEL"
+LABEL="${SCENARIO}_batch${BATCH}_pipe${PIPELINE}_numkeys${NUM_KEYS}_workers${WORKERS_LABEL}_affinity${AFFINITY_MODE}_t${TS}_c${CS}_${TEST_TIME}s"
+REMOTE_ROOT="/tmp/${RUN_ID}"
+REMOTE_GROUP_DIR="$REMOTE_ROOT"
+LOCAL_GROUP_DIR="$LOCAL_ROOT"
+if [[ "$LOCAL_GROUP_DIR" == "$ROOT_DIR/"* ]]; then
+    LOCAL_LOG_DIR="${LOCAL_GROUP_DIR#"$ROOT_DIR"/}"
+else
+    LOCAL_LOG_DIR="$LOCAL_GROUP_DIR"
+fi
 
 mkdir -p "$LOCAL_GROUP_DIR"
 
 echo "Running one group: $LABEL"
-echo "Remote: $SSH_TARGET:$REMOTE_DIR"
-echo "Local : $LOCAL_GROUP_DIR"
+echo "Remote: root@$NODE:$REMOTE_DIR"
+echo "Local : $LOCAL_LOG_DIR"
+echo "Config: batch=$BATCH pipeline=$PIPELINE keys=$NUM_KEYS workers=$WORKERS ts=$TS cs=$CS test=${TEST_TIME}s flame=${FLAME_DURATION}s event=$EVENT build=$BUILD"
 
-ssh -p "$SSH_PORT" "$SSH_TARGET" bash -s -- \
+ssh -p "$SSH_PORT" "root@$NODE" bash -s -- \
     "$REMOTE_DIR" "$REMOTE_GROUP_DIR" "$REMOTE_FLAMEGRAPH_DIR" \
     "$PORT" "$BATCH" "$PIPELINE" "$NUM_KEYS" "$WORKERS" "$PIO" "$SNW" \
     "$TS" "$CS" "$TEST_TIME" "$FLAME_DURATION" "$FREQ" "$EVENT" \
-    "$AFFINITY_MODE" "$LABEL" <<'REMOTE_SCRIPT'
+    "$AFFINITY_MODE" "$LABEL" "$BUILD" <<'REMOTE_SCRIPT'
 set -euo pipefail
+
+status() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 REMOTE_DIR=$1
 REMOTE_GROUP_DIR=$2
@@ -126,23 +143,48 @@ FREQ=${15}
 EVENT=${16}
 AFFINITY_MODE=${17}
 LABEL=${18}
+BUILD=${19}
 
-mkdir -p "$REMOTE_GROUP_DIR/flame"
+mkdir -p "$REMOTE_GROUP_DIR"
 cd "$REMOTE_DIR"
 
-make -B -C src redis-server USE_UB=yes \
-    PROXY_REQUEST_BATCH="$BATCH" \
-    PROXY_RESPONSE_BATCH="$BATCH" \
-    PROXY_QUEUE_BATCH="$BATCH" \
-    VEMB_V16_PROXY_AFFINITY_MODE="$AFFINITY_MODE" \
-    >"$REMOTE_GROUP_DIR/build.log" 2>&1
+if [ "$BUILD" = "1" ]; then
+    status "building redis-server"
+    make -B -C src redis-server USE_UB=yes \
+        PROXY_REQUEST_BATCH="$BATCH" \
+        PROXY_RESPONSE_BATCH="$BATCH" \
+        PROXY_QUEUE_BATCH="$BATCH" \
+        VEMB_V16_PROXY_AFFINITY_MODE="$AFFINITY_MODE" \
+        2>&1 | tee "$REMOTE_GROUP_DIR/build.log"
+    status "building clients/c"
+    make -C clients/c -j 2>&1 | tee -a "$REMOTE_GROUP_DIR/build.log"
+    status "building memtier_benchmark"
+    make -C memtier_benchmark -j 2>&1 | tee -a "$REMOTE_GROUP_DIR/build.log"
+else
+    status "skipping remote build; using $REMOTE_DIR/src/redis-server"
+    [ -x "$REMOTE_DIR/src/redis-server" ] || {
+        echo "missing executable: $REMOTE_DIR/src/redis-server" >&2
+        exit 1
+    }
+    printf 'remote build skipped; using %s\n' "$REMOTE_DIR/src/redis-server" \
+        >"$REMOTE_GROUP_DIR/build.log"
+fi
 
+status "starting benchmark driver; streaming $REMOTE_GROUP_DIR/driver.log"
 env PORT="$PORT" NUM_KEYS="$NUM_KEYS" WORKERS="$WORKERS" TS="$TS" CS="$CS" \
     PIPELINE="$PIPELINE" TEST_TIME="$TEST_TIME" OUTDIR="$REMOTE_GROUP_DIR" \
     bash hpc_redis_max_tput.sh >"$REMOTE_GROUP_DIR/driver.log" 2>&1 &
 DRIVER=$!
+tail -n +1 -f "$REMOTE_GROUP_DIR/driver.log" &
+DRIVER_LOG_TAIL=$!
+cleanup_driver_log_tail() {
+    kill "$DRIVER_LOG_TAIL" 2>/dev/null || true
+    wait "$DRIVER_LOG_TAIL" 2>/dev/null || true
+}
+trap cleanup_driver_log_tail EXIT
 RAW="$REMOTE_GROUP_DIR/raw/pio${PIO}_snw${SNW}_t${TS}_c${CS}.txt"
 
+status "waiting for benchmark workload phase"
 for _ in $(seq 1 600); do
     [ -f "$RAW" ] && break
     kill -0 "$DRIVER" 2>/dev/null || break
@@ -152,6 +194,7 @@ done
     echo "benchmark did not reach workload phase; see $REMOTE_GROUP_DIR/driver.log" >&2
     exit 1
 }
+status "workload phase reached; locating redis-server"
 
 PIDFILE="/tmp/hpc_max_tput_server_${PORT}.pid"
 [ -r "$PIDFILE" ] || { echo "missing $PIDFILE" >&2; exit 1; }
@@ -163,12 +206,12 @@ PID=$(cat "$PIDFILE")
 }
 
 TS_NOW=$(date +%Y%m%d_%H%M%S)
-BASE_NAME="flamegraph_hpc_redis_server_only_${LABEL}"
-PERF_DATA="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.perf.data"
-PERF_SCRIPT="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.perf.script"
-COLLAPSED="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.collapsed.txt"
-SVG="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.svg"
-META="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.meta.txt"
+BASE_NAME="$LABEL"
+PERF_DATA="$REMOTE_GROUP_DIR/${BASE_NAME}.perf.data"
+PERF_SCRIPT="$REMOTE_GROUP_DIR/${BASE_NAME}.perf.script"
+COLLAPSED="$REMOTE_GROUP_DIR/${BASE_NAME}.collapsed.txt"
+SVG="$REMOTE_GROUP_DIR/${BASE_NAME}.svg"
+META="$REMOTE_GROUP_DIR/${BASE_NAME}.meta.txt"
 
 {
     echo "timestamp=$TS_NOW"
@@ -184,21 +227,26 @@ META="$REMOTE_GROUP_DIR/flame/${BASE_NAME}.meta.txt"
     echo "num_keys=$NUM_KEYS"
     echo "workers=$WORKERS"
     echo "affinity_mode=$AFFINITY_MODE"
+    echo "supernode_thread_names=merged"
     echo
-    ps -p "$PID" -o pid,ppid,comm,args
+    ps -p "$PID" -o 'pid,ppid,comm,args' || true
 } >"$META"
 
 # Attach to redis-server only. Without :u, the server's kernel I/O stack is
 # retained; without -a, memtier and redis-cli are excluded.
+status "sampling redis-server pid=$PID for ${FLAME_DURATION}s (event=$EVENT)"
 perf record -F "$FREQ" -g -e "$EVENT" -p "$PID" \
     -o "$PERF_DATA" -- sleep "$FLAME_DURATION"
+status "rendering flamegraph"
 perf script -i "$PERF_DATA" >"$PERF_SCRIPT"
-"$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$PERF_SCRIPT" >"$COLLAPSED"
+"$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$PERF_SCRIPT" |
+    sed -E 's/^vemb-sn-[0-9]+;/redis-server;/' >"$COLLAPSED"
 "$FLAMEGRAPH_DIR/flamegraph.pl" \
-    --title "hpc-redis server-only host-mt $LABEL" \
+    --title "hpc-redis server-only $LABEL" \
     "$COLLAPSED" >"$SVG"
 
 wait "$DRIVER"
+status "benchmark driver completed"
 rm -f "$PERF_SCRIPT"
 cat "$REMOTE_GROUP_DIR/summary.tsv"
 printf 'REMOTE_GROUP_DIR=%s\nSVG=%s\nCOLLAPSED=%s\n' \
@@ -208,15 +256,18 @@ REMOTE_SCRIPT
 # Pull the flamegraph, perf metadata, and benchmark summary needed for the
 # chapter. Raw per-request memtier logs stay on the remote host because they
 # are large and are not needed to inspect or reproduce the flamegraph result.
-scp -r -P "$SSH_PORT" "$SSH_TARGET:$REMOTE_GROUP_DIR/flame" "$LOCAL_GROUP_DIR/"
 scp -P "$SSH_PORT" \
-    "$SSH_TARGET:$REMOTE_GROUP_DIR/summary.tsv" \
-    "$SSH_TARGET:$REMOTE_GROUP_DIR/build.log" \
-    "$SSH_TARGET:$REMOTE_GROUP_DIR/driver.log" \
+    "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.perf.data" \
+    "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.collapsed.txt" \
+    "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.meta.txt" \
+    "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.svg" \
+    "root@$NODE:$REMOTE_GROUP_DIR/summary.tsv" \
+    "root@$NODE:$REMOTE_GROUP_DIR/build.log" \
+    "root@$NODE:$REMOTE_GROUP_DIR/driver.log" \
     "$LOCAL_GROUP_DIR/"
 
 echo
 echo "Generated locally:"
-echo "  SVG      : $LOCAL_GROUP_DIR/flame/flamegraph_hpc_redis_server_only_${LABEL}.svg"
-echo "  collapsed: $LOCAL_GROUP_DIR/flame/flamegraph_hpc_redis_server_only_${LABEL}.collapsed.txt"
-echo "  meta     : $LOCAL_GROUP_DIR/flame/flamegraph_hpc_redis_server_only_${LABEL}.meta.txt"
+echo "  SVG      : $LOCAL_LOG_DIR/${LABEL}.svg"
+echo "  collapsed: $LOCAL_LOG_DIR/${LABEL}.collapsed.txt"
+echo "  meta     : $LOCAL_LOG_DIR/${LABEL}.meta.txt"
