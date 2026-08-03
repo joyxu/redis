@@ -312,6 +312,7 @@ run_one_config() {
     local jb_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
     local jb_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
     local jb_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
+    local jb_sec=$(date +%s)
 
     # === run memtier on CLIENT ===
     # is_hpc 通过位置参数 ${15} 传给 helper (ssh 不传环境变量)
@@ -325,13 +326,15 @@ run_one_config() {
 
     # === jiffies after ===
     local ja=$(snapshot_jiffies $SERVER_PORT)
-    local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_sec=$(date +%s)
+    local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
+    local cores=$(awk -v d=$((ja - jb)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local ja_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
     local ja_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
     local ja_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
-    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
 
     # === sar %ifutil 解析 ===
     wait $sar_pid 2>/dev/null || true

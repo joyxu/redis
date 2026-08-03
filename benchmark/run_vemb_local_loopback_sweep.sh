@@ -111,15 +111,17 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ----------------------------------------------------------------------------
 # jiffies 采集 (按端口匹配, 避免 pkill 噪音)
+# 输出 "utime stime", 分别对应用户态和内核态 CPU jiffies
 snapshot_jiffies() {
-    local port=$1 total=0 j
+    local port=$1 ut=0 st=0
     for pid in $(pgrep -x redis-server); do
         if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
-            j=$(awk '{s+=$14+$15} END{print s+0}' /proc/$pid/task/*/stat 2>/dev/null)
-            total=$((total + ${j:-0}))
+            read ut_j st_j < <(awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null)
+            ut=$((ut + ${ut_j:-0}))
+            st=$((st + ${st_j:-0}))
         fi
     done
-    echo $total
+    echo "$ut $st"
 }
 
 # system-wide background CPU counters (/proc/stat, units=jiffies)
@@ -270,8 +272,10 @@ run_one_config() {
     local raw="$RAWDIR/${server_type}_${OP_TYPE}_t${t}_c${c}_p${p}.log"
     log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s"
 
-    local jb=$(snapshot_jiffies $PORT)
+    local jb_ut jb_st
+    read jb_ut jb_st < <(snapshot_jiffies $PORT)
     local jb_iowait=$(snapshot_iowait) jb_si=$(snapshot_si) jb_hi=$(snapshot_hi)
+    local jb_sec=$(date +%s)
     if [ "$server_type" = "hpc" ]; then
         # hpc server: VEMB V16 二进制协议
         #   所有 OP 统一 item: key 范围
@@ -320,12 +324,17 @@ run_one_config() {
                 --test-time=$TEST_TIME --hide-histogram --select-db=0 \
                 > "$raw" 2>&1 || true
     fi
-    local ja=$(snapshot_jiffies $PORT)
-    local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_ut ja_st
+    read ja_ut ja_st < <(snapshot_jiffies $PORT)
+    local ja_sec=$(date +%s)
+    local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
+    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", (du+ds)/100.0/s}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local ja_iowait=$(snapshot_iowait) ja_si=$(snapshot_si) ja_hi=$(snapshot_hi)
-    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
 
     # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)
     local totals ops avg p50 p99 kb
@@ -344,10 +353,10 @@ run_one_config() {
         ops_note=" (÷2, 2-key equiv)"
         ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
     fi
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
-        "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
-    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores iowait=$c_iowait si=$c_si hi=$c_hi"
+        "$core_ut" "$core_st" "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores(ut=$core_ut st=$core_st) iowait=$c_iowait si=$c_si hi=$c_hi"
     rm -f "$raw"
 }
 
@@ -358,7 +367,7 @@ log "=== ${OP_TYPE} 本地回环 sweep (${NCONFIGS} 档 × ${SERVERS_ONLY} serve
 log "TEST_TIME=${TEST_TIME}s/档, DIM=$DIM, TCP 127.0.0.1:$PORT"
 log "DIM=$DIM NUM_KEYS=$NUM_KEYS"
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tiowait\tsi\thi\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tcore_ut\tcore_st\tiowait\tsi\thi\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then
