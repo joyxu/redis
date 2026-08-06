@@ -660,7 +660,6 @@ $(OUT_DIR)/tlc_urma_server: tlc_urma_server.c $(OUT_DIR)/liburma.so $(TLC_COMMON
 VEMB_V16_MAX_CHANNELS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 64)
 VEMB_V16_EXTRA_CFLAGS ?=
 VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I. -DVEMB_V16_MAX_CHANNELS=$(VEMB_V16_MAX_CHANNELS)
-VEMB_V16_CFLAGS += -DVEMB_V16_CLIENT_RING_USE_SVE
 ifeq ($(USE_SVE),yes)
 VEMB_V16_CFLAGS += -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve
 endif

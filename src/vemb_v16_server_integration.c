@@ -146,6 +146,15 @@ int vemb_v16_server_integration_init(void) {
             return -1;
         }
     }
+    if (vemb_v16_proxy_set_batch_request_size(
+            server.vemb_v16_proxy,
+            (uint32_t)server.vemb_v16_batch_request_size) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16_proxy_set_batch_request_size failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
 
     /* Transport selection. Aeron TCP control is received by Redis' existing
      * TCP accept loop and handed to the proxy after ATTACH sniffing, so the
@@ -223,9 +232,9 @@ int vemb_v16_server_integration_init(void) {
 
 /* Try to steal a new connection for cross-node aeron ATTACH.
  *
- * Peeks the first 24 bytes; if they exactly match VEMB_V16_AERON_ATTACH_MAGIC,
- * consumes those bytes and hands the fd to vemb_v16_aeron_attach_handle_fd
- * (which performs a synchronous request/response exchange then closes fd).
+ * Peeks the first 24 bytes; if they exactly match a v1 or v2 ATTACH magic,
+ * consumes those bytes and hands the fd to the matching handler (which
+ * performs a synchronous request/response exchange then closes fd).
  * The ATTACH magic's first 4 bytes are "VEMB" (0x424d4556), which is
  * different from VEMB_V16_MAGIC (0x56313645 = "VEmb"), so no collision with
  * the normal VEMB sniff path.
@@ -260,8 +269,11 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     if (n < (ssize_t)sizeof(magic_buf))
         return 0;
 
-    if (memcmp(magic_buf, VEMB_V16_AERON_ATTACH_MAGIC,
-               VEMB_V16_AERON_ATTACH_MAGIC_LEN) != 0)
+    int is_v1 = memcmp(magic_buf, VEMB_V16_AERON_ATTACH_MAGIC,
+                       VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0;
+    int is_v2 = memcmp(magic_buf, VEMB_V16_AERON_ATTACH_V2_MAGIC,
+                       VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN) == 0;
+    if (!is_v1 && !is_v2)
         return 0;
 
     /* ATTACH magic matched. Consume the 24-byte magic from the socket
@@ -280,14 +292,16 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     conn->fd = -1;
 
     serverLog(LL_NOTICE,
-              "VEMB V16 AERON ATTACH on fd %d, dispatching to attach_handle_fd",
-              fd);
+              "VEMB V16 AERON ATTACH v%d on fd %d, dispatching to handler",
+              is_v2 ? 2 : 1, fd);
 
-    int rc = vemb_v16_aeron_attach_handle_fd(server.vemb_v16_proxy, fd);
+    int rc = is_v2 ?
+        vemb_v16_aeron_attach_v2_handle_fd(server.vemb_v16_proxy, fd) :
+        vemb_v16_aeron_attach_handle_fd(server.vemb_v16_proxy, fd);
     if (rc != 0) {
         serverLog(LL_WARNING,
-                  "VEMB V16 AERON ATTACH handle_fd rejected fd %d (rc=%d)",
-                  fd, rc);
+                  "VEMB V16 AERON ATTACH v%d handler rejected fd %d (rc=%d)",
+                  is_v2 ? 2 : 1, fd, rc);
     }
 
     /* handle_fd always closes fd (success or error) per the protocol

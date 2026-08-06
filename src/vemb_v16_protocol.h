@@ -5,6 +5,7 @@
 #include "vemb_v16_cacheline.h"
 #include "vemb_v16_hash.h"
 #include "vemb_v16_peer_view_map.h"
+#include "vemb_v16_util.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -719,8 +720,7 @@ static inline size_t vemb_v16_req_inline_len(uint32_t vector_bytes) {
 static inline uint32_t vemb_v16_aeron_req_slot_size(uint32_t dim) {
     size_t payload = 24u + 4u + VEMB_V16_MAX_KEY_LEN +
         (size_t)dim * sizeof(float);
-    return (uint32_t)vemb_v16_align_up_size(payload,
-                                            VEMB_V16_CACHELINE_SIZE);
+    return (uint32_t)align_up_size(payload, CACHELINE_SIZE);
 }
 
 static inline void vemb_v16_proto_put_u8(uint8_t **p, uint8_t v) {
@@ -1900,10 +1900,10 @@ static inline size_t vemb_v16_resp_encoded_len(const vemb_v16_resp_t *resp) {
 }
 
 static inline uint32_t vemb_v16_aeron_resp_slot_size(void) {
-    return (uint32_t)vemb_v16_align_up_size(
+    return (uint32_t)align_up_size(
         vemb_v16_resp_encoded_len_for_fields(VEMB_V16_STATUS_OK,
                                              VEMB_V16_OP_VEMB_HANDLE),
-        VEMB_V16_CACHELINE_SIZE);
+        CACHELINE_SIZE);
 }
 
 static inline int vemb_v16_resp_encode(uint8_t *dst,

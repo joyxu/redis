@@ -67,6 +67,7 @@ int main(int argc, char **argv) {
         VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH;
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
+    uint32_t batch_request_size = VEMB_V16_BATCH_REQUEST_SIZE_DEFAULT;
     int reset_warm_regions = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -99,6 +100,8 @@ int main(int argc, char **argv) {
             proxy_io_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--supernode-workers") && i + 1 < argc) {
             supernode_workers = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--batch-request-size") && i + 1 < argc) {
+            batch_request_size = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
             vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--warm-regions-manifest") && i + 1 < argc) {
@@ -141,6 +144,11 @@ int main(int argc, char **argv) {
     }
     if (supernode_workers == 0) {
         fprintf(stderr, "--supernode-workers must be >= 1\n");
+        goto cleanup;
+    }
+    if (batch_request_size == 0 ||
+        batch_request_size > VEMB_V16_BATCH_REQUEST_SIZE_MAX) {
+        fprintf(stderr, "invalid batch request size\n");
         goto cleanup;
     }
     if (!uds_path || uds_path[0] == '\0' ||
@@ -246,6 +254,11 @@ int main(int argc, char **argv) {
     }
     if (vemb_v16_proxy_set_proxy_io_threads(g_proxy, proxy_io_threads) != 0) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
+        goto cleanup;
+    }
+    if (vemb_v16_proxy_set_batch_request_size(g_proxy,
+                                              batch_request_size) != 0) {
+        serverLog(LL_WARNING, "failed to configure batch request size");
         goto cleanup;
     }
     if (!strcmp(transport, "aeron")) {

@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#include "vemb_v16_cacheline.h"
+#include "vemb_v16_util.h"
+
 /* =====================================================================
  *  Cross-node Aeron ATTACH protocol
  * =====================================================================
@@ -55,6 +58,67 @@
 #define VEMB_V16_AERON_SHMDEV_PATH_MAX   256u
 #define VEMB_V16_AERON_ATTACH_F_REMOTE_PATH 0x1u
 
+/* v2 batch requests use a separate ATTACH ABI and channel. The v1 fixed-size
+ * structs below remain unchanged so old SDKs keep their current wire layout. */
+#define VEMB_V16_AERON_ATTACH_V2_MAGIC "VEMB_V16_AERON_ATTACH2\0\0"
+#define VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN 24u
+#define VEMB_V16_AERON_ATTACHED_V2_MAGIC "VEMB_V16_AERON_ATTACHED2\0\0"
+#define VEMB_V16_AERON_ATTACHED_V2_MAGIC_LEN 26u
+#define VEMB_V16_BATCH_REQUEST_SIZE_DEFAULT 32u
+#define VEMB_V16_BATCH_REQUEST_SIZE_MAX 128u
+/* v2 keeps every frame contiguous in its byte arena. The first protocol
+ * revision uses one fixed bound so a client cannot grow UB allocations via
+ * ATTACH. A zero request value means this server default. */
+#define VEMB_V16_BATCH_MAX_BYTES_DEFAULT (64u * 1024u)
+#define VEMB_V16_BATCH_MAX_BYTES_MAX     (64u * 1024u)
+#define VEMB_V16_BATCH_DESCRIPTOR_SLOT_SIZE 64u
+
+static inline uint32_t vemb_v16_batch_aligned_bytes(uint32_t bytes) {
+    return (uint32_t)align_up_size(bytes, CACHELINE_SIZE);
+}
+
+static inline uint32_t vemb_v16_effective_batch_request_size(
+        uint32_t requested, uint32_t configured) {
+    if (requested == 0 || configured == 0)
+        return 0;
+    if (requested > VEMB_V16_BATCH_REQUEST_SIZE_MAX)
+        requested = VEMB_V16_BATCH_REQUEST_SIZE_MAX;
+    if (configured > VEMB_V16_BATCH_REQUEST_SIZE_MAX)
+        configured = VEMB_V16_BATCH_REQUEST_SIZE_MAX;
+    return requested < configured ? requested : configured;
+}
+
+typedef struct vemb_v16_aeron_batch_resource_desc {
+    uint32_t backend_type;
+    uint32_t path_len;
+    uint64_t mmap_offset;
+    uint64_t bytes;
+    char path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+} vemb_v16_aeron_batch_resource_desc_t;
+
+typedef struct vemb_v16_aeron_attach_v2_req {
+    char magic[VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN];
+    uint32_t dim;
+    uint32_t flags;
+    uint32_t requested_batch_size;
+    uint32_t max_batch_bytes;
+} vemb_v16_aeron_attach_v2_req_t;
+
+typedef struct vemb_v16_aeron_attach_v2_resp {
+    char magic[VEMB_V16_AERON_ATTACHED_V2_MAGIC_LEN];
+    int32_t status;
+    uint64_t channel_id;
+    uint64_t topology_epoch;
+    uint32_t effective_batch_size;
+    uint32_t max_batch_bytes;
+    uint32_t descriptor_slot_size;
+    uint32_t descriptor_ring_slots;
+    vemb_v16_aeron_batch_resource_desc_t request_descriptor;
+    vemb_v16_aeron_batch_resource_desc_t request_arena;
+    vemb_v16_aeron_batch_resource_desc_t response_descriptor;
+    vemb_v16_aeron_batch_resource_desc_t response_arena;
+} vemb_v16_aeron_attach_v2_resp_t;
+
 typedef struct {
     char     magic[VEMB_V16_AERON_ATTACH_MAGIC_LEN];
     uint32_t dim;
@@ -95,6 +159,11 @@ typedef struct {
  * fd). Defined in vemb_v16_aeron_attach.c. */
 struct vemb_v16_proxy;
 int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd);
+
+/* v2 counterpart of vemb_v16_aeron_attach_handle_fd(). The TCP sniff router
+ * already consumed the v2 magic and this function reads the remaining
+ * request fields, allocates four UB regions, and returns their descriptors. */
+int vemb_v16_aeron_attach_v2_handle_fd(struct vemb_v16_proxy *proxy, int fd);
 
 /* Client-side helper: send ATTACH req, read ATTACH resp. Returns 0 on
  * success and fills resp. Defined in vemb_v16_aeron_attach.c. */

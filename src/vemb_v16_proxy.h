@@ -31,6 +31,8 @@ int vemb_v16_proxy_enable_tcp_inject_only(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd);
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
                                         uint32_t threads);
+int vemb_v16_proxy_set_batch_request_size(vemb_v16_proxy_t *proxy,
+                                          uint32_t size);
 int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,
                                          uint32_t workers);
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy);
@@ -97,5 +99,11 @@ int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
 void vemb_v16_proxy_fill_attach_warm_region(
     vemb_v16_proxy_t *proxy,
     vemb_v16_aeron_attach_resp_t *resp);
+
+int vemb_v16_proxy_attach_cross_node_batch_channel(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_aeron_batch_channel_allocation_t *allocation,
+    uint32_t effective_batch_size, uint32_t max_batch_bytes,
+    uint64_t *out_channel_id);
 
 #endif

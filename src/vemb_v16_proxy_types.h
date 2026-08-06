@@ -3,6 +3,7 @@
 
 #include "vemb_v16_proxy_internal.h"
 #include "vemb_v16_aeron_ring.h"
+#include "vemb_v16_batch_context.h"
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_supernode.h"
@@ -25,6 +26,8 @@ typedef struct vemb_v16_proxy_io_worker {
     struct vemb_v16_proxy *proxy;
     pthread_t thread;
     vemb_v16_job_pool_t job_pools[VEMB_V16_JOB_POOL_COUNT];
+    vemb_v16_batch_context_t
+        batch_contexts[VEMB_V16_BATCH_CONTEXTS_PER_PROXY_WORKER];
     vemb_v16_mapped_region_t job_pool_slot_regions[VEMB_V16_JOB_POOL_COUNT];
     _Atomic(vemb_v16_aeron_channel_snapshot_t *) aeron_snapshot;
     atomic_uint_fast32_t aeron_snapshot_readers;
@@ -60,6 +63,11 @@ struct vemb_v16_channel {
     vemb_v16_client_ring_t *response_ring;
     size_t request_ring_bytes;
     size_t response_ring_bytes;
+    int batch_v2;
+    vemb_v16_aeron_batch_channel_allocation_t batch_allocation;
+    uint32_t batch_effective_size;
+    uint32_t batch_max_bytes;
+    batch_arena_producer_t batch_response_producer;
     uint32_t transport_type;
     int net_fd;
     atomic_int proxy_io_registered;
@@ -89,6 +97,7 @@ struct vemb_v16_proxy {
     char aeron_response_ub_path[256];
     uint32_t vector_dim;
     uint32_t vector_stride;
+    atomic_uint_fast32_t batch_request_size;
     uint32_t request_ring_slot_size;
     uint32_t response_ring_slot_size;
     uint32_t max_vectors;

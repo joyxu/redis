@@ -29,8 +29,6 @@ ARCH_FLAGS ?= -DUSE_ARM_SVE -march=armv8.2-a+sve
 else
 ARCH_FLAGS ?=
 endif
-ARCH_FLAGS += -DVEMB_V16_CLIENT_RING_USE_SVE
-
 # ---- paths (absolute, so `make -C` works from anywhere) ----
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SDK_DIR := $(THIS_DIR)
@@ -41,12 +39,15 @@ INTERNAL_DIR := $(THIS_DIR)/internal
 # then src/ (for protocol.h, net.h, etc.).
 INCLUDES := -I$(SDK_DIR) -I$(INTERNAL_DIR) -I$(SRC_DIR)
 
-# ---- sources (4 files comprising the SDK) ----
+# ---- sources comprising the SDK ----
 SDK_SOURCES := \
 	$(SDK_DIR)/vemb_v16_client_sdk.c \
+	$(SDK_DIR)/vemb_v16_cli_l0.c \
+	$(SDK_DIR)/vemb_v16_aeron_batch_client.c \
 	$(SRC_DIR)/vemb_v16_net.c \
 	$(SRC_DIR)/vemb_v16_client_topology.c \
-	$(SRC_DIR)/vemb_v16_topology.c
+	$(SRC_DIR)/vemb_v16_topology.c \
+	$(SRC_DIR)/monotonic.c
 
 # ---- build dirs ----
 BUILD_DIR := build
@@ -83,6 +84,14 @@ $(OBJ_DIR)/vemb_v16_client_sdk.o: $(SDK_DIR)/vemb_v16_client_sdk.c
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 
+$(OBJ_DIR)/vemb_v16_cli_l0.o: $(SDK_DIR)/vemb_v16_cli_l0.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
+$(OBJ_DIR)/vemb_v16_aeron_batch_client.o: $(SDK_DIR)/vemb_v16_aeron_batch_client.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
 # Compile rule: src/ .c files (vemb_v16_net.c, vemb_v16_client_topology.c, vemb_v16_topology.c)
 $(OBJ_DIR)/vemb_v16_net.o: $(SRC_DIR)/vemb_v16_net.c
 	@mkdir -p $(OBJ_DIR)
@@ -96,6 +105,10 @@ $(OBJ_DIR)/vemb_v16_topology.o: $(SRC_DIR)/vemb_v16_topology.c
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 
+$(OBJ_DIR)/monotonic.o: $(SRC_DIR)/monotonic.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -DVEMB_V16_CLIENT_SDK -MMD -c $< -o $@
+
 # Static library
 static: $(LIB_DIR)/libvemb_v16_client.a
 
@@ -108,7 +121,7 @@ shared: $(LIB_DIR)/libvemb_v16_client.so
 
 $(LIB_DIR)/libvemb_v16_client.so: $(SDK_OBJS)
 	@mkdir -p $(LIB_DIR)
-	$(CC) -shared -o $@ $^
+	$(CC) $(CFLAGS) -shared -o $@ $^
 
 # Flat header install
 install-headers: $(PUBLIC_HEADERS)

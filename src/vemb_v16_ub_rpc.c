@@ -3,6 +3,7 @@
 #include "vemb_v16_ub_rpc.h"
 
 #include "cpu_relax.h"
+#include "vemb_v16_cacheline.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_mapped_region.h"
 #include "vemb_v16_util.h"
@@ -243,8 +244,9 @@ static void tiny_pause(void) {
 }
 
 static uint32_t rpc_ring_slot_stride(uint32_t slot_size) {
-    return (uint32_t)vemb_v16_align64_size(
-        sizeof(vemb_v16_ub_rpc_ring_slot_t) + (size_t)slot_size);
+    return (uint32_t)align_up_size(
+        sizeof(vemb_v16_ub_rpc_ring_slot_t) + (size_t)slot_size,
+        CACHELINE_SIZE);
 }
 
 static size_t rpc_ring_bytes(uint32_t slot_size) {

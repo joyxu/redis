@@ -21,6 +21,7 @@
 #endif
 
 #include "vemb_v16_aeron_runner.h"
+#include "vemb_v16_aeron_runner_plan.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,8 @@ struct worker_arg {
     bool                skip_handle_read;
     /* channels — SDK owns the handles; we hold pointers */
     std::vector<vemb_v16_aeron_channel_t *> channels;
+    std::vector<vemb_v16_aeron_batch_client_t *> batch_clients;
+    bool                batch_sessions_enabled;
     /* ratio bookkeeping for mixed workloads */
     unsigned long set_ratio_count;
     unsigned long get_ratio_count;
@@ -216,6 +219,7 @@ struct aeron_debug_counters {
     uint64_t *status_other;
     uint64_t *handle_deref_ok;
     uint64_t *handle_deref_fail;
+    uint64_t *unmatched_responses;
 };
 
 static int account_response(worker_arg *w,
@@ -224,7 +228,8 @@ static int account_response(worker_arg *w,
                             const vemb_v16_resp_t *resp,
                             uint32_t wire_bytes,
                             float *vec_scratch,
-                            aeron_debug_counters *debug) {
+                            aeron_debug_counters *debug,
+                            const vemb_v16_aeron_batch_vector_view_t *vector_view) {
     if (w->pending_count[ch] == 0)
         return 0;
 
@@ -240,7 +245,17 @@ static int account_response(worker_arg *w,
             }
         }
         if (found < 0)
+        {
+            (*debug->unmatched_responses)++;
+            if (*debug->unmatched_responses <= 4) {
+                fprintf(stderr,
+                        "[aeron] unmatched response: channel=%u req_id=%u "
+                        "pending_head=%u pending_count=%u expected_req_id=%u\n",
+                        ch, resp->req_id, w->pending_head[ch],
+                        w->pending_count[ch], pe->req_id);
+            }
             return 0;
+        }
         if (found != (int)slot) {
             pending_op tmp = w->pending[ch][slot];
             w->pending[ch][slot] = w->pending[ch][found];
@@ -267,7 +282,14 @@ static int account_response(worker_arg *w,
         }
         unsigned int hits = 0, misses = 0;
         if (resp->status == VEMB_V16_STATUS_OK) {
-            if (w->skip_handle_read) {
+            if (vector_view && vector_view->attempted) {
+                if (vector_view->valid) {
+                    hits = 1;
+                    (*debug->handle_deref_ok)++;
+                } else {
+                    (*debug->handle_deref_fail)++;
+                }
+            } else if (w->skip_handle_read) {
                 hits = 1;
             } else {
                 int n = vemb_v16_aeron_read_vector(w->channels[ch],
@@ -289,9 +311,41 @@ static int account_response(worker_arg *w,
     return 1;
 }
 
+struct batch_completion_ctx {
+    worker_arg *worker;
+    uint32_t channel_index;
+    uint32_t pipeline;
+    float *vec_scratch;
+    aeron_debug_counters *debug;
+    int completed;
+};
+
+static void account_batch_completion(void *priv, uint64_t caller_cookie,
+                                     const vemb_v16_resp_t *response) {
+    batch_completion_ctx *ctx = (batch_completion_ctx *)priv;
+    vemb_v16_resp_t logical_response = *response;
+    logical_response.req_id = (uint32_t)caller_cookie;
+    ctx->completed += account_response(ctx->worker, ctx->channel_index,
+                                       ctx->pipeline, &logical_response, 0,
+                                       ctx->vec_scratch, ctx->debug, NULL);
+}
+
+static void account_batch_vector_completion(
+    void *priv, uint64_t caller_cookie, const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view) {
+    batch_completion_ctx *ctx = (batch_completion_ctx *)priv;
+    vemb_v16_resp_t logical_response = *response;
+    logical_response.req_id = (uint32_t)caller_cookie;
+    ctx->completed += account_response(ctx->worker, ctx->channel_index,
+                                       ctx->pipeline, &logical_response, 0,
+                                       ctx->vec_scratch, ctx->debug,
+                                       vector_view);
+}
+
 static void *worker_main(void *arg) {
     worker_arg *w = (worker_arg *)arg;
-    uint32_t n_ch = (uint32_t)w->channels.size();
+    uint32_t n_ch = w->batch_sessions_enabled ?
+        (uint32_t)w->batch_clients.size() : (uint32_t)w->channels.size();
     uint32_t pipeline = w->cfg->pipeline > 0 ? w->cfg->pipeline : 1;
 
     /* struct timeval timezone-aware for run_stats::update_*_op. */
@@ -316,9 +370,11 @@ static void *worker_main(void *arg) {
     uint64_t debug_loop_count = 0;
     uint64_t debug_status_ok = 0, debug_status_notfound = 0, debug_status_err = 0, debug_status_other = 0;
     uint64_t debug_handle_deref_ok = 0, debug_handle_deref_fail = 0;
+    uint64_t debug_unmatched_responses = 0;
     aeron_debug_counters debug = {
         &debug_status_ok, &debug_status_notfound, &debug_status_err,
-        &debug_status_other, &debug_handle_deref_ok, &debug_handle_deref_fail
+        &debug_status_other, &debug_handle_deref_ok, &debug_handle_deref_fail,
+        &debug_unmatched_responses
     };
 
     while (!w->stop->load(std::memory_order_acquire)) {
@@ -339,6 +395,45 @@ static void *worker_main(void *arg) {
                 batch_count = (uint32_t)(budget - op_idx);
             if (batch_count == 0) continue;
             if (w->stop->load(std::memory_order_acquire)) break;
+
+            if (w->batch_sessions_enabled) {
+                uint32_t accepted = 0;
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                for (uint32_t i = 0; i < batch_count; i++) {
+                    unsigned long long key_index = w->obj_gen->get_key_index(
+                        obj_iter_type(w->cfg, AERON_GET_CMD_IDX));
+                    w->obj_gen->generate_key(key_index);
+                    uint32_t actual_key_len = 0;
+                    (void)build_req(w, op_idx + accepted,
+                                    VEMB_V16_OP_VEMB_HANDLE,
+                                    w->obj_gen->get_key(),
+                                    w->obj_gen->get_key_len(), &req_batch[i],
+                                    &actual_key_len);
+                    int submit_rc = vemb_v16_aeron_batch_client_submit_handle(
+                        w->batch_clients[ch], req_batch[i].key,
+                        (uint16_t)actual_key_len, req_batch[i].req_id);
+                    if (submit_rc != 0)
+                        break;
+                    uint32_t slot = w->pending_tail[ch];
+                    w->pending[ch][slot].req_id = req_batch[i].req_id;
+                    w->pending[ch][slot].is_set = 0;
+                    w->pending[ch][slot].sent_time = now;
+                    w->pending[ch][slot].bytes_tx = 0;
+                    w->pending_tail[ch] = (slot + 1) % pipeline;
+                    w->pending_count[ch]++;
+                    accepted++;
+                    debug_publish_ok++;
+                }
+                if (accepted == 0) {
+                    debug_publish_fail++;
+                    continue;
+                }
+                op_idx += accepted;
+                published_any = 1;
+                next_ch = (ch + 1) % n_ch;
+                continue;
+            }
 
             for (uint32_t i = 0; i < batch_count; i++) {
                 uint8_t op = pick_next_op(w);
@@ -391,6 +486,27 @@ static void *worker_main(void *arg) {
         int polled_any = 0;
         for (uint32_t ch = 0; ch < n_ch; ch++) {
             if (w->pending_count[ch] == 0) continue;
+            if (w->batch_sessions_enabled) {
+                batch_completion_ctx ctx = {
+                    .worker = w, .channel_index = ch, .pipeline = pipeline,
+                    .vec_scratch = vec_scratch, .debug = &debug,
+                };
+                int got = w->skip_handle_read ?
+                    vemb_v16_aeron_batch_client_poll(
+                        w->batch_clients[ch], account_batch_completion, &ctx) :
+                    vemb_v16_aeron_batch_client_poll_shared_vector(
+                        w->batch_clients[ch], account_batch_vector_completion,
+                        &ctx);
+                if (got == 0) {
+                    debug_poll_zero++;
+                    continue;
+                }
+                if (got > 0) {
+                    debug_poll_got += (uint64_t)got;
+                    polled_any |= ctx.completed > 0;
+                }
+                continue;
+            }
             uint32_t got = vemb_v16_aeron_poll_response_batch_ex(
                 w->channels[ch], resp_batch, resp_wire_lens,
                 sizeof(resp_batch[0]), AERON_BATCH_SIZE);
@@ -403,7 +519,7 @@ static void *worker_main(void *arg) {
                 polled_any |= account_response(w, ch, pipeline,
                                                &resp_batch[i], resp_wire_lens[i],
                                                vec_scratch,
-                                               &debug);
+                                               &debug, NULL);
         }
 
         /* if nothing published and nothing polled, busy-spin with a CPU yield
@@ -434,6 +550,22 @@ static void *worker_main(void *arg) {
 
             for (uint32_t ch = 0; ch < n_ch; ch++) {
                 if (w->pending_count[ch] == 0) continue;
+                if (w->batch_sessions_enabled) {
+                    batch_completion_ctx ctx = {
+                        .worker = w, .channel_index = ch, .pipeline = pipeline,
+                        .vec_scratch = vec_scratch, .debug = &debug,
+                    };
+                    int got = w->skip_handle_read ?
+                        vemb_v16_aeron_batch_client_poll(
+                            w->batch_clients[ch], account_batch_completion,
+                            &ctx) :
+                        vemb_v16_aeron_batch_client_poll_shared_vector(
+                            w->batch_clients[ch],
+                            account_batch_vector_completion, &ctx);
+                    if (got > 0)
+                        debug_poll_got += (uint64_t)got;
+                    continue;
+                }
                 uint32_t got = vemb_v16_aeron_poll_response_batch_ex(
                     w->channels[ch], resp_batch, resp_wire_lens,
                     sizeof(resp_batch[0]), AERON_BATCH_SIZE);
@@ -444,7 +576,8 @@ static void *worker_main(void *arg) {
                 debug_poll_got += got;
                 for (uint32_t i = 0; i < got; i++)
                     account_response(w, ch, pipeline, &resp_batch[i],
-                                     resp_wire_lens[i], vec_scratch, &debug);
+                                     resp_wire_lens[i], vec_scratch, &debug,
+                                     NULL);
             }
             struct timespec ts = {0, 500};
             nanosleep(&ts, NULL);
@@ -454,7 +587,59 @@ static void *worker_main(void *arg) {
     struct timeval end_tv;
     gettimeofday(&end_tv, NULL);
     w->stats->set_end_time(&end_tv);
-    fprintf(stderr, "[aeron] w%u done: loops=%llu publish_ok=%llu publish_fail=%llu poll_zero=%llu poll_got=%llu ops_done=%llu status[ok=%llu nf=%llu err=%llu other=%llu] handle_deref[ok=%llu fail=%llu]\n",
+    if (w->batch_sessions_enabled) {
+        uint64_t leaders = 0, followers = 0, frames = 0, items = 0;
+        uint64_t fallback_v1 = 0, frame_bytes = 0;
+        uint64_t flush_eager = 0, flush_full = 0, flush_deadline = 0;
+        uint64_t flush_backpressure = 0;
+        uint64_t v2_stale_epochs = 0;
+        uint64_t v2_stale_responses = 0;
+        uint64_t vector_reads = 0, vector_read_failures = 0;
+        uint64_t vector_bytes = 0, vector_fanout = 0;
+        for (size_t i = 0; i < w->batch_clients.size(); i++) {
+            vemb_v16_aeron_batch_client_stats_t stats;
+            vemb_v16_aeron_batch_client_get_stats(w->batch_clients[i], &stats);
+            leaders += stats.l0_new_leader_groups;
+            followers += stats.l0_coalesced_followers;
+            frames += stats.batch_frames;
+            items += stats.batch_items;
+            fallback_v1 += stats.l0_fallback_v1;
+            frame_bytes += stats.batch_frame_bytes;
+            flush_eager += stats.batch_flush_eager;
+            flush_full += stats.batch_flush_full;
+            flush_deadline += stats.batch_flush_deadline;
+            flush_backpressure += stats.batch_flush_backpressure;
+            v2_stale_epochs += stats.v2_stale_epochs;
+            v2_stale_responses += stats.v2_stale_responses;
+            vector_reads += stats.shared_vector_group_reads;
+            vector_read_failures += stats.shared_vector_group_read_failures;
+            vector_bytes += stats.shared_vector_group_bytes;
+            vector_fanout += stats.shared_vector_fanout;
+        }
+        fprintf(stderr,
+                "[aeron] w%u batch-session: leaders=%llu followers=%llu "
+                "frames=%llu unique_items=%llu frame_bytes=%llu fallback_v1=%llu "
+                "flush_eager=%llu flush_full=%llu flush_deadline=%llu "
+                "flush_backpressure=%llu shared_vector_reads=%llu "
+                "shared_vector_read_failures=%llu shared_vector_bytes=%llu "
+                "shared_vector_fanout=%llu v2_stale_epochs=%llu "
+                "v2_stale_responses=%llu\n",
+                w->worker_id, (unsigned long long)leaders,
+                (unsigned long long)followers, (unsigned long long)frames,
+                (unsigned long long)items, (unsigned long long)frame_bytes,
+                (unsigned long long)fallback_v1,
+                (unsigned long long)flush_eager,
+                (unsigned long long)flush_full,
+                (unsigned long long)flush_deadline,
+                (unsigned long long)flush_backpressure,
+                (unsigned long long)vector_reads,
+                (unsigned long long)vector_read_failures,
+                (unsigned long long)vector_bytes,
+                (unsigned long long)vector_fanout,
+                (unsigned long long)v2_stale_epochs,
+                (unsigned long long)v2_stale_responses);
+    }
+    fprintf(stderr, "[aeron] w%u done: loops=%llu publish_ok=%llu publish_fail=%llu poll_zero=%llu poll_got=%llu ops_done=%llu unmatched=%llu status[ok=%llu nf=%llu err=%llu other=%llu] handle_deref[ok=%llu fail=%llu]\n",
             w->worker_id,
             (unsigned long long)debug_loop_count,
             (unsigned long long)debug_publish_ok,
@@ -462,6 +647,7 @@ static void *worker_main(void *arg) {
             (unsigned long long)debug_poll_zero,
             (unsigned long long)debug_poll_got,
             (unsigned long long)w->ops_done.load(),
+            (unsigned long long)debug_unmatched_responses,
             (unsigned long long)debug_status_ok,
             (unsigned long long)debug_status_notfound,
             (unsigned long long)debug_status_err,
@@ -548,46 +734,78 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         fprintf(stderr, "[aeron] local mode: control=%s\n", control_path);
     }
 
-    /* Allocate channels up-front (main thread). Each worker will own
-     * cfg->clients of them. */
-    fprintf(stderr, "[aeron] allocating %u channels%s\n",
-            total_channels, cross_node ? " (cross-node)" : "");
-    std::vector<vemb_v16_aeron_channel_t *> all_channels(total_channels, nullptr);
-    for (uint32_t i = 0; i < total_channels; i++) {
-        if (cross_node) {
-            all_channels[i] = vemb_v16_aeron_open_remote(cn_host.c_str(), cn_port,
-                                                         cfg->vemb_v16_dim);
-        } else {
-            all_channels[i] = vemb_v16_aeron_open(control_path, cfg->vemb_v16_dim);
-        }
-        if (!all_channels[i]) {
-            benchmark_error_log("[aeron] open channel %u failed: %s\n",
-                                i, strerror(errno));
-            for (uint32_t j = 0; j < i; j++) {
-                vemb_v16_aeron_close(all_channels[j]);
-                all_channels[j] = nullptr;
+    vemb_v16_aeron_runner_channel_plan channel_plan =
+        vemb_v16_aeron_runner_plan_channels(
+            cross_node, cfg->ratio.a, cfg->ratio.b, cfg->vemb_v16_vsim,
+            cfg->vemb_v16_vrem, cfg->vemb_v16_batch_disable, total_channels);
+    bool batch_sessions_enabled = channel_plan.batch_sessions_enabled;
+    std::vector<vemb_v16_aeron_channel_t *> all_channels;
+    std::vector<vemb_v16_aeron_batch_client_t *> all_batch_clients(
+        channel_plan.batch_sessions, nullptr);
+
+    /* A batch session owns its permanent v1 fallback and v2 channel. Do not
+     * attach an unused runner v1 channel before creating it. */
+    if (!batch_sessions_enabled) {
+        fprintf(stderr, "[aeron] allocating %u channels%s\n",
+                total_channels, cross_node ? " (cross-node)" : "");
+        all_channels.assign(channel_plan.legacy_channels, nullptr);
+        for (uint32_t i = 0; i < channel_plan.legacy_channels; i++) {
+            if (cross_node) {
+                all_channels[i] = vemb_v16_aeron_open_remote(
+                    cn_host.c_str(), cn_port, cfg->vemb_v16_dim);
+            } else {
+                all_channels[i] = vemb_v16_aeron_open(
+                    control_path, cfg->vemb_v16_dim);
             }
-            exit(1);
-        }
-        /* Map the warm region so worker_main can dereference VEMB_HANDLE
-         * offsets and read the actual vector bytes — without this the test
-         * would only validate that the server returns a handle, not that
-         * the handle points to real data.
-         *
-         * Cross-node ATTACH returns server-side UB paths; the SDK maps them
-         * to this client's local UB view before this call. */
-        if (vemb_v16_aeron_open_warm_region(all_channels[i]) != 0) {
-            benchmark_error_log("[aeron] open warm region %u failed: %s\n",
-                                i, strerror(errno));
-            for (uint32_t j = 0; j <= i; j++) {
-                vemb_v16_aeron_close(all_channels[j]);
-                all_channels[j] = nullptr;
+            if (!all_channels[i]) {
+                benchmark_error_log("[aeron] open channel %u failed: %s\n",
+                                    i, strerror(errno));
+                for (uint32_t j = 0; j < i; j++) {
+                    vemb_v16_aeron_close(all_channels[j]);
+                    all_channels[j] = nullptr;
+                }
+                exit(1);
             }
-            exit(1);
+            /* Map the warm region so worker_main can dereference VEMB_HANDLE
+             * offsets and read the actual vector bytes. Cross-node ATTACH
+             * returns server-side UB paths, mapped by the SDK here. */
+            if (vemb_v16_aeron_open_warm_region(all_channels[i]) != 0) {
+                benchmark_error_log("[aeron] open warm region %u failed: %s\n",
+                                    i, strerror(errno));
+                for (uint32_t j = 0; j <= i; j++) {
+                    vemb_v16_aeron_close(all_channels[j]);
+                    all_channels[j] = nullptr;
+                }
+                exit(1);
+            }
         }
+        fprintf(stderr, "[aeron] all %u channels ready%s\n",
+                channel_plan.legacy_channels,
+                cross_node ? " (cross-node, no warm region)" : " (warm region mapped)");
     }
-    fprintf(stderr, "[aeron] all %u channels ready%s\n",
-            total_channels, cross_node ? " (cross-node, no warm region)" : " (warm region mapped)");
+
+    if (batch_sessions_enabled) {
+        vemb_v16_aeron_batch_client_options_t batch_options = {
+            .requested_batch_size = cfg->vemb_v16_batch_request_size,
+            .max_batch_delay_us = cfg->vemb_v16_batch_max_delay_us,
+        };
+        for (uint32_t i = 0; i < channel_plan.batch_sessions; i++) {
+            all_batch_clients[i] = vemb_v16_aeron_batch_client_open_remote(
+                cn_host.c_str(), cn_port, cfg->vemb_v16_dim, &batch_options);
+            if (!all_batch_clients[i]) {
+                benchmark_error_log("[aeron] open batch session %u failed: %s\n",
+                                    i, strerror(errno));
+                for (uint32_t j = 0; j < i; j++)
+                    vemb_v16_aeron_batch_client_close(all_batch_clients[j], NULL, NULL);
+                exit(1);
+            }
+        }
+        fprintf(stderr,
+                "[aeron] batch sessions ready (channels=%u v1+v2 requested-size=%u max-delay-us=%u)\n",
+                channel_plan.batch_sessions,
+                cfg->vemb_v16_batch_request_size,
+                cfg->vemb_v16_batch_max_delay_us);
+    }
 
     /* Setup workers */
     std::vector<worker_arg> workers(cfg->threads);
@@ -614,6 +832,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         workers[i].obj_gen->set_random_seed((int)i + 1);
         workers[i].worker_id = i;
         workers[i].skip_handle_read = skip_handle_read;
+        workers[i].batch_sessions_enabled = batch_sessions_enabled;
         workers[i].stop = &stop;
         workers[i].done.store(false, std::memory_order_relaxed);
         workers[i].ops_done.store(0, std::memory_order_relaxed);
@@ -622,11 +841,18 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         workers[i].get_ratio_count = 0;
         workers[i].budget = per_worker_budget;
 
-        /* assign cfg->clients channels to this worker */
-        workers[i].channels.reserve(cfg->clients);
+        /* Batch sessions own their channels; legacy runner channels are only
+         * assigned to paths which use the legacy publish/poll loop. */
+        if (!batch_sessions_enabled)
+            workers[i].channels.reserve(cfg->clients);
+        if (batch_sessions_enabled)
+            workers[i].batch_clients.reserve(cfg->clients);
         for (unsigned int j = 0; j < cfg->clients; j++) {
             uint32_t idx = i * cfg->clients + j;
-            workers[i].channels.push_back(all_channels[idx]);
+            if (batch_sessions_enabled)
+                workers[i].batch_clients.push_back(all_batch_clients[idx]);
+            else
+                workers[i].channels.push_back(all_channels[idx]);
         }
         workers[i].pending.resize(cfg->clients);
         workers[i].pending_head.assign(cfg->clients, 0);
@@ -669,10 +895,14 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
     }
 
     /* Teardown channels — SDK handles UB ring unmap + TCP close notify. */
-    for (uint32_t i = 0; i < total_channels; i++) {
-        vemb_v16_aeron_close(all_channels[i]);
-        all_channels[i] = nullptr;
+    for (uint32_t i = 0; i < channel_plan.batch_sessions; i++) {
+        if (all_batch_clients[i]) {
+            vemb_v16_aeron_batch_client_close(all_batch_clients[i], NULL, NULL);
+            all_batch_clients[i] = nullptr;
+        }
     }
+    for (vemb_v16_aeron_channel_t *channel : all_channels)
+        vemb_v16_aeron_close(channel);
 
     /* Destroy cloned obj_gens + per-worker stats */
     for (unsigned int i = 0; i < cfg->threads; i++) {

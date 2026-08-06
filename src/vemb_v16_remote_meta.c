@@ -2,6 +2,7 @@
 
 #include "cpu_relax.h"
 #include "macro.h"
+#include "vemb_v16_cacheline.h"
 #include "vemb_v16_hash.h"
 #include "vemb_v16_util.h"
 
@@ -75,7 +76,8 @@ static int layout_sets(vemb_v16_remote_meta_view_t *view,
               ways == 0 || ways > VEMB_V16_REMOTE_META_MAX_WAYS,
               VEMB_V16_REMOTE_META_INVALID);
     size_t entries_off =
-        vemb_v16_align64_size(sizeof(vemb_v16_remote_meta_header_t));
+        align_up_size(sizeof(vemb_v16_remote_meta_header_t),
+                      CACHELINE_SIZE);
     size_t entry_count = (size_t)set_count * ways;
     size_t need =
         entries_off + entry_count * sizeof(vemb_v16_remote_meta_entry_t);
@@ -97,7 +99,8 @@ size_t vemb_v16_remote_meta_layout_bytes_for_sets(uint32_t set_count,
         return 0;
     }
     size_t entries_off =
-        vemb_v16_align64_size(sizeof(vemb_v16_remote_meta_header_t));
+        align_up_size(sizeof(vemb_v16_remote_meta_header_t),
+                      CACHELINE_SIZE);
     return entries_off +
            (size_t)set_count * ways * sizeof(vemb_v16_remote_meta_entry_t);
 }

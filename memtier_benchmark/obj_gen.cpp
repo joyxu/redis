@@ -32,7 +32,7 @@
 #endif
 
 #include "obj_gen.h"
-#include "memtier_benchmark.h"
+#include "config_types.h"
 
 random_generator::random_generator()
 {
@@ -351,10 +351,19 @@ void object_generator::set_key_range(unsigned long long key_min, unsigned long l
 void object_generator::set_key_zipfian(double s) { m_key_zipfian_s = s; }
 
 unsigned long long object_generator::zipfian_distribution(unsigned long long min, unsigned long long max, double s) {
-    unsigned long long n = max - min + 1;
+    const double n = (double)(max - min + 1);
     double u = (double)m_random.get_random() / (double)m_random.get_random_max();
-    double p = pow(u, 1.0 / s);
-    return min + (unsigned long long)(p * n) % n;
+    double rank;
+
+    if (fabs(s - 1.0) < 1e-12)
+        rank = exp(u * log(n));
+    else
+        rank = pow(1.0 + u * (pow(n, 1.0 - s) - 1.0), 1.0 / (1.0 - s));
+
+    unsigned long long offset = (unsigned long long)(rank - 1.0);
+    if (offset >= (unsigned long long)n)
+        offset = (unsigned long long)n - 1;
+    return min + offset;
 }
 
 void object_generator::set_key_distribution(double key_stddev, double key_median)

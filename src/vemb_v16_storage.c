@@ -5066,11 +5066,11 @@ typedef struct {
 static pthread_mutex_t g_shmdev_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static vemb_v16_shmdev_pool_t g_shmdev_pools[2];
 
-static int open_ub_path_spec(const char *path_spec,
+static int open_ub_path_spec(const char *path_spec, int open_flags,
                              char selected[256]) {
     if (!path_spec || !path_spec[0]) return -1;
 
-    int fd = open(path_spec, O_RDWR);
+    int fd = open(path_spec, open_flags);
     if (fd >= 0) {
         strncpy(selected, path_spec, 255);
         selected[255] = '\0';
@@ -5099,7 +5099,7 @@ static int open_ub_path_spec(const char *path_spec,
         int written = snprintf(candidate, sizeof(candidate), "%.*s%lu",
                            (int)prefix_len, path_spec, id);
         if (written < 0 || (size_t)written >= sizeof(candidate)) return -1;
-        fd = open(candidate, O_RDWR);
+        fd = open(candidate, open_flags);
         if (fd >= 0) {
             strncpy(selected, candidate, 255);
             selected[255] = '\0';
@@ -5110,10 +5110,12 @@ static int open_ub_path_spec(const char *path_spec,
 }
 
 static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
-                            const char *path_spec) {
+                            const char *path_spec, int noncacheable) {
     if (pool->inited) return 0;
     char selected_path[256];
-    int fd = open_ub_path_spec(path_spec, selected_path);
+    int fd = open_ub_path_spec(path_spec,
+                               O_RDWR | (noncacheable ? O_SYNC : 0),
+                               selected_path);
     if (fd < 0) {
         serverLog(LL_WARNING, "aeron ub pool: no usable path in %s errno=%d (%s)",
                   path_spec, errno, strerror(errno));
@@ -5137,21 +5139,26 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
     strncpy(pool->path, selected_path, sizeof(pool->path) - 1);
     pool->path[sizeof(pool->path) - 1] = '\0';
     pool->inited = 1;
-    serverLog(LL_NOTICE, "aeron ub pool ready: configured=%s selected=%s size=%zu",
-              path_spec, pool->path, pool->size);
+    serverLog(LL_NOTICE,
+              "aeron ub pool ready: configured=%s selected=%s size=%zu mode=%s",
+              path_spec, pool->path, pool->size,
+              noncacheable ? "NC" : "CC");
     return 0;
 }
 
 static int shmdev_pool_reserve(vemb_v16_shmdev_pool_t *pool,
                                const char *path_spec,
+                               int noncacheable,
                                size_t bytes,
                                uint64_t *out_off,
                                void **out_mapping,
                                size_t *out_bytes,
                                char out_path[256]) {
-    if (shmdev_pool_init(pool, path_spec) != 0)
+    if (bytes == 0 || bytes % CACHELINE_SIZE != 0)
+        return -1;
+    if (shmdev_pool_init(pool, path_spec, noncacheable) != 0)
         return -2;
-    size_t aligned = vemb_v16_align_up_size(bytes, 4096u);
+    size_t aligned = align_up_size(bytes, 4096u);
     if (pool->bump + aligned > pool->size)
         return -1;
     size_t off = pool->bump;
@@ -5189,21 +5196,27 @@ int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
 
     if (!request_ub_path || !request_ub_path[0] ||
         !response_ub_path || !response_ub_path[0] ||
+        strcmp(request_ub_path, response_ub_path) == 0 ||
         !out_request_shmdev_path || !out_response_shmdev_path)
         return -1;
 
     pthread_mutex_lock(&g_shmdev_pool_lock);
     vemb_v16_shmdev_pool_t *req_pool = &g_shmdev_pools[0];
-    vemb_v16_shmdev_pool_t *resp_pool =
-        strcmp(request_ub_path, response_ub_path) == 0 ?
-            req_pool : &g_shmdev_pools[1];
-    int rc = shmdev_pool_reserve(req_pool, request_ub_path, req_bytes,
+    vemb_v16_shmdev_pool_t *resp_pool = &g_shmdev_pools[1];
+    size_t req_bump = req_pool->bump;
+    size_t resp_bump = resp_pool->bump;
+    int rc = shmdev_pool_reserve(req_pool, request_ub_path, 0, req_bytes,
                                  out_req_off, out_req_mapping, out_req_bytes,
                                  out_request_shmdev_path);
     if (rc == 0)
-        rc = shmdev_pool_reserve(resp_pool, response_ub_path, resp_bytes,
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1, resp_bytes,
                                  out_resp_off, out_resp_mapping, out_resp_bytes,
                                  out_response_shmdev_path);
+    if (rc != 0) {
+        req_pool->bump = req_bump;
+        if (resp_pool != req_pool)
+            resp_pool->bump = resp_bump;
+    }
     pthread_mutex_unlock(&g_shmdev_pool_lock);
     if (rc != 0)
         return rc;
@@ -5227,6 +5240,65 @@ void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
      * where rings survive until channel close. */
     (void)req_mapping; (void)req_bytes;
     (void)resp_mapping; (void)resp_bytes;
+}
+
+int vemb_v16_storage_alloc_aeron_batch_channel(
+    const char *request_ub_path, const char *response_ub_path,
+    uint32_t descriptor_slot_size, uint32_t descriptor_slots,
+    uint32_t request_arena_bytes, uint32_t response_arena_bytes,
+    vemb_v16_aeron_batch_channel_allocation_t *out) {
+    if (!request_ub_path || !request_ub_path[0] ||
+        !response_ub_path || !response_ub_path[0] ||
+        strcmp(request_ub_path, response_ub_path) == 0 || !out ||
+        descriptor_slot_size == 0 ||
+        descriptor_slot_size % CACHELINE_SIZE != 0 ||
+        descriptor_slots != VEMB_V16_CLIENT_RING_SIZE ||
+        request_arena_bytes == 0 || response_arena_bytes == 0 ||
+        request_arena_bytes % CACHELINE_SIZE != 0 ||
+        response_arena_bytes % CACHELINE_SIZE != 0)
+        return -1;
+
+    memset(out, 0, sizeof(*out));
+    size_t desc_bytes = vemb_v16_client_ring_bytes(descriptor_slot_size);
+    pthread_mutex_lock(&g_shmdev_pool_lock);
+    vemb_v16_shmdev_pool_t *req_pool = &g_shmdev_pools[0];
+    vemb_v16_shmdev_pool_t *resp_pool = &g_shmdev_pools[1];
+    size_t req_bump = req_pool->bump;
+    size_t resp_bump = resp_pool->bump;
+    int rc = shmdev_pool_reserve(req_pool, request_ub_path, 0, desc_bytes,
+                                 &out->request_desc_off, &out->request_desc_mapping,
+                                 &out->request_desc_bytes, out->request_path);
+    if (rc == 0)
+        rc = shmdev_pool_reserve(req_pool, request_ub_path, 0,
+                                 request_arena_bytes,
+                                 &out->request_arena_off, &out->request_arena_mapping,
+                                 &out->request_arena_bytes, out->request_path);
+    if (rc == 0)
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1, desc_bytes,
+                                 &out->response_desc_off, &out->response_desc_mapping,
+                                 &out->response_desc_bytes, out->response_path);
+    if (rc == 0)
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1,
+                                 response_arena_bytes,
+                                 &out->response_arena_off, &out->response_arena_mapping,
+                                 &out->response_arena_bytes, out->response_path);
+    if (rc != 0) {
+        req_pool->bump = req_bump;
+        if (resp_pool != req_pool)
+            resp_pool->bump = resp_bump;
+        memset(out, 0, sizeof(*out));
+    }
+    pthread_mutex_unlock(&g_shmdev_pool_lock);
+    if (rc != 0)
+        return rc;
+
+    memset(out->request_desc_mapping, 0, out->request_desc_bytes);
+    memset(out->request_arena_mapping, 0, out->request_arena_bytes);
+    memset(out->response_desc_mapping, 0, out->response_desc_bytes);
+    memset(out->response_arena_mapping, 0, out->response_arena_bytes);
+    vemb_v16_client_ring_init(out->request_desc_mapping, descriptor_slot_size);
+    vemb_v16_client_ring_init(out->response_desc_mapping, descriptor_slot_size);
+    return 0;
 }
 
 const vemb_v16_manifest_region_t *

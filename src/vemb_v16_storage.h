@@ -324,6 +324,32 @@ int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
 void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
                                          void *resp_mapping, size_t resp_bytes);
 
+typedef struct vemb_v16_aeron_batch_channel_allocation {
+    char request_path[256];
+    char response_path[256];
+    uint64_t request_desc_off;
+    uint64_t request_arena_off;
+    uint64_t response_desc_off;
+    uint64_t response_arena_off;
+    void *request_desc_mapping;
+    void *request_arena_mapping;
+    void *response_desc_mapping;
+    void *response_arena_mapping;
+    size_t request_desc_bytes;
+    size_t request_arena_bytes;
+    size_t response_desc_bytes;
+    size_t response_arena_bytes;
+} vemb_v16_aeron_batch_channel_allocation_t;
+
+/* Allocate the four UB regions for one v2 batch channel atomically. The
+ * descriptor regions are initialized as fixed-slot SPSC rings; the arenas
+ * are raw contiguous storage for batch frames. */
+int vemb_v16_storage_alloc_aeron_batch_channel(
+    const char *request_ub_path, const char *response_ub_path,
+    uint32_t descriptor_slot_size, uint32_t descriptor_slots,
+    uint32_t request_arena_bytes, uint32_t response_arena_bytes,
+    vemb_v16_aeron_batch_channel_allocation_t *out);
+
 int vemb_v16_storage_vector_slice(vemb_v16_storage_ctx_t *storage,
                                   vemb_v16_resp_t *resp,
                                   const uint8_t **vector,

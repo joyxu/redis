@@ -8,17 +8,16 @@
 
 int main(void) {
     const uint32_t slot_size = vemb_v16_aeron_req_slot_size(300);
-    assert(slot_size % VEMB_V16_CACHELINE_SIZE == 0);
+    assert(slot_size % CACHELINE_SIZE == 0);
 
     size_t ring_bytes = vemb_v16_client_ring_bytes(slot_size);
     void *storage = NULL;
-    assert(posix_memalign(&storage, VEMB_V16_CACHELINE_SIZE, ring_bytes) == 0);
+    assert(posix_memalign(&storage, CACHELINE_SIZE, ring_bytes) == 0);
     memset(storage, 0, ring_bytes);
     vemb_v16_client_ring_t *ring = storage;
     vemb_v16_client_ring_init(ring, slot_size);
-    assert(ring->slots_off % VEMB_V16_CACHELINE_SIZE == 0);
-    assert(vemb_v16_client_ring_slot_stride(ring->slot_size) %
-           VEMB_V16_CACHELINE_SIZE == 0);
+    assert(ring->slots_off % CACHELINE_SIZE == 0);
+    assert((RING_SLOT_META_BYTES + ring->slot_size) % CACHELINE_SIZE == 0);
 
     const uint8_t first[] = {1, 2, 3};
     const uint8_t second[] = {4, 5, 6, 7, 8};
@@ -28,7 +27,7 @@ int main(void) {
 
     uint8_t output[2][64] = {{0}};
     uint32_t output_lengths[2] = {0};
-    assert(vemb_v16_client_poll_batch_lengths(ring, output, output_lengths,
+    assert(vemb_v16_client_poll_batch(ring, output, output_lengths,
                                               sizeof(output[0]), 2) == 2);
     assert(output_lengths[0] == sizeof(first));
     assert(output_lengths[1] == sizeof(second));

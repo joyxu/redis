@@ -36,11 +36,14 @@ static void usage(const char *program) {
     fprintf(stderr,
             "Usage:\n"
             "  %s writer --path PATH --offset BYTES --seed VALUE [--hold-seconds N]\n"
+            "  %s writer-nc --path PATH --offset BYTES --seed VALUE [--hold-seconds N]\n"
             "  %s reader --path PATH --offset BYTES --seed VALUE [--watch-seconds N]\n"
+            "  %s reader-cc --path PATH --offset BYTES --seed VALUE [--watch-seconds N]\n"
             "\n"
-            "Writer uses O_RDWR (local CC). Reader uses O_RDWR|O_SYNC (remote NC).\n"
+            "writer/reader use local CC writer and remote NC reader. writer-nc/reader-cc\n"
+            "use remote NC writer and local CC reader.\n"
             "Offset must be 64-byte aligned. VALUE and BYTES accept decimal or 0x hex.\n",
-            program, program);
+            program, program, program, program);
 }
 
 static int parse_u64(const char *text, uint64_t *value) {
@@ -87,7 +90,9 @@ static int parse_options(int argc, char **argv, options_t *options) {
     }
 
     if ((!strcmp(options->mode, "writer") ||
-         !strcmp(options->mode, "reader")) &&
+         !strcmp(options->mode, "writer-nc") ||
+         !strcmp(options->mode, "reader") ||
+         !strcmp(options->mode, "reader-cc")) &&
         options->path && options->have_offset && options->have_seed &&
         (options->offset % CACHELINE_BYTES) == 0) {
         return 0;
@@ -151,22 +156,22 @@ static int map_line(const options_t *options,
     return 0;
 }
 
-static int run_writer(const options_t *options) {
+static int run_writer(const options_t *options, int flags, const char *mode) {
     int fd = -1;
     void *mapping = MAP_FAILED;
     size_t mapping_bytes = 0;
     uint8_t *line = NULL;
     uint64_t expected[8];
 
-    if (map_line(options, O_RDWR, &fd, &mapping, &mapping_bytes, &line) != 0)
+    if (map_line(options, flags, &fd, &mapping, &mapping_bytes, &line) != 0)
         return 1;
 
     fill_expected(expected, options->seed);
     memcpy(line, expected, CACHELINE_BYTES);
     atomic_thread_fence(memory_order_seq_cst);
 
-    printf("WRITER_READY path=%s flags=O_RDWR(CC) offset=%llu hold_seconds=%u\n",
-           options->path, (unsigned long long)options->offset,
+    printf("WRITER_READY path=%s flags=%s offset=%llu hold_seconds=%u\n",
+           options->path, mode, (unsigned long long)options->offset,
            options->hold_seconds);
     print_line("written:", expected);
     printf("Run the reader while this process is sleeping.\n");
@@ -183,7 +188,7 @@ static int line_matches(const uint64_t actual[8], const uint64_t expected[8]) {
     return memcmp(actual, expected, CACHELINE_BYTES) == 0;
 }
 
-static int run_reader(const options_t *options) {
+static int run_reader(const options_t *options, int flags, const char *mode) {
     int fd = -1;
     void *mapping = MAP_FAILED;
     size_t mapping_bytes = 0;
@@ -193,14 +198,14 @@ static int run_reader(const options_t *options) {
     unsigned attempts = options->watch_seconds ? options->watch_seconds + 1 : 1;
     int matched = 0;
 
-    if (map_line(options, O_RDWR | O_SYNC, &fd, &mapping,
+    if (map_line(options, flags, &fd, &mapping,
                  &mapping_bytes, &line) != 0) {
         return 1;
     }
 
     fill_expected(expected, options->seed);
-    printf("READER_READY path=%s flags=O_RDWR|O_SYNC(NC) offset=%llu watch_seconds=%u\n",
-           options->path, (unsigned long long)options->offset,
+    printf("READER_READY path=%s flags=%s offset=%llu watch_seconds=%u\n",
+           options->path, mode, (unsigned long long)options->offset,
            options->watch_seconds);
     print_line("expected:", expected);
 
@@ -227,6 +232,11 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    return !strcmp(options.mode, "writer") ?
-        run_writer(&options) : run_reader(&options);
+    if (!strcmp(options.mode, "writer"))
+        return run_writer(&options, O_RDWR, "O_RDWR(CC)");
+    if (!strcmp(options.mode, "writer-nc"))
+        return run_writer(&options, O_RDWR | O_SYNC, "O_RDWR|O_SYNC(NC)");
+    if (!strcmp(options.mode, "reader"))
+        return run_reader(&options, O_RDWR | O_SYNC, "O_RDWR|O_SYNC(NC)");
+    return run_reader(&options, O_RDWR, "O_RDWR(CC)");
 }

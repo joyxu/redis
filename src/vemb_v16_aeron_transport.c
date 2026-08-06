@@ -4,6 +4,7 @@
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_log.h"
+#include "vemb_v16_proxy_types.h"
 #include "macro.h"
 
 #include <stdatomic.h>
@@ -69,12 +70,35 @@ static int write_full(int fd, const void *buf, size_t n) {
 /// UB/SHM transport: poll client request ring and hand jobs to the scheduler.
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
+    if (ch->batch_v2) {
+        batch_desc_t desc;
+        int peek = batch_desc_peek(ch->request_ring, &desc);
+        if (peek <= 0)
+            return peek;
+        if (!batch_desc_is_current(ch->request_ring, &desc))
+            return 0;
+        if (desc.bytes == 0 || desc.bytes > ch->batch_max_bytes ||
+            desc.start % ch->batch_max_bytes + desc.bytes > ch->batch_max_bytes)
+            return 0;
+        batch_request_view_t view;
+        const uint8_t *frame = ch->batch_allocation.request_arena_mapping +
+            (desc.start % ch->batch_max_bytes);
+        if (batch_request_decode(&view, frame, desc.bytes) != 0 ||
+            view.batch_id != desc.batch_id ||
+            view.item_count != desc.item_count)
+            return 0;
+        int rc = vemb_v16_proxy_handle_batch_request(ch, &view,
+                                                      proxy_io_worker_id);
+        if (rc > 0)
+            vemb_v16_client_consume_batch(ch->request_ring, 1);
+        return rc;
+    }
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
     uint8_t wire[PROXY_REQUEST_BATCH][VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
     uint32_t wire_lens[PROXY_REQUEST_BATCH];
     vemb_v16_req_t reqs[PROXY_REQUEST_BATCH];
     const vemb_v16_req_t *req_ptrs[PROXY_REQUEST_BATCH];
-    uint32_t wire_count = vemb_v16_client_poll_batch_lengths(
+    uint32_t wire_count = vemb_v16_client_poll_batch(
         request_ring, wire, wire_lens, sizeof(wire[0]), PROXY_REQUEST_BATCH);
     if (wire_count == 0)
         return 0;
@@ -102,14 +126,16 @@ static int publish_wire_response(vemb_v16_channel_t *ch,
     size_t wire_len = 0;
     if (vemb_v16_resp_encode(wire, sizeof(wire), resp, &wire_len) != 0)
         return -1;
-    while (vemb_v16_client_publish(vemb_v16_channel_response_ring(ch),
-                                   wire, (uint32_t)wire_len) != 0 &&
-           vemb_v16_channel_proxy_running(ch) &&
-           vemb_v16_channel_active(ch)) {
+    ring_rc_t rc;
+    while ((rc = vemb_v16_client_publish(
+                vemb_v16_channel_response_ring(ch), wire,
+                (uint32_t)wire_len)) == RING_ERR_FULL &&
+           vemb_v16_channel_proxy_running(ch) && vemb_v16_channel_active(ch)) {
         vemb_v16_channel_add_proxy_response_ring_full(ch, 1);
         cpu_relax();
     }
-    return vemb_v16_channel_active(ch) ? 0 : -1;
+    return rc == RING_OK && vemb_v16_channel_active(ch) ?
+        RING_OK : RING_ERR_INVALID;
 }
 
 /// UB/SHM transport: publish one response to the client response ring.
@@ -143,6 +169,31 @@ int vemb_v16_aeron_publish_response_batch(vemb_v16_channel_t *ch,
         cpu_relax();
     }
     return vemb_v16_channel_active(ch) ? 0 : -1;
+}
+
+int vemb_v16_aeron_publish_batch_response(
+    vemb_v16_channel_t *ch, const batch_response_t *response) {
+    if (!ch || !ch->batch_v2 || !response)
+        return RING_ERR_INVALID;
+    uint8_t wire[VEMB_V16_BATCH_MAX_BYTES_MAX];
+    size_t wire_len = batch_response_encode(wire, response);
+    if (wire_len > ch->batch_max_bytes)
+        return RING_ERR_INVALID;
+    uint32_t spins = 0;
+    int rc;
+    while ((rc = batch_arena_publish(
+                ch->response_ring, ch->batch_allocation.response_arena_mapping,
+                ch->batch_max_bytes, &ch->batch_response_producer, wire,
+                (uint32_t)wire_len, response->item_count,
+                response->batch_id)) == RING_ERR_FULL &&
+           vemb_v16_channel_proxy_running(ch) && vemb_v16_channel_active(ch)) {
+        vemb_v16_channel_add_proxy_response_ring_full(ch, 1);
+        cpu_relax();
+        spins++;
+    }
+    (void)spins;
+    return rc == RING_OK && vemb_v16_channel_active(ch) ?
+        RING_OK : RING_ERR_INVALID;
 }
 
 /// UDS control plane: allocate UB/SHM channels and serve stats/close commands.

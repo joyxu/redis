@@ -33,6 +33,7 @@ MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 PORT=${PORT:-6395}
 SERVER_HOST=${SERVER_HOST:-127.0.0.1}
 ROLE=${ROLE:-both}
+VERIFY_VEMB_BUILD=${VERIFY_VEMB_BUILD:-yes}
 DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-100000}
 MAX_VECTORS=${MAX_VECTORS:-131072}
@@ -84,6 +85,19 @@ ulimit -n 200000
 mkdir -p "$RAWDIR"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+verify_vemb_build() {
+    [ "$VERIFY_VEMB_BUILD" = "yes" ] || return 0
+    case "$ROLE" in
+        server) "$HPC/scripts/vemb_v16_build_stamp.sh" verify server ;;
+        client) "$HPC/scripts/vemb_v16_build_stamp.sh" verify client ;;
+        both)
+            "$HPC/scripts/vemb_v16_build_stamp.sh" verify server
+            "$HPC/scripts/vemb_v16_build_stamp.sh" verify client
+            ;;
+        *) return 0 ;;
+    esac
+}
 
 collect_ub_paths() {
     UB_PATHS=("$AERON_UB_PATH" "$AERON_RESPONSE_UB_PATH")
@@ -163,6 +177,11 @@ fi
 trap cleanup EXIT
 cleanup
 sleep 0.5
+
+if ! verify_vemb_build; then
+    echo "FAIL: VEMB binary does not match current sources"
+    exit 4
+fi
 
 if [ "$NUM_KEYS" -gt "$MAX_VECTORS" ]; then
     echo "ERROR: NUM_KEYS=$NUM_KEYS > MAX_VECTORS=$MAX_VECTORS"

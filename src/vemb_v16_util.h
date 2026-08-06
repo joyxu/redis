@@ -26,8 +26,8 @@ static inline uint32_t vemb_v16_pow2_ceil_u32(uint64_t value) {
     return v + 1;
 }
 
-static inline size_t vemb_v16_align64_size(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
+static inline size_t align_up_size(size_t value, size_t alignment) {
+    return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
 #endif

@@ -1124,10 +1124,13 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
                                attach_magic,
                                sizeof(attach_magic),
                                MSG_PEEK | MSG_WAITALL);
-    if (attach_peek == (ssize_t)sizeof(attach_magic) &&
-        memcmp(attach_magic,
-               VEMB_V16_AERON_ATTACH_MAGIC,
-               VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0) {
+    int attach_v1 = attach_peek == (ssize_t)sizeof(attach_magic) &&
+        memcmp(attach_magic, VEMB_V16_AERON_ATTACH_MAGIC,
+               VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0;
+    int attach_v2 = attach_peek == (ssize_t)sizeof(attach_magic) &&
+        memcmp(attach_magic, VEMB_V16_AERON_ATTACH_V2_MAGIC,
+               VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN) == 0;
+    if (attach_v1 || attach_v2) {
         if (vemb_v16_proxy_data_transport(proxy) != VEMB_V16_TRANSPORT_AERON) {
             close(fd);
             return;
@@ -1135,10 +1138,12 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
         if (vemb_v16_net_read_full(fd,
                                    attach_magic,
                                    sizeof(attach_magic)) != 0 ||
-            vemb_v16_aeron_attach_handle_fd(proxy, fd) != 0) {
+            (attach_v2 ?
+                vemb_v16_aeron_attach_v2_handle_fd(proxy, fd) :
+                vemb_v16_aeron_attach_handle_fd(proxy, fd)) != 0) {
             serverLog(LL_WARNING,
-                      "vemb_v16 aeron TCP attach rejected: fd=%d",
-                      fd);
+                      "vemb_v16 aeron TCP attach v%d rejected: fd=%d",
+                      attach_v2 ? 2 : 1, fd);
         }
         close(fd);
         return;

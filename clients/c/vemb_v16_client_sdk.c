@@ -3,6 +3,7 @@
 #include "vemb_v16_client_sdk.h"
 #include "../../src/vemb_v16_net.h"
 #include "../../src/vemb_v16_aeron_attach.h"  /* cross-node ATTACH protocol */
+#include "../../src/vemb_v16_batch_ring.h"
 /* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
  * public SDK header — so C++ consumers stay clean. */
 #include "../../src/vemb_v16_client_ring.h"
@@ -2381,7 +2382,11 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
 struct vemb_v16_aeron_channel {
     vemb_v16_channel_desc_t    desc;
     vemb_v16_client_ring_t    *req_ring;
+    void                      *req_ring_mapping;
+    size_t                     req_ring_mapping_bytes;
     vemb_v16_client_ring_t    *resp_ring;
+    void                      *resp_ring_mapping;
+    size_t                     resp_ring_mapping_bytes;
     char                       control_endpoint[256];
     /* warm regions (lazy; opened by vemb_v16_aeron_open_warm_region) */
     struct {
@@ -2394,6 +2399,29 @@ struct vemb_v16_aeron_channel {
     } warm[VEMB_V16_MAX_DESC_WARM_REGIONS];
     uint32_t                   warm_count;
     int                        remote;
+};
+
+struct vemb_v16_aeron_batch_channel {
+    uint64_t                   channel_id;
+    uint64_t                   topology_epoch;
+    uint32_t                   effective_batch_size;
+    uint32_t                   max_batch_bytes;
+    uint32_t                   descriptor_slot_size;
+    uint32_t                   descriptor_ring_slots;
+    vemb_v16_client_ring_t    *request_descriptor_ring;
+    void                      *request_descriptor_mapping;
+    size_t                     request_descriptor_mapping_bytes;
+    vemb_v16_client_ring_t    *response_descriptor_ring;
+    void                      *response_descriptor_mapping;
+    size_t                     response_descriptor_mapping_bytes;
+    void                      *request_arena_mapping;
+    size_t                     request_arena_mapping_bytes;
+    uint8_t                   *request_arena;
+    void                      *response_arena_mapping;
+    size_t                     response_arena_mapping_bytes;
+    uint8_t                   *response_arena;
+    batch_arena_producer_t request_arena_producer;
+    char                       control_endpoint[256];
 };
 
 /* Connect to a UDS endpoint with a fixed receive/send timeout. Returns
@@ -2665,9 +2693,8 @@ static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
     munmap(r, vemb_v16_client_ring_bytes(slot_size));
 }
 
-/* Map a shared region with read/write access. POSIX SHM names are opened
- * through shm_open; UB devices are regular device paths. Both mappings use
- * O_RDWR so the server and client have identical cacheability attributes. */
+/* Map a shared region with read/write access. UB cacheability is selected by
+ * the direction owner, not by whether its local device path was translated. */
 static void *vemb_v16_mmap_shmdev_region(const char *path,
                                           uint32_t backend_type,
                                           int use_sync,
@@ -2701,15 +2728,17 @@ static void *vemb_v16_mmap_shmdev_region(const char *path,
 
 /* Open a UB-backed ring at a specific byte offset. */
 /* Map the server's physical UB view to the corresponding client view.
- * The current two-node layout exposes server devices 1-4 as client devices
- * 5-8. Paths outside that layout are preserved so same-host and non-OBMM
- * test paths continue to work. */
+ * Server-local CC devices 1-4 map to client NC imports 5-8; server NC
+ * imports 5-8 map back to the client's local CC devices 1-4. */
 static int vemb_v16_aeron_map_remote_ub_path(const char *server_path,
                                              char *client_path,
-                                             size_t client_path_cap) {
+                                             size_t client_path_cap,
+                                             int *out_remote_ub_view) {
     if (!server_path || !server_path[0] ||
         !client_path || client_path_cap == 0)
         return -1;
+    if (out_remote_ub_view)
+        *out_remote_ub_view = 0;
 
     size_t source_len = strnlen(server_path, client_path_cap);
     if (source_len >= client_path_cap)
@@ -2724,30 +2753,92 @@ static int vemb_v16_aeron_map_remote_ub_path(const char *server_path,
     const char *digits = marker + strlen("obmm_shmdev");
     char *end = NULL;
     unsigned long device_id = strtoul(digits, &end, 10);
-    if (end == digits || *end != '\0' || device_id < 1u || device_id > 4u) {
+    if (end == digits || *end != '\0' || device_id < 1u || device_id > 8u) {
         memcpy(client_path, server_path, source_len + 1);
         return 0;
     }
 
     size_t prefix_len = (size_t)(digits - server_path);
     int written = snprintf(client_path, client_path_cap, "%.*s%lu",
-                           (int)prefix_len, server_path, device_id + 4u);
-    return written >= 0 && (size_t)written < client_path_cap ? 0 : -1;
+                           (int)prefix_len, server_path,
+                           device_id <= 4u ? device_id + 4u : device_id - 4u);
+    if (written < 0 || (size_t)written >= client_path_cap)
+        return -1;
+    if (out_remote_ub_view)
+        *out_remote_ub_view = device_id <= 4u;
+    return 0;
 }
 
-static int vemb_v16_aeron_ring_open_shmdev(const char *path,
-                                           uint64_t ring_off,
-                                           uint32_t slot_size,
-                                           int use_sync,
-                                           vemb_v16_client_ring_t **out) {
-    if (!path || !path[0] || slot_size == 0 || !out) return -1;
-    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
-    void *ptr = vemb_v16_mmap_shmdev_region(path, VEMB_V16_REGION_UB,
-                                             use_sync,
-                                             ring_off, bytes, NULL, NULL);
-    if (!ptr) return -1;
-    *out = (vemb_v16_client_ring_t *)ptr;
+static int vemb_v16_aeron_map_ub_resource(
+    const char *path, uint64_t offset, size_t bytes, int remote_ub_view,
+    int noncacheable,
+    void **out_mapping, size_t *out_mapping_bytes, void **out_resource) {
+    if (!path || !path[0] || bytes == 0 || !out_mapping ||
+        !out_mapping_bytes || !out_resource)
+        return -1;
+
+    uint64_t mapping_offset = remote_ub_view ? 0 : offset;
+    size_t mapping_bytes = bytes;
+    if (remote_ub_view) {
+        if (offset > SIZE_MAX || bytes > SIZE_MAX - (size_t)offset)
+            return -1;
+        mapping_bytes += (size_t)offset;
+    }
+
+    size_t offset_delta = 0;
+    void *mapping = vemb_v16_mmap_shmdev_region(
+        path, VEMB_V16_REGION_UB, noncacheable, mapping_offset, mapping_bytes,
+        out_mapping_bytes, &offset_delta);
+    if (!mapping)
+        return -1;
+
+    *out_mapping = mapping;
+    *out_resource = (uint8_t *)mapping + offset_delta +
+        (remote_ub_view ? (size_t)offset : 0);
     return 0;
+}
+
+static int vemb_v16_aeron_ring_header_valid(
+    const vemb_v16_client_ring_t *ring, uint32_t slot_size) {
+    return ring && ring->slot_size ==
+        align_up_size(slot_size, CACHELINE_SIZE) &&
+        ring->slot_count == VEMB_V16_CLIENT_RING_SIZE &&
+        ring->slot_mask == VEMB_V16_CLIENT_RING_MASK &&
+        ring->slots_off == align_up_size(
+            sizeof(*ring), CACHELINE_SIZE);
+}
+
+static int vemb_v16_aeron_batch_resource_valid(
+    const vemb_v16_aeron_batch_resource_desc_t *resource) {
+    return resource && resource->backend_type == VEMB_V16_REGION_UB &&
+        resource->path_len > 0 &&
+        resource->path_len <= VEMB_V16_AERON_SHMDEV_PATH_MAX &&
+        resource->path[0] != '\0' &&
+        resource->path[resource->path_len - 1] == '\0' &&
+        resource->bytes > 0 && resource->bytes <= SIZE_MAX &&
+        resource->mmap_offset <= INT64_MAX;
+}
+
+static void vemb_v16_aeron_batch_unmap(
+    vemb_v16_aeron_batch_channel_t *ch) {
+    if (!ch)
+        return;
+    if (ch->request_descriptor_mapping)
+        munmap(ch->request_descriptor_mapping,
+               ch->request_descriptor_mapping_bytes);
+    if (ch->response_descriptor_mapping)
+        munmap(ch->response_descriptor_mapping,
+               ch->response_descriptor_mapping_bytes);
+    if (ch->request_arena_mapping)
+        munmap(ch->request_arena_mapping, ch->request_arena_mapping_bytes);
+    if (ch->response_arena_mapping)
+        munmap(ch->response_arena_mapping, ch->response_arena_mapping_bytes);
+    ch->request_descriptor_ring = NULL;
+    ch->response_descriptor_ring = NULL;
+    ch->request_descriptor_mapping = NULL;
+    ch->response_descriptor_mapping = NULL;
+    ch->request_arena_mapping = NULL;
+    ch->response_arena_mapping = NULL;
 }
 
 /* Best-effort server-side close notification. Errors are swallowed
@@ -2766,6 +2857,251 @@ static void vemb_v16_aeron_notify_close(const char *endpoint,
     else
         vemb_v16_aeron_uds_close(fd, channel_id);
     close(fd);
+}
+
+vemb_v16_aeron_batch_channel_t *vemb_v16_aeron_open_remote_batch(
+    const char *host, uint16_t port, uint32_t dim,
+    uint32_t requested_batch_size, uint32_t requested_max_batch_bytes) {
+    if (!host || !host[0] || port == 0 || dim == 0 ||
+        requested_batch_size == 0)
+        return NULL;
+
+    int fd = vemb_v16_aeron_tcp_connect(host, port);
+    if (fd < 0)
+        return NULL;
+
+    vemb_v16_aeron_attach_v2_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.magic, VEMB_V16_AERON_ATTACH_V2_MAGIC,
+           VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN);
+    req.dim = dim;
+    req.flags = VEMB_V16_AERON_ATTACH_F_REMOTE_PATH;
+    req.requested_batch_size = requested_batch_size;
+    req.max_batch_bytes = requested_max_batch_bytes;
+
+    vemb_v16_aeron_attach_v2_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int exchange_ok = vemb_v16_net_write_full(fd, &req, sizeof(req)) == 0 &&
+        vemb_v16_net_read_full(fd, &resp, sizeof(resp)) == 0 &&
+        memcmp(resp.magic, VEMB_V16_AERON_ATTACHED_V2_MAGIC,
+               VEMB_V16_AERON_ATTACHED_V2_MAGIC_LEN) == 0 &&
+        resp.status == 0;
+    close(fd);
+    if (!exchange_ok)
+        return NULL;
+
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "tcp://%s:%u", host, (unsigned)port);
+    if (resp.channel_id == 0 ||
+        resp.effective_batch_size == 0 ||
+        resp.effective_batch_size > VEMB_V16_BATCH_REQUEST_SIZE_MAX ||
+        resp.max_batch_bytes == 0 ||
+        resp.max_batch_bytes > VEMB_V16_BATCH_MAX_BYTES_MAX ||
+        resp.max_batch_bytes % CACHELINE_SIZE != 0 ||
+        resp.descriptor_slot_size != VEMB_V16_BATCH_DESCRIPTOR_SLOT_SIZE ||
+        resp.descriptor_ring_slots != VEMB_V16_CLIENT_RING_SIZE ||
+        !vemb_v16_aeron_batch_resource_valid(&resp.request_descriptor) ||
+        !vemb_v16_aeron_batch_resource_valid(&resp.request_arena) ||
+        !vemb_v16_aeron_batch_resource_valid(&resp.response_descriptor) ||
+        !vemb_v16_aeron_batch_resource_valid(&resp.response_arena) ||
+        resp.request_descriptor.bytes !=
+            vemb_v16_client_ring_bytes(resp.descriptor_slot_size) ||
+        resp.response_descriptor.bytes !=
+            vemb_v16_client_ring_bytes(resp.descriptor_slot_size) ||
+        resp.request_descriptor.bytes % CACHELINE_SIZE != 0 ||
+        resp.response_descriptor.bytes % CACHELINE_SIZE != 0 ||
+        resp.request_arena.bytes != resp.max_batch_bytes ||
+        resp.response_arena.bytes != resp.max_batch_bytes ||
+        resp.request_arena.bytes % CACHELINE_SIZE != 0 ||
+        resp.response_arena.bytes % CACHELINE_SIZE != 0) {
+        if (resp.channel_id != 0)
+            vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
+        return NULL;
+    }
+
+    char request_descriptor_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char request_arena_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char response_descriptor_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char response_arena_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    int request_remote_ub_view = 0;
+    int response_remote_ub_view = 0;
+    if (vemb_v16_aeron_map_remote_ub_path(resp.request_descriptor.path,
+                                           request_descriptor_path,
+                                           sizeof(request_descriptor_path),
+                                           &request_remote_ub_view) != 0 ||
+        vemb_v16_aeron_map_remote_ub_path(resp.request_arena.path,
+                                           request_arena_path,
+                                           sizeof(request_arena_path), NULL) != 0 ||
+        vemb_v16_aeron_map_remote_ub_path(resp.response_descriptor.path,
+                                           response_descriptor_path,
+                                           sizeof(response_descriptor_path),
+                                           &response_remote_ub_view) != 0 ||
+        vemb_v16_aeron_map_remote_ub_path(resp.response_arena.path,
+                                           response_arena_path,
+                                           sizeof(response_arena_path), NULL) != 0) {
+        vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
+        return NULL;
+    }
+
+    fprintf(stderr,
+            "[sdk] cross-node batch ch: cid=%llu req_desc_off=%llu "
+            "req_arena_off=%llu resp_desc_off=%llu resp_arena_off=%llu\n",
+            (unsigned long long)resp.channel_id,
+            (unsigned long long)resp.request_descriptor.mmap_offset,
+            (unsigned long long)resp.request_arena.mmap_offset,
+            (unsigned long long)resp.response_descriptor.mmap_offset,
+            (unsigned long long)resp.response_arena.mmap_offset);
+
+    vemb_v16_aeron_batch_channel_t *ch = calloc(1, sizeof(*ch));
+    if (!ch) {
+        vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
+        return NULL;
+    }
+    snprintf(ch->control_endpoint, sizeof(ch->control_endpoint),
+             "tcp://%s:%u", host, (unsigned)port);
+    ch->channel_id = resp.channel_id;
+    ch->topology_epoch = resp.topology_epoch;
+    ch->effective_batch_size = resp.effective_batch_size;
+    ch->max_batch_bytes = resp.max_batch_bytes;
+    ch->descriptor_slot_size = resp.descriptor_slot_size;
+    ch->descriptor_ring_slots = resp.descriptor_ring_slots;
+
+    void *request_descriptor = NULL;
+    void *response_descriptor = NULL;
+    void *request_arena = NULL;
+    void *response_arena = NULL;
+    if (vemb_v16_aeron_map_ub_resource(
+            request_descriptor_path, resp.request_descriptor.mmap_offset,
+            (size_t)resp.request_descriptor.bytes, request_remote_ub_view, 1,
+            &ch->request_descriptor_mapping,
+            &ch->request_descriptor_mapping_bytes, &request_descriptor) != 0 ||
+    vemb_v16_aeron_map_ub_resource(
+            response_descriptor_path, resp.response_descriptor.mmap_offset,
+            (size_t)resp.response_descriptor.bytes, response_remote_ub_view, 0,
+            &ch->response_descriptor_mapping,
+            &ch->response_descriptor_mapping_bytes, &response_descriptor) != 0 ||
+    vemb_v16_aeron_map_ub_resource(
+            request_arena_path, resp.request_arena.mmap_offset,
+            (size_t)resp.request_arena.bytes, request_remote_ub_view, 1,
+            &ch->request_arena_mapping,
+            &ch->request_arena_mapping_bytes, &request_arena) != 0 ||
+    vemb_v16_aeron_map_ub_resource(
+            response_arena_path, resp.response_arena.mmap_offset,
+            (size_t)resp.response_arena.bytes, response_remote_ub_view, 0,
+            &ch->response_arena_mapping,
+            &ch->response_arena_mapping_bytes, &response_arena) != 0) {
+        vemb_v16_aeron_batch_unmap(ch);
+        vemb_v16_aeron_notify_close(ch->control_endpoint, ch->channel_id);
+        free(ch);
+        return NULL;
+    }
+    ch->request_descriptor_ring = request_descriptor;
+    ch->response_descriptor_ring = response_descriptor;
+    ch->request_arena = request_arena;
+    ch->response_arena = response_arena;
+    batch_arena_producer_init(&ch->request_arena_producer);
+    return ch;
+}
+
+void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch) {
+    if (!ch) return;
+    vemb_v16_aeron_batch_unmap(ch);
+    vemb_v16_aeron_notify_close(ch->control_endpoint, ch->channel_id);
+    free(ch);
+}
+
+uint64_t vemb_v16_aeron_batch_channel_id(
+    const vemb_v16_aeron_batch_channel_t *ch) {
+    return ch ? ch->channel_id : 0;
+}
+
+uint64_t vemb_v16_aeron_batch_topology_epoch(
+    const vemb_v16_aeron_batch_channel_t *ch) {
+    return ch ? ch->topology_epoch : 0;
+}
+
+int vemb_v16_aeron_batch_get_resources(
+    const vemb_v16_aeron_batch_channel_t *ch,
+    vemb_v16_aeron_batch_resources_t *out) {
+    if (!ch || !out)
+        return -1;
+    *out = (vemb_v16_aeron_batch_resources_t){
+        .request_descriptor_ring = ch->request_descriptor_ring,
+        .request_arena = ch->request_arena,
+        .response_descriptor_ring = ch->response_descriptor_ring,
+        .response_arena = ch->response_arena,
+        .descriptor_slot_size = ch->descriptor_slot_size,
+        .descriptor_ring_slots = ch->descriptor_ring_slots,
+        .effective_batch_size = ch->effective_batch_size,
+        .max_batch_bytes = ch->max_batch_bytes,
+    };
+    return 0;
+}
+
+int vemb_v16_aeron_batch_publish_handle(
+    vemb_v16_aeron_batch_channel_t *ch, uint64_t batch_id,
+    const char *const *keys, const uint16_t *key_lens, uint32_t item_count) {
+    RETURN_IF(item_count > ch->effective_batch_size, RING_ERR_INVALID);
+
+    uint32_t key_bytes = 0;
+    for (uint32_t i = 0; i < item_count; i++) {
+        key_bytes += key_lens[i];
+    }
+    size_t frame_len = batch_request_encoded_len(key_bytes, item_count);
+    if (frame_len > VEMB_V16_BATCH_MAX_BYTES_MAX ||
+        frame_len > ch->max_batch_bytes) {
+        return RING_ERR_INVALID;
+    }
+    uint8_t frame[VEMB_V16_BATCH_MAX_BYTES_MAX];
+    batch_request_encode(frame, batch_id, ch->topology_epoch,
+                         keys, key_lens,
+                         item_count, key_bytes);
+    return batch_arena_publish(
+        ch->request_descriptor_ring, ch->request_arena, ch->max_batch_bytes,
+        &ch->request_arena_producer, frame, (uint32_t)frame_len,
+        item_count, batch_id);
+}
+
+int vemb_v16_aeron_batch_poll_response(
+    vemb_v16_aeron_batch_channel_t *ch, uint64_t *batch_id,
+    uint64_t *topology_epoch, vemb_v16_resp_t *entries) {
+    batch_desc_t desc;
+    int peek = batch_desc_peek(ch->response_descriptor_ring, &desc);
+    if (!peek) return 0;
+    if (!batch_desc_is_current(ch->response_descriptor_ring, &desc))
+        return 0;
+    if (desc.bytes == 0 || desc.bytes > ch->max_batch_bytes ||
+        desc.start % ch->max_batch_bytes + desc.bytes > ch->max_batch_bytes) {
+        fprintf(stderr,
+                "[sdk][WARNING] v2 batch response descriptor invalid: "
+                "channel_id=%llu start=%llu bytes=%u arena_bytes=%u\n",
+                (unsigned long long)ch->channel_id,
+                (unsigned long long)desc.start, desc.bytes,
+                ch->max_batch_bytes);
+        return 0;
+    }
+    batch_response_view_t response;
+    const uint8_t *frame = ch->response_arena + (desc.start % ch->max_batch_bytes);
+    /* A local CC mapping can observe the published descriptor before a
+     * reused remote-NC arena line becomes readable. Keep the descriptor at
+     * head and retry instead of consuming valid work and disabling v2. */
+    int decode_rc = batch_response_decode(&response, entries, frame, desc.bytes);
+    if (decode_rc != 0 || response.batch_id != desc.batch_id ||
+        response.item_count != desc.item_count ||
+        response.item_count > ch->effective_batch_size) {
+        fprintf(stderr,
+                "[sdk][WARNING] v2 batch response frame not ready or "
+                "inconsistent: channel_id=%llu sequence=%llu batch_id=%llu "
+                "item_count=%u decode_rc=%d\n",
+                (unsigned long long)ch->channel_id,
+                (unsigned long long)desc.sequence,
+                (unsigned long long)desc.batch_id, desc.item_count, decode_rc);
+        return 0;
+    }
+    *batch_id = response.batch_id;
+    *topology_epoch = response.topology_epoch;
+    vemb_v16_client_consume_batch(ch->response_descriptor_ring, 1);
+    return (int)response.item_count;
 }
 
 vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
@@ -2848,12 +3184,16 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
     }
     char client_request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     char client_response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    int request_remote_ub_view = 0;
+    int response_remote_ub_view = 0;
     if (vemb_v16_aeron_map_remote_ub_path(
             resp.request_shmdev_path, client_request_shmdev_path,
-            sizeof(client_request_shmdev_path)) != 0 ||
+            sizeof(client_request_shmdev_path),
+            &request_remote_ub_view) != 0 ||
         vemb_v16_aeron_map_remote_ub_path(
             resp.response_shmdev_path, client_response_shmdev_path,
-            sizeof(client_response_shmdev_path)) != 0) {
+            sizeof(client_response_shmdev_path),
+            &response_remote_ub_view) != 0) {
         return NULL;
     }
 
@@ -2869,20 +3209,35 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
     ch->desc.request_ring_slot_size  = resp.req_slot_size;
     ch->desc.response_ring_slot_size = resp.resp_slot_size;
 
-    if (vemb_v16_aeron_ring_open_shmdev(client_request_shmdev_path,
-                                        resp.req_ring_off,
-                                        resp.req_slot_size,
-                                        1,
-                                        &ch->req_ring) != 0) {
-        free(ch); return NULL;
+    void *request_ring = NULL;
+    void *response_ring = NULL;
+    if (vemb_v16_aeron_map_ub_resource(
+            client_request_shmdev_path, resp.req_ring_off,
+            vemb_v16_client_ring_bytes(resp.req_slot_size),
+            request_remote_ub_view, 1, &ch->req_ring_mapping,
+            &ch->req_ring_mapping_bytes, &request_ring) != 0 ||
+    vemb_v16_aeron_map_ub_resource(
+            client_response_shmdev_path, resp.resp_ring_off,
+            vemb_v16_client_ring_bytes(resp.resp_slot_size),
+            response_remote_ub_view, 0, &ch->resp_ring_mapping,
+            &ch->resp_ring_mapping_bytes, &response_ring) != 0) {
+        if (ch->req_ring_mapping)
+            munmap(ch->req_ring_mapping, ch->req_ring_mapping_bytes);
+        if (ch->resp_ring_mapping)
+            munmap(ch->resp_ring_mapping, ch->resp_ring_mapping_bytes);
+        vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);
+        free(ch);
+        return NULL;
     }
-    if (vemb_v16_aeron_ring_open_shmdev(client_response_shmdev_path,
-                                        resp.resp_ring_off,
-                                        resp.resp_slot_size,
-                                        1,
-                                        &ch->resp_ring) != 0) {
-        vemb_v16_aeron_ring_close(ch->req_ring, resp.req_slot_size);
-        free(ch); return NULL;
+    ch->req_ring = request_ring;
+    ch->resp_ring = response_ring;
+    if (!vemb_v16_aeron_ring_header_valid(ch->req_ring, resp.req_slot_size) ||
+        !vemb_v16_aeron_ring_header_valid(ch->resp_ring, resp.resp_slot_size)) {
+        munmap(ch->req_ring_mapping, ch->req_ring_mapping_bytes);
+        munmap(ch->resp_ring_mapping, ch->resp_ring_mapping_bytes);
+        vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);
+        free(ch);
+        return NULL;
     }
 
     /* Parse advertised warm region (if any) into channel desc so the
@@ -2893,7 +3248,7 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
         resp.warm_backend_type == VEMB_V16_REGION_UB &&
         vemb_v16_aeron_map_remote_ub_path(resp.warm_path,
                                           client_warm_path,
-                                          sizeof(client_warm_path)) == 0) {
+                                          sizeof(client_warm_path), NULL) == 0) {
         ch->desc.warm_region_count = 1;
         ch->desc.warm_regions[0].region_id   = resp.warm_region_id;
         ch->desc.warm_regions[0].backend_type = resp.warm_backend_type;
@@ -2940,8 +3295,16 @@ void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
         }
     }
     ch->warm_count = 0;
-    vemb_v16_aeron_ring_close(ch->req_ring,  ch->desc.request_ring_slot_size);
-    vemb_v16_aeron_ring_close(ch->resp_ring, ch->desc.response_ring_slot_size);
+    if (ch->req_ring_mapping)
+        munmap(ch->req_ring_mapping, ch->req_ring_mapping_bytes);
+    else
+        vemb_v16_aeron_ring_close(ch->req_ring,
+                                   ch->desc.request_ring_slot_size);
+    if (ch->resp_ring_mapping)
+        munmap(ch->resp_ring_mapping, ch->resp_ring_mapping_bytes);
+    else
+        vemb_v16_aeron_ring_close(ch->resp_ring,
+                                   ch->desc.response_ring_slot_size);
     vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);
     free(ch);
 }
@@ -3013,7 +3376,7 @@ uint32_t vemb_v16_aeron_poll_response_batch_ex(
     uint32_t *lengths = wire_lens ? wire_lens : local_lens;
     if (max_count > VEMB_V16_CLIENT_RING_SIZE)
         max_count = VEMB_V16_CLIENT_RING_SIZE;
-    uint32_t got = vemb_v16_client_poll_batch_lengths(
+    uint32_t got = vemb_v16_client_poll_batch(
         ch->resp_ring, slots, lengths, max_len, max_count);
     for (uint32_t i = 0; i < got; i++) {
         uint8_t *dst = (uint8_t *)slots + (size_t)i * max_len;

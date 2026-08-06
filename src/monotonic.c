@@ -3,7 +3,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef VEMB_V16_CLIENT_SDK
+#include <assert.h>
+#else
 #include "redisassert.h"
+#endif
 #include <string.h>
 
 /* The function pointer for clock retrieval.  */

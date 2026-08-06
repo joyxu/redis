@@ -321,6 +321,8 @@ static void config_init_defaults(struct benchmark_config *cfg)
         cfg->vemb_v16_topology_refresh_ms = 500;
     if (!cfg->vemb_v16_topology_retry_limit)
         cfg->vemb_v16_topology_retry_limit = 8;
+    if (!cfg->vemb_v16_batch_request_size)
+        cfg->vemb_v16_batch_request_size = 32;
 #ifdef USE_TLS
     if (!cfg->tls_protocols)
         cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
@@ -432,10 +434,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_handle,
         o_vemb_v16_vsim,
         o_vemb_v16_vrem,
+        o_vemb_v16_batch_disable,
         o_vemb_v16_endpoints,
         o_vemb_v16_client_topology,
         o_vemb_v16_topology_refresh_ms,
         o_vemb_v16_topology_retry_limit,
+        o_vemb_v16_batch_request_size,
+        o_vemb_v16_batch_max_delay_us,
         o_vemb_v16_transport,
         o_tls,
         o_tls_cert,
@@ -519,10 +524,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-handle",            0, 0, o_vemb_v16_handle },
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
+        { "vemb-v16-batch-disable",     0, 0, o_vemb_v16_batch_disable },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
         { "vemb-v16-client-topology",   0, 0, o_vemb_v16_client_topology },
         { "vemb-v16-topology-refresh-ms", 1, 0, o_vemb_v16_topology_refresh_ms },
         { "vemb-v16-topology-retry-limit", 1, 0, o_vemb_v16_topology_retry_limit },
+        { "vemb-v16-batch-request-size", 1, 0, o_vemb_v16_batch_request_size },
+        { "vemb-v16-batch-max-delay-us", 1, 0, o_vemb_v16_batch_max_delay_us },
         { "vemb-v16-transport",         1, 0, o_vemb_v16_transport },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { NULL,                         0, 0, 0 }
@@ -910,6 +918,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_vrem:
                     cfg->vemb_v16_vrem = true;
                     break;
+                case o_vemb_v16_batch_disable:
+                    cfg->vemb_v16_batch_disable = true;
+                    break;
                 case o_vemb_v16_endpoints:
                     cfg->vemb_v16_endpoints = optarg;
                     break;
@@ -922,6 +933,24 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_topology_retry_limit:
                     cfg->vemb_v16_topology_retry_limit = (unsigned int)atoi(optarg);
                     break;
+                case o_vemb_v16_batch_request_size:
+                    cfg->vemb_v16_batch_request_size = (uint32_t)strtoul(optarg, &endptr, 10);
+                    if (!cfg->vemb_v16_batch_request_size || !endptr || *endptr != '\0') {
+                        fprintf(stderr, "error: --vemb-v16-batch-request-size must be positive\n");
+                        return -1;
+                    }
+                    break;
+                case o_vemb_v16_batch_max_delay_us:
+                {
+                    unsigned long delay_us = strtoul(optarg, &endptr, 10);
+                    if (optarg[0] == '-' || endptr == optarg || !endptr || *endptr != '\0' ||
+                        delay_us > UINT32_MAX) {
+                        fprintf(stderr, "error: --vemb-v16-batch-max-delay-us must be non-negative\n");
+                        return -1;
+                    }
+                    cfg->vemb_v16_batch_max_delay_us = (uint32_t)delay_us;
+                    break;
+                }
                 case o_vemb_v16_transport:
                     if (strcmp(optarg, "tcp") != 0 &&
                         strcmp(optarg, "aeron") != 0 &&
@@ -1128,11 +1157,14 @@ void usage() {
             "      --vemb-v16-handle          Read vectors via warm-region handles instead of inline payloads\n"
             "      --vemb-v16-vsim            Use VSIM_INLINE instead of VEMB_HANDLE for vemb_v16 reads\n"
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
+            "      --vemb-v16-batch-disable   Disable v2 batch only for VEMB_HANDLE A/B baselines\n"
             "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
             "      --vemb-v16-client-topology  Fetch server topology and route by active owner ring\n"
             "      --vemb-v16-topology-refresh-ms=N  Refresh VEMB topology every N ms (default 500)\n"
             "      --vemb-v16-topology-retry-limit=N  Retry VEMB topology transitions up to N times (default 8)\n"
+            "      --vemb-v16-batch-request-size=N  Unique VEMB_HANDLE items per v2 batch frame (default 32)\n"
+            "      --vemb-v16-batch-max-delay-us=N  Max delay before flushing an underfilled v2 batch (default 0: eager)\n"
             "      --vemb-v16-transport=tcp|aeron|aeron-cross-node  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
             "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput;\n"
             "                               aeron-cross-node uses TCP ATTACH + UB shmdev mmap for cross-node deploy)\n"

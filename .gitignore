@@ -216,6 +216,10 @@ Makefile.dep
 /src/tlc-*-server
 /src/.make-settings
 /src/release.h
+/.vemb_v16_build_stamp.server
+/.vemb_v16_build_stamp.client
+/.vemb_v16_build_lock.server
+/.vemb_v16_build_lock.client
 
 /benchmark/redis_traditional_benchmark
 /benchmark/supernode_benchmark
@@ -242,10 +246,11 @@ FABRIC_UB_MEM_DESIGN_GAPS.md
 benchmark/ARCHITECTURE_DEEP_DIVE.md
 benchmark/read_output.txt
 benchmark/write_output.txt
-AGENTS.md
 .agents/
 SVE_OPERATION_DESIGN.md
 benchmark/*_ut
+/benchmark/vemb_v16_attach_smoke
+/benchmark/vemb_v16_batch_attach_smoke
 benchmark/*_bench
 benchmark/*_ctl
 /deps/lua/src/lua

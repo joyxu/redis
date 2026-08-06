@@ -22,6 +22,13 @@
 #define VEMB_V16_PROXY_IO_STATE_CLOSING (1u << 31)
 
 typedef struct vemb_v16_channel vemb_v16_channel_t;
+struct batch_request_view;
+
+/* Called only by the v2 request poll path with a live batch channel, a
+ * decoded request view, and a valid proxy I/O worker id. */
+int vemb_v16_proxy_handle_batch_request(
+    vemb_v16_channel_t *ch, const struct batch_request_view *view,
+    uint32_t proxy_io_worker_id);
 
 typedef struct vemb_v16_transport_listener {
     const char *name;

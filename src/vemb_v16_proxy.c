@@ -5,6 +5,7 @@
 #include "cpu_relax.h"
 #include "futex.h"
 #include "monotonic.h"
+#include "vemb_v16_cacheline.h"
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_server_integration.h"   /* vemb_v16_cross_node_aeron_enabled() */
 #include "vemb_v16_proxy_types.h"
@@ -12,6 +13,7 @@
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
 #include "vemb_v16_stats.h"
+#include "vemb_v16_util.h"
 #include "macro.h"
 #include "redisassert.h"
 #include "util.h"
@@ -239,10 +241,6 @@ static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
     ch->tcp_response_backlog_sent = 0;
 }
 
-static size_t align64_size(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
-}
-
 static void free_shard_queue_array(vemb_v16_shard_queue_t *queues,
                                    uint32_t count) {
     if (!queues)
@@ -389,6 +387,9 @@ static int proxy_aeron_channel_snapshot_update(vemb_v16_proxy_t *proxy,
     atomic_exchange_explicit(&worker->aeron_snapshot,
                              next,
                              memory_order_seq_cst);
+    serverLog(LL_NOTICE,
+              "vemb_v16 aeron snapshot %s: channel=%u worker=%u count=%u",
+              add ? "add" : "remove", ch->index, worker_id, next_count);
     return 0;
 }
 
@@ -462,8 +463,9 @@ static void job_pool_slot_reset(vemb_v16_job_pool_t *pool, uint32_t slot_id) {
 
 static size_t job_pool_slots_region_bytes(const vemb_v16_proxy_t *proxy,
                                           uint16_t pool_type) {
-    return align64_size((size_t)job_pool_slot_count(proxy, pool_type) *
-                        job_pool_slot_stride(pool_type));
+    return align_up_size((size_t)job_pool_slot_count(proxy, pool_type) *
+                             job_pool_slot_stride(pool_type),
+                         CACHELINE_SIZE);
 }
 
 static uint64_t job_pool_slots_region_offset(const vemb_v16_proxy_t *proxy,
@@ -835,6 +837,11 @@ static void reset_closed_channel(vemb_v16_channel_t *ch) {
     ch->response_ring = NULL;
     ch->request_ring_bytes = 0;
     ch->response_ring_bytes = 0;
+    ch->batch_v2 = 0;
+    memset(&ch->batch_allocation, 0, sizeof(ch->batch_allocation));
+    ch->batch_effective_size = 0;
+    ch->batch_max_bytes = 0;
+    memset(&ch->batch_response_producer, 0, sizeof(ch->batch_response_producer));
     ch->transport_type = 0;
     ch->net_fd = -1;
     ch->tcp_backpressure_enabled = 0;
@@ -1536,6 +1543,137 @@ error_response:
     publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
 }
 
+static void batch_context_abort_channel(vemb_v16_channel_t *ch) {
+    for (uint32_t worker_id = 0;
+         worker_id < ch->proxy->proxy_io_worker_count; worker_id++) {
+        vemb_v16_proxy_io_worker_t *worker =
+            &ch->proxy->proxy_io_workers[worker_id];
+        vemb_v16_batch_context_abort_channel(
+            worker->batch_contexts, VEMB_V16_BATCH_CONTEXTS_PER_PROXY_WORKER,
+            ch->channel_id);
+    }
+}
+
+static int publish_batch_response(vemb_v16_channel_t *ch,
+                                  vemb_v16_batch_context_t *context) {
+    for (uint32_t i = 0; i < context->response.item_count; i++)
+        context->response.entries[i].req_id = i;
+    if (vemb_v16_aeron_publish_batch_response(ch, &context->response) != 0)
+        return -1;
+    vemb_v16_batch_context_release(context);
+    return 0;
+}
+
+static int batch_context_complete(vemb_v16_channel_t *ch,
+                                  const vemb_v16_completion_t *completion) {
+    uint32_t worker_id = 0;
+    uint32_t context_slot = 0;
+    uint32_t generation = 0;
+    uint32_t item_index = 0;
+    if (vemb_v16_batch_token_decode(completion->batch_token, &worker_id,
+                                    &context_slot, &generation,
+                                    &item_index) != 0 ||
+        worker_id >= ch->proxy->proxy_io_worker_count)
+        return 0;
+    vemb_v16_batch_context_t *context =
+        vemb_v16_batch_context_lookup(
+            ch->proxy->proxy_io_workers[worker_id].batch_contexts,
+            VEMB_V16_BATCH_CONTEXTS_PER_PROXY_WORKER, worker_id,
+            ch->channel_id, completion->batch_token, &item_index);
+    if (!context)
+        return 0;
+    int completed = vemb_v16_batch_context_mark_complete(context, item_index);
+    if (completed <= 0)
+        return 0;
+    vemb_v16_make_response_from(&context->response.entries[item_index],
+                                 completion);
+    if (completed == 2)
+        return publish_batch_response(ch, context);
+    return 0;
+}
+
+int vemb_v16_proxy_handle_batch_request(
+    vemb_v16_channel_t *ch, const batch_request_view_t *view,
+    uint32_t proxy_io_worker_id) {
+    uint64_t epoch = 0;
+    vemb_v16_storage_epoch_get(ch->proxy->storage, &epoch, NULL);
+    uint32_t context_slot = 0;
+    vemb_v16_batch_context_t *context = vemb_v16_batch_context_acquire(
+        ch->proxy->proxy_io_workers[proxy_io_worker_id].batch_contexts,
+        VEMB_V16_BATCH_CONTEXTS_PER_PROXY_WORKER, ch->channel_id,
+        view->batch_id, epoch, view->item_count, &context_slot);
+    if (!context)
+        return 0;
+    if (view->item_count > ch->batch_effective_size ||
+        view->topology_epoch != epoch ||
+        vemb_v16_storage_migration_active(ch->proxy->storage)) {
+        for (uint32_t i = 0; i < view->item_count; i++)
+            context->response.entries[i] = (vemb_v16_resp_t){
+                .status = VEMB_V16_STATUS_STALE_TOPOLOGY,
+                .op = VEMB_V16_OP_VEMB_HANDLE,
+            };
+        return publish_batch_response(ch, context) == 0 ? 1 : -1;
+    }
+
+    vemb_v16_pending_job_publish_t pending[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
+    vemb_v16_job_ref_t refs[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
+    uint16_t pending_indices[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
+    uint32_t pending_count = 0;
+    const uint8_t *key = view->keys;
+    for (uint32_t i = 0; i < view->item_count; i++) {
+        uint16_t key_len = batch_request_key_len_at(view, i);
+        vemb_v16_req_t req = {
+            .op = VEMB_V16_OP_VEMB_HANDLE,
+            .req_id = i,
+            .channel_id = ch->channel_id,
+            .key_len = key_len,
+            .topology_epoch = epoch,
+            .dim = ch->proxy->vector_dim,
+            .vector_bytes = ch->proxy->vector_stride,
+        };
+        memcpy(req.key, key, key_len);
+        req.key_hash = vemb_v16_xxh3_64_str(req.key, key_len);
+        key += key_len;
+        if (prepare_request_job(ch, &req, key_len, proxy_io_worker_id,
+                                &pending[pending_count]) == 0) {
+            vemb_v16_job_slot_t *slot =
+                job_pool_slot(pending[pending_count].pool,
+                              pending[pending_count].slot_id);
+            slot->u.read_job.base.batch_token = vemb_v16_batch_token_make(
+                proxy_io_worker_id, context_slot, context->generation, i);
+            refs[pending_count] = pending[pending_count].ref;
+            pending_indices[pending_count++] = (uint16_t)i;
+            context->pending_count++;
+        } else {
+            context->response.entries[i] = (vemb_v16_resp_t){
+                .status = VEMB_V16_STATUS_ERR,
+                .op = VEMB_V16_OP_VEMB_HANDLE,
+            };
+        }
+    }
+    for (uint32_t i = 0; i < pending_count; i++) {
+        vemb_v16_job_slot_t *slot =
+            job_pool_slot(pending[i].pool, pending[i].slot_id);
+        atomic_store_explicit(&slot->hdr.state, VEMB_V16_JOB_SLOT_PUBLISHED,
+                              memory_order_release);
+    }
+    if (pending_count != 0 && publish_shard_job_batch(
+            ch, refs, pending_count, proxy_io_worker_id,
+            ch->proxy->job_shard_queues) != 0) {
+        for (uint32_t i = 0; i < pending_count; i++) {
+            job_pool_release_slot(pending[i].pool, pending[i].slot_id, 0);
+            context->response.entries[pending_indices[i]] =
+                (vemb_v16_resp_t){ .status = VEMB_V16_STATUS_ERR,
+                                    .op = VEMB_V16_OP_VEMB_HANDLE };
+        }
+        pending_count = 0;
+        context->pending_count = 0;
+    }
+    if (pending_count == 0)
+        return publish_batch_response(ch, context) == 0 ? 1 : -1;
+    return 1;
+}
+
 /// Response scheduling: drain SuperNode completions and publish by transport.
 static int drain_completions(vemb_v16_channel_t *ch) {
     vemb_v16_completion_t completions[PROXY_RESPONSE_BATCH];
@@ -1546,6 +1684,16 @@ static int drain_completions(vemb_v16_channel_t *ch) {
                                           completions,
                                           PROXY_RESPONSE_BATCH)) != 0) {
         total += n;
+        if (ch->batch_v2) {
+            for (uint32_t i = 0; i < n; i++) {
+                vemb_v16_completion_t *completion = &completions[i];
+                int rc = batch_context_complete(ch, completion);
+                completion_release_payload(completion);
+                if (rc != 0)
+                    return -1;
+            }
+            continue;
+        }
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (completions[i].channel_id != ch->channel_id ||
@@ -1595,6 +1743,13 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
                                             ch->request_ring_bytes,
                                             ch->response_ring,
                                             ch->response_ring_bytes);
+        if (ch->batch_v2) {
+            vemb_v16_storage_free_aeron_channel(
+                ch->batch_allocation.request_arena_mapping,
+                ch->batch_allocation.request_arena_bytes,
+                ch->batch_allocation.response_arena_mapping,
+                ch->batch_allocation.response_arena_bytes);
+        }
     }
     if (ch->net_fd >= 0) {
         shutdown(ch->net_fd, SHUT_RDWR);
@@ -1854,6 +2009,92 @@ int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
     return 0;
 }
 
+int vemb_v16_proxy_attach_cross_node_batch_channel(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_aeron_batch_channel_allocation_t *allocation,
+    uint32_t effective_batch_size, uint32_t max_batch_bytes,
+    uint64_t *out_channel_id) {
+    if (!proxy || !allocation || !allocation->request_desc_mapping ||
+        !allocation->request_arena_mapping ||
+        !allocation->response_desc_mapping ||
+        !allocation->response_arena_mapping ||
+        allocation->request_desc_bytes == 0 ||
+        allocation->request_arena_bytes == 0 ||
+        allocation->response_desc_bytes == 0 ||
+        allocation->response_arena_bytes == 0 ||
+        effective_batch_size == 0 ||
+        effective_batch_size > VEMB_V16_BATCH_REQUEST_SIZE_MAX ||
+        max_batch_bytes == 0 ||
+        max_batch_bytes != allocation->request_arena_bytes ||
+        max_batch_bytes != allocation->response_arena_bytes)
+        return -1;
+    uint32_t idx = VEMB_V16_MAX_CHANNELS;
+    uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
+                                               memory_order_relaxed);
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        uint32_t candidate = (start + i) % VEMB_V16_MAX_CHANNELS;
+        if (atomic_load_explicit(&proxy->channels[candidate].slot_channel_id,
+                                 memory_order_acquire) == 0) {
+            idx = candidate;
+            break;
+        }
+    }
+    if (idx == VEMB_V16_MAX_CHANNELS)
+        return -1;
+
+    vemb_v16_channel_t *ch = &proxy->channels[idx];
+    reset_closed_channel(ch);
+    ch->index = idx;
+    ch->channel_id = atomic_fetch_add_explicit(&proxy->next_channel_id, 1,
+                                               memory_order_relaxed);
+    ch->proxy = proxy;
+    ch->transport_type = VEMB_V16_TRANSPORT_AERON;
+    ch->net_fd = -1;
+    atomic_store_explicit(&ch->active, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
+    atomic_store_explicit(&ch->supernode_state, 0, memory_order_release);
+    if (posix_memalign(&ch->completion_slots, 64,
+                       sizeof(vemb_v16_completion_t) *
+                       VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch);
+        return -1;
+    }
+    if (vemb_v16_aeron_ring_init(&ch->completion_ring, ch->completion_slots,
+                                 sizeof(vemb_v16_completion_t),
+                                 VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch);
+        return -1;
+    }
+    ch->request_ring = allocation->request_desc_mapping;
+    ch->response_ring = allocation->response_desc_mapping;
+    ch->request_ring_bytes = allocation->request_desc_bytes;
+    ch->response_ring_bytes = allocation->response_desc_bytes;
+    ch->batch_v2 = 1;
+    ch->batch_allocation = *allocation;
+    ch->batch_effective_size = effective_batch_size;
+    ch->batch_max_bytes = max_batch_bytes;
+    batch_arena_producer_init(&ch->batch_response_producer);
+    ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
+        .worker_id = ch->index,
+        .channel_active = &ch->active,
+        .running = &proxy->running,
+        .completion_ring = &ch->completion_ring,
+        .storage = proxy->storage,
+        .stats = &ch->stats,
+    };
+    atomic_store_explicit(&ch->active, 1, memory_order_release);
+    atomic_store_explicit(&ch->slot_channel_id, ch->channel_id,
+                          memory_order_release);
+    if (proxy_aeron_channel_snapshot_update(proxy, ch, 1) != 0) {
+        cleanup_unstarted_channel(ch);
+        return -1;
+    }
+    if (out_channel_id)
+        *out_channel_id = ch->channel_id;
+    return 0;
+}
+
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
@@ -1882,6 +2123,8 @@ static void close_channel(vemb_v16_channel_t *ch) {
     if (pooled_supernode) {
         supernode_channel_wait_closed(ch);
     }
+    if (ch->batch_v2)
+        batch_context_abort_channel(ch);
     pthread_mutex_lock(&ch->proxy->stats_lock);
     vemb_v16_stats_add_channel_counters(&ch->proxy->closed_stats, &ch->stats);
     pthread_mutex_unlock(&ch->proxy->stats_lock);
@@ -1890,6 +2133,13 @@ static void close_channel(vemb_v16_channel_t *ch) {
                                             ch->request_ring_bytes,
                                             ch->response_ring,
                                             ch->response_ring_bytes);
+        if (ch->batch_v2) {
+            vemb_v16_storage_free_aeron_channel(
+                ch->batch_allocation.request_arena_mapping,
+                ch->batch_allocation.request_arena_bytes,
+                ch->batch_allocation.response_arena_mapping,
+                ch->batch_allocation.response_arena_bytes);
+        }
     }
     if (ch->net_fd >= 0) {
         close(ch->net_fd);
@@ -2100,7 +2350,8 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
                                  memory_order_seq_cst);
         for (uint32_t i = 0; i < snapshot->count; i++) {
             uint32_t channel_index = snapshot->indices[i];
-            if (channel_index >= VEMB_V16_MAX_CHANNELS)
+            if (channel_index >= VEMB_V16_MAX_CHANNELS ||
+                channel_index % worker_count != worker->worker_id)
                 continue;
             vemb_v16_channel_t *ch = &proxy->channels[channel_index];
             if (!proxy_io_channel_acquire(ch))
@@ -2803,6 +3054,7 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
             .req_id = job->req_id,
             .channel_id = job->channel_id,
             .channel_index = job->channel_index,
+            .batch_token = job->batch_token,
             .status = job->op == VEMB_V16_OP_PING ?
                 VEMB_V16_STATUS_OK :
                 VEMB_V16_STATUS_ERR,
@@ -3346,6 +3598,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
             VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH,
             sizeof(proxy->aeron_response_ub_path) - 1);
     atomic_init(&proxy->running, 0);
+    atomic_init(&proxy->batch_request_size,
+                VEMB_V16_BATCH_REQUEST_SIZE_DEFAULT);
     atomic_init(&proxy->next_channel_id, 1);
     atomic_init(&proxy->next_channel_index, 0);
     atomic_init(&proxy->scaleout_notify_stop, 0);
@@ -3522,11 +3776,20 @@ int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,
 }
 
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
-                                        uint32_t threads) {
+                                         uint32_t threads) {
     return proxy_set_worker_count(proxy,
                                   proxy->proxy_io_pool_started,
                                   threads,
                                   &proxy->proxy_io_worker_count);
+}
+
+int vemb_v16_proxy_set_batch_request_size(vemb_v16_proxy_t *proxy,
+                                          uint32_t size) {
+    if (!proxy || size == 0 || size > VEMB_V16_BATCH_REQUEST_SIZE_MAX)
+        return -1;
+    atomic_store_explicit(&proxy->batch_request_size, size,
+                          memory_order_release);
+    return 0;
 }
 
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
