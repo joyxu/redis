@@ -2350,8 +2350,9 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
                                  memory_order_seq_cst);
         for (uint32_t i = 0; i < snapshot->count; i++) {
             uint32_t channel_index = snapshot->indices[i];
-            if (channel_index >= VEMB_V16_MAX_CHANNELS ||
-                channel_index % worker_count != worker->worker_id)
+            /* Snapshot updates place each Aeron channel in the buffer owned
+             * by its lane.  Do not repeat the modulo dispatch check here. */
+            if (channel_index >= VEMB_V16_MAX_CHANNELS)
                 continue;
             vemb_v16_channel_t *ch = &proxy->channels[channel_index];
             if (!proxy_io_channel_acquire(ch))

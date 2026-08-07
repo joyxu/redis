@@ -2678,3 +2678,200 @@ fallback、非 OK completion 或 handle failure。这是正常 UB 可见性重�
 
 相对 21.13 的 `14.127M QPS` uniform 单轮样本，本轮低约 `0.73%`，处于跨机单轮波动范围内；当前
 ring 优化没有带来可辨识的 100k uniform 吞吐提升，不能据此宣称性能收益。
+
+### 21.15 100k uniform 用户态+内核态火焰图（2026-08-07，工作区未提交）
+
+基于 21.14 的 current v2 local-L0 基线，在 fresh 111 server 上重新执行一次 100k uniform
+跨机读取，并在两台机器各自生成火焰图。两端均先通过 O3/LTO/SVE build stamp 验证；111 为
+`redis-server`，112 为 SDK/memtier。request 为 `112 dev7 NC -> 111 dev3 CC`，response 为
+`111 dev6 NC -> 112 dev2 CC`，client warm read 为本地映射的 `dev8`。
+
+运行参数为：顺序 v1 VADD 预填充 100k key（`S:S`）；随后真实 `VEMB_HANDLE` read 使用
+`R:R`、`t=64,c=4,pipeline=32,BATCH_REQUEST_SIZE=32,max-delay-us=0,test-time=30s`。
+111 server 在读压开始前运行 `perf record -F 99 -g -e cycles -p <redis-server-pid> -- sleep 25`；
+112 直接以 `perf record -F 99 -g -e cycles -- taskset ... memtier_benchmark ...` 启动 30 秒读压。
+没有使用 `cycles:u` 或 `-a`，故两张图均包含目标进程的用户态和内核态调用栈，但不混入系统中
+无关进程。
+
+| QPS | P99 | leaders | followers | frames | vector reads | vector bytes | 平均 fanout | fallback/backpressure/vector read failure/NOT_FOUND/server error/handle failure |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 14.044M | 0.567ms | 421,414,988 | 65,428 | 13,171,263 | 421,414,988 | 505,697,985,600 | 1.00016 | 0 / 0 / 0 / 0 / 0 / 0 |
+
+64 个 batch session 和 64 个 worker 全部完成；111 server log 的 `vemb_v16 handle miss` 为 0。
+server 采集到 1,825 samples，CLI 采集到 187,193 samples。两侧 raw script 都包含
+`[kernel.kallsyms]` frame（server 20,118 行、CLI 15,714 行），并分别包含 `redis-server` 和
+`memtier_benchmark` 用户态 frame，确认火焰图覆盖了两种特权级。
+
+server SVG 使用 `server.process.collapsed.txt` 重绘：将原 folded stack 的第一个 frame（worker
+thread comm，例如 `vemb-io-*`）统一替换为 `redis-server`，并增加 `all` 根。最终唯一根为
+`all -> redis-server`，覆盖 100% server samples；后续的 `proxy_io_pool_thread_main`、
+`supernode_pool_thread_main` 等保留为真实调用链入口。因而图中不会按单个 server thread 分组，
+但仍完整显示不同 server role 的工作及其用户态、内核态后续栈。
+
+**采样覆盖更正：** 上述 SVG 的进程级折叠语义正确，但原始 `server.perf.data` 没有捕获任何
+`vemb-sn-*` 或 `supernode_pool_thread_main` sample；`batch_processor_thread` 属于独立的 legacy
+batch processor，不能替代 VEMB pooled SuperNode。因此它只能用于已采集到的 main/proxy/legacy
+batch 线程分析，**不能作为完整 server 火焰图使用**。后续必须重跑同一 workload：在采样开始前通过
+`ps -T -p <redis-server-pid>` 枚举全部 server TID，并以 `perf record -F 99 -g -e cycles --tid
+<comma-separated-tids>` 显式绑定 main、`vemb-io-*` 与 `vemb-sn-*`；生成 SVG 前要求 raw script
+至少各含一个 `vemb-sn-*` 和 `supernode_pool_thread_main` sample，否则本轮 server 图无效。
+
+**全 TID replacement server sample：** 随后 fresh 111 server 重预填充并重跑相同 100k uniform
+workload。采样前的 `ps -T` 确认有 21 个 `vemb-io-*` 与 21 个 `vemb-sn-*`；将全部 server TID
+显式传入 `perf record -F 99 -g -e cycles --tid <comma-separated-tids> -- sleep 25`。这份 trace
+采集到 29,677 samples，其中 `vemb-sn-*` 为 7,328、`supernode_pool_thread_main` 为 7,203、
+`proxy_io_pool_thread_main` 为 21,982，且有 22,846 个 kernel frame。由此生成的 SVG 为唯一
+`all -> redis-server` 根：proxy IO 占 `74.77%`、pooled SuperNode 占 `24.52%`，两者均保留完整
+用户态和内核态后续调用链。
+
+对应驱动 workload 为 `14.122M QPS`、P99 `0.567ms`；64 worker 全部 join，fallback、backpressure、
+vector read failure、NOT_FOUND、server error、handle dereference failure 和 handle miss 均为 0。
+这份 replacement SVG 才是本节可用于 server 分析的火焰图：
+[server all-TID SVG](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server_resample/server.svg)，
+其 [raw perf script](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server_resample/server.alltid.perf.script)
+和 [process-level folded stacks](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server_resample/server.process.collapsed.txt)
+也已归档。
+
+本地归档目录为
+[`perf/aeron_cross_20260807_100k_uniform_flame_101854`](../perf/aeron_cross_20260807_100k_uniform_flame_101854/)。
+核心可视化产物：
+
+- [initial server SVG (incomplete: no pooled SuperNode samples)](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server/server.svg) 和 [server metadata](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server/server.meta.txt)
+- [process-level server collapsed stacks](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server/server.process.collapsed.txt)
+- [CLI SVG](../perf/aeron_cross_20260807_100k_uniform_flame_101854/client/client.svg) 和 [CLI metadata](../perf/aeron_cross_20260807_100k_uniform_flame_101854/client/client.meta.txt)
+- [server raw perf script](../perf/aeron_cross_20260807_100k_uniform_flame_101854/server/server.perf.script) 和 [CLI raw perf script](../perf/aeron_cross_20260807_100k_uniform_flame_101854/client/client.perf.script)
+
+归档还保留两端 `perf.data`、collapsed stacks、server log、prefill log 与完整 workload log。四份
+原始 `perf.data`/`perf.script` 已以 SHA-256 和远端产物逐一核对一致。测试结束后，111 的 6395
+实例已经停止，端口和测试 UB 设备无残留 holder。
+
+### 21.16 跨节点火焰图 runner（2026-08-07）
+
+`scripts/run_aeron_cross_node_flamegraph.sh` 固化了本节的 fresh-server 跨节点流程：两端 build
+stamp 门禁、UB/port preflight、111 server 启动、112 顺序 v1 VADD prefill、真实 v2
+`VEMB_HANDLE` read、两端本机 `perf`/FlameGraph 渲染和归档拉回 controller 本地。
+
+默认运行 100k uniform：
+
+```bash
+bash scripts/run_aeron_cross_node_flamegraph.sh
+```
+
+文档中的 Zipf 热点场景直接指定 key pattern 和指数，例如：
+
+```bash
+KEY_PATTERN=Z:Z ZIPF_S=1.5 NUM_KEYS=100000 \
+  bash scripts/run_aeron_cross_node_flamegraph.sh
+```
+
+`NUM_KEYS`、`DIM`、`THREADS`、`CLIENTS`、`PIPELINE`、`BATCH_REQUEST_SIZE`、
+`BATCH_MAX_DELAY_US`、`PIO`、`SNW`、CPU mask、UB path、
+manifest、采样 event/frequency/duration、节点和输出目录均可由同名环境变量覆盖。`BUILD=verify`
+（默认）要求两端当前 O3/LTO/SVE stamp；源码同步后用 `BUILD=build` 强制重建。
+
+server 不能再以仅 process leader 的采样替代全线程采样。runner 在 prefill 后枚举
+`ps -T -p <redis-server-pid>` 的全部 TID，以 `perf --tid` 采集；随后把 `vemb-io-*`、
+`vemb-sn-*` 等 thread comm 统一归并为 `all -> redis-server` 根，但保留 proxy/SuperNode 的调用链。
+默认硬性要求 raw script 同时含 `vemb-sn-*`、`supernode_pool_thread_main` 和
+`proxy_io_pool_thread_main`，否则拒绝产出有效 server 图。`REQUIRE_VEMB_THREAD_SAMPLES=0` 仅用于
+明确知道 SuperNode 应无 CPU 样本的诊断场景。
+
+每次运行的完整 server/client `perf.data`、`perf.script`、collapsed stacks、SVG、build metadata、
+thread manifest、prefill/workload/server log 分别打包在远端临时 run directory，并解包到本地
+`LOCAL_ROOT/server` 与 `LOCAL_ROOT/client`。默认完成或失败时停止 fresh 6395 server；使用
+`KEEP_SERVER=1` 才保留它。`DRY_RUN=1` 只验证参数与输出布局，不执行 SSH、构建、测试或采样。
+
+**runner smoke 验证（2026-08-07）：** 实际执行了 15 秒 `R:R` 和 15 秒
+`KEY_PATTERN=Z:Z ZIPF_S=1.2` 的 100k smoke。两种场景均完成远端归档、本地拉回和 server 自动
+清理；Zipf 场景为 `28.111M QPS`、P99 `0.343ms`，64 worker 全部 join，fallback、backpressure、
+vector read failure、non-OK response 与 handle dereference failure 均为 0。其 server raw trace
+分别含 8,276 个 `vemb-sn-*`、8,207 个 `supernode_pool_thread_main`、18,341 个
+`proxy_io_pool_thread_main` 和 19,580 个 kernel frame，满足完整 server 图门禁。
+
+runner 向 SSH 传递可选的 `ZIPF_S` 时使用非空哨兵值，并在远端还原为空字符串。原因是 OpenSSH
+会丢弃空的位置参数；未处理时 uniform `R:R` 的后续参数会左移，导致远端 shell 以错误字段作为
+线程数或 CPU mask。该修复已由上述 uniform 与 Zipf smoke 同时覆盖。
+
+**server CPU 归档（2026-08-07）：** runner 仅对 111 server 采集 CPU，不对 client 增加 CPU
+统计。`server.cpu.process.tsv` 使用 Redis 进程 jiffies，在固定 `TEST_TIME` 窗口给出 `user`、
+`system` 和 `total=user+system` 的秒数及等效核数。`server.cpu.cpuset.mpstat.txt` 保留
+`SERVER_CPU_MASK` 内每个 CPU 的原始 `mpstat` 数据；`server.cpu.cpuset.summary.tsv` 汇总
+`usr/nice/sys/iowait/irq/soft/steal/guest/gnice/total` 的平均百分比和等效核数，其中
+`soft` 即 `si`，`total=100-idle`。`soft/irq` 属于该 CPU set 的系统 CPU 时间，不能错误归因成
+Redis 进程自身时间。`server.cpu.summary.txt` 将这些数据渲染为固定列宽的可读表，并在 runner 成功
+结束时输出；该表不显示 `idle` 行，只保留 `total`。
+
+**跨机测试环境门禁（2026-08-07）：** 在一次无效 smoke 中，client 仅有 `5.21M QPS`、P99
+`15.7ms`，而 111 的 CPU set 却显示 `42.093` 核。复核发现该 host 上已有另一 `redis-server`
+在 1 秒 `pidstat` 样本中占用约 38 核；因此 CPU-set 的系统总量不能归因给 fresh server。runner
+现在在 111/112 启动任一测试角色前强制执行 load gate：默认拒绝单进程超过 `10%` CPU、全进程合计
+超过 `20%` CPU，或单进程 RSS 超过 `256MiB` 的情况，并打印 blocker 的 PID、CPU/RSS 与 command。
+原始 `pidstat` 和 blocker 清单归档随样本保存。阈值可用
+`MAX_FOREIGN_CPU_PCT`、`MAX_FOREIGN_TOTAL_CPU_PCT`、`MAX_FOREIGN_RSS_MB` 调整。
+当确认 `opencode` 与本轮无关时，可显式设定 `KILL_OPENCODE=1`：runner 在两端 gate 前只匹配
+comm 精确为 `opencode` 的进程，发送 `SIGKILL` 并确认退出后再继续；默认 `0` 不执行任何杀进程操作。
+
+**火焰图参数标签（2026-08-07）：** server/client SVG 的顶部 title 使用 compact run label：key 数和
+分布、dim、`PIO/SNW`、`t/c`、pipeline、batch、batch delay、测试/采样时长和 `RUN_ID`；subtitle
+额外标注 role、CPU mask、event 与采样频率。这样从独立 SVG 即可辨别样本参数，无需依赖目录名。
+
+**load-gated 100k distribution 复测（2026-08-07）：** 清理与本轮无关的 `opencode` 和 `mutagen-agent` 后，runner
+在两端通过 CPU/RSS gate（server/client 的 CPU/RSS blocker 文件均为空）并运行 100k、dim=300、
+`PIO=21,SNW=21,t=64,c=4,pipeline=32,batch=32,max-delay-us=0` 的 30 秒 V2 `VEMB_HANDLE` read。
+三轮都完成 64 worker join，fallback、backpressure、vector-read failure、non-OK response、handle
+failure 与 server handle miss 均为 0；25 秒 server all-TID `perf` 与 client process `perf` 均已归档，
+测试结束后 6395 已释放。
+
+| key distribution | QPS | P99 | server process total cores | server CPU-set total cores | artifacts | server SVG | client SVG |
+|---|---:|---:|---:|---:|---|---|---|
+| Uniform `R:R` | 13.873M | 0.583ms | 27.641 | 28.091 | [`aeron_cross_uniform_100k_20260807_1220`](../perf/aeron_cross_uniform_100k_20260807_1220/) | [server](../perf/aeron_cross_uniform_100k_20260807_1220/server/server.svg) | [client](../perf/aeron_cross_uniform_100k_20260807_1220/client/client.svg) |
+| Zipf `s=1.2` | 28.359M | 0.343ms | 28.955 | 29.725 | [`aeron_cross_zipf12_20260807_1215_r2`](../perf/aeron_cross_zipf12_20260807_1215_r2/) | [server](../perf/aeron_cross_zipf12_20260807_1215_r2/server/server.svg) | [client](../perf/aeron_cross_zipf12_20260807_1215_r2/client/client.svg) |
+| Zipf `s=1.5` | 39.321M | 0.247ms | 29.226 | 30.183 | [`aeron_cross_zipf15_20260807_1215`](../perf/aeron_cross_zipf15_20260807_1215/) | [server](../perf/aeron_cross_zipf15_20260807_1215/server/server.svg) | [client](../perf/aeron_cross_zipf15_20260807_1215/client/client.svg) |
+
+三组 server/client SVG title 分别含 `keys100000_RR_...`、`keys100000_Z1.2_...` 和
+`keys100000_Z1.5_...` 的完整 compact run label，可在不依赖目录名的情况下识别参数。
+
+15 秒 100k uniform smoke 验证中，Redis 进程采样窗口为 `15.004s`，user/system/total 分别为
+`25.632/0.592/26.224` 核；绑定的 48 核 CPU set 的 user/sys/irq/soft/total 分别为
+`25.727/0.612/0.274/0.017/26.630` 核。CPU 采样与 client workload 同时开始，独立 sampler 在
+固定窗口结束时写入进程结果，因而不包含随后的 client `perf script` 和 SVG 渲染时间。
+
+### 21.17 v2 request ready bitmap 落地（2026-08-07，工作区未提交）
+
+针对 14:14、16:16、18:18 的 CPU/QPS 对照，v2 batch channel 已加入 request/completion 共用的
+ready bitmap：client 在 descriptor 发布后置 bit，PIO 以 acquire exchange 取走 bit 并只 poll 对应
+channel；SuperNode completion 发布后也置相同 bit，避免最后一个 request 的 response 停留在 completion
+ring。旧 v1 与没有协商 bitmap 的通道保留周期 snapshot probe，以兼容永久 fallback channel。
+
+布局、内存序的无丢通知证明、close/reuse 语义、epoch 不在热路径递增的原因、分阶段范围与性能验收
+要求见 [ready bitmap 设计](VEMB_V16_AERON_READY_BITMAP_DESIGN_20260807.md)。该变更尚未写入性能结论；
+必须完成 fresh-server 跨节点复测后才可比较 CPU cores 与 QPS。
+
+**首次实现复测：** 在 `PIO=14,SNW=14`、30 秒、load gate 全通过的 fresh 样本
+[`aeron_cross_20260807_164350`](../perf/aeron_cross_20260807_164350/) 中，启用 bitmap 的 QPS 仅
+`4.840M`、P99 `0.279ms`、server process `9.565` cores。虽然相对之前 14:14 的 `13.548` cores
+下降，但 QPS 相对 `13.477M` 下降约 `64.1%`，不能作为优化接受。ready-map 创建日志为
+`/dev/obmm_shmdev3@761856`、`14 lanes x 10 words`，64 worker 均 join，所有 publish failure、fallback、
+backpressure、non-OK status 和 handle dereference failure 均为零；因此这不是错误或回退导致的假下降。
+
+该实验代码随后已撤回：当前 attach ABI、SDK 和 server 均不再包含 ready bitmap，v2 默认恢复完整 PIO
+poll；设计文档和失败样本仅作为实验记录保留。后续若重做通知机制，须先以低成本 doorbell/ack 替代跨机
+shared-word 原子 RMW，并通过同参数 A/B 后再更新默认策略。
+
+### 21.18 Aeron lane snapshot 热路径优化（2026-08-07）
+
+检查发现现有双缓冲 snapshot 已在控制面按 `channel_index % PIO` 分配到对应 worker 的独立列表，因而
+PIO 热循环中再次执行同一个 modulo 过滤是重复工作。代码撤回 ready bitmap 后，删除该重复判断，保留
+snapshot 内部的 channel-index 边界检查；v1 channel（包括 VADD/VSIM）和 v2 channel 的扫描语义不变。
+
+在两台机器同步并重建后，使用相同的 100k uniform workload（`t=64,c=4,pipeline=32,batch=32`、
+30 秒、`PIO=16,SNW=16`）进行两轮 fresh-server 测试：
+
+| run | QPS | P99 | server process cores | artifacts |
+|---|---:|---:|---:|---|
+| `aeron_cross_20260807_171001` | 13.8276M | 0.655ms | 14.633 | [perf](../perf/aeron_cross_20260807_171001/) |
+| `aeron_cross_20260807_171750` | 13.8161M | 0.655ms | 14.614 | [perf](../perf/aeron_cross_20260807_171750/) |
+
+两轮均为 64 worker join，publish、fallback、backpressure、non-OK response 和 handle dereference failure
+均为 0。两轮均值为 `13.8219M QPS / 14.623 cores`，相对旧 `16:16` 结果
+（`13.723M / 14.864 cores`）约提升 `0.7%` QPS、降低 `1.6%` server cores；收益较小，但没有吞吐回退。
