@@ -1,6 +1,6 @@
 $ ssh -p 22 root@192.168.90.112
 $ directory:
-$ - /root/szz/codespace/hpc-redis_bench
+$ - /root/szz/codespace/hpc-redis
 $ - /root/FlameGraph/flamegraph.pl: only for redis-server
 $- 编译的时 redis-server，不是 vemb_server
 $ run
@@ -23,7 +23,7 @@ $ run
 
 ## 本轮火焰图约束
 - 不要错误编译 src/vemb_v16_server 并错误使用
-- 远端实验代码固定使用 `/root/szz/codespace/hpc-redis_bench`，不得使用旧的 `/root/szz/codespace/hpc-redis` 路径。
+- 远端实验代码固定使用 `/root/szz/codespace/hpc-redis`。
 - 火焰图只采样 hpc-redis 的 `redis-server` 进程及其线程，禁止把独立的 `memtier_benchmark`、`redis-cli` 或其他进程纳入火焰图。
 - 先从 `/tmp/hpc_max_tput_server_<PORT>.pid` 获取 server PID，再使用进程定向采样：
   `perf record -F 99 -g -e cycles -p <REDIS_SERVER_PID> -- sleep 20`
@@ -40,6 +40,8 @@ $ run
 ## memtier_benchmar
 - 如果需要编译 memtier_benchmark, 流程:
 ```
+- 在本地同步当前代码到远端测试目录（只同步代码、头文件和 Makefile，不传文档或二进制）：
+  NODE=192.168.90.112 REMOTE_ROOT=/root/szz/codespace/hpc-redis bash scripts/sync_changed_code_to_peer.sh --all-code
 - 先编译 client sdk : cd clients/c/ && make -j
 - 再编译 memtier_benchmark:  autoreconf -ivf && ./configure && make -j
 make -C clients/c -j && make -C memtier_benchmark -j
