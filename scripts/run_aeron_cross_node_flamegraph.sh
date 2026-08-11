@@ -107,9 +107,10 @@ Before either role starts, both hosts must pass the load gate. It samples all
 processes with pidstat for one second and fails when a process exceeds
 MAX_FOREIGN_CPU_PCT (10%), all processes exceed MAX_FOREIGN_TOTAL_CPU_PCT
 (20%), or a process RSS exceeds MAX_FOREIGN_RSS_MB (256 MiB).
-By default, exact-name opencode and mutagen-agent processes are SIGKILLed on
-both hosts before this load gate runs. Set KILL_OPENCODE=0 or KILL_MUTAGEN=0
-to retain either process type.
+By default, the opencode tmux session and residual exact-name opencode
+processes are SIGKILLed. Each mutagen-agent's direct parent and the agent are
+also SIGKILLed on both hosts before this load gate runs. Set KILL_OPENCODE=0
+or KILL_MUTAGEN=0 to retain either process type.
 
 The server capture enumerates all redis-server TIDs and uses perf --tid. It
 fails by default unless both vemb-sn-* and supernode_pool_thread_main appear
@@ -265,6 +266,7 @@ mkdir -p "$run"
 command -v pidstat >/dev/null || { echo "missing pidstat for $role load gate" >&2; exit 1; }
 
 if [ "$kill_opencode" = 1 ]; then
+    tmux kill-session -t opencode 2>/dev/null || true
     opencode_pids="$(pgrep -x opencode || true)"
     if [ -n "$opencode_pids" ]; then
         printf 'removing opencode on %s: %s\n' "$role" "$opencode_pids"
@@ -281,15 +283,15 @@ if [ "$kill_opencode" = 1 ]; then
 fi
 
 if [ "$kill_mutagen" = 1 ]; then
-    # An active Mutagen SSH session can respawn its agent immediately after a
-    # kill. Keep the default cleanup window open until it has remained absent.
-    for _ in $(seq 1 10); do
-        mutagen_pids="$(pgrep -x mutagen-agent || true)"
-        if [ -n "$mutagen_pids" ]; then
-            printf 'removing mutagen-agent on %s: %s\n' "$role" "$mutagen_pids"
-            kill -9 $mutagen_pids
+    mutagen_pids="$(pgrep -x mutagen-agent || true)"
+    for pid in $mutagen_pids; do
+        parent="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+        if [ -n "$parent" ] && [ "$parent" -gt 1 ]; then
+            printf 'removing mutagen parent on %s: agent=%s parent=%s\n' \
+                "$role" "$pid" "$parent"
+            kill -9 "$parent" 2>/dev/null || true
         fi
-        sleep 0.1
+        kill -9 "$pid" 2>/dev/null || true
     done
     ! pgrep -x mutagen-agent >/dev/null || {
         echo "failed to remove mutagen-agent on $role" >&2
@@ -584,10 +586,16 @@ perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
         --test-time="$test_time" --hide-histogram "${zipf_args[@]}" \
         >"$run/client.workload.log" 2>&1
 
-! grep -q 'Connection error' "$run/client.workload.log"
+if grep -q 'Connection error' "$run/client.workload.log"; then
+    echo 'ERROR: client workload reported a connection error' >&2
+    exit 1
+fi
 grep -q 'all workers joined' "$run/client.workload.log"
-! grep -Eq 'fallback_v1=[1-9]|flush_backpressure=[1-9]|shared_vector_read_failures=[1-9]|status\[.*(nf|err|other)=[1-9]|handle_deref\[.*fail=[1-9]' \
-    "$run/client.workload.log"
+if grep -Eq 'fallback_v1=[1-9]|flush_backpressure=[1-9]|shared_vector_read_failures=[1-9]|status\[.*(nf|err|other)=[1-9]|handle_deref\[.*fail=[1-9]' \
+    "$run/client.workload.log"; then
+    echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
+    exit 1
+fi
 awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/client.workload.log"
 

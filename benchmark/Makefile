@@ -410,8 +410,8 @@ ub_client_ut: test_runtime_shim.c $(UB_UT_SRCS)
 
 .PHONY: ub_client_ut
 
-ub_cc_nc_visibility_ut: ub_cc_nc_visibility_ut.c
-	$(CC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
+ub_cc_nc_visibility_ut: ub_cc_nc_visibility_ut.c ../src/monotonic.c ../src/redisassert.c
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../src -o $@ $< ../src/monotonic.c ../src/redisassert.c
 	@echo "✅ Built: $@"
 
 .PHONY: ub_cc_nc_visibility_ut
