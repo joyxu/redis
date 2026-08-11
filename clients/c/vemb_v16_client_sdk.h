@@ -205,6 +205,7 @@ void vemb_v16_client_set_retry_budget(vemb_v16_client_t *client,
 typedef struct {
     uint64_t ask_redirects;
     uint64_t moved_redirects;
+    uint64_t moved_override_applies;  /* ops routed via override_owner */
     uint64_t stale_topology_responses;
     uint64_t topology_refresh_calls;
 } vemb_v16_redirect_stats_t;

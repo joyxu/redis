@@ -86,7 +86,7 @@ static void *control_fd_worker(void *arg) {
         }
     }
 
-    serverLog(LL_NOTICE,
+    serverLog(LL_DEBUG,
               "vemb_v16 control fd worker start: fd=%d",
               fd);
 

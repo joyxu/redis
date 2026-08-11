@@ -106,11 +106,24 @@ struct vemb_v16_client {
     sdk_backend_t   owner_channels[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     uint8_t         owner_channel_inited[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
 
+    /* MOVED override: once any key returns MOVED with target_owner=X, the
+     * cached active ring is permanently stale for this client's lifetime
+     * (we don't auto-refresh). All subsequent multi-endpoint ops route to
+     * override_owner instead of consulting the ring, which avoids the
+     * thundering-herd of N workers each opening a fresh TCP control
+     * connection to fetch topology. UINT32_MAX = disabled.
+     *
+     * Valid because cutover starts only after every key's baseline has
+     * been pushed to the target (DEST_COMMITTED on node1), so reads of
+     * any key against the override owner will succeed there. */
+    uint32_t        override_owner;
+
     /* Retry + observability. */
     uint32_t        retry_budget;     /* Default set in create_multi */
     uint32_t        connect_timeout_ms; /* 0 = default 10000 */
     uint64_t        ask_redirects;
     uint64_t        moved_redirects;
+    uint64_t        moved_override_applies;
     uint64_t        stale_topology_responses;
     uint64_t        topology_refresh_calls;
 
@@ -904,6 +917,7 @@ vemb_v16_client_t *vemb_v16_client_create_multi(const char *endpoints[],
 
     c->retry_budget = 256;  /* covers worst-case migration window */
     c->topology_state = TOPO_UNINITIALIZED;
+    c->override_owner = UINT32_MAX;  /* disabled until first MOVED */
     return c;
 }
 
@@ -1085,6 +1099,11 @@ static int client_execute_with_redirect(
                 return -1;
             topology_epoch = plan.topology_epoch;
             active_owner = plan.active_owner;
+            /* Apply MOVED override: bypass the now-stale ring lookup. */
+            if (client->override_owner != UINT32_MAX) {
+                active_owner = client->override_owner;
+                client->moved_override_applies++;
+            }
             if (ensure_owner_channel(client, active_owner) != 0)
                 return -1;
             target = &client->owner_channels[active_owner];
@@ -1226,10 +1245,25 @@ static int client_execute_with_redirect(
         }
 
         /* REFRESH path: MOVED or STALE_TOPOLOGY (or ASK-that-still-redirected).
-         * Mark topology stale, re-fetch, and retry from the top. */
-        if (out_resp->status == VEMB_V16_STATUS_MOVED)
+         *
+         * MOVED: bypass topology fetch entirely. The wire already carries
+         * redirect_owner (=target_owner). Once any key returns MOVED, the
+         * cutover has started, which means every key's baseline has already
+         * been pushed to node1 (DEST_COMMITTED). Set override_owner once
+         * and let the next loop iteration route directly there — no
+         * thundering-herd of TCP control connections across worker threads.
+         *
+         * STALE_TOPOLOGY (or ASK-that-still-redirected): still needs a
+         * topology fetch — that signal means our cached epoch predates
+         * min_write_epoch and we have no redirect hint. */
+        if (out_resp->status == VEMB_V16_STATUS_MOVED) {
             client->moved_redirects++;
-        else if (out_resp->status == VEMB_V16_STATUS_STALE_TOPOLOGY)
+            if (client->override_owner != out_resp->redirect_owner) {
+                client->override_owner = out_resp->redirect_owner;
+            }
+            continue;  /* next iteration applies override_owner */
+        }
+        if (out_resp->status == VEMB_V16_STATUS_STALE_TOPOLOGY)
             client->stale_topology_responses++;
         client->topology_state = TOPO_STALE;
         if (fetch_topology_via_seed_conn(client, 0) != 0)
@@ -1397,6 +1431,11 @@ static int client_pipeline_execute_with_redirect(
                 }
                 owners[i] = plan.active_owner;
                 topology_epoch = plan.topology_epoch;
+                /* Apply MOVED override: bypass the now-stale ring lookup. */
+                if (client->override_owner != UINT32_MAX) {
+                    owners[i] = client->override_owner;
+                    client->moved_override_applies++;
+                }
             }
         }
 
@@ -1416,6 +1455,7 @@ static int client_pipeline_execute_with_redirect(
         }
 
         int any_refresh = 0;
+        int any_override = 0;  /* MOVED: override set, just re-route */
 
         /* Process each distinct owner's group. */
         for (uint32_t oi = 0; oi < distinct_count; oi++) {
@@ -1618,12 +1658,19 @@ static int client_pipeline_execute_with_redirect(
                         break;
                     }
                     case VEMB_V16_RESP_CLASS_REFRESH:
-                        /* MOVED or STALE — leave PENDING, set refresh. */
-                        if (resp.status == VEMB_V16_STATUS_MOVED)
+                        /* MOVED: bypass fetch — set override_owner and let
+                         * the outer loop re-route via the override path.
+                         * STALE_TOPOLOGY: still needs fetch. */
+                        if (resp.status == VEMB_V16_STATUS_MOVED) {
                             client->moved_redirects++;
-                        else
+                            if (client->override_owner != resp.redirect_owner) {
+                                client->override_owner = resp.redirect_owner;
+                            }
+                            any_override = 1;
+                        } else {
                             client->stale_topology_responses++;
-                        any_refresh = 1;
+                            any_refresh = 1;
+                        }
                         break;
                     case VEMB_V16_RESP_CLASS_FATAL:
                     default:
@@ -1655,6 +1702,11 @@ static int client_pipeline_execute_with_redirect(
                 return 0;
             }
             /* Continue outer loop to re-route pending entries. */
+            continue;
+        }
+
+        /* MOVED override applied — re-route without fetch. */
+        if (any_override) {
             continue;
         }
 
@@ -2097,6 +2149,7 @@ void vemb_v16_client_get_redirect_stats(const vemb_v16_client_t *client,
     if (!client || !out) return;
     out->ask_redirects            = client->ask_redirects;
     out->moved_redirects          = client->moved_redirects;
+    out->moved_override_applies   = client->moved_override_applies;
     out->stale_topology_responses = client->stale_topology_responses;
     out->topology_refresh_calls   = client->topology_refresh_calls;
 }

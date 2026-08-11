@@ -231,7 +231,7 @@ start_node() {
         --vemb-v16-warm-regions-manifest $manifest \
         $reset_flag \
         --vemb-v16-proxy-io-threads $PIO --vemb-v16-supernode-workers $SNW \
-        --daemonize yes --logfile $logfile --loglevel notice \
+        --daemonize yes --logfile $logfile --loglevel warning \
         >/dev/null 2>&1"
 }
 
@@ -471,8 +471,9 @@ ssh_run "$NODE0_HOST" "cd $REMOTE_DIR && ./benchmark/vemb_v16_topology_ctl \
     --owner-endpoints 0=$NODE0_HOST:$PORT,1=$NODE1_HOST:$PORT \
     --coordinator-endpoint $NODE0_HOST:$COORD_PORT --timeout-ms $COMBINED_TIMEOUT"
 
-# 等扩容完成（最多 120s）
-ssh_run "$NODE0_HOST" "for _ in \$(seq 1 120); do \
+# 等扩容完成（最多 BG_TIME_SCALEOUT+60s，给 cutover 充足时间）
+SCALEOUT_WAIT=$((BG_TIME_SCALEOUT + 60))
+ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $SCALEOUT_WAIT); do \
     if grep -q '^scaleout_all_sources_done=1$' $COORD_OUT 2>/dev/null && \
        grep -q '^scaleout_full_active_published=' $COORD_OUT 2>/dev/null; then exit 0; fi; \
     sleep 1; done; exit 1"
@@ -535,6 +536,20 @@ log "Phase 6: Cleanup"
 stop_memtier_bg || true
 stop_node "$NODE0_HOST"
 stop_node "$NODE1_HOST"
+
+# Truncate server logs to last ${LOG_TAIL_LINES:-0} lines — vemb_v16
+# per-iteration logs during scaleout/baseline_push can otherwise grow to
+# GBs and exhaust disk.  Default 0 = keep full log for post-run analysis.
+# Set LOG_TAIL_LINES=5000 to restore old truncate behavior.
+LOG_TAIL_LINES="${LOG_TAIL_LINES:-500}"
+if [ "$LOG_TAIL_LINES" -gt 0 ]; then
+    truncate_log() {
+        local host=$1 path=$2
+        ssh_run "$host" "[ -f $path ] && { tail -${LOG_TAIL_LINES} $path > ${path}.tmp && mv ${path}.tmp $path; }" || true
+    }
+    truncate_log "$NODE0_HOST" "$NODE0_LOG"
+    truncate_log "$NODE1_HOST" "$NODE1_LOG"
+fi
 
 log "DONE — $TSV"
 cat "$TSV"
