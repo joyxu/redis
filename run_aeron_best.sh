@@ -4,21 +4,20 @@
 # Aeron transport (UDS+SHM) local loopback VEMB 17-config sweep
 #
 # 使用方法（所有参数都有默认值，按需覆盖）：
-#   bash run_aeron_best.sh
-#   TEST_TIME=60 T=64 C=4 PIPELINE=32 PIO=21 SNW=21 bash run_aeron_best.sh
-#   ssh HW01 'TEST_TIME=60 bash /root/gqs/codespace/UnifiedBus/test_hpc/run_aeron_best.sh'
+#   bash run_aeron_best.sh                                    # 默认 17 档
+#   TS="64" CS="4" PS="32" bash run_aeron_best.sh            # 单档
+#   TEST_TIME=10 bash run_aeron_best.sh                       # smoke
 #
 # 可调参数（环境变量）：
-#   TEST_TIME     bench 持续秒数         (默认 60)
-#   T C           client -t / -c         (默认 64 / 4)
-#   PIPELINE      每 channel in-flight   (默认 32)
-#   NUM_KEYS      prefill key 数         (默认 10000)
-#   MAX_VECTORS   server vector 容量上限 (默认 131072=128K；NUM_KEYS 不能超过这个)
+#   TEST_TIME     bench 持续秒数         (默认 30)
+#   TS CS PS      memtier -t/-c/--pipeline (默认 17 档数组，见 TS_DEFAULT/CS_DEFAULT/PS_DEFAULT)
+#   NUM_KEYS      prefill key 数         (默认 100000)
+#   MAX_VECTORS   server vector 容量上限 (默认 131072；NUM_KEYS 不能超过这个)
 #   DIM           vector 维度            (默认 300)
 #   SERVER_MASK   server taskset         (默认 "0-47")
-#   PIO           vemb-v16 proxy IO 线程数 (默认 21)
-#   SNW           vemb-v16 supernode worker 数 (默认 21)
 #   CLIENT_MASK   client taskset         (默认 "96-191")
+#   HPC_PIO       proxy IO 线程数        (默认 8)
+#   HPC_SNW       supernode worker 数    (默认 8)
 #   SERVER_HOST   client 连接的 server IP (默认 127.0.0.1)
 #   PORT          server 端口            (默认 6395)
 #   ROLE          both|server|client     (默认 both)

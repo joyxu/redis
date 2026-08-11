@@ -32,11 +32,21 @@ HPC-Redis 源码托管在内部 Git 仓库，同时通过 mutagen 在本地 macO
 **从内部 Git 仓库克隆**
 
 ```bash
-git clone git@github.com:<org>/UnifiedBus.git
-cd UnifiedBus/hpc-redis
+git clone https://github.com/moreaicc/hpc-redis.git
+cd hpc-redis
 ```
 
 ### 编译 redis-server
+0. 编译依赖（仅首次编译需要）
+   ```bash
+   gcc -O3 -fPIC -c deps/xxhash/xxhash.c -o deps/xxhash/xxhash.o
+   ar rcs deps/xxhash/libxxhash.a deps/xxhash/xxhash.o
+   cd deps/jemalloc
+   ./autogen.sh --with-version=5.3.0-0-g0
+   make
+   make install
+   cd -
+   ```
 
 1. 编译 `redis-server`
 

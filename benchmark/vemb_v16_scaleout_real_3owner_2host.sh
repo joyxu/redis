@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-HOST01="${HOST01:-192.168.90.111}"
-HOST2="${HOST2:-192.168.90.112}"
+HOST01="${HOST01:-192.168.1.111}"
+HOST2="${HOST2:-192.168.1.112}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
 

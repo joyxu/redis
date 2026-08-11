@@ -26,12 +26,13 @@
 #   transport=TCP 127.0.0.1, VEMB RAW=1 (INT8 量化直传)
 #
 # 命令对照 (参考 hpc_redis_v{sim,add,rem}_max_tput.sh / redis_baseline_v{sim,add,rem}_max_tput.sh):
-#   OP_TYPE | hpc memtier                                    | baseline memtier (RESP3)
-#   --------+------------------------------------------------+-----------------------------------------------
-#   VEMB    | --protocol vemb_v16 --ratio=0:1 R:R item:     | --command="VEMB myset ELE __key__ raw" item: R
-#   VSIM    | --protocol vemb_v16 --vemb-v16-vsim R:R item:  | --command="VSIM myset ELE __key__" R item:
-#   VADD    | --protocol vemb_v16 --ratio=1:0 S:S item:      | --command="VADD myset VALUES $DIM $VEC __key__" S item:
-#   VREM    | --protocol vemb_v16 --vemb-v16-vrem 1:0 S:S item: | --command="VREM myset __key__" S item:
+#   OP_TYPE   | hpc memtier                                       | baseline memtier (RESP3)
+#   ----------+---------------------------------------------------+-----------------------------------------------
+#   VEMB      | --protocol vemb_v16 --ratio=0:1 R:R item:        | --command="VEMB myset __key__ raw" item: R
+#   VSIM      | --protocol vemb_v16 --vemb-v16-vsim R:R item:     | --command="VSIM myset VALUES $DIM $FIXED_VECTOR COUNT 1" R item:
+#   VSIM_2KEY | --protocol vemb_v16 --vemb-v16-vsim-key-key R:R   | --command="VEMB myset __key__ raw" R:R item: (2 fetches, no client cosine)
+#   VADD      | --protocol vemb_v16 --ratio=1:0 S:S item:         | --command="VADD myset VALUES $DIM $FIXED_VECTOR __key__" S item:
+#   VREM      | --protocol vemb_v16 --vemb-v16-vrem 1:0 S:S item: | --command="VREM myset __key__" S item:
 #
 # 编译口径 (服务器一致):
 #   cd /root/gqs/codespace/redis-8.6.3 && \
@@ -51,8 +52,8 @@ DATA_DIR=${DATA_DIR:-/tmp/redis-loopback-sweep}
 # === OP_TYPE ===
 OP_TYPE=${OP_TYPE:-VEMB}
 case "$OP_TYPE" in
-    VEMB|VSIM|VADD|VREM) ;;
-    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
+    VEMB|VSIM|VSIM_2KEY|VADD|VREM) ;;
+    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VSIM_2KEY/VADD/VREM (got: $OP_TYPE)"; exit 2 ;;
 esac
 
 # === 测试参数 ===
@@ -110,19 +111,26 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ----------------------------------------------------------------------------
 # jiffies 采集 (按端口匹配, 避免 pkill 噪音)
+# 输出 "utime stime", 分别对应用户态和内核态 CPU jiffies
 snapshot_jiffies() {
-    local port=$1 total=0 j
+    local port=$1 ut=0 st=0
     for pid in $(pgrep -x redis-server); do
         if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
-            j=$(awk '{s+=$14+$15} END{print s+0}' /proc/$pid/task/*/stat 2>/dev/null)
-            total=$((total + ${j:-0}))
+            read ut_j st_j < <(awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null)
+            ut=$((ut + ${ut_j:-0}))
+            st=$((st + ${st_j:-0}))
         fi
     done
-    echo $total
+    echo "$ut $st"
 }
 
+# system-wide background CPU counters (/proc/stat, units=jiffies)
+snapshot_iowait() { awk '/^cpu /{print $6}' /proc/stat 2>/dev/null; }
+snapshot_si()     { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
+snapshot_hi()     { awk '/^cpu /{print $7}' /proc/stat 2>/dev/null; }
+
 # ----------------------------------------------------------------------------
-wait_port() {
+wait_port(){
     local port=$1 count=0
     while ! $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $port PING 2>/dev/null | grep -q PONG; do
         sleep 0.2
@@ -144,11 +152,17 @@ start_baseline() {
             --dir $DATA_DIR --logfile $DATA_DIR/baseline.log \
             --daemonize yes
     wait_port $PORT || { log "FAIL: baseline server"; exit 1; }
+    sleep 1  # let server fully stabilize before prefill
 }
 
 start_hpc() {
     log "启动 hpc-redis (pio=$HPC_PIO snw=$HPC_SNW)..."
     local max_vec=$((NUM_KEYS + 1000))
+    local tcp_args=""
+    if [ "${HPC_TCP_PORT:-0}" -gt 0 ]; then
+        tcp_args="--vemb-v16-tcp-port $HPC_TCP_PORT --vemb-v16-tcp-host 127.0.0.1"
+        log "  [hpc] TCP mode: VEMB on port $HPC_TCP_PORT (no sniff)"
+    fi
     taskset -c $HPC_SERVER_CPUSET \
         $HPC_DIR/src/redis-server \
             --port $PORT --bind 127.0.0.1 --protected-mode no \
@@ -161,10 +175,12 @@ start_hpc() {
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $MANIFEST \
             --vemb-v16-reset-warm-regions yes \
+            $tcp_args \
             --appendonly no --save '' \
             --dir $DATA_DIR --logfile $DATA_DIR/hpc.log \
             --daemonize yes
     wait_port $PORT || { log "FAIL: hpc server"; exit 1; }
+    sleep 1  # let server fully stabilize before prefill
 }
 
 stop_server() {
@@ -207,14 +223,15 @@ prefill() {
     $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT FLUSHDB >/dev/null 2>&1
 
     if [ "$server_type" = "hpc" ]; then
-        # hpc server: VEMB V16 协议单 conn 写入
-        #   所有 OP 统一 item: prefix, -n=NUM_KEYS
-        #   VSIM/VREM: item: prefix, -n=NUM_KEYS
+        # hpc server: VEMB V16 binary protocol prefill
+        # -n is per-thread with vemb_v16, use --test-time for reliable completion
         local nfill=$((kmax - kmin + 1))
-        # 写死 -t 8 -c 1 并发 (参考 hpc_redis_vrem_max_tput.sh:85)
+        local prefill_sec=$((nfill / 2000 + 10))
+        local hpc_mport=$PORT
+        [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-                -s 127.0.0.1 -p $PORT -t 8 -c 1 -n $nfill \
+                -s 127.0.0.1 -p $hpc_mport -t 8 -c 1 --test-time=$prefill_sec \
                 --ratio=1:0 --key-pattern=S:S --key-prefix=$prefix \
                 --key-minimum=$kmin --key-maximum=$kmax \
                 > "$RAWDIR/${server_type}_${OP_TYPE}_prefill.log" 2>&1
@@ -238,6 +255,10 @@ prefill() {
     else
         local vc=$( $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT VCARD myset 2>/dev/null)
         log "[$server_type] prefill 完成: myset VCARD=$vc"
+        if [ -z "$vc" ] || [ "$vc" -eq 0 ]; then
+            log "FATAL: [$server_type] prefill failed, myset VCARD=$vc"
+            exit 1
+        fi
     fi
 }
 
@@ -251,7 +272,10 @@ run_one_config() {
     local raw="$RAWDIR/${server_type}_${OP_TYPE}_t${t}_c${c}_p${p}.log"
     log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s"
 
-    local jb=$(snapshot_jiffies $PORT)
+    local jb_ut jb_st
+    read jb_ut jb_st < <(snapshot_jiffies $PORT)
+    local jb_iowait=$(snapshot_iowait) jb_si=$(snapshot_si) jb_hi=$(snapshot_hi)
+    local jb_sec=$(date +%s)
     if [ "$server_type" = "hpc" ]; then
         # hpc server: VEMB V16 二进制协议
         #   所有 OP 统一 item: key 范围
@@ -262,14 +286,17 @@ run_one_config() {
         case "$OP_TYPE" in
             VEMB) ;;
             VSIM) op_flag="--vemb-v16-vsim" ;;
+            VSIM_2KEY) op_flag="--vemb-v16-vsim-key-key" ;;
             VADD) ratio="--ratio=1:0"; kp="S:S" ;;
             VREM) op_flag="--vemb-v16-vrem"; ratio="--ratio=1:0"; kp="S:S" ;;
         esac
         # VSIM/VADD/VREM 高并发可能 hang, timeout 兜底 (TEST_TIME + 30s); VEMB 也统一走 timeout
         local hpc_timeout=$((TEST_TIME + 30))
+        local hpc_mport=$PORT
+        [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         timeout ${hpc_timeout}s numactl --membind=$NUMA_NODE_CLIENT taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM $op_flag \
-                -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$p \
+                -s 127.0.0.1 -p $hpc_mport -t $t -c $c --pipeline=$p \
                 $ratio --key-pattern=$kp \
                 --key-prefix=$prefix --key-minimum=$kmin --key-maximum=$kmax \
                 --test-time=$TEST_TIME --hide-histogram \
@@ -282,8 +309,9 @@ run_one_config() {
         #   VREM: VREM myset __key__          S       (单 myset 删除)
         local cmd kp
         case "$OP_TYPE" in
-            VEMB) cmd="VEMB myset ELE __key__ raw";                        kp="R" ;;
-            VSIM) cmd="VSIM myset ELE __key__";                              kp="R" ;;
+            VEMB) cmd="VEMB myset __key__ raw";                              kp="R" ;;
+            VSIM) cmd="VSIM myset VALUES $DIM $FIXED_VECTOR COUNT 1";        kp="R" ;;
+            VSIM_2KEY) cmd="VEMB myset __key__ raw";                         kp="R" ;;  # 1 VEMB/op, ×2 for 2-key compare
             VADD) cmd="VADD myset VALUES $DIM $FIXED_VECTOR __key__";        kp="S" ;;
             VREM) cmd="VREM myset __key__";                                  kp="S" ;;
         esac
@@ -296,8 +324,17 @@ run_one_config() {
                 --test-time=$TEST_TIME --hide-histogram --select-db=0 \
                 > "$raw" 2>&1 || true
     fi
-    local ja=$(snapshot_jiffies $PORT)
-    local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_ut ja_st
+    read ja_ut ja_st < <(snapshot_jiffies $PORT)
+    local ja_sec=$(date +%s)
+    local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
+    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", (du+ds)/100.0/s}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_iowait=$(snapshot_iowait) ja_si=$(snapshot_si) ja_hi=$(snapshot_hi)
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
 
     # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)
     local totals ops avg p50 p99 kb
@@ -309,10 +346,18 @@ run_one_config() {
             else            printf "0 NA NA NA NA"
         }'
     )
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
-    log "    => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
-    rm -f "$raw"  # TSV 已经记录, raw log 可删
+    # VSIM_2KEY baseline: 1 memtier op = 1× VEMB raw, need 2× for 2-key compare
+    # => TSV writes ÷2 so it's directly comparable to hpc VSIM_KEY_KEY (per-2-key ops/sec)
+    local ops_note=""
+    if [ "$OP_TYPE" = "VSIM_2KEY" ] && [ "$server_type" = "baseline" ]; then
+        ops_note=" (÷2, 2-key equiv)"
+        ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
+    fi
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
+        "$core_ut" "$core_st" "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores(ut=$core_ut st=$core_st) iowait=$c_iowait si=$c_si hi=$c_hi"
+    rm -f "$raw"
 }
 
 # ============================================================================
@@ -322,7 +367,7 @@ log "=== ${OP_TYPE} 本地回环 sweep (${NCONFIGS} 档 × ${SERVERS_ONLY} serve
 log "TEST_TIME=${TEST_TIME}s/档, DIM=$DIM, TCP 127.0.0.1:$PORT"
 log "DIM=$DIM NUM_KEYS=$NUM_KEYS"
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tcore_ut\tcore_st\tiowait\tsi\thi\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then

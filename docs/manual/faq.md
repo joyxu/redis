@@ -153,7 +153,6 @@ memtier 或 SDK 程序在高并发连接时大量报连接错误。
 
 - 服务端 `maxclients` 配置过低，超出上限的连接被拒绝。
 - 客户端 ephemeral port 耗尽（`TIME_WAIT` 堆积）。
-- `VEMB_V16_MAX_CHANNELS` 过小（见上一条 FAQ）。
 
 ### __结论、解决方案及效果__
 

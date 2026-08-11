@@ -781,6 +781,26 @@ bool vemb_v16_multi_client::retry_topology_response(
             return false;
         }
         request_flags = VEMB_V16_REQ_F_ASK_REDIRECT;
+    } else if (status == VEMB_V16_STATUS_MOVED) {
+        /* MOVED: redirect_owner is the new permanent owner for this vnode.
+         * Route directly without refreshing topology — the wire already
+         * carries target_owner, and cutover has started which means every
+         * key's baseline has been pushed to the target (DEST_COMMITTED
+         * on node1), so reads against the redirect owner will succeed.
+         *
+         * Skipping refresh_topology() avoids the thundering-herd of N
+         * memtier threads each opening a fresh TCP control connection
+         * to fetch topology. STALE_TOPOLOGY (next response if our
+         * cached epoch predates min_write_epoch) still refreshes. */
+        if (route_owner_to_backend(response->get_vemb_v16_redirect_owner(),
+                                   &backend_idx) != 0) {
+            /* redirect_owner not in owner map — fall back to refresh. */
+            refresh_topology();
+            if (route_key_to_backend(vr->m_key, &backend_idx) != 0) {
+                return false;
+            }
+        }
+        /* no ASK_REDIRECT flag — this is a permanent move */
     } else {
         refresh_topology();
         if (route_key_to_backend(vr->m_key, &backend_idx) != 0) {
@@ -922,7 +942,8 @@ int vemb_v16_multi_client::connect(void)
         if (!vemb_parse_endpoint(m_endpoint_ptrs[i], host, sizeof(host), &port))
             return -1;
 
-        shard_connection* sc = create_shard_connection(main_sc->get_protocol());
+        abstract_protocol *clone_p = main_sc->get_protocol()->clone();
+        shard_connection* sc = create_shard_connection(clone_p);
         if (!connect_shard_connection(sc, host, port)) {
             return -1;
         }

@@ -431,6 +431,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_dim,
         o_vemb_v16_handle,
         o_vemb_v16_vsim,
+        o_vemb_v16_vsim_key_key,
         o_vemb_v16_vrem,
         o_vemb_v16_endpoints,
         o_vemb_v16_client_topology,
@@ -518,6 +519,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-dim",               1, 0, o_vemb_v16_dim },
         { "vemb-v16-handle",            0, 0, o_vemb_v16_handle },
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
+        { "vemb-v16-vsim-key-key",      0, 0, o_vemb_v16_vsim_key_key },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
         { "vemb-v16-client-topology",   0, 0, o_vemb_v16_client_topology },
@@ -907,6 +909,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_vsim:
                     cfg->vemb_v16_vsim = true;
                     break;
+                case o_vemb_v16_vsim_key_key:
+                    cfg->vemb_v16_vsim_key_key = true;
+                    break;
                 case o_vemb_v16_vrem:
                     cfg->vemb_v16_vrem = true;
                     break;
@@ -1127,6 +1132,7 @@ void usage() {
             "      --vemb-v16-dim=DIM         Vector dimension for vemb_v16 protocol (default: 0)\n"
             "      --vemb-v16-handle          Read vectors via warm-region handles instead of inline payloads\n"
             "      --vemb-v16-vsim            Use VSIM_INLINE instead of VEMB_HANDLE for vemb_v16 reads\n"
+            "      --vemb-v16-vsim-key-key    Use VSIM_KEY_KEY (2-key cosine similarity) for vemb_v16 reads\n"
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
             "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
@@ -1170,6 +1176,11 @@ struct cg_thread {
             if (m_config->vemb_v16_dim > 0) vp->set_dim(m_config->vemb_v16_dim);
             if (m_config->vemb_v16_handle) vp->set_handle_mode(true);
             if (m_config->vemb_v16_vsim) vp->set_vsim_mode(true);
+            if (m_config->vemb_v16_vsim_key_key) {
+                vp->set_vsim_key_key_mode(true);
+                vp->set_vsim_key_key_range(m_config->key_minimum,
+                                           m_config->key_maximum);
+            }
             if (m_config->vemb_v16_vrem) vp->set_vrem_mode(true);
         }
 

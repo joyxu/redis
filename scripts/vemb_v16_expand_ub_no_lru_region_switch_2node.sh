@@ -5,8 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_SCRIPT="${BASE_SCRIPT:-${SCRIPT_DIR}/vemb_v16_expand_ub_memory_2node.sh}"
 
-NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
-NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
+NODE0_HOST="${NODE0_HOST:-192.168.1.111}"
+NODE1_HOST="${NODE1_HOST:-192.168.1.112}"
 SSH_USER="${SSH_USER:-root}"
 
 export NODE0_HOST

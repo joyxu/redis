@@ -1,0 +1,30 @@
+expected_local_owner_id: 0
+attach_now: true
+ub_rpc_timeout_ms: 2000
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev5
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+remote_meta_views:
+  - owner_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev5
+    mmap_offset: 268435456
+    entries: 16384
+    buckets: 32768
+ub_rpc_peers:
+  - owner_id: 1
+    provider: ub
+    request_path: /dev/obmm_shmdev2
+    request_mmap_offset: 8388608
+    response_path: /dev/obmm_shmdev6
+    response_mmap_offset: 16777216
+    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_mmap_offset: 8388608
+    outbound_response_path: /dev/obmm_shmdev4
+    outbound_response_mmap_offset: 16777216

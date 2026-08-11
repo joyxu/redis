@@ -1,0 +1,17 @@
+local_ub_node_id: 0
+local_region_weight: 4
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev1
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 16384
+remote_meta_buckets: 32768
+ub_rpc_timeout_ms: 2000
+warm_regions:
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev1
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1

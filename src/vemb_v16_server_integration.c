@@ -119,42 +119,52 @@ int vemb_v16_server_integration_init(void) {
         }
     }
 
-    /* Transport selection.  Default is "sniff" — UDS listener for direct
-     * VEMB V16 SHM clients + Redis-port sniff (fd inject) for VEMB frames
-     * arriving on port 6379.  "aeron" enables only the UDS listener for a
-     * pure SHM/Aeron datapath (no sniff on Redis ports). */
-    const char *vemb_transport =
-        (server.vemb_v16_transport && server.vemb_v16_transport[0])
-            ? server.vemb_v16_transport : "sniff";
-
-    /* Enable Aeron/UDS listener so direct VEMB V16 clients can connect to
-     * /tmp/vemb_v16.sock.  In sniff mode this coexists with inject — the
-     * proxy main loop drains both the UDS accept queue and the inject pipe
-     * each iteration. */
-    if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
-        serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
-        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
-        server.vemb_v16_proxy = NULL;
-        return -1;
-    }
-    serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
-
-    /* Enable inject pipe so Redis accept path can hand off VEMB connections.
-     * Sniff rides the Redis accept loop on every listening fd (port, TLS,
-     * bind) and steals fds whose first bytes match the VEMB magic.  Skipped
-     * in pure "aeron" mode where clients must connect to the UDS socket
-     * directly. */
-    if (strcmp(vemb_transport, "aeron") != 0) {
-        if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
-            serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
+    /* Transport selection.
+     *   --vemb-v16-tcp-port N  → pure-TCP datapath on port N (no sniff/UDS)
+     *   "sniff" (default)      → UDS + Redis-port sniff (fd inject)
+     *   "aeron"                → UDS only for SHM/Aeron datapath */
+    if (server.vemb_v16_tcp_port > 0) {
+        const char *tcp_host = server.vemb_v16_tcp_host && server.vemb_v16_tcp_host[0]
+            ? server.vemb_v16_tcp_host : "0.0.0.0";
+        if (vemb_v16_proxy_enable_tcp(server.vemb_v16_proxy,
+                                      tcp_host,
+                                      (uint16_t)server.vemb_v16_tcp_port) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_proxy_enable_tcp failed: %s:%d",
+                      tcp_host, server.vemb_v16_tcp_port);
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
             server.vemb_v16_proxy = NULL;
             return -1;
         }
-        serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
-                  vemb_transport);
+        /* TCP mode is mutually exclusive with UDS+sniff — the proxy assert
+         * enforces uds_enabled != tcp_enabled. */
     } else {
-        serverLog(LL_NOTICE, "VEMB V16 transport=aeron: TCP sniff accepts control frames; data clients use UDS/UB rings");
+        const char *vemb_transport =
+            (server.vemb_v16_transport && server.vemb_v16_transport[0])
+                ? server.vemb_v16_transport : "sniff";
+
+        /* Enable UDS listener so direct VEMB V16 clients can connect. */
+        if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
+            vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+            server.vemb_v16_proxy = NULL;
+            return -1;
+        }
+        serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
+
+        /* Enable inject pipe for Redis-port sniff (fd steal).  Skipped in
+         * pure "aeron" mode. */
+        if (strcmp(vemb_transport, "aeron") != 0) {
+            if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
+                serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
+                vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+                server.vemb_v16_proxy = NULL;
+                return -1;
+            }
+            serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
+                      vemb_transport);
+        } else {
+            serverLog(LL_NOTICE, "VEMB V16 transport=aeron: TCP sniff accepts control frames; data clients use UDS/UB rings");
+        }
     }
 
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,

@@ -53,14 +53,14 @@
 MEMTIER=/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark
 
 # 预填充（写入 100000 个向量）
-numactl -N 1 taskset -c 96-191 $MEMTIER \
+taskset -c 96-191 $MEMTIER \
     --protocol vemb_v16 --vemb-v16-dim 300 \
     -s 127.0.0.1 -p 6379 -t 1 -c 1 -n 100000 \
     --ratio=1:0 --key-pattern=S:S --key-prefix=item: \
     --key-minimum=1 --key-maximum=100000
 
 # 读吞吐测试（VEMB_INLINE，随机 key，64 线程 × 4 连接，pipeline 32，30 秒）
-numactl -N 1 taskset -c 96-191 $MEMTIER \
+taskset -c 96-191 $MEMTIER \
     --protocol vemb_v16 --vemb-v16-dim 300 \
     -s 127.0.0.1 -p 6379 -t 64 -c 4 --pipeline=32 --test-time=30 \
     --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
@@ -90,7 +90,7 @@ MANIFEST=$HPC/examples/vemb_v16_warm_regions_111.yaml
 DIM=300; NUM_KEYS=100000; KEY_PREFIX="item:"
 
 # 1. 启动 redis-server（pio=32 snw=64 甜点配比）
-numactl -N 0 -l taskset -c 0-95 $HPC/src/redis-server \
+taskset -c 0-95 $HPC/src/redis-server \
   --port 6379 --bind 0.0.0.0 --protected-mode no \
   --vemb-v16-enabled yes --vemb-v16-dim $DIM --vemb-v16-max-vectors 131072 \
   --vemb-v16-warm-regions-manifest "$MANIFEST" \
@@ -102,13 +102,13 @@ numactl -N 0 -l taskset -c 0-95 $HPC/src/redis-server \
 for i in $(seq 1 50); do ss -tln | grep -q ':6379 ' && break; sleep 0.2; done
 
 # 3. 预填充
-numactl -N 1 taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
   -s 127.0.0.1 -p 6379 -t 1 -c 1 -n $NUM_KEYS \
   --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
   --key-minimum=1 --key-maximum=$NUM_KEYS
 
 # 4. 读吞吐测试（30 秒）
-numactl -N 1 taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
   -s 127.0.0.1 -p 6379 -t 64 -c 4 --pipeline=32 --test-time=30 \
   --ratio=0:1 --key-pattern=R:R --key-prefix=$KEY_PREFIX \
   --key-minimum=1 --key-maximum=$NUM_KEYS
@@ -119,13 +119,13 @@ $HPC/output/src/redis-cli -p 6379 SHUTDOWN NOSAVE
 
 ## 跨节点多 SuperNode 部署
 
-适用于 HW01 + HW02 双节点场景。每节点各起一个 `redis-server`，客户端通过 `memtier_benchmark --vemb-v16-endpoints` 同时连接两个端点，按 key 一致性哈希自动分流。
+适用于双节点场景。每节点各起一个 `redis-server`，客户端通过 `memtier_benchmark --vemb-v16-endpoints` 同时连接两个端点，按 key 一致性哈希自动分流。
 
 ### 启动双节点服务
 
 ```bash
-# HW01（192.168.90.111）
-ssh HW01 'numactl -N 0 -l taskset -c 0-95 \
+# server 1
+taskset -c 0-95 \
     /root/gqs/codespace/UnifiedBus/hpc-redis/src/redis-server \
     --port 6379 --bind 0.0.0.0 --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim 300 --vemb-v16-max-vectors 131072 \
@@ -133,10 +133,10 @@ ssh HW01 'numactl -N 0 -l taskset -c 0-95 \
         /root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111.yaml \
     --vemb-v16-reset-warm-regions yes \
     --vemb-v16-proxy-io-threads 32 --vemb-v16-supernode-workers 64 \
-    --daemonize yes --loglevel notice'
+    --daemonize yes --loglevel notice
 
-# HW02（192.168.90.112）使用 112.yaml manifest
-ssh HW01 'ssh root@192.168.90.112 "numactl -N 0 -l taskset -c 0-95 \
+# server 2
+taskset -c 0-95 \
     /root/gqs/codespace/UnifiedBus/hpc-redis/src/redis-server \
     --port 6379 --bind 0.0.0.0 --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim 300 --vemb-v16-max-vectors 131072 \
@@ -144,7 +144,7 @@ ssh HW01 'ssh root@192.168.90.112 "numactl -N 0 -l taskset -c 0-95 \
         /root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_112.yaml \
     --vemb-v16-reset-warm-regions yes \
     --vemb-v16-proxy-io-threads 32 --vemb-v16-supernode-workers 64 \
-    --daemonize yes --loglevel notice"'
+    --daemonize yes --loglevel notice
 ```
 
 ### 跨节点压测（memtier_benchmark）
@@ -156,7 +156,7 @@ ssh HW01 'ssh root@192.168.90.112 "numactl -N 0 -l taskset -c 0-95 \
 MEMTIER=/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark
 
 # 1) 预填充：每节点 prefill 自己负责的那一半 key（memtier 按 key 哈希分流写入）
-numactl -N 0 taskset -c 0-95 $MEMTIER \
+taskset -c 0-95 $MEMTIER \
     --protocol vemb_v16 --vemb-v16-dim 300 \
     --vemb-v16-endpoints=192.168.90.111:6379,192.168.90.112:6379 \
     -t 64 -c 4 --pipeline=32 -n 100000 \
@@ -164,7 +164,7 @@ numactl -N 0 taskset -c 0-95 $MEMTIER \
     --key-minimum=1 --key-maximum=100000
 
 # 2) 读吞吐测试（key 哈希分流到对应节点）
-numactl -N 0 taskset -c 0-95 $MEMTIER \
+taskset -c 0-95 $MEMTIER \
     --protocol vemb_v16 --vemb-v16-dim 300 \
     --vemb-v16-endpoints=192.168.90.111:6379,192.168.90.112:6379 \
     -t 64 -c 4 --pipeline=32 --test-time=60 \
@@ -197,8 +197,8 @@ VEMB V16 的吞吐主要受两个线程池影响：
 
 | 角色 | 推荐配置 |
 | --- | --- |
-| server | `numactl -N 0 -l taskset -c 0-95`（NUMA 0，核心 0-95） |
-| client（memtier / SDK 程序） | `numactl -N 1 taskset -c 96-191`（NUMA 1，核心 96-191） |
+| server | `taskset -c 0-95`（NUMA 0，核心 0-95） |
+| client（memtier / SDK 程序） | `taskset -c 96-191`（NUMA 1，核心 96-191） |
 
 未绑核的压测数据不具备可比性，请在测试报告中显式声明绑核配置。
 
