@@ -95,7 +95,10 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "$ALL_CODE" -eq 1 ]; then
-    git ls-files -co --exclude-standard >"$candidate_file"
+    {
+        git ls-files
+        git ls-files -o --exclude-standard
+    } | sort -u >"$candidate_file"
 else
     {
         git diff --name-only HEAD

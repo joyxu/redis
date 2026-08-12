@@ -72,7 +72,7 @@ Important parameters:
 | `MAX_FOREIGN_CPU_PCT` | `10` | Fail before startup if any existing process consumes more CPU than this percentage in a 1-second `pidstat` sample. |
 | `MAX_FOREIGN_TOTAL_CPU_PCT` | `20` | Fail before startup if all existing processes together exceed this CPU percentage. |
 | `MAX_FOREIGN_RSS_MB` | `256` | Fail before startup if an existing process RSS exceeds this MiB limit. |
-| `KILL_OPENCODE` | `0` | Set `1` to SIGKILL processes whose comm is exactly `opencode` before the load gate. |
+| `KILL_OPENCODE` | `1` | Set `0` to preserve the `opencode` tmux session and exact-name `opencode` processes before the load gate. |
 | `RUN_ID`, `LOCAL_ROOT` | timestamp | Artifact name and local output directory. |
 
 The CPU/RSS gate is mandatory on both 111 and 112 before the server, prefill,
@@ -81,9 +81,10 @@ command; clear the unrelated workload rather than bypassing the gate. Its raw
 `pidstat` and blocker files are retained in the successful server/client
 archives.
 
-Use `KILL_OPENCODE=1` only when those exact-name processes are known to be
-unrelated to the run. The runner sends `SIGKILL`, waits for their removal, and
-then evaluates the normal CPU/RSS gate.
+By default the runner stops the `opencode` tmux session before removing any
+residual exact-name process. It also removes each `mutagen-agent` direct parent
+before removing the agent, preventing its immediate respawn. Set
+`KILL_OPENCODE=0` or `KILL_MUTAGEN=0` only to retain the respective workload.
 
 Each SVG title carries the compact run label: key count and distribution,
 dimension, `PIO`/`SNW`, threads/clients, pipeline, batch size, batch delay,

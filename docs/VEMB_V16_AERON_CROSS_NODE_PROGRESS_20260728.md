@@ -2,6 +2,27 @@
 
 更新时间：2026-07-28
 
+## 0. 提交定位索引
+
+下表中的“代码/实验基线”是对应设计或测试运行时最近可定位的源码提交；“文档提交”是该段内容写入本文的提交。章节中若明确写有“工作区未提交”，说明测试还包含该提交之后的本地改动，不能仅凭基线 hash 复现，必须同时保留当时的工作区 diff 和结果目录。
+
+**后续测试记录规范：** 所有新增的机器测试结果表，无论是性能、正确性、火焰图还是 UT，均须逐行包含
+`测试代码提交` 和 `工作区状态` 两列。`测试代码提交` 填写运行时的 commit hash；存在未提交改动时，
+`工作区状态` 必须填写 `基线 <hash> + 未提交 diff`，并在结果目录归档对应 diff。即使整张表使用同一个提交，
+也不得仅在标题或上级章节中间接说明。
+
+| 内容范围 | 代码/实验基线 | 文档提交 | 定位说明 |
+|---|---|---|---|
+| 第 1--12 节：跨机基线、架构、batch/SVE 与 Redis target 复测 | `a84d4ffcf89173421c67a783a26df27a1514b6fb` | `a84d4ffcf89173421c67a783a26df27a1514b6fb` | Aeron/UB 跨机基线及 batch/SVE 实现。 |
+| 第 13--15 节：compact frame、双 UB path、warm path 反向对照与 cycles 火焰图 | `c6ea39c19dfe5650ba812776b64123ef7feee751` | `9639bfe16f84aaf1da4812e8760de1b62cdea938` | 代码基线为 compact frame/双 path；测试与分析记录在 futex 提交中写入。 |
+| 第 16--19 节：轮询/唤醒设计、ring metadata 设计及 batch/perf 对照 | `c6ea39c19dfe5650ba812776b64123ef7feee751` + `9639bfe16f84aaf1da4812e8760de1b62cdea938` | `9639bfe16f84aaf1da4812e8760de1b62cdea938` | 第 17 节的收益表是设计估算；第 18--19 节为同一代码演进链上的实测。 |
+| 第 20--21.3 节：CLI/Proxy 两级缓存、单帧 batch_request 设计及最小闭环 | `6249f284be128f87a74b98c1ebed69a4fa302c16` | `6249f284be128f87a74b98c1ebed69a4fa302c16` | v2 batch 数据面设计、ATTACH 修复和最小闭环。 |
+| 第 21.3.4--21.14 节：CLI L0/shared-L0 checkpoint 及跨机 baseline 数据 | `6249f284be128f87a74b98c1ebed69a4fa302c16` | `6249f284be128f87a74b98c1ebed69a4fa302c16` | 各完成记录已标注“工作区未提交”；该 hash 是最近提交的源码基线，不是这些实验的完整源码快照。 |
+| 第 21.15--21.18 节：火焰图 runner、load gate、ready bitmap 实验及 lane snapshot | `b98ffaec9ce04fd441ce6e4b5623e0cdde29d4b8` | `b98ffaec9ce04fd441ce6e4b5623e0cdde29d4b8` | lane snapshot 优化已提交；ready bitmap 等实验仍按正文标注的工作区状态定位。 |
+| 第 21.19--21.20 节：response frame 可见性复现、cacheline 隔离尝试及 L1 规划 | `b98ffaec9ce04fd441ce6e4b5623e0cdde29d4b8`（基线） | 工作区未提交 | 本节当前新增内容及对应实验代码尚未形成 commit；复现必须结合当前工作区 diff、实验目录和该基线。 |
+
+短 hash 可直接用于 `git show`；表中的完整 hash 用于避免后续对象缩写碰撞。结果目录中的原始日志、perf 数据和 manifest 是测试数据本身的补充定位信息。
+
 ## 1. 文档目的
 
 本文记录当前 Aeron/UB 数据面的实现状态、最近一次有效跨机测试、已确认的问题和下一阶段的演进方向，作为后续继续开发和回归测试的基线。
@@ -126,6 +147,8 @@ proxy 与 SuperNode 的 worker 数可以分别配置。1:1 配置可以让 queue
 本轮工作树还包含 `scripts/run_host_mt_server_flamegraph.sh` 等测试辅助脚本，提交前需要将功能改动与实验产物分开审查。
 
 ## 5. 最近一次有效跨机测试
+
+测试代码提交：`a84d4ff`。
 
 ### 5.1 测试配置
 编译的时 redis-server，不是 vemb_server
@@ -317,6 +340,8 @@ bash run_aeron_best.sh
 
 ## 11. 2026-07-29 batch/SVE 实现
 
+构建验证代码提交：`a84d4ff`。
+
 针对上述瓶颈和 ring 轮询开销，已将 Aeron UB path 的 request/response 热路径改为 batch：
 
 - server request ingress 使用 `poll_batch`，先复制到本地 request batch，再交给 proxy；server response batch 保持一次发布；
@@ -326,6 +351,8 @@ bash run_aeron_best.sh
 编译说明：跨机 memtier Aeron CLI 不需要手工设置 `USE_SVE=yes`。`clients/c/Makefile` 在 `aarch64` 上默认加入 `-DUSE_ARM_SVE -march=armv8.2-a+sve`；`USE_SVE=yes` 仍适用于 server 的 `src` target 或 standalone SVE benchmark/UT。已验证 `make -C clients/c static install-headers`、`make -C memtier_benchmark` 和 `make -C src vemb_v16_server` 通过。
 
 ## 12. 2026-07-29 Redis target batch/SVE 复测
+
+测试代码提交：`a84d4ff`。
 
 本轮按 Redis 正式 target 编译和启动，未使用独立的 `vemb_v16_server`：
 
@@ -358,6 +385,8 @@ p99:  1.271 ms
 （`bytes: 4294967296`），供下一轮启动使用。上面的 `6.646851M QPS` 仍对应调整前的 1G 测试。
 
 ## 13. 2026-07-29 compact frame / 双 UB path 复测
+
+测试代码提交：`c6ea39c`。
 
 为进一步降低 CLI 与 proxy 之间的跨机数据量，本轮将 Aeron ring 中的 request/response
 从内部完整结构改为按 op/status 编码的 compact frame：GET request 只携带 key 和必要
@@ -411,6 +440,8 @@ protocol error。
 
 ## 14. 2026-07-29 warm path 反向对照：server 8 -> client 4
 
+测试代码提交：`c6ea39c`；关联的 UB view flags 修正提交见正文。
+
 按设备拓扑做反向 warm-region 对照：server manifest 使用
 `/dev/obmm_shmdev8`，CLI 显式设置
 `VEMB_V16_AERON_CLIENT_WARM_UB_PATH=/dev/obmm_shmdev4`；request/response ring
@@ -447,6 +478,8 @@ p99:  1.51100 ms
 warm-region handle 解引用和 1200B vector copy，而不是 ATTACH 或 ring 丢包。
 
 ## 15. 2026-07-29 c6 模式 cycles 火焰图
+
+测试代码提交：`c6ea39c`。
 
 恢复到 c6 模式后，以 `TS=64`、`CS=4`、`PIPELINE=32`、`NUM_KEYS=100000`、
 `DIM=300`、`MAX_VECTORS=131072`、`TEST_TIME=60` 重跑。最终结果为：
@@ -723,6 +756,8 @@ idle、batch 和 item counters 可先用于确认 proxy CPU 是否下降。
 
 ## 18. 2026-07-29 跨机 batch/perf 复测
 
+测试代码提交：`c6ea39c` + `9639bfe`。
+
 ### 18.1 配置与同步校验
 
 本轮使用 `RUN_ID=20260729_effect_flame5`，server 为 `192.168.90.111`，client
@@ -819,6 +854,8 @@ wait 降低了空转。
    已经解决的 cursor/publish 成本误判为主瓶颈。
 
 ## 19. 2026-07-29 第 17 节优化复测结论
+
+测试代码提交：`c6ea39c` + `9639bfe`。
 
 本轮重新同步到两端正确目录：server 源码位于 `src/`，SDK 位于 `clients/c/`，并在
 111 上使用 `redis-server` target 编译。server manifest 更新为 4 GiB
@@ -1255,6 +1292,8 @@ maintenance 当作 OBMM 跨机 ATTACH 的正确性条件。
 
 #### 21.3.2 跨机 ATTACH non-zero-offset 缺陷（2026-08-03）
 
+测试代码提交：`6249f28`。
+
 复现条件是 111 server 使用 CC UB view（`/dev/obmm_shmdev3` request、
 `/dev/obmm_shmdev2` response），112 client 使用对应 NC view（`/dev/obmm_shmdev7`、
 `/dev/obmm_shmdev6`），连续创建 channel。第一条通常位于 offset 0；第二条 v1 曾出现 request
@@ -1274,6 +1313,8 @@ response，跨机可见性继续由 UB 的 CC/NC mapping 保证。
 `3 -> 7` 和 `2 -> 6` 的 CC writer / NC reader 基础可见性。
 
 #### 21.3.3 v2 batch 数据面最小闭环（2026-08-03）
+
+测试代码提交：`6249f28`。
 
 v2 descriptor/arena 现已接入数据面。client 将一个只含 `VEMB_HANDLE` key 的 request frame
 写入 request arena，再向 descriptor ring 发布 `(start, bytes, item_count)`；proxy 从 descriptor
@@ -1573,6 +1614,8 @@ key 强行合并。follower 数也需要硬上限；达到上限时新的调用�
 
 #### 21.3.6 CLI L0 batch session 实现状态（2026-08-04）
 
+测试代码基线：`6249f28`；本节的后续实现和测试包含工作区未提交变更。
+
 第 4 阶段首版已实现为 `clients/c` 的 C API，而非 `memtier_benchmark` 私有逻辑。公开的
 `vemb_v16_aeron_batch_client_t` 在 remote open 时创建一个永久 v1 fallback channel 和一个必需的
 v2 batch channel；v2 ATTACH、四段 UB 资源映射或 L0 初始化失败时 session open 直接失败，不会创建
@@ -1780,6 +1823,8 @@ dereference 执行；它不能替代或与 `--vemb-v16-vrem` 混用，后者会�
 标记完成，必须先通过本节定义的 UT 和跨机验收。除非另有明确要求，整个过程不自动提交代码。
 
 #### CP-0 `[x]` 修正 batch benchmark 的冗余 channel
+
+测试代码基线：`6249f28`；验收结果包含工作区未提交变更。
 
 **目的：** 当前 memtier 在 batch session 建立前先创建 `all_channels`，随后每个 batch session
 又创建自己的 v1+v2 channel。因此 batch benchmark 暂时为每个 logical client 分配三个 server
@@ -2294,6 +2339,8 @@ vemb_v16_cli_deadline_ut vemb_v16_aeron_runner_plan_ut`、三个 UT、`make -C c
 
 ### 21.6 UB 全双工 CC/NC 方向修正 checkpoint（2026-08-05，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 此前文档中把 server `/dev2` 与 client `/dev6` 的旧单向实验关系沿用到 batch
 response，和真实双机拓扑不一致。统一规则是每个节点的 `1-4` 均为本节点 local CC
 region，`5-8` 均为对端 `1-4` 的 imported NC view。因此当前 112 client 到 111
@@ -2359,6 +2406,8 @@ exhaustion counters，并将 capacity failure 改为 bounded fallback 或明确 
 
 ### 21.7 local-v2 基线恢复与热日志根因 checkpoint（2026-08-05，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 在正确的全双工 UB 方向下，首次 local-v2 30 秒样本只有 `3.832M QPS`，而相同 v1
 样本仍有 `11.543M QPS`；因此不能将问题归因为 shared-L0。定位发现
 `proxy_io_aeron_poll_thread_main()` 在每次发现 request ring 非空时调用
@@ -2413,6 +2462,8 @@ session”；worker-local L0、deadline-aware flush 和 shared-vector read 均�
 
 ### 21.8 v2 baseline fallback 筛选（2026-08-05，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 在 112 -> 111 的正确 CC/NC UB 方向、fresh 6395 server、顺序预填充 10k key、真实
 `VEMB_HANDLE` 读取、`batch=32,max-delay=0,pipeline=32,test-time=30s` 下，v2 worker-local
 L0 的当前最高吞吐样本为 `t=64,c=4`：`22.973M QPS`、P99 `0.383ms`。请求/响应 channel 和
@@ -2438,6 +2489,8 @@ mismatch 与 stale-epoch 的原因计数及 channel/batch id，再用该计数�
 修复前不再做更多参数扫描。
 
 ### 21.9 v2 reused-arena payload 可见性修复与零 fallback 验收（2026-08-05，工作区未提交）
+
+测试代码基线：`6249f28` + 工作区未提交变更。
 
 21.8 的 fallback 不是 batch session 数、`BATCH_REQUEST_SIZE`、pipeline 或普通 request
 ring/arena 满导致。单 worker 的 10 秒样本表明 v2 可先持续工作，再因一次 response poll
@@ -2489,6 +2542,8 @@ shutdown 等待 pid/port 释放的竞态；现有总控脚本仍偶发在 prefil
 
 ### 21.10 跨机联调可复现流程与 build-stamp gate（2026-08-05，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 本轮跨机 v2 联调反复遇到的问题已归纳为四类，后续性能数据必须同时通过以下 gate，不能只以
 `Totals` QPS 判断成功。
 
@@ -2535,6 +2590,8 @@ retry 仅能证明正常 UB 传播延迟不触发 v1 fallback，不能证明损�
 
 ### 21.11 O3/LTO/SVE 跨机 v2 baseline（2026-08-05，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 111 server 与 112 SDK/memtier 均通过新的 build-stamp 策略强制重建：server 使用
 `-O3 -flto -fno-omit-frame-pointer` 和 `USE_SVE=yes`；SDK 与 memtier 的 C/C++ 编译及链接
 使用 `-O3 -flto -DUSE_ARM_SVE -march=armv8.2-a+sve`。111 的 LTO link 成功完成（49 个 LTRANS
@@ -2555,6 +2612,8 @@ LTO；后续性能结论应继续以 fresh-server 单轮有效样本为最小单
 补受控重复。
 
 ### 21.12 Zipf key generator 修复与 local-L0 聚合验证（2026-08-05，工作区未提交）
+
+测试代码基线：`6249f28` + 工作区未提交变更。
 
 原 `zipfian_distribution()` 使用 `pow(u, 1/s)` 再取模。它不是 Zipf inverse-CDF：尤其在
 `s=1` 时退化为 uniform，取模还会破坏尾部概率。因此此前标为 Zipf 的样本不能用于判断
@@ -2631,6 +2690,8 @@ worker-local L0 的聚合收益。
 
 ### 21.13 100k uniform 与 Zipf s=1.0 边界样本（2026-08-06）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 为量化 worker-local L0 对热点强度的敏感性，在相同 O3/LTO/SVE 构建、UB 双向路径、fresh 6395、
 顺序 v1 VADD 预填充、真实 `VEMB_HANDLE` 和
 `t=64,c=4,pipeline=32,BATCH_REQUEST_SIZE=32,max-delay-us=0,test-time=30s` 下，补充 100k
@@ -2656,6 +2717,8 @@ local-L0 只在同一 worker 的当前聚合窗口内合并相同 key，因此�
 
 ### 21.14 ring 优化快照的 100k uniform 回归（2026-08-06，工作区未提交）
 
+测试代码基线：`6249f28` + 工作区未提交变更。
+
 当前 ring 优化快照重新同步到 111/112 后，两端均以 O3/LTO/SVE 强制重建并通过 build stamp。
 构建过程发现并修复两项 build gate 问题：ring UT 不应继续调用已内联删除的 slot-stride helper，
 改为直接断言当前 `RING_SLOT_META_BYTES + slot_size` 的 cacheline 对齐；build-stamp 强制覆盖
@@ -2680,6 +2743,8 @@ fallback、非 OK completion 或 handle failure。这是正常 UB 可见性重�
 ring 优化没有带来可辨识的 100k uniform 吞吐提升，不能据此宣称性能收益。
 
 ### 21.15 100k uniform 用户态+内核态火焰图（2026-08-07，工作区未提交）
+
+测试代码基线：`b98ffae` + 工作区未提交变更。
 
 基于 21.14 的 current v2 local-L0 基线，在 fresh 111 server 上重新执行一次 100k uniform
 跨机读取，并在两台机器各自生成火焰图。两端均先通过 O3/LTO/SVE build stamp 验证；111 为
@@ -2746,6 +2811,8 @@ vector read failure、NOT_FOUND、server error、handle dereference failure 和 
 实例已经停止，端口和测试 UB 设备无残留 holder。
 
 ### 21.16 跨节点火焰图 runner（2026-08-07）
+
+测试代码提交：`b98ffae`。
 
 `scripts/run_aeron_cross_node_flamegraph.sh` 固化了本节的 fresh-server 跨节点流程：两端 build
 stamp 门禁、UB/port preflight、111 server 启动、112 顺序 v1 VADD prefill、真实 v2
@@ -2838,6 +2905,8 @@ failure 与 server handle miss 均为 0；25 秒 server all-TID `perf` 与 clien
 
 ### 21.17 v2 request ready bitmap 落地（2026-08-07，工作区未提交）
 
+测试代码基线：`b98ffae` + 工作区未提交变更。
+
 针对 14:14、16:16、18:18 的 CPU/QPS 对照，v2 batch channel 已加入 request/completion 共用的
 ready bitmap：client 在 descriptor 发布后置 bit，PIO 以 acquire exchange 取走 bit 并只 poll 对应
 channel；SuperNode completion 发布后也置相同 bit，避免最后一个 request 的 response 停留在 completion
@@ -2860,18 +2929,272 @@ shared-word 原子 RMW，并通过同参数 A/B 后再更新默认策略。
 
 ### 21.18 Aeron lane snapshot 热路径优化（2026-08-07）
 
+测试代码提交：`b98ffae`。
+
 检查发现现有双缓冲 snapshot 已在控制面按 `channel_index % PIO` 分配到对应 worker 的独立列表，因而
 PIO 热循环中再次执行同一个 modulo 过滤是重复工作。代码撤回 ready bitmap 后，删除该重复判断，保留
 snapshot 内部的 channel-index 边界检查；v1 channel（包括 VADD/VSIM）和 v2 channel 的扫描语义不变。
 
-在两台机器同步并重建后，使用相同的 100k uniform workload（`t=64,c=4,pipeline=32,batch=32`、
-30 秒、`PIO=16,SNW=16`）进行两轮 fresh-server 测试：
+在两台机器同步并重建后，使用相同的 100k workload（`t=64,c=4,pipeline=32,batch=32`、30 秒、
+`PIO=16,SNW=16`）进行 uniform 和 Zipf fresh-server 测试。uniform 两轮中按 QPS 选取较好的一组，
+与两个 Zipf 场景放在同一张表中：
 
-| run | QPS | P99 | server process cores | artifacts |
-|---|---:|---:|---:|---|
-| `aeron_cross_20260807_171001` | 13.8276M | 0.655ms | 14.633 | [perf](../perf/aeron_cross_20260807_171001/) |
-| `aeron_cross_20260807_171750` | 13.8161M | 0.655ms | 14.614 | [perf](../perf/aeron_cross_20260807_171750/) |
+| distribution | run | QPS | P99 | server process cores | artifacts |
+|---|---|---:|---:|---:|---|
+| Uniform `R:R` | `aeron_cross_20260807_171001` | 13.8276M | 0.655ms | 14.633 | [perf](../perf/aeron_cross_20260807_171001/) |
+| Zipf `s=1.2` | `aeron_lane_snapshot_p16_s16_zipf12_frame_retry_r2_20260810_095505` | 18.474646M | 0.487ms | 13.176 | [perf](../perf/aeron_lane_snapshot_p16_s16_zipf12_frame_retry_r2_20260810_095505/) |
+| Zipf `s=1.5` | `aeron_lane_snapshot_p16_s16_zipf15_frame_retry_20260810_095815` | 23.252459M | 0.383ms | 12.314 | [perf](../perf/aeron_lane_snapshot_p16_s16_zipf15_frame_retry_20260810_095815/) |
 
 两轮均为 64 worker join，publish、fallback、backpressure、non-OK response 和 handle dereference failure
 均为 0。两轮均值为 `13.8219M QPS / 14.623 cores`，相对旧 `16:16` 结果
 （`13.723M / 14.864 cores`）约提升 `0.7%` QPS、降低 `1.6%` server cores；收益较小，但没有吞吐回退。
+
+三组均为 `100K, PIO=16, SNW=16, t=64, c=4, pipeline=32, batch=32, 30s`；Zipf 两轮完成 v2 response
+arena 临时可见性重试后，均为 64 worker join，最终 `fallback_v1`、publish failure、backpressure、
+stale/non-OK/unmatched response、vector read failure 和 handle dereference failure 均为 0。response retry
+warning 仅表示 client 读到尚未完整可见的 response arena 并重试 descriptor，最终不会消费该帧的部分内容；
+其不计入数据面失败。
+
+### 21.19 batch response body 可见性根因与完整 frame 提交（2026-08-10，工作区未提交）
+
+测试代码基线：`b98ffae` + 工作区未提交变更。
+
+**当前 SSH 入口：** 本文仍按逻辑角色称为 `111`（server）和 `112`（client），分别直接登录
+`ssh -p 22 root@192.168.90.111` 与 `ssh -p 22 root@192.168.90.112`。这些地址用于 VEMB TCP
+服务端点时，仍按具体服务端口区分。
+
+`PIO=18,SNW=18,100K Zipf s=1.2,batch=32` 的一次样本曾在 client 读到
+`sequence=68511,batch_id=68511,index=3` 时出现混合的 `region_id/offset`，同一 descriptor
+稍后重试后恢复为合法 handle。该 response arena 段在 descriptor 尚未 consume 时不会被 server
+复用，且 server completion 到 response entry 的字段复制已核对正确。因此根因不是 handle 构造或
+复用旧 frame，而是跨机 UB 上 descriptor/final marker 已可见而 response body 尚未完整可见。
+
+**出现过程与证据：** v2 response 的 writer 是 server 对 import UB 的 NC 映射，reader 是 client
+对同一 UB 的本地 CC 映射。server 先在 response arena 写 frame body，再写尾部 commit，最后 release
+发布 response descriptor。release 保证 server CPU 的写入程序顺序，但它不把多个 UB cache line 合并成
+client 一次原子可见的整帧。arena 复用或传播延迟时，client 可以先获得新 descriptor、新 trailer 和当前
+`batch_id`，而 entry body 的部分 cache line 仍是上一帧或未完全传播的内容。
+
+时序如下，其中 `body line A/B` 是同一 response frame 的不同 cache line。`release` 约束的是
+server 发出写入的先后关系；它不是跨机 UB 的“整帧到达确认”，不会令 client 的 CC 映射在一个原子时刻
+同时更新 A、B、trailer 与 descriptor。
+
+```text
+server: import UB / NC writer       UB propagation          client: local UB / CC reader
+-----------------------------       --------------          ----------------------------
+write body line A (new)  ---------> A becomes visible
+write body line B (new)  ---------> B propagation delayed
+release fence
+write checksum (new)     ---------> checksum becomes visible
+release fence
+write batch_id (new)     ---------> batch_id becomes visible
+publish descriptor       ---------> descriptor/tail visible
+                                                            acquire descriptor
+                                                            read batch_id == descriptor id
+                                                            read A == new, B == old
+
+current protocol:                                           only batch_id matched: decode/consume
+                                                            -> mixed handle can escape
+
+checksum experiment:                                        hash(A,new + B,old) != trailer
+                                                            -> retain ring head and retry
+
+                                  B becomes visible  -----> read A,B all new
+                                                            hash(body) == trailer
+                                                            -> decode and consume
+```
+
+因此这里的 `release` 仍然必要：它确保 server 不会在程序顺序上先发布 descriptor 再写 body 或 trailer。
+但在 UB 的 NC-to-CC 最终可见性模型中，它不等价于“client 已经取得完整 frame”的 ack，也不为多个独立
+cache line 提供 transaction/atomic-snapshot 语义。checksum experiment 只能隔离错误消费，不能改变
+UB 的可见性；该实验已撤回，不能作为当前修复方案。
+
+这次异常按以下链路首次被定位：
+
+1. 在 `PIO=18,SNW=18,100K Zipf s=1.2,batch=32` 下，client 已看到 `sequence=68511` 与
+   `batch_id=68511`，所以不是 descriptor slot 复用、顺序错乱或旧 frame 的 batch-id mismatch。
+2. decoder 可通过旧的 magic、长度和 `batch_id` 校验，但 `index=3` 的 `VEMB_HANDLE` 出现
+   `region_id=3823584000, offset=2364844800, bytes=1200`。`bytes=1200` 仍等于 `dim=300` 的正确长度，
+   但 region id 不属于 client 已映射 warm region；该组合不可能由合法 completion 产生。
+3. 定位期间，client 在 consume descriptor 前临时增加 warm-region span 校验，拒绝该 entry 并保持 ring
+   head；同一 `sequence/batch_id/index` 的后续 poll 读到合法 handle，输出 `visibility recovered`。期间
+   server 不能复用该 arena 段，排除了 server 后续覆盖导致的读写竞争。该临时 validator 已随实验撤回。
+4. server 侧 `completion_set_vector_handle()` 和 `vemb_v16_make_response_from()` 已核对为从同一个
+   completion 一致复制 `region_id/vector_offset/vector_bytes`，因此排除 response 构造的字段赋值错误。
+5. 结论是旧 frame body、当前 frame body 与当前 control/trailer 在 client CC 映射的可见时间不同。
+   这不需要、也不能以 `dc cvac`、`dc ivac` 或 `dsb sy` 修复：UB 负责 NC writer 到 CC reader 的最终
+   可见性；应用协议无法把这种范围级部分可见修复成原子整帧可见。
+
+**已撤回的应用层隔离实验：** 曾把 request/response trailer 从 8-byte `batch_id` 扩为
+`u64 batch_id + u64 body_hash`，并在 consume 前校验完整 body。首次采用逐字节 FNV-1a 的 P18 回归
+[`aeron_frame_checksum_p18_s18_zipf12_b32_20260810_1130`](../perf/aeron_frame_checksum_p18_s18_zipf12_b32_20260810_1130/)
+证明完整性语义正确：`fallback_v1=0`、`shared_vector_read_failures=0`、handle dereference failure=0，
+且 22 次未完整 response 都被 `decode_rc=-1` 重试而没有消费。该实现仅得到 `7.445M QPS`，远低于
+旧 P18 样本，原因是 FNV-1a 对每个 frame body 的串行逐字节乘法成为双端热点；该数据不得用于性能对比。
+后续曾改为 `XXH3-64`，但尚未以它建立有效的跨机性能样本。该实验以及临时 span validator 均已撤回：
+当前代码恢复原始 8-byte `batch_id` trailer，未改变 frame ABI。原因是它们只是防止 client 错误消费的
+应用层补偿，不是 UB 连续 range 部分可见的根因修复。
+
+**当前待解决项：** UB 必须明确并实现范围级 publish 语义：server 在写完一个连续 response frame 后，
+通过 UB 提供的完成/doorbell/fence 原语发布 descriptor；client 在观察到该发布后必须看到该范围内全部
+cache line 的本轮内容。若 UB 的现有 contract 已承诺这一点，则本现象是 UB 实现或 driver 的可见性 bug，
+应以最小 UB 可见性 UT 稳定复现并在 UB 侧修复；不得继续以 checksum、`dc cvac`、`dc ivac` 或客户端
+retry 伪装为根治。
+
+本轮还修复了 `sync_changed_code_to_peer.sh --all-code` 的候选文件枚举：旧实现使用
+`git ls-files -co`，会遗漏已跟踪但未暂存的工作区修改，因而可能只同步部分 frame ABI 源码。
+现在 `--all-code` 显式合并全部 tracked 文件与 untracked 文件，再按工作区内容 hash 比较；所有跨机
+重建前都应使用该模式，不能依赖 staging 状态。
+
+**完整 frame UT（本地与跨机复现完成）：** `benchmark/ub_cc_nc_visibility_ut` 已增加
+`frame-writer-nc` 和 `frame-reader-cc`。它复用同一 4KiB（可配置）frame，frame 首尾都写入 generation，
+body 每个 word 写入 `(seed, generation, index)` 的确定性 pattern，descriptor 在 body 后发布。反向 UB ack
+强制 writer 等待 reader 检查完整 frame 后才开始下一代，所以检测到混合 body 时可排除 writer 复用覆盖。
+
+本地普通共享文件已经验证：1,000 次无注入复用不误报；第 2 代通过 UT 专用
+`--inject-mixed-at 2` 保留一个旧 body word 时，reader 的 `--expect-mixed` 正确输出
+`FRAME_VISIBILITY_FAILURE type=mixed generation=2 descriptor=2 index=3`，且 header/trailer 都为当前 generation。这只验证
+检测器，不能替代真实 UB 路径。两机恢复后应使用无注入版本稳定复现：
+
+```text
+111 frame-writer-nc: data=/dev/obmm_shmdev6 (NC write), ack=/dev/obmm_shmdev3 (CC read)
+112 frame-reader-cc: data=/dev/obmm_shmdev2 (CC read), ack=/dev/obmm_shmdev7 (NC write)
+```
+
+新的 SSH 入口下，按该路径执行无注入 `frame_bytes=4096, iterations=1000000` 已在第 2 代复现：
+`FRAME_VISIBILITY_FAILURE type=marker generation=2 descriptor=2 header=2 trailer=1`。这说明当前
+descriptor 与 header 已在 112 client CC 映射可见，但 trailer 仍为上一代；writer 等待本代 ack，故不能归因于
+arena 提前复用。该次 reader 使用 `--expect-visibility-failure` 并返回 `0`。常规复现中该开关对任一
+marker/body 部分可见失败均返回 `0`；
+`NOT_REPRODUCED` 返回 `3`，明确表示该次未触发，不能记录为通过。`--expect-mixed` 只用于严格要求 body
+混合且 frame 首尾 marker 均为当前 generation 的场景。
+
+**cacheline 隔离尝试（2026-08-10，已撤回）：** response frame codec 曾调整为 `64B header | entries
+body（每个 entry 固定 64B）| padding | 64B commit line`，commit `batch_id` 保持该 frame 的最后 8B，
+frame 总长度也对齐至 64B，因而 header、entries、commit 以及相邻 frame 不再共用 cacheline。32 个
+`VEMB_HANDLE + OK` entry 由紧凑布局的 `1184B` 增加为 `2176B`。本地与 111/112
+`vemb_v16_batch_ring_ut` 均通过。本地 UT 已固定断言 32-entry frame 的 `2176B` 长度、64B 对齐和
+encode/decode round-trip。
+
+按相同 `111 dev6 NC -> 112 dev2 CC`、`111 dev3 CC <- 112 dev7 NC` ack 路径，以精确 `2176B`、32 个固定
+64B entry 的 layout 无注入复测，仍在 generation `2` 复现
+`FRAME_VISIBILITY_FAILURE type=marker descriptor=2 header=2 trailer=1`，reader 使用
+`--expect-visibility-failure` 返回 `0`。因此这不是 header/body/trailer 共享 cacheline 导致的局部布局
+问题，也不是 entry 跨 cacheline 导致，而是连续 cacheline 的 UB 范围可见性仍可跨行混代。因此该 ABI 已撤回，
+当前代码恢复为 24B header、可变长 entry 和末尾 8B commit 的紧凑布局。本 checkpoint 未用新 ABI 重建完整 Redis/client
+并运行数据面 workload，不能当作端到端回归结果。
+
+### 21.20 CLI worker-owned L1 completed-vector cache 落地规划（未开始）
+
+本 checkpoint 的目标是先落地 CLI L1，而不是 proxy L2：在已经预填充、无写入、纯
+`VEMB_HANDLE` 读取的 benchmark 中，让 completed-vector hit 完全绕开 channel、server 和 UB
+warm-region dereference。这样不要求 server、proxy、ATTACH 或 wire ABI 改造，直接削减 UB 读取和
+client 端 vector copy；L1 默认关闭，只有显式配置 cache entry 数时才启用。
+
+**前置门禁：** 21.19 记录的 UB 连续 frame 范围级 publish 语义必须先由 UB 修复或得到明确保证。
+L1 只缓存一次已 materialize 的 vector；若 batch response 本身可能部分可见，L1 会把一次错误 handle
+或错误 vector 延长为多次本地命中，不能作为绕过该问题的补偿或在该问题未解决时运行端到端 L1 性能结论。
+
+#### 21.20.1 首版语义和边界
+
+- 仅接纳成功的 `VEMB_HANDLE` response，且 workload 必须是 prefill 后无 `VADD`、`VREM`、迁移、
+  扩容或 topology epoch 变化的 immutable pure-read 阶段；`NOT_FOUND`、非 `OK`、fallback、超时、
+  `MOVED`/`ASK` 和任何 handle dereference failure 都不得填入 L1。
+- 首版没有 TTL，也不宣称跨 client 写入下的 strict 或 bounded-stale 语义。当前阶段不存在写入，
+  因此 entry 在 worker 生命周期内保持有效，直到显式 clear、worker 退出或容量淘汰。
+- key 是完整 final VEMB key bytes 加 `dim`；hash/fingerprint 仅用于定位，命中必须比较完整 key，
+  不得 hash-only 命中。value 保存 `vemb_v16_resp` 的成功元数据和已经从 UB 物化出的完整 vector snapshot，
+  不保存仅含 `offset` 的 handle。
+- `slot_meta`、key hash/fingerprint、`owner_generation` 和 `write_seq` 的 warm-state 校验本轮不实现。
+  后续在允许写入或迁移前必须补齐如下语义，届时不通过则 invalidate 并重新从 server 解析：
+
+```c
+/*
+ * TODO(vemb-v16): Before serving an L1 vector, validate the cached
+ * region/slot against warm slot_meta state, key hash/fingerprint,
+ * owner_generation, and write_seq. A same-owner write_seq change
+ * should refresh from UB; owner/key mismatch must invalidate the
+ * entry and resolve a new handle through the server.
+ */
+```
+
+#### 21.20.2 所有权、并发和容量
+
+memtier 的一个 worker 是 L1 的唯一 owner；该 worker 所持有的全部 batch session 共享一个 L1。
+现有 L0 保持 batch-session-owned：它只合并同一 session 中尚未完成的相同 key，不保存 completed
+value。L1 位于其之前并跨该 worker 的 session 复用 completed vector，二者不可合并为同一个 table。
+
+所有 L1 lookup、insert、evict、pin/release 和统计均只由 owner worker 执行，首版不使用 mutex、
+原子 hash table 或跨 worker 共享缓存。每 worker 在启动时一次性预分配固定 entry pool、key storage 和
+vector storage；热路径不得 malloc、rehash、创建链表或按 entry 分配 vector。建议首版使用固定容量、
+4-way set-associative table 和 CLOCK replacement；entry 被 local completion 引用期间必须 pin，CLOCK
+不得淘汰，完成回调处理后 release。pool/set 全部 pinned 或满时视为运行期资源压力，直接 miss 并走现有
+L0/batch 路径，不临时扩容。
+
+初始默认建议为每 worker `4096` entries。`dim=300` 时 vector payload 约 `4.7 MiB/worker`，64 worker
+约 `300 MiB`，不含 key 和 entry metadata；最终值必须由实际 worker 数、DIM、RSS 预算和热点分布复核。
+100K uniform 在此容量下的 hit ratio 可能很低，4-key hotspot 与 Zipf 才是首要收益场景。
+
+#### 21.20.3 请求、填充和本地完成路径
+
+```text
+logical VEMB_HANDLE read (worker-owned)
+        |
+        v
+L1 exact-key lookup
+   | hit                         | miss
+   v                             v
+enqueue local completion     current session L0 admission
+                                  | follower: wait for leader
+                                  v
+                              batch publish -> server -> response
+                                  |
+                                  v
+                         materialize UB vector exactly once per L0 group
+                                  |
+                                  v
+                         L1 put exactly once, then L0 leader/follower fan-out
+```
+
+L1 hit 不能伪造 Aeron response，也不能直接重入现有 submit 栈。每个 worker 维护固定容量的 local
+completion queue，容量至少覆盖该 worker 的 `batch sessions * pipeline` 最大未完成量。queue item 保存
+原逻辑请求的 caller cookie/`req_id`、完成所需的 response 信息，以及被 pin 的 L1 entry index 和
+generation；owner worker 在正常 poll/accounting 阶段消费 queue、回调并 release pin。因此 hit 和 miss
+走相同的逻辑 completion 记账、延迟统计和 pipeline credit 归还，而命中不触发 channel/server/UB 访问。
+
+响应回填必须挂在 batch client 的“一个 L0 group 已获得成功 response、尚未释放该 group”这一点：先取得
+group 的精确 key，materialize 一次 UB vector，调用 worker-owned L1 fill hook 一次，再使用同一 materialized
+结果完成 leader/follower fan-out。不得在每个 follower 回调中重复填 L1，也不得在 `vemb_v16_cli_l0_finish()`
+释放 group/key 后再尝试回填。
+
+#### 21.20.4 channel 路由与 batch-agg 的关系
+
+首版保留当前 session/channel round-robin：worker 仍按现有 `next_ch` 选择 channel，key 在该选择之后生成。
+这样可以把 L1 A/B 与 channel 调度、per-channel batch 聚合率的变化隔离开。L1 hit 根本不进入 channel；
+只有 L1 miss 继续使用当前 L0 和 batch-agg，故不会破坏已有 channel ownership 或 SPSC 假设。
+
+后续可单独实验“仅对 L1 miss 按 key 固定路由 channel”，以集中热点并提高单 session L0/batch-agg 的
+相同 key 合并概率。但它会改变 channel 负载、tail latency 和 backpressure 分布，不能与第一版 L1 收益
+混在同一次比较中；应在 L1 自身 A/B 正确后再以独立 checkpoint 评估，且仍不得跨 worker 共享 L1。
+
+#### 21.20.5 实现切分、指标和验收
+
+1. 新建固定容量的 `clients/c/internal/vemb_v16_cli_l1.h` 与 `clients/c/vemb_v16_cli_l1.c`，提供
+   create/destroy、exact-key lookup、put、pin/release、clear 和 stats；新增单元测试覆盖 exact collision、
+   CLOCK eviction、all-pinned resource pressure、generation ABA、防止 hot-path allocation，以及 key/vector
+   storage exhaustion。
+2. 在 memtier worker 创建/销毁 L1 与 local completion queue，并增加默认关闭的 cache-entry 配置；先只让
+   pure `VEMB_HANDLE` consumer 在 submit 前查 L1，命中经 queue 完成。
+3. 为 batch client 增加一次-per-L0-group 的成功 materialization hook；worker 用其回填 L1，保持现有
+   L0 leader/follower response 和错误收敛语义不变。
+4. 输出 `l1_hit`、`l1_miss`、`l1_insert`、`l1_evict`、`l1_hit_ratio`、`l1_vector_bytes`、
+   `l1_ub_read_bytes_saved` 和 `local_completion_count`；`l1_ub_read_bytes_saved` 只按实际 L1 hit
+   省掉的 vector bytes 计数，不能把 L0 coalescing 的收益混入。
+5. 先通过 L1 UT、`make -C clients/c`、`make -C memtier_benchmark` 与 `git diff --check`；随后在 UB
+   完整 frame 门禁通过后，比较 disabled/enabled 的 4-key hotspot、100K Zipf `s=1.2` 和 100K uniform。
+   每组须同时报告 QPS、P99、L1 hit ratio、server items、UB read bytes 和 client RSS；所有现有
+   fallback、backpressure、non-OK、stale/unmatched response 与 handle dereference failure 必须为零。
+
+本节只定义 worker-local completed-vector cache。proxy L2 location cache、跨 worker shared cache、
+key-affine channel routing、`slot_meta` 校验，以及可写 workload 的 TTL/lease/invalidation 仍是后续独立
+阶段，不能随首版 L1 一起启用或宣称完成。
