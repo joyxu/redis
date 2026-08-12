@@ -39,6 +39,9 @@ CLIENTS="${CLIENTS:-4}"
 PIPELINE="${PIPELINE:-32}"
 BATCH_REQUEST_SIZE="${BATCH_REQUEST_SIZE:-32}"
 BATCH_MAX_DELAY_US="${BATCH_MAX_DELAY_US:-0}"
+PROXY_REQUEST_BATCH="${PROXY_REQUEST_BATCH:-$BATCH_REQUEST_SIZE}"
+PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-$BATCH_REQUEST_SIZE}"
+PROXY_QUEUE_BATCH="${PROXY_QUEUE_BATCH:-$BATCH_REQUEST_SIZE}"
 PIO="${PIO:-21}"
 SNW="${SNW:-21}"
 SERVER_CPU_MASK="${SERVER_CPU_MASK:-0-47}"
@@ -89,6 +92,7 @@ Important environment variables:
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX DIM MAX_VECTORS
   THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US
+  PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
   TEST_TIME SERVER_FLAME_DURATION FREQ EVENT
   MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_RSS_MB
@@ -97,7 +101,9 @@ Important environment variables:
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
 
 BUILD=verify requires current O3/LTO/SVE build stamps. BUILD=build force-builds
-the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run.
+the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run. The
+three server-internal batch macros default to BATCH_REQUEST_SIZE and are
+recorded in the server build stamp.
 
 Use KEY_PATTERN=R:R for uniform random reads. Use KEY_PATTERN=Z:Z together
 with a positive ZIPF_S such as 1.0, 1.2, or 1.5 for the documented Zipf hot-key
@@ -194,7 +200,9 @@ fi
 [ "$DRY_RUN" = 0 ] || [ "$DRY_RUN" = 1 ] || die "DRY_RUN must be 0 or 1"
 
 for value in "$PORT" "$DIM" "$MAX_VECTORS" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
-    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$PIO" "$SNW" \
+    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" \
+    "$PROXY_REQUEST_BATCH" "$PROXY_RESPONSE_BATCH" "$PROXY_QUEUE_BATCH" \
+    "$PIO" "$SNW" \
     "$TEST_TIME" "$SERVER_FLAME_DURATION" "$FREQ" \
     "$MAX_FOREIGN_CPU_PCT" "$MAX_FOREIGN_TOTAL_CPU_PCT" "$MAX_FOREIGN_RSS_MB"; do
     is_uint "$value" || die "numeric parameters must be non-negative integers"
@@ -202,6 +210,8 @@ done
 [ "$PORT" -gt 0 ] && [ "$DIM" -gt 0 ] && [ "$MAX_VECTORS" -gt 0 ] &&
     [ "$NUM_KEYS" -gt 0 ] && [ "$THREADS" -gt 0 ] && [ "$CLIENTS" -gt 0 ] &&
     [ "$PIPELINE" -gt 0 ] && [ "$BATCH_REQUEST_SIZE" -gt 0 ] &&
+    [ "$PROXY_REQUEST_BATCH" -gt 0 ] && [ "$PROXY_RESPONSE_BATCH" -gt 0 ] &&
+    [ "$PROXY_QUEUE_BATCH" -gt 0 ] &&
     [ "$PIO" -gt 0 ] && [ "$SNW" -gt 0 ] &&
     [ "$TEST_TIME" -gt 0 ] && [ "$SERVER_FLAME_DURATION" -gt 0 ] && [ "$FREQ" -gt 0 ] ||
     die "positive parameters must be greater than zero"
@@ -222,13 +232,13 @@ pattern_label="${KEY_PATTERN//:/}"
 if [ "$KEY_PATTERN" = Z:Z ]; then
     pattern_label="Z${ZIPF_S}"
 fi
-run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
+run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
 
 mkdir -p "$LOCAL_ROOT/server" "$LOCAL_ROOT/client"
 
 status "cross-node flamegraph run: $RUN_ID"
 status "server=$SERVER_PEER:$SERVER_ROOT client=$CLIENT_PEER:$CLIENT_ROOT"
-status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE"
+status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
 status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD local=$LOCAL_ROOT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -238,10 +248,10 @@ fi
 
 status "checking build stamps"
 if [ "$BUILD" = build ]; then
-    server_ssh "cd '$SERVER_ROOT' && bash scripts/vemb_v16_build_stamp.sh build server"
+    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' bash scripts/vemb_v16_build_stamp.sh build server"
     client_ssh "cd '$CLIENT_ROOT' && bash scripts/vemb_v16_build_stamp.sh build client"
 else
-    server_ssh "cd '$SERVER_ROOT' && bash scripts/vemb_v16_build_stamp.sh verify server"
+    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' bash scripts/vemb_v16_build_stamp.sh verify server"
     client_ssh "cd '$CLIENT_ROOT' && bash scripts/vemb_v16_build_stamp.sh verify client"
 fi
 
@@ -628,6 +638,7 @@ server_ssh bash -s -- \
     "$SERVER_ROOT" "$REMOTE_RUN_DIR" "$FLAMEGRAPH_DIR" "$SERVER_FLAME_DURATION" \
     "$FREQ" "$EVENT" "$NUM_KEYS" "$KEY_PATTERN" "$THREADS" "$CLIENTS" \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" \
+    "$PROXY_REQUEST_BATCH" "$PROXY_RESPONSE_BATCH" "$PROXY_QUEUE_BATCH" \
     "$REQUIRE_VEMB_THREAD_SAMPLES" "$SERVER_CPU_MASK" "$run_label" <<'REMOTE_SERVER_RENDER'
 set -euo pipefail
 
@@ -644,9 +655,12 @@ clients=${10}
 pipeline=${11}
 batch_size=${12}
 max_delay_us=${13}
-require_vemb=${14}
-cpu_mask=${15}
-run_label=${16}
+proxy_request_batch=${14}
+proxy_response_batch=${15}
+proxy_queue_batch=${16}
+require_vemb=${17}
+cpu_mask=${18}
+run_label=${19}
 
 mpstat_pid="$(cat "$run/server.cpu.mpstat.pid")"
 for _ in $(seq 1 100); do
@@ -775,6 +789,8 @@ fi
         "$event" "$freq" "$duration"
     printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s\n' \
         "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us"
+    printf 'server_internal_batches=request=%s response=%s queue=%s supernode=%s\n' \
+        "$proxy_request_batch" "$proxy_response_batch" "$proxy_queue_batch" "$proxy_queue_batch"
     printf 'run_label=%s\n' "$run_label"
     printf 'server_cpu_mask=%s\n' "$cpu_mask"
     printf 'server_process_cpu_tsv=server.cpu.process.tsv\n'
