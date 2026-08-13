@@ -180,10 +180,10 @@ gate；server 均确认有 12 个 `vemb-io-*` 和 12 个 `vemb-sn-*` 线程。
 
 | 分布 | PIO:SNW | run | QPS | P99 | 当前 L1 hit | server process cores | 单 core QPS | 测试代码提交 | 产物 |
 |---|---|---|---:|---:|---:|---:|---:|---|---|
-| Uniform `R:R` | `12:12` | `l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732` | 7.944863M | 1.391ms | 4.0925% | 10.291 | 0.7720M | `5ab79d39` + L1 working tree | [perf](../perf/l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732/) |
-| Zipf `s=1.0` | `12:12` | `l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753` | 13.190124M | 0.703ms | 59.3575% | 8.973 | 1.4699M | `5ab79d39` + L1 working tree | [perf](../perf/l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753/) |
-| Zipf `s=1.2` | `12:12` | `l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735` | 17.628362M | 0.511ms | 83.9782% | 8.397 | 2.0994M | `5ab79d39` + L1 working tree | [perf](../perf/l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735/) |
-| Zipf `s=1.5` | `12:12` | `l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739` | 39.550067M | 0.383ms | 97.6277% | 7.841 | 5.0442M | `5ab79d39` + L1 working tree | [perf](../perf/l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739/) |
+| Uniform `R:R` | `12:12` | `l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732` | 7.944863M | 1.391ms | 4.0925% | 10.291 | 0.7720M | `a150ab7` | [perf](../perf/l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732/) |
+| Zipf `s=1.0` | `12:12` | `l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753` | 13.190124M | 0.703ms | 59.3575% | 8.973 | 1.4699M | `a150ab7` | [perf](../perf/l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753/) |
+| Zipf `s=1.2` | `12:12` | `l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735` | 17.628362M | 0.511ms | 83.9782% | 8.397 | 2.0994M | `a150ab7` | [perf](../perf/l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735/) |
+| Zipf `s=1.5` | `12:12` | `l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739` | 39.550067M | 0.383ms | 97.6277% | 7.841 | 5.0442M | `a150ab7` | [perf](../perf/l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739/) |
 
 `server process cores` 为 redis-server 的 user+system CPU time / 30 秒 wall time；`单 core QPS`
 按该 process core-equivalent 计算。所有样本的 `fallback_v1`、backpressure、non-OK、unmatched
