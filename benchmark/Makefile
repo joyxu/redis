@@ -154,6 +154,18 @@ vemb_v16_cli_l0_ut: vemb_v16_cli_l0_ut.c ../clients/c/vemb_v16_cli_l0.c ../clien
 	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/vemb_v16_cli_l0.c
 	./$@
 
+vemb_v16_cli_l1_ut: vemb_v16_cli_l1_ut.c ../clients/c/vemb_v16_cli_l1.c ../clients/c/internal/vemb_v16_cli_l1.h ../src/vemb_v16_protocol.h
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/vemb_v16_cli_l1.c
+	./$@
+
+vemb_v16_cli_local_completion_ut: vemb_v16_cli_local_completion_ut.cpp ../memtier_benchmark/vemb_v16_aeron_local_completion.h ../clients/c/internal/vemb_v16_cli_l1.h ../clients/c/build/libvemb_v16_client.a
+	$(CXX) -O2 -Wall -Wextra -std=gnu++11 -I../memtier_benchmark -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/build/libvemb_v16_client.a -lpthread -lm
+	./$@
+
+vemb_v16_cli_l1_materialization_ut: vemb_v16_cli_l1_materialization_ut.c ../clients/c/vemb_v16_aeron_batch_client.c ../clients/c/vemb_v16_cli_l0.c ../clients/c/vemb_v16_cli_l1.c ../clients/c/vemb_v16_client_sdk.c
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -DVEMB_V16_CLIENT_SDK -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/vemb_v16_cli_l0.c ../clients/c/vemb_v16_cli_l1.c ../clients/c/vemb_v16_client_sdk.c ../src/vemb_v16_net.c ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/monotonic.c -lpthread -lm
+	./$@
+
 vemb_v16_cli_deadline_ut: vemb_v16_cli_deadline_ut.c ../clients/c/vemb_v16_cli_l0.c ../clients/c/internal/vemb_v16_cli_deadline.h ../clients/c/internal/vemb_v16_cli_l0.h ../src/vemb_v16_aeron_attach.h ../src/vemb_v16_protocol.h
 	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/vemb_v16_cli_l0.c
 

@@ -43,6 +43,7 @@ INCLUDES := -I$(SDK_DIR) -I$(INTERNAL_DIR) -I$(SRC_DIR)
 SDK_SOURCES := \
 	$(SDK_DIR)/vemb_v16_client_sdk.c \
 	$(SDK_DIR)/vemb_v16_cli_l0.c \
+	$(SDK_DIR)/vemb_v16_cli_l1.c \
 	$(SDK_DIR)/vemb_v16_aeron_batch_client.c \
 	$(SRC_DIR)/vemb_v16_net.c \
 	$(SRC_DIR)/vemb_v16_client_topology.c \
@@ -85,6 +86,10 @@ $(OBJ_DIR)/vemb_v16_client_sdk.o: $(SDK_DIR)/vemb_v16_client_sdk.c
 	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 
 $(OBJ_DIR)/vemb_v16_cli_l0.o: $(SDK_DIR)/vemb_v16_cli_l0.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
+$(OBJ_DIR)/vemb_v16_cli_l1.o: $(SDK_DIR)/vemb_v16_cli_l1.c
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 

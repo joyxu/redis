@@ -65,7 +65,10 @@ source_sha256() {
         find src -type f \( -name '*.c' -o -name '*.h' -o -name '*.inc' -o \
             -name '*.S' -o -name '*.s' -o -name '*.mk' -o -name 'Makefile' \)
         if [ "$target" = client ]; then
-            find clients/c memtier_benchmark -type f \( -name '*.c' -o -name '*.cc' -o \
+            find clients/c -path clients/c/build -prune -o -type f \( \
+                -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o \
+                -name '*.hpp' -o -name '*.mk' -o -name 'Makefile' \) -print
+            find memtier_benchmark -type f \( -name '*.c' -o -name '*.cc' -o \
                 -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.mk' -o \
                 -name 'Makefile' \)
         fi
@@ -159,7 +162,7 @@ build_server() {
 
 build_client() {
     make -B -C clients/c USE_SVE=yes CFLAGS="$SDK_CFLAGS" ARCH_FLAGS="$SDK_ARCH_FLAGS"
-    make -B -C memtier_benchmark USE_SVE=yes CFLAGS="$MEMTIER_CFLAGS" \
+    make -B -C memtier_benchmark memtier_benchmark USE_SVE=yes CFLAGS="$MEMTIER_CFLAGS" \
         CXXFLAGS="$MEMTIER_CXXFLAGS"
     write_stamp client
 }

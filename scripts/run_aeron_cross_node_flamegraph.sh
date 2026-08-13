@@ -39,6 +39,7 @@ CLIENTS="${CLIENTS:-4}"
 PIPELINE="${PIPELINE:-32}"
 BATCH_REQUEST_SIZE="${BATCH_REQUEST_SIZE:-32}"
 BATCH_MAX_DELAY_US="${BATCH_MAX_DELAY_US:-0}"
+L1_ENTRIES="${L1_ENTRIES:-0}"
 PROXY_REQUEST_BATCH="${PROXY_REQUEST_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_QUEUE_BATCH="${PROXY_QUEUE_BATCH:-$BATCH_REQUEST_SIZE}"
@@ -56,6 +57,7 @@ KEEP_SERVER="${KEEP_SERVER:-0}"
 REQUIRE_VEMB_THREAD_SAMPLES="${REQUIRE_VEMB_THREAD_SAMPLES:-1}"
 MAX_FOREIGN_CPU_PCT="${MAX_FOREIGN_CPU_PCT:-10}"
 MAX_FOREIGN_TOTAL_CPU_PCT="${MAX_FOREIGN_TOTAL_CPU_PCT:-20}"
+MAX_FOREIGN_CPUSET_BUSY_PCT="${MAX_FOREIGN_CPUSET_BUSY_PCT:-10}"
 MAX_FOREIGN_RSS_MB="${MAX_FOREIGN_RSS_MB:-256}"
 KILL_OPENCODE="${KILL_OPENCODE:-1}"
 KILL_MUTAGEN="${KILL_MUTAGEN:-1}"
@@ -91,11 +93,11 @@ Important environment variables:
   SERVER_MANIFEST SERVER_REQUEST_UB_PATH SERVER_RESPONSE_UB_PATH SERVER_WARM_UB_PATH
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX DIM MAX_VECTORS
-  THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US
+  THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES
   PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
   TEST_TIME SERVER_FLAME_DURATION FREQ EVENT
-  MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_RSS_MB
+  MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_CPUSET_BUSY_PCT MAX_FOREIGN_RSS_MB
   KILL_OPENCODE=0|1 KILL_MUTAGEN=0|1
   BUILD=verify|build KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
@@ -110,9 +112,11 @@ with a positive ZIPF_S such as 1.0, 1.2, or 1.5 for the documented Zipf hot-key
 scenarios. Prefill is always sequential S:S so every generated read key exists.
 
 Before either role starts, both hosts must pass the load gate. It samples all
-processes with pidstat for one second and fails when a process exceeds
-MAX_FOREIGN_CPU_PCT (10%), all processes exceed MAX_FOREIGN_TOTAL_CPU_PCT
-(20%), or a process RSS exceeds MAX_FOREIGN_RSS_MB (256 MiB).
+processes with pidstat for one second and the target CPU set through two
+/proc/stat snapshots. It fails when a process exceeds MAX_FOREIGN_CPU_PCT
+(10%), all processes exceed MAX_FOREIGN_TOTAL_CPU_PCT (20%), target CPU-set
+busy time exceeds MAX_FOREIGN_CPUSET_BUSY_PCT (10%), or a process RSS exceeds
+MAX_FOREIGN_RSS_MB (256 MiB).
 By default, the opencode tmux session and residual exact-name opencode
 processes are SIGKILLed. Each mutagen-agent's direct parent and the agent are
 also SIGKILLed on both hosts before this load gate runs. Set KILL_OPENCODE=0
@@ -200,11 +204,12 @@ fi
 [ "$DRY_RUN" = 0 ] || [ "$DRY_RUN" = 1 ] || die "DRY_RUN must be 0 or 1"
 
 for value in "$PORT" "$DIM" "$MAX_VECTORS" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
-    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" \
+    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" \
     "$PROXY_REQUEST_BATCH" "$PROXY_RESPONSE_BATCH" "$PROXY_QUEUE_BATCH" \
     "$PIO" "$SNW" \
     "$TEST_TIME" "$SERVER_FLAME_DURATION" "$FREQ" \
-    "$MAX_FOREIGN_CPU_PCT" "$MAX_FOREIGN_TOTAL_CPU_PCT" "$MAX_FOREIGN_RSS_MB"; do
+    "$MAX_FOREIGN_CPU_PCT" "$MAX_FOREIGN_TOTAL_CPU_PCT" \
+    "$MAX_FOREIGN_CPUSET_BUSY_PCT" "$MAX_FOREIGN_RSS_MB"; do
     is_uint "$value" || die "numeric parameters must be non-negative integers"
 done
 [ "$PORT" -gt 0 ] && [ "$DIM" -gt 0 ] && [ "$MAX_VECTORS" -gt 0 ] &&
@@ -217,6 +222,13 @@ done
     die "positive parameters must be greater than zero"
 [ "$SERVER_FLAME_DURATION" -lt "$TEST_TIME" ] ||
     die "SERVER_FLAME_DURATION must be less than TEST_TIME"
+if [ "$L1_ENTRIES" -ne 0 ]; then
+    [ "$L1_ENTRIES" -ge 4 ] && [ $((L1_ENTRIES % 4)) -eq 0 ] ||
+        die "L1_ENTRIES must be 0 or 4 times a power of two"
+    l1_sets=$((L1_ENTRIES / 4))
+    [ $((l1_sets & (l1_sets - 1))) -eq 0 ] ||
+        die "L1_ENTRIES must be 0 or 4 times a power of two"
+fi
 
 case "$KEY_PATTERN" in
     R:R|S:S|Z:Z) ;;
@@ -232,13 +244,13 @@ pattern_label="${KEY_PATTERN//:/}"
 if [ "$KEY_PATTERN" = Z:Z ]; then
     pattern_label="Z${ZIPF_S}"
 fi
-run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
+run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_l1${L1_ENTRIES}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
 
 mkdir -p "$LOCAL_ROOT/server" "$LOCAL_ROOT/client"
 
 status "cross-node flamegraph run: $RUN_ID"
 status "server=$SERVER_PEER:$SERVER_ROOT client=$CLIENT_PEER:$CLIENT_ROOT"
-status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
+status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
 status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD local=$LOCAL_ROOT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -258,11 +270,12 @@ fi
 host_load_gate() {
     local role=$1
     local peer_fn=$2
+    local cpu_mask=$3
 
     "$peer_fn" bash -s -- \
         "$REMOTE_RUN_DIR" "$role" "$MAX_FOREIGN_CPU_PCT" \
         "$MAX_FOREIGN_TOTAL_CPU_PCT" "$MAX_FOREIGN_RSS_MB" "$KILL_OPENCODE" \
-        "$KILL_MUTAGEN" <<'REMOTE_HOST_LOAD_GATE'
+        "$KILL_MUTAGEN" "$cpu_mask" "$MAX_FOREIGN_CPUSET_BUSY_PCT" <<'REMOTE_HOST_LOAD_GATE'
 set -euo pipefail
 
 run=$1
@@ -272,6 +285,8 @@ total_limit=$4
 rss_limit_mb=$5
 kill_opencode=$6
 kill_mutagen=$7
+cpu_mask=$8
+cpuset_busy_limit=$9
 mkdir -p "$run"
 command -v pidstat >/dev/null || { echo "missing pidstat for $role load gate" >&2; exit 1; }
 
@@ -312,6 +327,7 @@ fi
 cpu_raw="$run/$role.preflight.pidstat.txt"
 cpu_blockers="$run/$role.preflight.cpu-blockers.tsv"
 rss_blockers="$run/$role.preflight.rss-blockers.tsv"
+cpuset_busy="$run/$role.preflight.cpuset.tsv"
 LC_ALL=C pidstat -u -p ALL 1 1 >"$cpu_raw"
 awk -v limit="$per_process_limit" '
 $1 == "Average:" && $3 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+([.][0-9]+)?$/ && $8 > limit {
@@ -321,10 +337,67 @@ total_cpu="$(awk '$1 == "Average:" && $3 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+([.][0-9]+
 ps -eo pid=,rss=,comm= | awk -v limit_mb="$rss_limit_mb" '
 $2 > limit_mb * 1024 { printf "%s\t%.2f\t%s\n", $1, $2 / 1024, $3 }' >"$rss_blockers"
 
+sample_cpuset_stat() {
+    awk -v mask="$cpu_mask" '
+    function selected(cpu,    parts, n, i, bounds) {
+        n = split(mask, parts, ",")
+        for (i = 1; i <= n; i++) {
+            if (parts[i] ~ /^[0-9]+-[0-9]+$/) {
+                split(parts[i], bounds, "-")
+                if (cpu >= bounds[1] && cpu <= bounds[2])
+                    return 1
+            } else if (parts[i] ~ /^[0-9]+$/ && cpu == parts[i]) {
+                return 1
+            }
+        }
+        return 0
+    }
+    $1 ~ /^cpu[0-9]+$/ {
+        cpu = substr($1, 4) + 0
+        if (!selected(cpu))
+            next
+        count++
+        for (i = 2; i <= NF && i <= 11; i++)
+            total += $i
+        idle += $5
+        if (NF >= 6)
+            idle += $6
+    }
+    END {
+        if (count == 0)
+            exit 1
+        printf "%.0f %.0f %u\n", total, idle, count
+    }' /proc/stat
+}
+
+read -r cpuset_total_start cpuset_idle_start cpuset_cpu_count < <(sample_cpuset_stat)
+sleep 1
+read -r cpuset_total_end cpuset_idle_end cpuset_cpu_count_end < <(sample_cpuset_stat)
+[ "$cpuset_cpu_count" = "$cpuset_cpu_count_end" ] || {
+    echo "ERROR: $role CPU-set changed during load gate" >&2
+    exit 1
+}
+VEMB_CPUSET_MASK="$cpu_mask" awk -v total_start="$cpuset_total_start" \
+    -v idle_start="$cpuset_idle_start" -v total_end="$cpuset_total_end" \
+    -v idle_end="$cpuset_idle_end" -v cpu_count="$cpuset_cpu_count" '
+BEGIN {
+    delta_total = total_end - total_start
+    delta_idle = idle_end - idle_start
+    if (delta_total <= 0 || delta_idle > delta_total)
+        exit 1
+    busy_pct = 100 * (delta_total - delta_idle) / delta_total
+    printf "cpu_mask\tcpu_count\twindow_total_jiffies\tbusy_pct\tbusy_core_equiv\n"
+    printf "%s\t%s\t%.0f\t%.3f\t%.6f\n", ENVIRON["VEMB_CPUSET_MASK"], cpu_count, \
+           delta_total, busy_pct, busy_pct * cpu_count / 100
+}' >"$cpuset_busy"
+cpuset_busy_pct="$(awk -F '\t' 'NR == 2 { print $4 }' "$cpuset_busy")"
+
 if [ -s "$cpu_blockers" ] || [ -s "$rss_blockers" ] || \
-    awk -v total="$total_cpu" -v limit="$total_limit" 'BEGIN { exit !(total > limit) }'; then
-    echo "ERROR: $role host load gate failed: per-process CPU <= ${per_process_limit}%, total CPU <= ${total_limit}%, RSS <= ${rss_limit_mb} MiB" >&2
+    awk -v total="$total_cpu" -v limit="$total_limit" 'BEGIN { exit !(total > limit) }' || \
+    awk -v busy="$cpuset_busy_pct" -v limit="$cpuset_busy_limit" 'BEGIN { exit !(busy > limit) }'; then
+    echo "ERROR: $role host load gate failed: per-process CPU <= ${per_process_limit}%, total CPU <= ${total_limit}%, target CPU-set busy <= ${cpuset_busy_limit}%, RSS <= ${rss_limit_mb} MiB" >&2
     printf 'measured_total_cpu_pct=%s\n' "$total_cpu" >&2
+    printf 'measured_cpuset_busy_pct=%s cpuset=%s\n' "$cpuset_busy_pct" "$cpu_mask" >&2
     if [ -s "$cpu_blockers" ]; then
         printf 'cpu_blockers(pid cpu_pct command):\n' >&2
         cat "$cpu_blockers" >&2
@@ -335,13 +408,14 @@ if [ -s "$cpu_blockers" ] || [ -s "$rss_blockers" ] || \
     fi
     exit 1
 fi
-printf '%s load gate passed: total_cpu_pct=%s\n' "$role" "$total_cpu"
+printf '%s load gate passed: total_cpu_pct=%s cpuset_busy_pct=%s cpuset=%s\n' \
+    "$role" "$total_cpu" "$cpuset_busy_pct" "$cpu_mask"
 REMOTE_HOST_LOAD_GATE
 }
 
 status "checking host CPU and memory load gates"
-host_load_gate server server_ssh
-host_load_gate client client_ssh
+host_load_gate server server_ssh "$SERVER_CPU_MASK"
+host_load_gate client client_ssh "$CLIENT_CPU_MASK"
 
 status "preflighting server UB paths and starting fresh server"
 server_ssh bash -s -- \
@@ -545,7 +619,7 @@ status "running CLI workload under perf on $CLIENT_NODE"
 client_ssh bash -s -- \
     "$CLIENT_ROOT" "$REMOTE_RUN_DIR" "$SERVER_IP" "$PORT" "$NUM_KEYS" \
     "$KEY_PATTERN" "$zipf_s_arg" "$KEY_PREFIX" "$DIM" "$THREADS" "$CLIENTS" \
-    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$TEST_TIME" \
+    "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" "$TEST_TIME" \
     "$CLIENT_CPU_MASK" "$FREQ" "$EVENT" "$FLAMEGRAPH_DIR" "$run_label" <<'REMOTE_CLIENT_PERF'
 set -euo pipefail
 
@@ -566,12 +640,13 @@ clients=${11}
 pipeline=${12}
 batch_size=${13}
 max_delay_us=${14}
-test_time=${15}
-cpu_mask=${16}
-freq=${17}
-event=${18}
-flamegraph_dir=${19}
-run_label=${20}
+l1_entries=${15}
+test_time=${16}
+cpu_mask=${17}
+freq=${18}
+event=${19}
+flamegraph_dir=${20}
+run_label=${21}
 
 mkdir -p "$run"
 [ -x "$root/memtier_benchmark/memtier_benchmark" ] || exit 1
@@ -582,10 +657,34 @@ zipf_args=()
 if [ "$pattern" = Z:Z ]; then
     zipf_args=("--key-zipfian-s=$zipf_s")
 fi
+l1_args=()
+if [ "$l1_entries" -ne 0 ]; then
+    l1_args=("--vemb-v16-l1-entries=$l1_entries")
+fi
 
 cd "$root/memtier_benchmark"
+timed_workload_cmd='run_timed_workload() {
+    local cpu_mask=$1
+    local workload_pid max_rss_kib=0 rss_kib status
+
+    shift
+    taskset -c "$cpu_mask" "$@" &
+    workload_pid=$!
+    while kill -0 "$workload_pid" 2>/dev/null; do
+        rss_kib="$(awk '\''/VmHWM:/ { print $2; exit }'\'' "/proc/$workload_pid/status" 2>/dev/null || true)"
+        if [ -n "$rss_kib" ] && [ "$rss_kib" -gt "$max_rss_kib" ]; then
+            max_rss_kib=$rss_kib
+        fi
+        sleep 0.05
+    done
+    wait "$workload_pid"
+    status=$?
+    printf "l1_client_max_rss_kib=%s\\n" "$max_rss_kib"
+    return "$status"
+}
+run_timed_workload "$@"'
 perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
-    taskset -c "$cpu_mask" ./memtier_benchmark \
+    /bin/bash -c "$timed_workload_cmd" bash "$cpu_mask" ./memtier_benchmark \
         --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port" \
         --threads="$threads" --clients="$clients" --pipeline="$pipeline" \
         --ratio=0:1 --key-minimum=1 --key-maximum="$keys" \
@@ -593,7 +692,7 @@ perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
         --vemb-v16-handle --vemb-v16-transport=aeron-cross-node \
         --vemb-v16-batch-request-size="$batch_size" \
         --vemb-v16-batch-max-delay-us="$max_delay_us" \
-        --test-time="$test_time" --hide-histogram "${zipf_args[@]}" \
+        --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}" \
         >"$run/client.workload.log" 2>&1
 
 if grep -q 'Connection error' "$run/client.workload.log"; then
@@ -601,13 +700,58 @@ if grep -q 'Connection error' "$run/client.workload.log"; then
     exit 1
 fi
 grep -q 'all workers joined' "$run/client.workload.log"
-if grep -Eq 'fallback_v1=[1-9]|flush_backpressure=[1-9]|shared_vector_read_failures=[1-9]|status\[.*(nf|err|other)=[1-9]|handle_deref\[.*fail=[1-9]' \
+if grep -Eq 'fallback_v1=[1-9]|flush_backpressure=[1-9]|shared_vector_read_failures=[1-9]|status\[.*(nf|err|other)=[1-9]|handle_deref\[.*fail=[1-9]|l1_queue_full_fallbacks=[1-9]|l1_all_pinned=[1-9]|l1_(key|vector)_storage_exhausted=[1-9]|l1_stale_ref=[1-9]' \
     "$run/client.workload.log"; then
     echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
     exit 1
 fi
 awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/client.workload.log"
+grep -q '^\[aeron\] l1-summary:' "$run/client.workload.log"
+
+rss_kib="$(awk -F= '/^l1_client_max_rss_kib=/ { value=$2 } END { if (value == "") exit 1; print value }' "$run/client.workload.log")"
+awk -v entries="$l1_entries" -v rss_kib="$rss_kib" '
+function metric(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        if ($i ~ ("^" name "=")) {
+            split($i, pair, "=")
+            return pair[2]
+        }
+    }
+    return "NA"
+}
+BEGIN {
+    OFS = "\t"
+    print "l1_entries\tops_sec\tp99_ms\tl1_hit\tl1_miss\tl1_insert\tl1_evict\tl1_hit_ratio\tl1_vector_bytes\tl1_ub_read_bytes_saved\tlocal_completion_count\tserver_items\tub_read_bytes\tclient_max_rss_kib"
+}
+/^Totals/ {
+    ops_sec = $2
+    p99_ms = $7
+    have_totals = 1
+}
+/^\[aeron\] l1-summary:/ {
+    l1_hit = metric("l1_hit")
+    l1_miss = metric("l1_miss")
+    l1_insert = metric("l1_insert")
+    l1_evict = metric("l1_evict")
+    l1_hit_ratio = metric("l1_hit_ratio")
+    l1_vector_bytes = metric("l1_vector_bytes")
+    l1_ub_read_bytes_saved = metric("l1_ub_read_bytes_saved")
+    local_completion_count = metric("local_completion_count")
+    server_items = metric("server_items")
+    ub_read_bytes = metric("ub_read_bytes")
+    have_l1_summary = 1
+}
+END {
+    if (have_totals && have_l1_summary) {
+        print entries, ops_sec, p99_ms, l1_hit, l1_miss, l1_insert, l1_evict, \
+            l1_hit_ratio, l1_vector_bytes, l1_ub_read_bytes_saved, \
+            local_completion_count, server_items, ub_read_bytes, rss_kib
+    }
+}
+' "$run/client.workload.log" >"$run/client.l1_summary.tsv"
+awk 'NR == 2 && $1 != "" { found = 1 } END { exit !found }' \
+    "$run/client.l1_summary.tsv"
 
 perf script -i "$run/client.perf.data" >"$run/client.perf.script"
 grep -q '\[kernel.kallsyms\]' "$run/client.perf.script"
@@ -622,14 +766,14 @@ grep -q 'vemb-v16 cross-node cli' "$run/client.svg"
 {
     printf 'host=%s\n' "$(hostname)"
     printf 'role=client\nmode=process user+kernel\nevent=%s\nfrequency_hz=%s\n' "$event" "$freq"
-    printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s\n' \
-        "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us"
+    printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s l1_entries=%s\n' \
+        "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us" "$l1_entries"
     printf 'run_label=%s\n' "$run_label"
     cat "$root/.vemb_v16_build_stamp.client"
 } >"$run/client.meta.txt"
 tar -C "$run" -czf "$run/client_artifacts.tar.gz" \
-    client.preflight.pidstat.txt client.preflight.cpu-blockers.tsv client.preflight.rss-blockers.tsv \
-    prefill.log client.workload.log client.perf.data client.perf.script \
+    client.preflight.pidstat.txt client.preflight.cpu-blockers.tsv client.preflight.rss-blockers.tsv client.preflight.cpuset.tsv \
+    prefill.log client.workload.log client.l1_summary.tsv client.perf.data client.perf.script \
     client.collapsed.txt client.svg client.meta.txt
 REMOTE_CLIENT_PERF
 
@@ -802,7 +946,7 @@ fi
     cat "$root/.vemb_v16_build_stamp.server"
 } >"$run/server.meta.txt"
 tar -C "$run" -czf "$run/server_artifacts.tar.gz" \
-    server.preflight.pidstat.txt server.preflight.cpu-blockers.tsv server.preflight.rss-blockers.tsv \
+    server.preflight.pidstat.txt server.preflight.cpu-blockers.tsv server.preflight.rss-blockers.tsv server.preflight.cpuset.tsv \
     server.pid server.log server.threads.txt server.perf.log server.perf.data \
     server.perf.script server.collapsed.txt server.process.collapsed.txt server.svg server.meta.txt \
     server.cpu.process.start server.cpu.process.tsv server.cpu.cpuset.mpstat.txt \

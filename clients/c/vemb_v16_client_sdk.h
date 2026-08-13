@@ -508,6 +508,16 @@ typedef void (*vemb_v16_aeron_batch_vector_completion_cb)(
     void *priv, uint64_t caller_cookie, const vemb_v16_resp_t *response,
     const vemb_v16_aeron_batch_vector_view_t *vector_view);
 
+/* Invoked once for a successfully materialized v2 L0 group before its L0
+ * entry is finished and before leader/follower fan-out. final_key and
+ * vector_view->data are borrowed only for the duration of this callback.
+ * Direct v1 requests, v1 fallback groups, non-OK responses, and invalid
+ * vector views do not invoke this callback. */
+typedef void (*vemb_v16_aeron_batch_materialized_group_cb)(
+    void *priv, const char *final_key, uint16_t key_len,
+    const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view);
+
 typedef struct vemb_v16_aeron_batch_client_stats {
     uint64_t l0_new_leader_groups;
     uint64_t l0_coalesced_followers;
@@ -576,6 +586,15 @@ int vemb_v16_aeron_batch_client_poll(
  * The callback must not retain vector_view->data after it returns. */
 int vemb_v16_aeron_batch_client_poll_shared_vector(
     vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_vector_completion_cb cb, void *priv);
+
+/* Like poll_shared_vector(), with an optional once-per-v2-group hook after
+ * successful materialization and before l0_finish() releases the borrowed
+ * exact key. The hook is synchronous and must not retain either borrowed
+ * pointer. Logical completion cb semantics are unchanged. */
+int vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv);
 
 /* Uses the v1 channel's warm-region mappings to dereference a handle from a

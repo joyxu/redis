@@ -117,6 +117,8 @@ struct benchmark_config {
     unsigned int vemb_v16_topology_retry_limit;
     uint32_t vemb_v16_batch_request_size;
     uint32_t vemb_v16_batch_max_delay_us;
+    /* Per-Aeron-worker completed-vector L1 entries; zero disables L1. */
+    uint32_t vemb_v16_l1_entries;
     /* transport: "tcp" (default, libevent RESP/sniff) or "aeron"
      * (UDS + POSIX SHM SPSC ring, side-channel runner bypassing libevent). */
     const char *vemb_v16_transport;
