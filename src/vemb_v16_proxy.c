@@ -57,6 +57,7 @@ int vemb_v16_cross_node_aeron_enabled(void) {
 #define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
 #define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
 #define VEMB_V16_SUPERNODE_IDLE_SPIN_NS 5000ULL
+#define VEMB_V16_SUPERNODE_IDLE_CLOCK_CHECK_ROUNDS 32u
 
 static void completion_release_payload(vemb_v16_completion_t *completion) {
     vemb_v16_completion_release_inline_snapshot(completion);
@@ -3322,6 +3323,7 @@ static void *supernode_pool_thread_main(void *arg) {
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
     monotime idle_spin_start;
     int idle_spinning = 0;
+    uint32_t idle_spin_rounds = 0;
 #endif
 
     supernode_worker_set_affinity(proxy, worker->worker_id);
@@ -3338,18 +3340,25 @@ static void *supernode_pool_thread_main(void *arg) {
                 elapsedStartNs(&idle_spin_start);
                 idle_spinning = 1;
             }
+            if (++idle_spin_rounds < VEMB_V16_SUPERNODE_IDLE_CLOCK_CHECK_ROUNDS) {
+                cpu_relax();
+                continue;
+            }
+            idle_spin_rounds = 0;
             if (elapsedNs(idle_spin_start) < VEMB_V16_SUPERNODE_IDLE_SPIN_NS) {
                 cpu_relax();
                 continue;
             }
             supernode_worker_wait_for_jobs(worker);
             idle_spinning = 0;
+            idle_spin_rounds = 0;
 #else
             cpu_relax();
 #endif
         } else {
 #ifdef __linux__
             idle_spinning = 0;
+            idle_spin_rounds = 0;
 #endif
         }
     }
