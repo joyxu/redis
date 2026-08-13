@@ -30,10 +30,13 @@ int main(void) {
     assert(proxy);
     atomic_init(&proxy->next_channel_id, 1);
     atomic_init(&proxy->next_channel_index, 0);
+    atomic_init(&proxy->next_v2_lane_index, 0);
+    atomic_store_explicit(&proxy->next_channel_index, 1,
+                          memory_order_relaxed);
     atomic_init(&proxy->running, 1);
     pthread_mutex_init(&proxy->stats_lock, NULL);
-    proxy->proxy_io_worker_count = 1;
-    proxy->supernode_worker_count = 1;
+    proxy->proxy_io_worker_count = 2;
+    proxy->supernode_worker_count = 2;
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *channel = &proxy->channels[i];
         atomic_init(&channel->slot_channel_id, 0);
@@ -68,8 +71,10 @@ int main(void) {
     assert(vemb_v16_proxy_attach_cross_node_batch_channel(
                proxy, &allocation, 1, CACHELINE_SIZE,
                &channel_id) == 0);
-    vemb_v16_channel_t *channel = &proxy->channels[0];
+    vemb_v16_channel_t *channel = &proxy->channels[1];
     assert(channel_id == channel->channel_id && channel->batch_v2);
+    assert(channel->proxy_io_worker_id == 0);
+    assert(channel->supernode_worker_id == 0);
 
     /* Model a job already dequeued by SuperNode before close starts. */
     atomic_store_explicit(&channel->supernode_state, 1, memory_order_release);

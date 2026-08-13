@@ -56,6 +56,10 @@ struct vemb_v16_channel {
     uint64_t channel_id;
     atomic_uint_fast64_t slot_channel_id;
     uint32_t index;
+    /* Stable data-plane owners.  index is a channel-table slot, not a lane
+     * identity; v2 channels receive independent round-robin owners. */
+    uint32_t proxy_io_worker_id;
+    uint32_t supernode_worker_id;
     atomic_int active;
     char request_ring_name[64];
     char response_ring_name[64];
@@ -105,6 +109,7 @@ struct vemb_v16_proxy {
     vemb_v16_channel_t channels[VEMB_V16_MAX_CHANNELS];
     atomic_uint_fast64_t next_channel_id;
     atomic_uint_fast32_t next_channel_index;
+    atomic_uint_fast32_t next_v2_lane_index;
     atomic_int running;
     int listen_fd;
     uint16_t tcp_port;
