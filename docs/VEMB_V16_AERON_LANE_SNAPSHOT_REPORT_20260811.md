@@ -243,3 +243,40 @@ Uniform workload 下，`7:7` 已接近吞吐平台区间，继续增加 lane 的
 stale epoch/response 和 handle dereference failure 均为 `0`。相较 `7:7`，QPS 下降约 `0.27%`，
 P99 仅降低约 `2.27%`，但 Redis process cores 增加约 `8.87%`，单 core QPS 降至 `0.6989M`；
 该结果确认 Uniform 场景的有效 lane 数在 `7` 附近达到平台，`8:8` 不具备 CPU/吞吐优势。
+
+### 9.1 P3 SNW idle clock sampling 同 mask A/B
+
+本段是在上述 P0 lane-owner 修复后，固定 `PIO:SNW=6:6` 的后续 CPU 优化结果。两轮均使用
+server `0-47`、CLI `96-191`、`100K` Uniform `R:R`、`t=64`、`c=4`、`pipeline=batch=32`、30 秒、
+`USE_SVE=yes`、`-O3 -flto` 及全部内部 batch=`32`。P0 为提交 `ffc91ec`；P3 为提交 `c20eeb7`
+（`perf(vemb-v16): sample idle SNW clock checks`），相对 P0 的 server 代码唯一差异为
+`src/vemb_v16_proxy.c`：SNW 在空闲自旋时每 `32` 轮才读取一次 monotonic clock，
+保持原有 `5us` spin window、`arm -> recheck -> futex wait` 和 wake 语义。两轮的 client source、SDK
+archive、memtier artifact 相同，server 线程拓扑均为 `6` 个 `vemb-sn-*` 加 `6` 个 `vemb-io-*`，
+preflight CPU blocker 和全部数据面错误均为 `0`。
+
+| version | PIO:SNW | run | QPS | P99 | server process cores | 单 core QPS | leaders | CPU/leader | 产物 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|
+| P0 (`ffc91ec`) | `6:6` | `p0_p6_s6_uniform_20260813` | 8.143054M | 1.119ms | 9.413 | 0.8652M | 244,481,989 | 1.155177us | [perf](../perf/p0_p6_s6_uniform_20260813/) |
+| P3 (`c20eeb7`) | `6:6` | `p3_p6_s6_svr0-47_uniform_20260813_r1` | 9.613668M | 1.023ms | 10.595 | 0.9074M | 288,559,793 | 1.101713us | [perf](../perf/p3_p6_s6_svr0-47_uniform_20260813_r1/) |
+| delta | - | - | +18.060% | -8.579% | +12.564% | +4.883% | +18.026% | -4.628% | - |
+
+结论：P3 已生效。尽管总 `server process cores` 随吞吐提高而增加，但完成的 leaders 增幅
+（`18.026%`）大于 CPU 增幅（`12.564%`），所以每 leader CPU 下降 `4.628%`、单 core QPS 提升
+`4.883%`；这正是固定 `6:6` 下的 CPU 效率改善。火焰图也直接验证了目标热点被消除：
+`getMonotonicNs_aarch64` 从 `2.850%` 降至 `0.108%`，`__udivti3` 从 `2.811%` 降至 `0.080%`，
+二者合计从 `5.661%` 降至 `0.188%`。该 A/B 每侧目前各一轮，百分比是同配置下的已验证点估计；
+后续补交错重复样本可给出置信区间，但不改变“`c20eeb7` 是唯一代码差异且已产生 CPU/leader 收益”的归因。
+
+### 9.2 当前 UB 带宽判断
+
+在当前 UB 配置下，实测有效带宽上限约为 `10.7GB/s`。峰值 `7:7` 样本在 30 秒内记录
+`shared_vector_bytes=294,798,049,200B`，即 vector load 为 `9.8266GB/s`；同一批处理路径的
+`frame_bytes=12,470,964,920B`，即 UB-based request/response channel 为 `0.4157GB/s`。二者合计
+约 `10.2423GB/s`，约为该有效上限的 `95.7%`。因此，`8.181778M QPS` 已非常接近当前配置的
+有效带宽上限，继续增加 lane 数不会带来线性吞吐增长，这也与 `7:7` 到 `8:8` 的平台/回落现象一致。
+
+该合计包含逻辑 vector payload 和日志记录的 batch request/response frame payload（含 frame
+header/commit），不包含 descriptor ring、缓存行/对齐放大及其他协议访问；因此它支持“接近打满
+当前有效带宽”的判断，但不能单独证明物理 UB/DRAM 链路已经饱和。后续如需确认硬件带宽利用率，
+应补充平台 PMU 或设备带宽计数器。

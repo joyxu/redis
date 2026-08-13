@@ -66,7 +66,7 @@ Important parameters:
 | `BATCH_REQUEST_SIZE` | `32` | VEMB v2 request batch size on both client and server. |
 | `BATCH_MAX_DELAY_US` | `0` | Client batch deadline; zero disables delay-based flushing. |
 | `PIO`, `SNW` | `21`, `21` | Server proxy-IO and SuperNode worker counts. |
-| `SERVER_CPU_MASK`, `CLIENT_CPU_MASK` | `0-47`, `96-191` | CPU sets used by server and client. |
+| `SERVER_CPU_MASK`, `CLIENT_CPU_MASK` | `0-15`, `96-191` | CPU sets used by server and client. |
 | `BUILD` | `verify` | `verify` requires matching O3/LTO/SVE build stamps; `build` rebuilds the respective remote role first. |
 | `KEEP_SERVER` | `0` | Set `1` to keep the temporary server running after the run. |
 | `MAX_FOREIGN_CPU_PCT` | `10` | Fail before startup if any existing process consumes more CPU than this percentage in a 1-second `pidstat` sample. |
