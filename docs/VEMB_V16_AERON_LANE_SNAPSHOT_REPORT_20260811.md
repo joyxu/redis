@@ -171,3 +171,24 @@ legacy v1 fallback channel 和一个 v2 batch channel，二者占用连续 chann
 legacy channel，v2 channel 随后固定落在偶数 index。当前 server 以 `channel_index % lane_count` 选 lane，
 所以 `PIO=SNW=12` 将所有正常 v2 流量固定映射到一半 lane。此现象与 UB request/response/warm 的换向无关；
 奇数 lane 数（例如此前 `11:11`）会因取模改变奇偶性而覆盖全部 lane。
+
+## 8. CLI Cache `12:12` 测试
+在前述 lane 基线上接入 worker-local CLI L1 completed-vector cache 后，使用 `L1_ENTRIES=4096`、
+server `0-15`、CLI `96-191`，保持 `100K`、`t=64`、`c=4`、`pipeline=32`、`batch=32`、
+`max_delay=0` 和 30 秒配置。四场启动前均通过 build stamp、全主机 workload gate 与目标 CPU-set
+gate；server 均确认有 12 个 `vemb-io-*` 和 12 个 `vemb-sn-*` 线程。
+
+| 分布 | PIO:SNW | run | QPS | P99 | 当前 L1 hit | server process cores | 单 core QPS | 测试代码提交 | 产物 |
+|---|---|---|---:|---:|---:|---:|---:|---|---|
+| Uniform `R:R` | `12:12` | `l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732` | 7.944863M | 1.391ms | 4.0925% | 10.291 | 0.7720M | `a150ab7` | [perf](../perf/l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732/) |
+| Zipf `s=1.0` | `12:12` | `l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753` | 13.190124M | 0.703ms | 59.3575% | 8.973 | 1.4699M | `a150ab7` | [perf](../perf/l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753/) |
+| Zipf `s=1.2` | `12:12` | `l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735` | 17.628362M | 0.511ms | 83.9782% | 8.397 | 2.0994M | `a150ab7` | [perf](../perf/l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735/) |
+| Zipf `s=1.5` | `12:12` | `l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739` | 39.550067M | 0.383ms | 97.6277% | 7.841 | 5.0442M | `a150ab7` | [perf](../perf/l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739/) |
+
+`server process cores` 为 redis-server 的 user+system CPU time / 30 秒 wall time；`单 core QPS`
+按该 process core-equivalent 计算。所有样本的 `fallback_v1`、backpressure、non-OK、unmatched
+response、handle/shared-vector read failure、L1 queue-full、all-pinned、key/vector storage exhaustion
+和 stale ref 均为 `0`。uniform 远端 L0 聚合为 30.686 items/frame，已恢复接近 32-item batch。
+
+本表是 L1 enabled-only 功能与资源验证：用户要求不跑 4-key，且当前分支没有开发 L1 的版本才是
+disabled 版本。因此不与本报告历史无 L1 lane 数据计算 A/B 性能收益，也不以该表改变原有 lane 数结论。

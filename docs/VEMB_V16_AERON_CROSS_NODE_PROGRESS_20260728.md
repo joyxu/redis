@@ -3084,16 +3084,17 @@ encode/decode round-trip。
 当前代码恢复为 24B header、可变长 entry 和末尾 8B commit 的紧凑布局。本 checkpoint 未用新 ABI 重建完整 Redis/client
 并运行数据面 workload，不能当作端到端回归结果。
 
-### 21.20 CLI worker-owned L1 completed-vector cache 落地规划（未开始）
+### 21.20 CLI worker-owned L1 completed-vector cache 落地与验证
 
 本 checkpoint 的目标是先落地 CLI L1，而不是 proxy L2：在已经预填充、无写入、纯
 `VEMB_HANDLE` 读取的 benchmark 中，让 completed-vector hit 完全绕开 channel、server 和 UB
 warm-region dereference。这样不要求 server、proxy、ATTACH 或 wire ABI 改造，直接削减 UB 读取和
 client 端 vector copy；L1 默认关闭，只有显式配置 cache entry 数时才启用。
 
-**前置门禁：** 21.19 记录的 UB 连续 frame 范围级 publish 语义必须先由 UB 修复或得到明确保证。
-L1 只缓存一次已 materialize 的 vector；若 batch response 本身可能部分可见，L1 会把一次错误 handle
-或错误 vector 延长为多次本地命中，不能作为绕过该问题的补偿或在该问题未解决时运行端到端 L1 性能结论。
+21.19 记录的 UB 连续 frame 范围级 publish 可见性问题已经确认属于硬件问题并完成修复，
+不再作为 L1 实现的前置门禁。L1 仍只缓存一次已经完整 materialize 的成功 vector；端到端测试
+必须继续验证 response/frame 完整性、handle dereference 成功率和 stale/unmatched response 为零，
+不能用缓存结果掩盖数据面错误。
 
 #### 21.20.1 首版语义和边界
 
@@ -3102,9 +3103,32 @@ L1 只缓存一次已 materialize 的 vector；若 batch response 本身可能�
   `MOVED`/`ASK` 和任何 handle dereference failure 都不得填入 L1。
 - 首版没有 TTL，也不宣称跨 client 写入下的 strict 或 bounded-stale 语义。当前阶段不存在写入，
   因此 entry 在 worker 生命周期内保持有效，直到显式 clear、worker 退出或容量淘汰。
-- key 是完整 final VEMB key bytes 加 `dim`；hash/fingerprint 仅用于定位，命中必须比较完整 key，
-  不得 hash-only 命中。value 保存 `vemb_v16_resp` 的成功元数据和已经从 UB 物化出的完整 vector snapshot，
-  不保存仅含 `offset` 的 handle。
+- key 是完整 final VEMB key bytes；worker 的 L1 在创建时固定 `dim`，entry 不重复保存 `dim`。
+  hash/fingerprint 仅用于定位，命中必须比较完整 key，不得 hash-only 命中。value 保存已经从 UB
+  物化出的完整 vector snapshot，以及后续完成所需的最小成功 metadata，不保存仅含 `offset` 的 handle。
+- 首版 entry 固定为 32B；显式保留 4B `reserved`，后续新增 metadata 时优先消耗该空间：
+
+```c
+typedef struct vemb_v16_cli_l1_entry {
+    uint64_t key_hash;      /* Hash used to select the cache set. */
+    uint16_t key_len;       /* Exact final-key length in bytes. */
+    uint16_t vector_bytes;  /* Materialized vector size in bytes. */
+    uint32_t key_slot;      /* Index into the preallocated key slab. */
+    uint32_t vector_slot;   /* Index into the preallocated vector pool. */
+    uint32_t generation;    /* L1 slot generation used to reject stale refs. */
+    uint16_t pin_count;     /* Number of local completions holding this entry. */
+    uint8_t  valid;         /* Entry contains a completed vector. */
+    uint8_t  clock_ref;     /* CLOCK replacement reference bit. */
+    uint8_t  reserved[4];   /* Reserved for future metadata fields. */
+} vemb_v16_cli_l1_entry_t;
+
+_Static_assert(sizeof(vemb_v16_cli_l1_entry_t) == 32,
+               "L1 entry must remain 32 bytes");
+```
+
+  `generation` 是 L1 slot 重用代际，用于拒绝旧 completion 对新 entry 的 stale release；它不能
+  与远端 warm location 的 `owner_generation` 合并。`vector_bytes` 保留用于 materialize 后的
+  shape 校验（当前最大 `DIM=4096` 时不超过 `16384` bytes）。
 - `slot_meta`、key hash/fingerprint、`owner_generation` 和 `write_seq` 的 warm-state 校验本轮不实现。
   后续在允许写入或迁移前必须补齐如下语义，届时不通过则 invalidate 并重新从 server 解析：
 
@@ -3131,9 +3155,20 @@ vector storage；热路径不得 malloc、rehash、创建链表或按 entry 分�
 不得淘汰，完成回调处理后 release。pool/set 全部 pinned 或满时视为运行期资源压力，直接 miss 并走现有
 L0/batch 路径，不临时扩容。
 
+L1 的索引遵循 Valkey/L0 已验证的局部模式：`key_hash -> set`、高 8 位 `h2` 指纹预筛、完整 hash/长度/
+key bytes 确认；`h2` 永远不是命中依据。L1 固定为 `N/4` 个 set、每 set 4 个 way，set metadata 保持
+一条 cache line；它不采用 Valkey 的 child bucket、动态扩缩容或 incremental rehash。**TODO(vemb-v16):**
+当 L0、L1 和 server 侧出现足够多相同的 worker-local fixed-hash 使用者时，统一沉淀 hash、`h2`、
+exact-key compare、generation 和 bucket layout 的设计规范或窄索引底座；不得把 L0 的 in-flight 生命周期、
+L1 的 pin-aware CLOCK 或 server 的 authoritative/rehash 语义强行合并到同一个通用表。
+
 初始默认建议为每 worker `4096` entries。`dim=300` 时 vector payload 约 `4.7 MiB/worker`，64 worker
 约 `300 MiB`，不含 key 和 entry metadata；最终值必须由实际 worker 数、DIM、RSS 预算和热点分布复核。
 100K uniform 在此容量下的 hit ratio 可能很低，4-key hotspot 与 Zipf 才是首要收益场景。
+
+CLI 打开 server 广告的 warm region 时只允许读权限：使用 `O_RDONLY` 和 `PROT_READ` 的映射。
+request/response ring 以及 batch descriptor/arena 仍必须使用 `O_RDWR` 和可读写映射，因为 CLI
+需要发布请求并推进/消费 ring metadata。warm region 映射不得成为修改 server warm 数据的路径。
 
 #### 21.20.3 请求、填充和本地完成路径
 
@@ -3167,6 +3202,26 @@ group 的精确 key，materialize 一次 UB vector，调用 worker-owned L1 fill
 结果完成 leader/follower fan-out。不得在每个 follower 回调中重复填 L1，也不得在 `vemb_v16_cli_l0_finish()`
 释放 group/key 后再尝试回填。
 
+推荐 batch client 提供一次-per-group 的 materialization hook（可作为现有
+`poll_shared_vector()` 的扩展 API），回调参数包含 borrowed 的完整 key、成功 response metadata
+和临时 vector view。worker 在回调中把 vector 复制到预分配的 L1 vector pool，然后才调用 L0 finish。
+该临时 view 只在 callback 期间有效，L1 不得保存其指针。
+
+严格时序为：
+
+```text
+response item
+  -> resolve L0 group
+  -> borrow group key
+  -> materialize vector
+  -> L1 put exactly once
+  -> l0_finish()
+  -> leader/follower fan-out
+```
+
+只有 `status == OK` 且 handle dereference 成功的正常 VEMB_HANDLE response 才能触发该 hook；
+`NOT_FOUND`、非 OK、fallback v1、stale topology、超时、关闭错误和 dereference failure 均不得填充 L1。
+
 #### 21.20.4 channel 路由与 batch-agg 的关系
 
 首版保留当前 session/channel round-robin：worker 仍按现有 `next_ch` 选择 channel，key 在该选择之后生成。
@@ -3177,23 +3232,182 @@ group 的精确 key，materialize 一次 UB vector，调用 worker-owned L1 fill
 相同 key 合并概率。但它会改变 channel 负载、tail latency 和 backpressure 分布，不能与第一版 L1 收益
 混在同一次比较中；应在 L1 自身 A/B 正确后再以独立 checkpoint 评估，且仍不得跨 worker 共享 L1。
 
-#### 21.20.5 实现切分、指标和验收
+#### 21.20.5 分阶段实现、checkpoint 和验收
 
-1. 新建固定容量的 `clients/c/internal/vemb_v16_cli_l1.h` 与 `clients/c/vemb_v16_cli_l1.c`，提供
-   create/destroy、exact-key lookup、put、pin/release、clear 和 stats；新增单元测试覆盖 exact collision、
-   CLOCK eviction、all-pinned resource pressure、generation ABA、防止 hot-path allocation，以及 key/vector
-   storage exhaustion。
-2. 在 memtier worker 创建/销毁 L1 与 local completion queue，并增加默认关闭的 cache-entry 配置；先只让
-   pure `VEMB_HANDLE` consumer 在 submit 前查 L1，命中经 queue 完成。
-3. 为 batch client 增加一次-per-L0-group 的成功 materialization hook；worker 用其回填 L1，保持现有
-   L0 leader/follower response 和错误收敛语义不变。
-4. 输出 `l1_hit`、`l1_miss`、`l1_insert`、`l1_evict`、`l1_hit_ratio`、`l1_vector_bytes`、
-   `l1_ub_read_bytes_saved` 和 `local_completion_count`；`l1_ub_read_bytes_saved` 只按实际 L1 hit
-   省掉的 vector bytes 计数，不能把 L0 coalescing 的收益混入。
-5. 先通过 L1 UT、`make -C clients/c`、`make -C memtier_benchmark` 与 `git diff --check`；随后在 UB
-   完整 frame 门禁通过后，比较 disabled/enabled 的 4-key hotspot、100K Zipf `s=1.2` 和 100K uniform。
-   每组须同时报告 QPS、P99、L1 hit ratio、server items、UB read bytes 和 client RSS；所有现有
-   fallback、backpressure、non-OK、stale/unmatched response 与 handle dereference failure 必须为零。
+L1 代码按以下阶段落地。每个阶段完成后单独形成 checkpoint，不把多个阶段的性能收益混在一个
+提交或一张结果表中。每个 checkpoint 必须记录：测试代码提交、工作区状态、改动文件、UT/build
+命令、关键计数和未覆盖风险。存在未提交改动时，结果目录必须归档对应的 `git diff`。
+
+**L1-P0：权限和基线冻结。 DONE（2026-08-12）**
+
+- 保留已完成的 warm-region 只读约束：CLI warm mapping 使用 `O_RDONLY + PROT_READ`；req/resp
+  ring 和 batch descriptor/arena 继续使用 `O_RDWR + PROT_READ|PROT_WRITE`。
+- 建立 L1 disabled 基线，不改变请求、L0、batch 或 completion 语义；确认 21.19 硬件修复后的
+  response/frame 完整性、handle dereference、stale/unmatched response 均正常。
+- 验收完成：`git diff --check`、`make -C clients/c`、`make -C memtier_benchmark -j2`。
+  两个构建均成功；构建输出中的既有 unused-variable、uninitialized-warning 和 macOS linker
+  deprecation warning 不属于本阶段改动。4-key hotspot 的 disabled 运行参数和结果尚未在本阶段
+  归档，待跨节点测试环境可用后作为独立基线 checkpoint 补充，不阻塞权限边界和构建验收。
+- checkpoint：当前工作区包含 warm-region 只读映射改动；工作区状态为基线提交加未提交 diff，
+  后续归档测试结果时必须同时保存该 diff。P0 未实现 L1 entry、lookup、local completion 或回填路径。
+
+**L1-P1：独立固定池模块。 DONE（2026-08-12）**
+
+- 新建 `clients/c/internal/vemb_v16_cli_l1.h` 和 `clients/c/vemb_v16_cli_l1.c`；entry 固定为
+  32B（含 4B `reserved`），worker 创建时固定 `dim`，不在 entry 重复保存 `dim`。
+- API 只负责 worker-local cache：`create/destroy`、exact-key lookup、put、pin/release、clear
+  和 stats。固定 key slab、vector pool、4-way set table 和 CLOCK replacement；热路径禁止 malloc、
+  rehash 和按 entry 分配。
+- UT 覆盖完整 key collision、CLOCK eviction、all-pinned miss、generation ABA、key/vector storage
+  exhaustion，以及 hit/insert/evict 计数。此阶段不接入 memtier，不改变线上路径。
+- 验收：L1 UT、`make -C clients/c`、`git diff --check`。
+- 已完成：新增固定池模块及 `vemb_v16_cli_l1_ut`。L1 使用 `N/4 x 4-way`、一条 cache line 的 set
+  metadata、`h2` 预筛和 full-key confirm；每次 lookup 自动 pin，返回 `entry_id + generation`，只有
+  release 后才允许 CLOCK 淘汰。UT 已覆盖相同 hash/h2 的完整 key collision、CLOCK replacement、
+  all-pinned resource pressure、stale generation ABA、key/vector pool exhaustion、clear invalidation
+  及 hit/insert/evict 计数。
+- 验收完成：`make -B -C benchmark vemb_v16_cli_l1_ut`、`make -B -C benchmark
+  vemb_v16_cli_l0_ut`、`make -C clients/c`、`git diff --check` 均通过。测试代码提交：
+  `5ab79d39babd79549492b44cfb1e32596ef99f15`；工作区状态：基线 `5ab79d39` + 未提交 diff。P1
+  仅构建独立模块，未改 memtier、batch-agg、server、proxy 或 wire path；端到端填充/本地完成仍留给 P2/P3。
+
+**L1-P2：worker 生命周期和本地完成队列。 DONE（2026-08-12）**
+
+- 增加 `--vemb-v16-l1-entries=N`，默认 `0`（关闭）；在每个 memtier worker 创建/销毁一个 L1，
+  所有该 worker 的 batch session 共享它。
+- 增加固定容量 local completion queue，容量至少覆盖 `batch sessions * pipeline`。queue item
+  保存 caller cookie/req_id、sent time、L1 entry index 和 generation；命中只入队，不直接重入
+  submit 或 callback。
+- 仅接入纯 `VEMB_HANDLE` consumer 的 submit 前 lookup；poll/accounting 阶段消费 local queue，
+  复用现有 latency、pipeline credit 和 completion 记账，完成后 release pin。
+- 验收：L1 disabled 行为与基线一致；enabled 的 synthetic local-hit UT 覆盖队列满、pin/release
+  和 generation mismatch。此阶段暂不填充 L1，所有请求仍可走现有 server miss 路径。
+- 已完成：新增 `--vemb-v16-l1-entries=N`（默认 `0`），只允许 pure cross-node `VEMB_HANDLE`
+  batch session 使用；entry 数必须是 `4 * 2^k`，与固定 `N/4 x 4-way` L1 set layout 对齐。每个
+  worker 创建一个 C SDK L1，旗下 batch session 共用；worker join 后、batch session teardown 前销毁。
+- runner 的 local completion queue 只是 C++ accounting 适配：worker 启动前一次性分配
+  `clients * pipeline` 个固定槽，保存 channel、caller cookie、sent time、pinned vector view 和
+  C SDK `entry_id + generation` ref。命中占用原有 pending slot，只入队，不向 batch client、channel、
+  server 或 UB publish；poll/drain 时构造本地 OK completion，复用现有 latency、pipeline credit 和
+  get accounting，然后 release L1 pin。queue 满时 release pin 并走原有 batch submit path。
+- cache 的 hash table、key/vector pool、pin/release 和 CLOCK 策略仍完全在 `clients/c` 的 C SDK；
+  runner 没有复制或扩展 cache 模型。P2 没有 L1 fill/materialization hook，也没有 P4 的 L1 汇总指标，
+  因而真实端到端运行仍是 L1 miss，不应据此报告 cache 性能收益。
+- 验收完成：`make -B -C benchmark vemb_v16_cli_l1_ut`、`make -B -C benchmark
+  vemb_v16_cli_local_completion_ut`、`make -B -C benchmark vemb_v16_cli_l0_ut`、
+  `make -B -C clients/c`、`make -B -C memtier_benchmark -j2`、`git diff --check` 均通过。local
+  completion UT 覆盖 FIFO/queue-full、L1 lookup pin/release 和 clear/reuse 后 stale generation ref
+  rejection。P2 测试代码尚未独立提交；改动为 `memtier_benchmark/memtier_benchmark.{h,cpp}`、
+  `memtier_benchmark/vemb_v16_aeron_runner.cpp`、`memtier_benchmark/vemb_v16_aeron_local_completion.h`、
+  `memtier_benchmark/Makefile.am`、`benchmark/Makefile` 与
+  `benchmark/vemb_v16_cli_local_completion_ut.cpp`，另更新本进度文档。构建中的既有 unused-variable、
+  uninitialized-variable、C++ VLA extension 及 macOS linker deprecation warning 不属于本阶段改动；
+  工作区仍是基线 `5ab79d39` 加未提交 diff。
+
+**L1-P3：L0 group materialization hook 和回填。 DONE（2026-08-12）**
+
+- 为 batch client 增加一次-per-L0-group 的 materialization hook，扩展现有
+  `poll_shared_vector()`；hook 在 `l0_finish()` 前取得 borrowed key，并传递成功 response metadata
+  和临时 vector view。
+- worker 在 hook 中将 vector 复制到预分配 L1 pool，成功 `VEMB_HANDLE` 且 dereference 成功时
+  `put` exactly once，然后执行原有 leader/follower fan-out。不得在 follower callback 重复填充，
+  不得保存临时 view 指针。
+- fallback v1、NOT_FOUND、非 OK、stale topology、超时、关闭错误和 dereference failure 不填 L1。
+- 验收：batch/L0 UT 验证一个 group 只产生一次 insert，重复 follower 不增加 insert；错误收敛和
+  stale response 行为保持不变。
+- 已完成：C SDK 新增
+  `vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook()`；既有
+  `poll_shared_vector()` ABI 保持不变，只是以空 hook 转发到新 API。SDK 仅在一个 v2、`PUBLISHED`
+  L0 group 收到 `OK VEMB_HANDLE`、`vector_bytes == dim * sizeof(float)` 且完整 warm-region read
+  成功后，在 `vemb_v16_cli_l0_finish()` 前同步交付 borrowed key/vector view。v1 direct、v1 fallback
+  和所有非 OK、错误 shape 或 read failure 均不触发 hook。
+- worker 只在 L1 已启用且未使用 `VEMB_AERON_SKIP_HANDLE_READ` 时注册 hook，并在其中立即调用 C SDK
+  `vemb_v16_cli_l1_put()` 复制 vector；固定池资源压力的 put 失败不会改变原有远端 completion 或
+  leader/follower fan-out。runner 不保留 scratch view，也没有实现第二套 cache 模型。
+- 新增 `vemb_v16_cli_l1_materialization_ut`，通过真实 L0 `submit -> publish -> resolve -> finish`
+  状态机验证 hook 早于 fan-out、leader/follower 只插入一次；另覆盖 invalid vector、非 OK 和
+  `FALLBACK_V1` 均不插入。验收完成：`make -B -C benchmark vemb_v16_cli_l1_materialization_ut`、
+  `make -B -C benchmark vemb_v16_cli_l1_ut`、`make -B -C benchmark
+  vemb_v16_cli_local_completion_ut`、`make -B -C benchmark vemb_v16_cli_l0_ut`、`make -B -C clients/c`、
+  `make -B -C memtier_benchmark -j2` 与 `git diff --check` 均通过。P3 测试和实现仍是基线
+  `5ab79d39` 上的未提交 diff；P4 的汇总指标、日志和功能 A/B 尚未开始。
+
+**L1-P4：统计、日志和功能场景验证。 DONE（enabled-only，2026-08-12）**
+
+- 增加并汇总 `l1_hit`、`l1_miss`、`l1_insert`、`l1_evict`、`l1_hit_ratio`、`l1_vector_bytes`、
+  `l1_ub_read_bytes_saved` 和 `local_completion_count`。后者只统计本地命中完成；saved bytes
+  只按实际 L1 hit 计算，不能混入 L0 coalescing 收益。
+- 本轮仅执行 100K uniform、Zipf `s=1.0`、Zipf `s=1.2` 和 Zipf `s=1.5` 的 enabled 场景；按本 checkpoint 的
+  约定，未开发 CLI L1 的版本才是 disabled 版本。用户明确要求不跑 4-key hotspot，也不以本轮数据
+  声称 A/B 增益。每组记录 QPS、P99、L1 hit ratio、server items、UB read bytes、client RSS 和
+  server process CPU core-equivalent。
+- 验收：enabled 命中不访问 channel/server/warm region；所有 fallback、backpressure、non-OK、
+  stale/unmatched response 和 handle dereference failure 为零或有明确归因。
+- 已完成：C SDK L1 stats 增加 `live_vector_bytes`；runner 在销毁每 worker L1 前汇总并输出一行
+  `[aeron] l1-summary`，包括 `l1_hit`、`l1_miss`、`l1_insert`、`l1_evict`、`l1_hit_ratio`、
+  `l1_vector_bytes`、`l1_ub_read_bytes_saved`、`local_completion_count`，以及资源压力、stale ref、
+  queue-full fallback、`server_items` 和 `ub_read_bytes`。`l1_vector_bytes` 是运行末尾 live vector
+  payload，不等同于 `l1_vector_capacity_bytes` 这个预分配 RSS 预算上限。
+- `local_completion_count` 与 `l1_ub_read_bytes_saved` 仅在 local queue 的命中被实际消费并完成
+  accounting 后增长；queue 满时 pin 被释放并走远端，因而不会虚报本地完成或节省的 UB read。`server_items`
+  是 v2 unique batch item 加实际 v1 fallback/direct request，`ub_read_bytes` 是成功 materialize 的
+  shared-vector read；两者不混入 L0 follower coalescing 收益。
+- `scripts/run_aeron_cross_node_flamegraph.sh` 增加 `L1_ENTRIES`（默认 0）并严格检查 `0` 或
+  `4 * 2^k`。每次样本将该值写进 run label，采集 client max RSS，并在
+  `client.l1_summary.tsv` 归档 QPS/P99、全部 L1 指标、server items、UB read bytes 与 RSS；异常
+  fallback、backpressure、read failure、非 OK、queue-full、all-pinned、storage exhaustion 或 stale ref
+  直接使样本失败。脚本语法、dry-run、容量拒绝和 TSV 合成解析均已验证。
+- batch-wave 修复：第一次在 `PIO=12, SNW=12, server CPU=0-15` 的 L1 enabled uniform 样本中发现
+  local L1 hit 先归还一个 pipeline slot，会令该 channel 的未完成远端 L0 group 在
+  `max_batch_delay_us=0` 下被 eager flush；下一轮仅补入一个 miss，导致远端 batch 退化为单项 frame。
+  runner 现为 L1 enabled channel 增加 remote batch-wave gate：一个 publish wave 有远端 submit 后，
+  只有该 wave 的全部远端 logical completion 已 account，才允许该 channel refill。local completion
+  仍在正常 poll/accounting 阶段完成。disabled 路径不启用该 gate。新增 local-completion UT 覆盖
+  wave 的 seal/complete 边界。
+- 为防止外部 workload 再次污染结果，`run_aeron_cross_node_flamegraph.sh` 的启动 gate 在原有全主机
+  `pidstat` 检查外，增加对目标 CPU set 的两次 `/proc/stat` snapshot 采样；target busy 超过
+  `MAX_FOREIGN_CPUSET_BUSY_PCT`（默认 10%）即拒绝运行。采样用 CPU id 映射解析，避免早期
+  positional `paste` 计算的列错位。
+- 受控跨机验证配置：`L1_ENTRIES=4096`，100K prefill 后 immutable pure read，`t=64 c=4`
+  `pipeline=32 batch=32 max_delay=0`，30s；server `PIO=12 SNW=12 taskset=0-15`，client
+  `taskset=96-191`，`KILL_OPENCODE=0 KILL_MUTAGEN=0`。四场启动前 build stamp、全主机 load gate
+  和 target CPU-set gate 均通过；server thread inventory 均为 12 `vemb-io-*` + 12 `vemb-sn-*`。
+
+  | workload | QPS | P99 | L1 hit ratio | server items | UB read bytes | client max RSS | redis-server cores | CPU-set total cores (0-15) |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | uniform `R:R` | 7,944,863.20 | 1.391 ms | 4.0925% | 228,757,328 | 274,508,793,600 | 430,480 KiB | 10.291 | 10.833 |
+  | Zipf `Z:Z`, `s=1.0` | 13,190,123.63 | 0.703 ms | 59.3575% | 160,666,648 | 192,799,977,600 | 423,252 KiB | 8.973 | 9.413 |
+  | Zipf `Z:Z`, `s=1.2` | 17,628,362.45 | 0.511 ms | 83.9782% | 84,662,643 | 101,595,171,600 | 425,784 KiB | 8.397 | 8.870 |
+  | Zipf `Z:Z`, `s=1.5` | 39,550,067.31 | 0.383 ms | 97.6277% | 28,091,517 | 33,709,820,400 | 411,824 KiB | 7.841 | 8.262 |
+
+  `redis-server cores` 是 process user+system CPU time / 30s wall time；CPU-set total 还包含
+  IRQ 和该 set 内其他极小系统活动，故略高于进程值。此前不具可比性的 `PIO=21/SNW=21`、server
+  `0-47` 样本（25.002 cores）不纳入本表。
+
+  uniform 的 L0 聚合为 7,454,866 frames / 228,757,328 unique items，即 30.686 items/frame，已恢复
+  接近 32-item batch，证明修复消除了此前约 1.18 items/frame 的 local-hit refill 退化。Zipf 1.0/1.2/1.5
+  分别为 12.987/5.138/1.415 items/frame；这是 L1 先剔除热点命中、剩余远端 key 又被 L0 合并后的实际 unique
+  miss 分布，不能与 uniform 的独立 key frame size 直接比较。
+
+  四场均为 enabled-only 功能与资源验证，不构成 disabled 对照或性能收益声明。所有样本的
+  `fallback_v1`、`flush_backpressure`、shared-vector read failure、non-OK status、unmatched response、
+  handle dereference failure、`l1_queue_full_fallbacks`、`l1_all_pinned`、L1 key/vector storage
+  exhaustion 与 `l1_stale_ref` 均为零。完整工件位于：
+  `perf/l1p4_uniform_enabled_p12_s12_svr0_15_wavefix_20260812_1732/`、
+  `perf/l1p4_zipf10_enabled_p12_s12_svr0_15_wavefix_20260812_1753/`、
+  `perf/l1p4_zipf12_enabled_p12_s12_svr0_15_wavefix_20260812_1735/`、
+  `perf/l1p4_zipf15_enabled_p12_s12_svr0_15_wavefix_20260812_1739/`；每目录均保留 server/client
+  perf data、SVG、CPU sampling、workload log 和 `client.l1_summary.tsv`。本次代码仍在基线
+  `5ab79d39` 上的未提交工作区，结果不能作为已提交源码快照的 A/B 基线。
+
+**L1-P5：扩展前的封存 checkpoint。**
+
+- 汇总 P1-P4 的代码、UT 和 A/B 结果，冻结首版 immutable pure-read 语义，明确 entry 容量与 RSS
+  预算建议。
+- 在此 checkpoint 之前不实现 proxy L2、跨 worker shared cache、key-affine channel routing、
+  `slot_meta/write_seq` 校验，以及可写 workload 的 TTL/lease/invalidation。
+- P5 之后如需支持迁移或写入，必须单独设计 generation/失效协议和新的 checkpoint，不得把它们
+  作为首版 L1 的隐式扩展。
 
 本节只定义 worker-local completed-vector cache。proxy L2 location cache、跨 worker shared cache、
 key-affine channel routing、`slot_meta` 校验，以及可写 workload 的 TTL/lease/invalidation 仍是后续独立

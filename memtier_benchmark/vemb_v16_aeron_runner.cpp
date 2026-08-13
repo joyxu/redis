@@ -22,6 +22,7 @@
 
 #include "vemb_v16_aeron_runner.h"
 #include "vemb_v16_aeron_runner_plan.h"
+#include "vemb_v16_aeron_local_completion.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,6 +76,13 @@ struct worker_arg {
     std::vector<vemb_v16_aeron_channel_t *> channels;
     std::vector<vemb_v16_aeron_batch_client_t *> batch_clients;
     bool                batch_sessions_enabled;
+    /* SDK-owned worker-local completed-vector cache. */
+    vemb_v16_cli_l1_t *l1;
+    vemb_v16_aeron_local_completion_queue local_completions;
+    std::vector<vemb_v16_aeron_remote_batch_wave> remote_waves;
+    uint64_t local_completion_count;
+    uint64_t l1_ub_read_bytes_saved;
+    uint64_t l1_queue_full_fallbacks;
     /* ratio bookkeeping for mixed workloads */
     unsigned long set_ratio_count;
     unsigned long get_ratio_count;
@@ -98,6 +106,43 @@ static uint64_t now_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static bool l1_entry_count_valid(uint32_t entry_count) {
+    if (entry_count < VEMB_V16_CLI_L1_WAYS ||
+        entry_count % VEMB_V16_CLI_L1_WAYS != 0)
+        return false;
+    uint32_t set_count = entry_count / VEMB_V16_CLI_L1_WAYS;
+    return (set_count & (set_count - 1u)) == 0;
+}
+
+struct aeron_l1_stats_total {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t inserts;
+    uint64_t evicts;
+    uint64_t exact_key_mismatch;
+    uint64_t all_pinned;
+    uint64_t key_storage_exhausted;
+    uint64_t vector_storage_exhausted;
+    uint64_t stale_ref;
+    uint64_t live_vector_bytes;
+    uint64_t live_entries;
+};
+
+static void l1_stats_add(aeron_l1_stats_total *total,
+                         const vemb_v16_cli_l1_stats_t *worker) {
+    total->hits += worker->hits;
+    total->misses += worker->misses;
+    total->inserts += worker->inserts;
+    total->evicts += worker->evicts;
+    total->exact_key_mismatch += worker->exact_key_mismatch;
+    total->all_pinned += worker->all_pinned;
+    total->key_storage_exhausted += worker->key_storage_exhausted;
+    total->vector_storage_exhausted += worker->vector_storage_exhausted;
+    total->stale_ref += worker->stale_ref;
+    total->live_vector_bytes += worker->live_vector_bytes;
+    total->live_entries += worker->live_entries;
 }
 
 /* Map cfg->key_pattern[idx] to object_generator iterator type.
@@ -325,9 +370,12 @@ static void account_batch_completion(void *priv, uint64_t caller_cookie,
     batch_completion_ctx *ctx = (batch_completion_ctx *)priv;
     vemb_v16_resp_t logical_response = *response;
     logical_response.req_id = (uint32_t)caller_cookie;
-    ctx->completed += account_response(ctx->worker, ctx->channel_index,
-                                       ctx->pipeline, &logical_response, 0,
-                                       ctx->vec_scratch, ctx->debug, NULL);
+    int accounted = account_response(ctx->worker, ctx->channel_index,
+                                     ctx->pipeline, &logical_response, 0,
+                                     ctx->vec_scratch, ctx->debug, NULL);
+    ctx->completed += accounted;
+    if (accounted && ctx->worker->l1)
+        ctx->worker->remote_waves[ctx->channel_index].complete_one();
 }
 
 static void account_batch_vector_completion(
@@ -336,10 +384,51 @@ static void account_batch_vector_completion(
     batch_completion_ctx *ctx = (batch_completion_ctx *)priv;
     vemb_v16_resp_t logical_response = *response;
     logical_response.req_id = (uint32_t)caller_cookie;
-    ctx->completed += account_response(ctx->worker, ctx->channel_index,
-                                       ctx->pipeline, &logical_response, 0,
-                                       ctx->vec_scratch, ctx->debug,
-                                       vector_view);
+    int accounted = account_response(ctx->worker, ctx->channel_index,
+                                     ctx->pipeline, &logical_response, 0,
+                                     ctx->vec_scratch, ctx->debug,
+                                     vector_view);
+    ctx->completed += accounted;
+    if (accounted && ctx->worker->l1)
+        ctx->worker->remote_waves[ctx->channel_index].complete_one();
+}
+
+static void fill_l1_from_materialized_group(
+    void *priv, const char *final_key, uint16_t key_len,
+    const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view) {
+    worker_arg *w = (worker_arg *)priv;
+    assert(response->status == VEMB_V16_STATUS_OK);
+    assert(vector_view->valid);
+    (void)vemb_v16_cli_l1_put(w->l1, final_key, key_len,
+                               vemb_v16_xxh3_64_str(final_key, key_len),
+                               vector_view->data,
+                               (uint16_t)vector_view->bytes);
+}
+
+static int account_local_completions(worker_arg *w, uint32_t pipeline,
+                                     aeron_debug_counters *debug) {
+    int completed = 0;
+    while (!w->local_completions.empty()) {
+        vemb_v16_aeron_local_completion completion = w->local_completions.pop();
+        vemb_v16_resp_t response = {};
+        response.req_id = (uint32_t)completion.caller_cookie;
+        response.status = VEMB_V16_STATUS_OK;
+        vemb_v16_aeron_batch_vector_view_t vector_view = {
+            .data = completion.vector,
+            .bytes = completion.vector_bytes,
+            .attempted = 1,
+            .valid = 1,
+        };
+        int accounted = account_response(w, completion.channel_index, pipeline,
+                                         &response, 0, NULL, debug, &vector_view);
+        assert(accounted == 1);
+        completed += accounted;
+        w->local_completion_count++;
+        w->l1_ub_read_bytes_saved += completion.vector_bytes;
+        assert(vemb_v16_cli_l1_release(w->l1, &completion.ref) == 0);
+    }
+    return completed;
 }
 
 static void *worker_main(void *arg) {
@@ -389,6 +478,8 @@ static void *worker_main(void *arg) {
         int published_any = 0;
         for (uint32_t k = 0; k < n_ch; k++) {
             uint32_t ch = (next_ch + k) % n_ch;
+            if (w->l1 && w->remote_waves[ch].active())
+                continue;
             uint32_t batch_count = pipeline - w->pending_count[ch];
             if (batch_count > AERON_BATCH_SIZE) batch_count = AERON_BATCH_SIZE;
             if (budget > 0 && op_idx < budget && budget - op_idx < batch_count)
@@ -398,6 +489,7 @@ static void *worker_main(void *arg) {
 
             if (w->batch_sessions_enabled) {
                 uint32_t accepted = 0;
+                uint32_t remote_submitted = 0;
                 struct timeval now;
                 gettimeofday(&now, NULL);
                 for (uint32_t i = 0; i < batch_count; i++) {
@@ -410,6 +502,37 @@ static void *worker_main(void *arg) {
                                     w->obj_gen->get_key(),
                                     w->obj_gen->get_key_len(), &req_batch[i],
                                     &actual_key_len);
+                    if (w->l1) {
+                        vemb_v16_cli_l1_value_t value;
+                        int l1_hit = vemb_v16_cli_l1_lookup(
+                            w->l1, req_batch[i].key, (uint16_t)actual_key_len,
+                            req_batch[i].key_hash, &value);
+                        if (l1_hit) {
+                            uint32_t slot = w->pending_tail[ch];
+                            vemb_v16_aeron_local_completion completion = {
+                                .channel_index = ch,
+                                .req_id = req_batch[i].req_id,
+                                .caller_cookie = req_batch[i].req_id,
+                                .sent_time = now,
+                                .vector = (const float *)value.vector,
+                                .vector_bytes = value.vector_bytes,
+                                .ref = value.ref,
+                            };
+                            if (w->local_completions.push(completion)) {
+                                w->pending[ch][slot].req_id = req_batch[i].req_id;
+                                w->pending[ch][slot].is_set = 0;
+                                w->pending[ch][slot].sent_time = now;
+                                w->pending[ch][slot].bytes_tx = 0;
+                                w->pending_tail[ch] = (slot + 1) % pipeline;
+                                w->pending_count[ch]++;
+                                accepted++;
+                                debug_publish_ok++;
+                                continue;
+                            }
+                            w->l1_queue_full_fallbacks++;
+                            assert(vemb_v16_cli_l1_release(w->l1, &value.ref) == 0);
+                        }
+                    }
                     int submit_rc = vemb_v16_aeron_batch_client_submit_handle(
                         w->batch_clients[ch], req_batch[i].key,
                         (uint16_t)actual_key_len, req_batch[i].req_id);
@@ -422,6 +545,7 @@ static void *worker_main(void *arg) {
                     w->pending[ch][slot].bytes_tx = 0;
                     w->pending_tail[ch] = (slot + 1) % pipeline;
                     w->pending_count[ch]++;
+                    remote_submitted++;
                     accepted++;
                     debug_publish_ok++;
                 }
@@ -429,6 +553,8 @@ static void *worker_main(void *arg) {
                     debug_publish_fail++;
                     continue;
                 }
+                if (w->l1 && remote_submitted != 0)
+                    w->remote_waves[ch].seal(remote_submitted);
                 op_idx += accepted;
                 published_any = 1;
                 next_ch = (ch + 1) % n_ch;
@@ -483,7 +609,7 @@ static void *worker_main(void *arg) {
         }
 
         /* ---- poll phase: copy a response batch from each channel. ---- */
-        int polled_any = 0;
+        int polled_any = account_local_completions(w, pipeline, &debug) > 0;
         for (uint32_t ch = 0; ch < n_ch; ch++) {
             if (w->pending_count[ch] == 0) continue;
             if (w->batch_sessions_enabled) {
@@ -494,9 +620,13 @@ static void *worker_main(void *arg) {
                 int got = w->skip_handle_read ?
                     vemb_v16_aeron_batch_client_poll(
                         w->batch_clients[ch], account_batch_completion, &ctx) :
-                    vemb_v16_aeron_batch_client_poll_shared_vector(
-                        w->batch_clients[ch], account_batch_vector_completion,
-                        &ctx);
+                    (w->l1 ?
+                     vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+                         w->batch_clients[ch], fill_l1_from_materialized_group,
+                         w, account_batch_vector_completion, &ctx) :
+                     vemb_v16_aeron_batch_client_poll_shared_vector(
+                         w->batch_clients[ch], account_batch_vector_completion,
+                         &ctx));
                 if (got == 0) {
                     debug_poll_zero++;
                     continue;
@@ -548,6 +678,8 @@ static void *worker_main(void *arg) {
             if (!any_pending) break;
             if (now_ns() - drain_start > 1000000000ull) break;
 
+            (void)account_local_completions(w, pipeline, &debug);
+
             for (uint32_t ch = 0; ch < n_ch; ch++) {
                 if (w->pending_count[ch] == 0) continue;
                 if (w->batch_sessions_enabled) {
@@ -559,9 +691,14 @@ static void *worker_main(void *arg) {
                         vemb_v16_aeron_batch_client_poll(
                             w->batch_clients[ch], account_batch_completion,
                             &ctx) :
-                        vemb_v16_aeron_batch_client_poll_shared_vector(
-                            w->batch_clients[ch],
-                            account_batch_vector_completion, &ctx);
+                        (w->l1 ?
+                         vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+                             w->batch_clients[ch],
+                             fill_l1_from_materialized_group, w,
+                             account_batch_vector_completion, &ctx) :
+                         vemb_v16_aeron_batch_client_poll_shared_vector(
+                             w->batch_clients[ch],
+                             account_batch_vector_completion, &ctx));
                     if (got > 0)
                         debug_poll_got += (uint64_t)got;
                     continue;
@@ -739,6 +876,15 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
             cross_node, cfg->ratio.a, cfg->ratio.b, cfg->vemb_v16_vsim,
             cfg->vemb_v16_vrem, cfg->vemb_v16_batch_disable, total_channels);
     bool batch_sessions_enabled = channel_plan.batch_sessions_enabled;
+    if (cfg->vemb_v16_l1_entries != 0 && !batch_sessions_enabled) {
+        benchmark_error_log("[aeron] --vemb-v16-l1-entries requires pure cross-node VEMB_HANDLE batch sessions\n");
+        exit(1);
+    }
+    if (cfg->vemb_v16_l1_entries != 0 &&
+        !l1_entry_count_valid(cfg->vemb_v16_l1_entries)) {
+        benchmark_error_log("[aeron] --vemb-v16-l1-entries must be 4 times a power of two\n");
+        exit(1);
+    }
     std::vector<vemb_v16_aeron_channel_t *> all_channels;
     std::vector<vemb_v16_aeron_batch_client_t *> all_batch_clients(
         channel_plan.batch_sessions, nullptr);
@@ -821,6 +967,12 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
     }
 
     uint32_t pipeline = cfg->pipeline > 0 ? cfg->pipeline : 1;
+    uint64_t local_completion_capacity = (uint64_t)cfg->clients * pipeline;
+    if (cfg->vemb_v16_l1_entries != 0 &&
+        local_completion_capacity > UINT32_MAX) {
+        benchmark_error_log("[aeron] clients*pipeline exceeds local completion queue capacity\n");
+        exit(1);
+    }
 
     for (unsigned int i = 0; i < cfg->threads; i++) {
         workers[i].stats = new run_stats(cfg);
@@ -833,6 +985,10 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         workers[i].worker_id = i;
         workers[i].skip_handle_read = skip_handle_read;
         workers[i].batch_sessions_enabled = batch_sessions_enabled;
+        workers[i].l1 = NULL;
+        workers[i].local_completion_count = 0;
+        workers[i].l1_ub_read_bytes_saved = 0;
+        workers[i].l1_queue_full_fallbacks = 0;
         workers[i].stop = &stop;
         workers[i].done.store(false, std::memory_order_relaxed);
         workers[i].ops_done.store(0, std::memory_order_relaxed);
@@ -858,8 +1014,24 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         workers[i].pending_head.assign(cfg->clients, 0);
         workers[i].pending_tail.assign(cfg->clients, 0);
         workers[i].pending_count.assign(cfg->clients, 0);
+        workers[i].remote_waves.resize(cfg->clients);
         for (unsigned int j = 0; j < cfg->clients; j++) {
             workers[i].pending[j].assign(pipeline, pending_op());
+        }
+        if (cfg->vemb_v16_l1_entries != 0) {
+            vemb_v16_cli_l1_config_t l1_config = {
+                cfg->vemb_v16_dim,
+                cfg->vemb_v16_l1_entries,
+                0,
+                0,
+            };
+            workers[i].l1 = vemb_v16_cli_l1_create(&l1_config);
+            if (!workers[i].l1) {
+                benchmark_error_log("[aeron] create worker %u L1 failed\n", i);
+                exit(1);
+            }
+            workers[i].local_completions.init(
+                (uint32_t)local_completion_capacity);
         }
     }
 
@@ -885,6 +1057,67 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         pthread_join(tids[i], NULL);
     }
     fprintf(stderr, "[aeron] all workers joined\n");
+
+    aeron_l1_stats_total l1_total = {};
+    uint64_t local_completion_count = 0;
+    uint64_t l1_ub_read_bytes_saved = 0;
+    uint64_t l1_queue_full_fallbacks = 0;
+    uint64_t server_items = 0;
+    uint64_t ub_read_bytes = 0;
+    for (size_t i = 0; i < all_batch_clients.size(); i++) {
+        if (!all_batch_clients[i])
+            continue;
+        vemb_v16_aeron_batch_client_stats_t batch_stats;
+        vemb_v16_aeron_batch_client_get_stats(all_batch_clients[i],
+                                               &batch_stats);
+        server_items += batch_stats.batch_items + batch_stats.l0_fallback_v1 +
+            batch_stats.v1_direct_requests;
+        ub_read_bytes += batch_stats.shared_vector_group_bytes;
+    }
+    for (unsigned int i = 0; i < cfg->threads; i++) {
+        if (workers[i].l1) {
+            vemb_v16_cli_l1_stats_t l1_worker;
+            vemb_v16_cli_l1_get_stats(workers[i].l1, &l1_worker);
+            l1_stats_add(&l1_total, &l1_worker);
+            vemb_v16_cli_l1_destroy(workers[i].l1);
+            workers[i].l1 = NULL;
+        }
+        local_completion_count += workers[i].local_completion_count;
+        l1_ub_read_bytes_saved += workers[i].l1_ub_read_bytes_saved;
+        l1_queue_full_fallbacks += workers[i].l1_queue_full_fallbacks;
+    }
+    uint64_t l1_lookups = l1_total.hits + l1_total.misses;
+    double l1_hit_ratio = l1_lookups ?
+        (double)l1_total.hits / (double)l1_lookups : 0.0;
+    uint64_t l1_vector_capacity_bytes = (uint64_t)cfg->threads *
+        cfg->vemb_v16_l1_entries * cfg->vemb_v16_dim * sizeof(float);
+    fprintf(stderr,
+            "[aeron] l1-summary: enabled=%u entries_per_worker=%u "
+            "l1_hit=%llu l1_miss=%llu l1_insert=%llu l1_evict=%llu "
+            "l1_hit_ratio=%.6f l1_vector_bytes=%llu "
+            "l1_vector_capacity_bytes=%llu l1_ub_read_bytes_saved=%llu "
+            "local_completion_count=%llu l1_queue_full_fallbacks=%llu "
+            "server_items=%llu ub_read_bytes=%llu "
+            "l1_live_entries=%llu l1_all_pinned=%llu "
+            "l1_key_storage_exhausted=%llu "
+            "l1_vector_storage_exhausted=%llu l1_stale_ref=%llu\n",
+            cfg->vemb_v16_l1_entries != 0, cfg->vemb_v16_l1_entries,
+            (unsigned long long)l1_total.hits,
+            (unsigned long long)l1_total.misses,
+            (unsigned long long)l1_total.inserts,
+            (unsigned long long)l1_total.evicts, l1_hit_ratio,
+            (unsigned long long)l1_total.live_vector_bytes,
+            (unsigned long long)l1_vector_capacity_bytes,
+            (unsigned long long)l1_ub_read_bytes_saved,
+            (unsigned long long)local_completion_count,
+            (unsigned long long)l1_queue_full_fallbacks,
+            (unsigned long long)server_items,
+            (unsigned long long)ub_read_bytes,
+            (unsigned long long)l1_total.live_entries,
+            (unsigned long long)l1_total.all_pinned,
+            (unsigned long long)l1_total.key_storage_exhausted,
+            (unsigned long long)l1_total.vector_storage_exhausted,
+            (unsigned long long)l1_total.stale_ref);
 
     /* Merge per-worker stats into one run_stats — reuse run_stats::merge
      * with iteration counter (matches client_group::merge_run_stats). */

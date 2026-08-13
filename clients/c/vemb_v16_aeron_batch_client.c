@@ -6,6 +6,7 @@
 #include "internal/vemb_v16_cli_l0.h"
 #include "../../src/vemb_v16_util.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -240,25 +241,65 @@ static void batch_client_materialize_vector(
     vemb_v16_aeron_batch_client_t *client, const vemb_v16_resp_t *response,
     float *out, vemb_v16_aeron_batch_vector_view_t *view) {
     *view = (vemb_v16_aeron_batch_vector_view_t){0};
-    if (response->status != VEMB_V16_STATUS_OK)
+    if (response->status != VEMB_V16_STATUS_OK ||
+        response->op != VEMB_V16_OP_VEMB_HANDLE)
         return;
     view->attempted = 1;
+    uint32_t expected_bytes = client->dim * (uint32_t)sizeof(float);
+    if (response->vector_bytes != expected_bytes)
+        return;
     int bytes = vemb_v16_aeron_read_vector(client->legacy_channel,
                                             response->region_id,
                                             response->vector_offset,
                                             response->vector_bytes, out,
-                                            client->dim * sizeof(float));
-    if (bytes <= 0)
+                                            expected_bytes);
+    if (bytes != (int)expected_bytes)
         return;
     view->data = out;
     view->bytes = (uint32_t)bytes;
     view->valid = 1;
 }
 
+static uint32_t batch_client_finish_materialized_group(
+    vemb_v16_aeron_batch_client_t *client,
+    const vemb_v16_cli_l0_completion_t *completion,
+    const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
+    vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
+    if (group_cb && response->status == VEMB_V16_STATUS_OK &&
+        response->op == VEMB_V16_OP_VEMB_HANDLE && vector_view->valid) {
+        const char *key;
+        uint16_t key_len;
+        uint32_t generation;
+        uint8_t state;
+        assert(vemb_v16_cli_l0_get_group(client->l0, completion->entry_id,
+                                          &key, &key_len, &generation,
+                                          &state) == 0);
+        assert(generation == completion->generation);
+        if (state == VEMB_V16_CLI_L0_GROUP_PUBLISHED)
+            group_cb(group_priv, key, key_len, response, vector_view);
+    }
+    vemb_v16_batch_client_vector_fanout_t fanout = {
+        .cb = cb,
+        .priv = priv,
+        .response = response,
+        .vector_view = vector_view,
+    };
+    client->group_pending[completion->entry_id].active = 0;
+    if (vemb_v16_cli_l0_finish(client->l0, completion,
+                                batch_client_vector_fanout, &fanout) != 0)
+        return 0;
+    if (vector_view->valid)
+        client->stats.shared_vector_fanout += fanout.completed;
+    return fanout.completed;
+}
+
 static uint32_t batch_client_finish_group_shared(
     vemb_v16_aeron_batch_client_t *client,
     const vemb_v16_cli_l0_completion_t *completion,
     const vemb_v16_resp_t *response,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
     vemb_v16_aeron_batch_vector_view_t vector_view;
     float *vector = client->shared_vector;
@@ -271,19 +312,9 @@ static uint32_t batch_client_finish_group_shared(
             client->stats.shared_vector_group_read_failures++;
         }
     }
-    vemb_v16_batch_client_vector_fanout_t fanout = {
-        .cb = cb,
-        .priv = priv,
-        .response = response,
-        .vector_view = &vector_view,
-    };
-    client->group_pending[completion->entry_id].active = 0;
-    if (vemb_v16_cli_l0_finish(client->l0, completion,
-                                batch_client_vector_fanout, &fanout) != 0)
-        return 0;
-    if (vector_view.valid)
-        client->stats.shared_vector_fanout += fanout.completed;
-    return fanout.completed;
+    return batch_client_finish_materialized_group(
+        client, completion, response, &vector_view, group_cb, group_priv, cb,
+        priv);
 }
 
 vemb_v16_aeron_batch_client_t *vemb_v16_aeron_batch_client_open_remote(
@@ -475,6 +506,7 @@ static int batch_client_poll_v1(vemb_v16_aeron_batch_client_t *client,
 
 static int batch_client_poll_v1_shared(
     vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
     vemb_v16_resp_t response;
     int rc = vemb_v16_aeron_poll_response(client->legacy_channel, &response,
@@ -491,7 +523,8 @@ static int batch_client_poll_v1_shared(
             .generation = pending->generation,
         };
         return (int)batch_client_finish_group_shared(client, &completion,
-                                                     &response, cb, priv);
+                                                     &response, group_cb,
+                                                     group_priv, cb, priv);
     }
     for (uint32_t i = 0; i < VEMB_V16_BATCH_CLIENT_DIRECT_PENDING; i++) {
         vemb_v16_batch_client_direct_pending_t *pending =
@@ -549,6 +582,7 @@ static int batch_client_poll_v2(vemb_v16_aeron_batch_client_t *client,
 
 static int batch_client_poll_v2_shared(
     vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
     if (!client->batch_channel)
         return 0;
@@ -578,12 +612,16 @@ static int batch_client_poll_v2_shared(
             error.status = VEMB_V16_STATUS_ERR;
             callbacks += (int)batch_client_finish_group_shared(client,
                                                                  &completion,
-                                                                 &error, cb,
-                                                                 priv);
+                                                                 &error,
+                                                                 group_cb,
+                                                                 group_priv,
+                                                                 cb, priv);
             continue;
         }
         callbacks += (int)batch_client_finish_group_shared(client, &completion,
-                                                             &responses[i], cb,
+                                                             &responses[i],
+                                                             group_cb,
+                                                             group_priv, cb,
                                                              priv);
     }
     return callbacks;
@@ -608,14 +646,23 @@ int vemb_v16_aeron_batch_client_poll(
 int vemb_v16_aeron_batch_client_poll_shared_vector(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
+    return vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+        client, NULL, NULL, cb, priv);
+}
+
+int vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
+    vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
     if (!client || client->closing)
         return -1;
     (void)batch_client_flush_if_due(client);
     int callbacks = 0;
-    int rc = batch_client_poll_v2_shared(client, cb, priv);
+    int rc = batch_client_poll_v2_shared(client, group_cb, group_priv, cb,
+                                         priv);
     if (rc > 0)
         callbacks += rc;
-    rc = batch_client_poll_v1_shared(client, cb, priv);
+    rc = batch_client_poll_v1_shared(client, group_cb, group_priv, cb, priv);
     if (rc > 0)
         callbacks += rc;
     return callbacks;

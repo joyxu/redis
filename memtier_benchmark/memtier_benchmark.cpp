@@ -441,6 +441,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_topology_retry_limit,
         o_vemb_v16_batch_request_size,
         o_vemb_v16_batch_max_delay_us,
+        o_vemb_v16_l1_entries,
         o_vemb_v16_transport,
         o_tls,
         o_tls_cert,
@@ -531,6 +532,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-topology-retry-limit", 1, 0, o_vemb_v16_topology_retry_limit },
         { "vemb-v16-batch-request-size", 1, 0, o_vemb_v16_batch_request_size },
         { "vemb-v16-batch-max-delay-us", 1, 0, o_vemb_v16_batch_max_delay_us },
+        { "vemb-v16-l1-entries",        1, 0, o_vemb_v16_l1_entries },
         { "vemb-v16-transport",         1, 0, o_vemb_v16_transport },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { NULL,                         0, 0, 0 }
@@ -951,6 +953,19 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     cfg->vemb_v16_batch_max_delay_us = (uint32_t)delay_us;
                     break;
                 }
+                case o_vemb_v16_l1_entries:
+                {
+                    errno = 0;
+                    unsigned long entry_count = strtoul(optarg, &endptr, 10);
+                    if (optarg[0] == '-' || endptr == optarg || !endptr ||
+                        *endptr != '\0' || errno == ERANGE ||
+                        entry_count > UINT32_MAX) {
+                        fprintf(stderr, "error: --vemb-v16-l1-entries must be non-negative\n");
+                        return -1;
+                    }
+                    cfg->vemb_v16_l1_entries = (uint32_t)entry_count;
+                    break;
+                }
                 case o_vemb_v16_transport:
                     if (strcmp(optarg, "tcp") != 0 &&
                         strcmp(optarg, "aeron") != 0 &&
@@ -1165,6 +1180,7 @@ void usage() {
             "      --vemb-v16-topology-retry-limit=N  Retry VEMB topology transitions up to N times (default 8)\n"
             "      --vemb-v16-batch-request-size=N  Unique VEMB_HANDLE items per v2 batch frame (default 32)\n"
             "      --vemb-v16-batch-max-delay-us=N  Max delay before flushing an underfilled v2 batch (default 0: eager)\n"
+            "      --vemb-v16-l1-entries=N  Per-worker completed-vector L1 entries (default 0: disabled)\n"
             "      --vemb-v16-transport=tcp|aeron|aeron-cross-node  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
             "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput;\n"
             "                               aeron-cross-node uses TCP ATTACH + UB shmdev mmap for cross-node deploy)\n"
