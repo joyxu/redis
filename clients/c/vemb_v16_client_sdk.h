@@ -12,6 +12,7 @@
  * lines via sed so external consumers get a path-free #include. */
 #include "../../src/vemb_v16_protocol.h"
 #include "../../src/vemb_v16_client_topology.h"
+#include "../../src/vemb_v16_ring_rc.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -367,7 +368,7 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
 void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
 
 /* =====================================================================
- *  Aeron transport (UDS control + POSIX SHM SPSC ring)
+ *  Aeron transport (TCP control + UB-backed SPSC ring)
  * =====================================================================
  *
  * Side-channel transport that bypasses TCP/libevent. Each channel is a
@@ -391,6 +392,21 @@ void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
  */
 
 typedef struct vemb_v16_aeron_channel vemb_v16_aeron_channel_t;
+typedef struct vemb_v16_aeron_batch_channel vemb_v16_aeron_batch_channel_t;
+
+/* Four mappings owned by a v2 batch channel. Descriptor ring pointers use
+ * the existing fixed-slot client-ring layout; arenas contain contiguous v2
+ * batch frames. The pointers stay valid until vemb_v16_aeron_batch_close(). */
+typedef struct vemb_v16_aeron_batch_resources {
+    void *request_descriptor_ring;
+    void *request_arena;
+    void *response_descriptor_ring;
+    void *response_arena;
+    uint32_t descriptor_slot_size;
+    uint32_t descriptor_ring_slots;
+    uint32_t effective_batch_size;
+    uint32_t max_batch_bytes;
+} vemb_v16_aeron_batch_resources_t;
 
 /* Allocate and map one channel via the control plane.
  *   uds_path  — VEMB_V16_UDS_PATH ("/tmp/vemb_v16.sock") or
@@ -414,6 +430,191 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
 vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
                                                      uint16_t port,
                                                      uint32_t dim);
+
+/* Open the v2 batch channel through cross-node TCP ATTACH and map its
+ * request/response descriptor rings plus byte arenas.
+ *
+ * requested_batch_size must be nonzero. requested_max_batch_bytes may be
+ * zero to accept the server default. Returns NULL when v2 is unavailable,
+ * the server is in migration, or any resource cannot be mapped. */
+vemb_v16_aeron_batch_channel_t *vemb_v16_aeron_open_remote_batch(
+    const char *host, uint16_t port, uint32_t dim,
+    uint32_t requested_batch_size, uint32_t requested_max_batch_bytes);
+
+/* Unmap all four v2 resources and best-effort notify the server to close the
+ * v2 logical channel. Safe to call with NULL. */
+void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch);
+
+uint64_t vemb_v16_aeron_batch_channel_id(
+    const vemb_v16_aeron_batch_channel_t *ch);
+uint64_t vemb_v16_aeron_batch_topology_epoch(
+    const vemb_v16_aeron_batch_channel_t *ch);
+int vemb_v16_aeron_batch_get_resources(
+    const vemb_v16_aeron_batch_channel_t *ch,
+    vemb_v16_aeron_batch_resources_t *out);
+
+/* Publish one stable-topology VEMB_HANDLE batch. `ch` must be a live channel
+ * returned by open_remote_batch(); batch_id and item_count must be nonzero;
+ * keys and key_lens must point to item_count entries, each key must be
+ * non-NULL, and each length must be in [1, VEMB_V16_MAX_KEY_LEN]. Violating
+ * these preconditions is undefined behavior. The key array describes unique
+ * items; CLI L0 coalescing remains the caller's next layer. Returns RING_OK,
+ * RING_ERR_INVALID, or RING_ERR_FULL. */
+int vemb_v16_aeron_batch_publish_handle(
+    vemb_v16_aeron_batch_channel_t *ch, uint64_t batch_id,
+    const char *const *keys, const uint16_t *key_lens, uint32_t item_count);
+
+/* Poll one completed v2 batch. `ch` must be a live channel; batch_id and
+ * topology_epoch must be writable; entries must reference at least
+ * effective_batch_size writable responses. Violating these preconditions is
+ * undefined behavior.
+ * Returns the item count, or zero when no complete response is consumable.
+ * Outputs are valid only for a positive return; entries are in request order. */
+int vemb_v16_aeron_batch_poll_response(
+    vemb_v16_aeron_batch_channel_t *ch, uint64_t *batch_id,
+    uint64_t *topology_epoch, vemb_v16_resp_t *entries);
+
+/* =====================================================================
+ *  Reusable CLI VEMB_HANDLE batch session
+ * =====================================================================
+ *
+ * One session is single-thread owned and contains a permanent v1 Aeron
+ * channel plus a required v2 batch channel. submit_handle() coalesces only
+ * identical unfinished final key bytes; all other operations stay on a
+ * caller-managed v1 path. Completion callbacks retain the original caller
+ * cookie for both leaders and coalesced followers.
+ */
+typedef struct vemb_v16_aeron_batch_client vemb_v16_aeron_batch_client_t;
+
+typedef struct vemb_v16_aeron_batch_client_options {
+    uint32_t requested_batch_size;       /* zero selects 32 */
+    uint32_t requested_max_batch_bytes;  /* zero accepts server default */
+    uint32_t max_batch_delay_us;          /* zero preserves eager flush */
+} vemb_v16_aeron_batch_client_options_t;
+
+typedef void (*vemb_v16_aeron_batch_completion_cb)(
+    void *priv, uint64_t caller_cookie, const vemb_v16_resp_t *response);
+
+/* The view is valid only for the duration of its completion callback. A
+ * successful shared group dereferences the warm-region handle once, then
+ * presents the same read-only buffer to its leader and followers. */
+typedef struct vemb_v16_aeron_batch_vector_view {
+    const float *data;
+    uint32_t bytes;
+    uint8_t attempted;
+    uint8_t valid;
+} vemb_v16_aeron_batch_vector_view_t;
+
+typedef void (*vemb_v16_aeron_batch_vector_completion_cb)(
+    void *priv, uint64_t caller_cookie, const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view);
+
+/* Invoked once for a successfully materialized v2 L0 group before its L0
+ * entry is finished and before leader/follower fan-out. final_key and
+ * vector_view->data are borrowed only for the duration of this callback.
+ * Direct v1 requests, v1 fallback groups, non-OK responses, and invalid
+ * vector views do not invoke this callback. */
+typedef void (*vemb_v16_aeron_batch_materialized_group_cb)(
+    void *priv, const char *final_key, uint16_t key_len,
+    const vemb_v16_resp_t *response,
+    const vemb_v16_aeron_batch_vector_view_t *vector_view);
+
+typedef struct vemb_v16_aeron_batch_client_stats {
+    uint64_t l0_new_leader_groups;
+    uint64_t l0_coalesced_followers;
+    uint64_t l0_exact_key_mismatch;
+    uint64_t l0_bucket_full;
+    uint64_t l0_entry_exhausted;
+    uint64_t l0_follower_exhausted;
+    uint64_t l0_key_slab_exhausted;
+    uint64_t l0_stale_response;
+    uint64_t l0_fallback_v1;
+    uint64_t batch_frames;
+    uint64_t batch_items;
+    uint64_t batch_frame_bytes;
+    uint64_t batch_flush_eager;
+    uint64_t batch_flush_full;
+    uint64_t batch_flush_deadline;
+    uint64_t batch_flush_backpressure;
+    uint64_t v2_stale_epochs;
+    uint64_t v2_stale_responses;
+    uint64_t v1_direct_requests;
+    uint64_t shared_vector_group_reads;
+    uint64_t shared_vector_group_read_failures;
+    uint64_t shared_vector_group_bytes;
+    uint64_t shared_vector_fanout;
+    uint32_t l0_active_groups;
+    uint32_t effective_batch_size;
+    uint32_t max_batch_bytes;
+    int batch_enabled;
+} vemb_v16_aeron_batch_client_stats_t;
+
+/* Opens the permanent v1 fallback channel and required v2 batch channel.
+ * Returns NULL when v2 ATTACH, its resource mapping, or CLI L0 setup fails;
+ * this API never returns a v1-only batch session. */
+vemb_v16_aeron_batch_client_t *vemb_v16_aeron_batch_client_open_remote(
+    const char *host, uint16_t port, uint32_t dim,
+    const vemb_v16_aeron_batch_client_options_t *options);
+
+/* Submits one logical VEMB_HANDLE read for final key bytes. Returns 0 once
+ * the caller cookie is owned by the session, -2 if v1 fallback pressure
+ * prevents acceptance, and -1 for invalid input or a closed session. */
+int vemb_v16_aeron_batch_client_submit_handle(
+    vemb_v16_aeron_batch_client_t *client, const char *final_key,
+    uint16_t key_len, uint64_t caller_cookie);
+
+/* Attempts to publish one v2 frame. A zero return means no error, including
+ * an empty pending queue; -2 means v2 ring/arena pressure retained leaders
+ * in PENDING_SEND for a later retry. */
+int vemb_v16_aeron_batch_client_flush(vemb_v16_aeron_batch_client_t *client);
+
+/* Returns the monotonic flush deadline for pending v2 leaders, or zero when
+ * there is none. A zero max_batch_delay_us keeps eager poll-driven flushes. */
+uint64_t vemb_v16_aeron_batch_client_next_flush_deadline_ns(
+    const vemb_v16_aeron_batch_client_t *client);
+
+/* Polls v1 and v2 completions and invokes cb once per logical caller. The
+ * return value is the number of callbacks made, zero if no response is
+ * available, or -1 on invalid input. poll flushes on the configured deadline
+ * and retries a deadline-expired frame after v2 ring/arena backpressure. */
+int vemb_v16_aeron_batch_client_poll(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_completion_cb cb, void *priv);
+
+/* Like poll(), but for each completed L0 group the SDK materializes its
+ * VEMB_HANDLE exactly once and fan-outs a temporary read-only vector view.
+ * Direct v1 fallback requests receive an independently materialized view.
+ * The callback must not retain vector_view->data after it returns. */
+int vemb_v16_aeron_batch_client_poll_shared_vector(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_vector_completion_cb cb, void *priv);
+
+/* Like poll_shared_vector(), with an optional once-per-v2-group hook after
+ * successful materialization and before l0_finish() releases the borrowed
+ * exact key. The hook is synchronous and must not retain either borrowed
+ * pointer. Logical completion cb semantics are unchanged. */
+int vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
+    vemb_v16_aeron_batch_vector_completion_cb cb, void *priv);
+
+/* Uses the v1 channel's warm-region mappings to dereference a handle from a
+ * batch completion. The session does not retain completed vectors. */
+int vemb_v16_aeron_batch_client_read_vector(
+    vemb_v16_aeron_batch_client_t *client, uint32_t region_id,
+    uint64_t offset, uint32_t bytes, float *out, uint32_t out_cap);
+
+int vemb_v16_aeron_batch_client_batch_enabled(
+    const vemb_v16_aeron_batch_client_t *client);
+void vemb_v16_aeron_batch_client_get_stats(
+    const vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_client_stats_t *out);
+
+/* Stops submit, reports every retained caller as ERR through cb, and releases
+ * both channels plus all fixed-pool state. Safe with a NULL client. */
+void vemb_v16_aeron_batch_client_close(
+    vemb_v16_aeron_batch_client_t *client,
+    vemb_v16_aeron_batch_completion_cb cb, void *priv);
 
 /* Close one channel: unmaps both rings and notifies the server to
  * release its state. Safe to call with NULL (no-op). UDS errors are
@@ -439,12 +640,35 @@ uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch);
 int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
                                    const void *buf, uint32_t len);
 
+/* Non-blocking batch publish into the request ring. `bufs` may contain
+ * variable-length request frames (VADD inline frames and handle frames can
+ * be mixed). The call is all-or-none when the ring lacks capacity. */
+int vemb_v16_aeron_publish_request_batch(vemb_v16_aeron_channel_t *ch,
+                                         const void *const *bufs,
+                                         const uint32_t *lens,
+                                         uint32_t count);
+
 /* Non-blocking poll from the response ring.
  * Returns bytes copied into buf (>0) on success, 0 if empty, -3 if
  * ch is NULL. If max_len exceeds the ring slot size, only slot_size
  * bytes are copied. */
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
                                  void *buf, uint32_t max_len);
+
+/* Non-blocking batch poll from the response ring. Responses are copied to
+ * `slots` with `max_len` bytes reserved per response. Returns the number of
+ * responses copied, or zero when empty/invalid. */
+uint32_t vemb_v16_aeron_poll_response_batch(vemb_v16_aeron_channel_t *ch,
+                                            void *slots,
+                                            uint32_t max_len,
+                                            uint32_t max_count);
+
+/* Same as vemb_v16_aeron_poll_response_batch(), with the compact Aeron wire
+ * length returned for every decoded response. `slots` still receives one
+ * vemb_v16_resp_t at each `max_len` stride. */
+uint32_t vemb_v16_aeron_poll_response_batch_ex(
+    vemb_v16_aeron_channel_t *ch, void *slots, uint32_t *wire_lens,
+    uint32_t max_len, uint32_t max_count);
 
 /* Open the warm region referenced by this channel's server-provided
  * channel_desc (mmap of /dev/obmm_shmdev* or POSIX SHM). Required before

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "vemb_v16_tcp_transport.h"
+#include "vemb_v16_aeron_attach.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
 #include "redisassert.h"
@@ -1115,6 +1116,39 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     vemb_v16_net_set_tcp_nodelay(fd);
     vemb_v16_net_set_timeouts(fd, 10000);
 
+    /* Aeron-TCP control uses the existing cross-node ATTACH ABI.  Keep this
+     * sniff before framed control parsing because ATTACH is a raw request,
+     * while the same listener also serves framed stats/topology/close calls. */
+    char attach_magic[VEMB_V16_AERON_ATTACH_MAGIC_LEN];
+    ssize_t attach_peek = recv(fd,
+                               attach_magic,
+                               sizeof(attach_magic),
+                               MSG_PEEK | MSG_WAITALL);
+    int attach_v1 = attach_peek == (ssize_t)sizeof(attach_magic) &&
+        memcmp(attach_magic, VEMB_V16_AERON_ATTACH_MAGIC,
+               VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0;
+    int attach_v2 = attach_peek == (ssize_t)sizeof(attach_magic) &&
+        memcmp(attach_magic, VEMB_V16_AERON_ATTACH_V2_MAGIC,
+               VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN) == 0;
+    if (attach_v1 || attach_v2) {
+        if (vemb_v16_proxy_data_transport(proxy) != VEMB_V16_TRANSPORT_AERON) {
+            close(fd);
+            return;
+        }
+        if (vemb_v16_net_read_full(fd,
+                                   attach_magic,
+                                   sizeof(attach_magic)) != 0 ||
+            (attach_v2 ?
+                vemb_v16_aeron_attach_v2_handle_fd(proxy, fd) :
+                vemb_v16_aeron_attach_handle_fd(proxy, fd)) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 aeron TCP attach v%d rejected: fd=%d",
+                      attach_v2 ? 2 : 1, fd);
+        }
+        close(fd);
+        return;
+    }
+
     vemb_v16_net_hdr_t hdr;
     if (vemb_v16_net_read_header(fd, &hdr) != 0) {
         close(fd);
@@ -1208,12 +1242,18 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
         return;
     }
     if (hdr.type == VEMB_V16_NET_ALLOC_AERON_CHANNEL) {
+        if (vemb_v16_proxy_data_transport(proxy) != VEMB_V16_TRANSPORT_AERON) {
+            tcp_write_status(fd, VEMB_V16_STATUS_ERR, 0);
+            close(fd);
+            return;
+        }
         tcp_handle_aeron_alloc_channel(proxy, fd, hdr.payload_len);
         return;
     }
 
     vemb_v16_alloc_req_t req;
-    if (hdr.type != VEMB_V16_NET_HELLO ||
+    if (vemb_v16_proxy_data_transport(proxy) != VEMB_V16_TRANSPORT_TCP ||
+        hdr.type != VEMB_V16_NET_HELLO ||
         hdr.flags != 0 ||
         hdr.payload_len != vemb_v16_alloc_req_encoded_len()) {
         close(fd);

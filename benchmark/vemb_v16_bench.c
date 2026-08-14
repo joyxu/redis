@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "../src/vemb_v16_client_topology.h"
+#include "../src/vemb_v16_aeron_attach.h"
 #include "../src/vemb_v16_client_ring.h"
 #include "../src/vemb_v16_net.h"
 #include "../src/vemb_v16_protocol.h"
@@ -57,6 +58,7 @@ typedef struct bench_cfg {
     int pin_threads;
     uint32_t pipeline;
     uint32_t transport_type;
+    int aeron_control_tcp;
     uint16_t tcp_port;
     int vsim_key2_owner;
     int client_topology_enabled;
@@ -82,6 +84,7 @@ typedef struct bench_node_channel {
     vemb_v16_client_ring_t *resp_ring;
     int net_fd;
     uint32_t transport_type;
+    int control_tcp;
     const char *tcp_host;
     uint16_t tcp_port;
     uint32_t timeout_ms;
@@ -202,6 +205,56 @@ static int connect_uds(const char *path) {
     return fd;
 }
 
+static const char *tcp_host_for_node(const bench_cfg_t *cfg,
+                                     uint32_t node_index);
+static uint16_t tcp_port_for_node(const bench_cfg_t *cfg,
+                                  uint32_t node_index);
+
+static int aeron_attach_client_exchange(
+    int fd,
+    const vemb_v16_aeron_attach_req_t *req,
+    vemb_v16_aeron_attach_resp_t *resp) {
+    if (write_full(fd, req, sizeof(*req)) != 0 ||
+        read_full(fd, resp, sizeof(*resp)) != 0 ||
+        memcmp(resp->magic,
+               VEMB_V16_AERON_ATTACHED_MAGIC,
+               VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0 ||
+        resp->status != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* The server returns its UB device view in ATTACH. On the paired client
+ * node, server devices 1-4 are exposed as devices 5-8. Keep this mapping in
+ * the client, alongside the SDK's cross-node path mapping. */
+static int map_remote_ub_path(const char *server_path,
+                              char *client_path,
+                              size_t client_path_cap) {
+    if (!server_path || !server_path[0] ||
+        !client_path || client_path_cap == 0)
+        return -1;
+    size_t source_len = strnlen(server_path, client_path_cap);
+    if (source_len >= client_path_cap)
+        return -1;
+    const char *marker = strstr(server_path, "obmm_shmdev");
+    if (!marker) {
+        memcpy(client_path, server_path, source_len + 1);
+        return 0;
+    }
+    const char *digits = marker + strlen("obmm_shmdev");
+    char *end = NULL;
+    unsigned long device_id = strtoul(digits, &end, 10);
+    if (end == digits || *end != '\0' || device_id < 1u || device_id > 4u) {
+        memcpy(client_path, server_path, source_len + 1);
+        return 0;
+    }
+    size_t prefix_len = (size_t)(digits - server_path);
+    int written = snprintf(client_path, client_path_cap, "%.*s%lu",
+                           (int)prefix_len, server_path, device_id + 4u);
+    return written >= 0 && (size_t)written < client_path_cap ? 0 : -1;
+}
+
 static int alloc_channel(const bench_cfg_t *cfg, vemb_v16_channel_desc_t *desc) {
     int fd = connect_uds(cfg->socket_path);
     if (fd < 0) return -1;
@@ -217,6 +270,111 @@ static int alloc_channel(const bench_cfg_t *cfg, vemb_v16_channel_desc_t *desc) 
         return -1;
     }
     close(fd);
+    return 0;
+}
+
+static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
+                                   uint32_t node_index,
+                                   int remote_path,
+                                   vemb_v16_channel_desc_t *desc) {
+    int fd = vemb_v16_net_connect(tcp_host_for_node(cfg, node_index),
+                                  tcp_port_for_node(cfg, node_index),
+                                  cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+
+    vemb_v16_aeron_attach_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.magic,
+           VEMB_V16_AERON_ATTACH_MAGIC,
+           VEMB_V16_AERON_ATTACH_MAGIC_LEN);
+    req.dim = cfg->dim;
+    req.flags = remote_path ? VEMB_V16_AERON_ATTACH_F_REMOTE_PATH : 0;
+    vemb_v16_aeron_attach_resp_t resp;
+    if (aeron_attach_client_exchange(fd, &req, &resp) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (resp.request_shmdev_path_len == 0 ||
+        resp.request_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.response_shmdev_path_len == 0 ||
+        resp.response_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||
+        resp.req_slot_size == 0 ||
+        resp.resp_slot_size == 0 ||
+        resp.ring_size_slots != VEMB_V16_CLIENT_RING_SIZE ||
+        resp.request_shmdev_path[0] == '\0' ||
+        resp.response_shmdev_path[0] == '\0') {
+        return -1;
+    }
+
+    char client_request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    char client_response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    if (remote_path) {
+        if (map_remote_ub_path(resp.request_shmdev_path,
+                               client_request_shmdev_path,
+                               sizeof(client_request_shmdev_path)) != 0 ||
+            map_remote_ub_path(resp.response_shmdev_path,
+                               client_response_shmdev_path,
+                               sizeof(client_response_shmdev_path)) != 0)
+            return -1;
+    } else {
+        strncpy(client_request_shmdev_path, resp.request_shmdev_path,
+                sizeof(client_request_shmdev_path) - 1);
+        client_request_shmdev_path[sizeof(client_request_shmdev_path) - 1] = '\0';
+        strncpy(client_response_shmdev_path, resp.response_shmdev_path,
+                sizeof(client_response_shmdev_path) - 1);
+        client_response_shmdev_path[sizeof(client_response_shmdev_path) - 1] = '\0';
+    }
+
+    memset(desc, 0, sizeof(*desc));
+    desc->magic = VEMB_V16_MAGIC;
+    desc->version = VEMB_V16_VERSION;
+    desc->channel_id = resp.channel_id;
+    desc->vector_dim = cfg->dim;
+    desc->vector_stride = cfg->dim * sizeof(float);
+    desc->request_ring_slot_size = resp.req_slot_size;
+    desc->response_ring_slot_size = resp.resp_slot_size;
+    snprintf(desc->request_ring_name,
+             sizeof(desc->request_ring_name),
+             "%s@off%llu",
+             client_request_shmdev_path,
+             (unsigned long long)resp.req_ring_off);
+    snprintf(desc->response_ring_name,
+             sizeof(desc->response_ring_name),
+             "%s@off%llu",
+             client_response_shmdev_path,
+             (unsigned long long)resp.resp_ring_off);
+    if (resp.warm_region_count > 1 ||
+        (resp.warm_region_count != 0 &&
+         (resp.warm_path_len == 0 ||
+          resp.warm_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX))) {
+        return -1;
+    }
+    char client_warm_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
+    int warm_path_ok = resp.warm_region_count == 1 &&
+        resp.warm_path[0] != '\0';
+    if (warm_path_ok && remote_path &&
+        resp.warm_backend_type == VEMB_V16_REGION_UB) {
+        warm_path_ok = map_remote_ub_path(resp.warm_path,
+                                          client_warm_path,
+                                          sizeof(client_warm_path)) == 0;
+    } else if (warm_path_ok) {
+        strncpy(client_warm_path, resp.warm_path,
+                sizeof(client_warm_path) - 1);
+        client_warm_path[sizeof(client_warm_path) - 1] = '\0';
+    }
+    if (warm_path_ok) {
+        desc->warm_region_count = 1;
+        desc->warm_regions[0].region_id = resp.warm_region_id;
+        desc->warm_regions[0].backend_type = resp.warm_backend_type;
+        desc->warm_regions[0].region_bytes = resp.warm_region_bytes;
+        desc->warm_regions[0].mmap_offset = resp.warm_mmap_offset;
+        strncpy(desc->warm_regions[0].path,
+                client_warm_path,
+                sizeof(desc->warm_regions[0].path) - 1);
+    }
     return 0;
 }
 
@@ -478,14 +636,22 @@ static int apply_client_topology_endpoints(bench_cfg_t *cfg) {
             cfg->tcp_ports[owner] = endpoint->tcp_port;
         } else {
             if (endpoint->transport_type != VEMB_V16_TRANSPORT_AERON ||
-                endpoint->uds_path[0] == '\0') {
+                (cfg->aeron_control_tcp &&
+                 (endpoint->host[0] == '\0' || endpoint->tcp_port == 0)) ||
+                (!cfg->aeron_control_tcp && endpoint->uds_path[0] == '\0')) {
                 return -1;
             }
-            strncpy(cfg->socket_paths[owner],
-                    endpoint->uds_path,
-                    sizeof(cfg->socket_paths[owner]) - 1);
-            cfg->socket_paths[owner][sizeof(cfg->socket_paths[owner]) - 1] =
-                '\0';
+            if (cfg->aeron_control_tcp) {
+                strncpy(cfg->tcp_hosts[owner], endpoint->host,
+                        sizeof(cfg->tcp_hosts[owner]) - 1);
+                cfg->tcp_hosts[owner][sizeof(cfg->tcp_hosts[owner]) - 1] = '\0';
+                cfg->tcp_ports[owner] = endpoint->tcp_port;
+            } else {
+                strncpy(cfg->socket_paths[owner], endpoint->uds_path,
+                        sizeof(cfg->socket_paths[owner]) - 1);
+                cfg->socket_paths[owner][sizeof(cfg->socket_paths[owner]) - 1] =
+                    '\0';
+            }
         }
         if (owner + 1 > cfg->node_count)
             cfg->node_count = owner + 1;
@@ -511,6 +677,15 @@ static int refresh_client_topology(bench_cfg_t *cfg) {
                                                 &cfg->client_topology,
                                                 &resp);
     } else {
+        if (cfg->aeron_control_tcp) {
+            rc = vemb_v16_client_topology_fetch_tcp(
+                tcp_host_for_node(cfg, 0),
+                tcp_port_for_node(cfg, 0),
+                cfg->timeout_ms,
+                &cfg->client_topology,
+                &resp);
+            goto topology_fetched;
+        }
         int fd = connect_uds(cfg->socket_paths[0]);
         if (fd < 0)
             return -1;
@@ -519,6 +694,7 @@ static int refresh_client_topology(bench_cfg_t *cfg) {
                                                    &resp);
         close(fd);
     }
+topology_fetched:
     if (rc != 0 ||
         apply_client_topology_endpoints(cfg) != 0 ||
         !client_topology_owners_fit_nodes(cfg)) {
@@ -532,15 +708,42 @@ static int refresh_client_topology(bench_cfg_t *cfg) {
 static int open_ring(const char *name,
                      uint32_t slot_size,
                      vemb_v16_client_ring_t **ring) {
-    int fd = shm_open(name, O_RDWR, 0666);
+    const char *offset_marker = strstr(name, "@off");
+    if (!offset_marker)
+        return -1;
+    uint64_t mmap_offset = 0;
+    char path[VEMB_V16_BENCH_PATH_MAX];
+    if (offset_marker) {
+        size_t path_len = (size_t)(offset_marker - name);
+        if (path_len == 0 || path_len >= sizeof(path))
+            return -1;
+        memcpy(path, name, path_len);
+        path[path_len] = '\0';
+        char *end = NULL;
+        mmap_offset = strtoull(offset_marker + 4, &end, 10);
+        if (end == offset_marker + 4 || *end != '\0')
+            return -1;
+    }
+    int fd = open(path, O_RDWR);
     if (fd < 0) return -1;
     size_t bytes = vemb_v16_client_ring_bytes(slot_size);
-    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                     MAP_SHARED, fd, 0);
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
+    uint64_t aligned_offset = mmap_offset & ~page_mask;
+    size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
+    size_t map_size = bytes + offset_delta;
+    void *base = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, (off_t)aligned_offset);
     close(fd);
-    if (ptr == MAP_FAILED) return -1;
-    *ring = ptr;
+    if (base == MAP_FAILED) return -1;
+    *ring = (vemb_v16_client_ring_t *)((uint8_t *)base + offset_delta);
     return 0;
+}
+
+static int aeron_endpoint_is_local(const char *host) {
+    return host && (!strcmp(host, "127.0.0.1") ||
+                    !strcmp(host, "localhost") ||
+                    !strcmp(host, "::1"));
 }
 
 static int open_warm_region_desc(uint32_t region_id,
@@ -555,9 +758,9 @@ static int open_warm_region_desc(uint32_t region_id,
         return -1;
     int fd = -1;
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM) {
-        fd = shm_open(path, O_RDONLY, 0666);
+        fd = shm_open(path, O_RDWR, 0666);
     } else if (backend_type == VEMB_V16_REGION_UB) {
-        fd = open(path, O_RDONLY);
+        fd = open(path, O_RDWR);
     } else {
         return -1;
     }
@@ -781,9 +984,14 @@ static void prepare_req_key2(vemb_v16_req_t *req, const char *key2) {
 
 static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, size_t len,
                     uint64_t *publish_spins, uint32_t timeout_ms) {
+    uint8_t wire[VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
+    size_t wire_len = 0;
+    if (vemb_v16_req_encode(wire, sizeof(wire), req, &wire_len) != 0)
+        return -1;
     uint64_t spins = 0;
     uint64_t start = now_ns();
-    while (vemb_v16_client_publish(ring, req, (uint32_t)len) != 0) {
+    (void)len;
+    while (vemb_v16_client_publish(ring, wire, (uint32_t)wire_len) != 0) {
         spins++;
         if ((spins & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (publish_spins) *publish_spins += spins;
@@ -797,10 +1005,11 @@ static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, siz
 
 static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
                      uint64_t *empty_polls, uint32_t timeout_ms) {
+    uint8_t wire[VEMB_V16_AERON_RESP_WIRE_MAX_LEN];
     int got;
     uint64_t polls = 0;
     uint64_t start = now_ns();
-    while ((got = vemb_v16_client_poll(ring, resp, sizeof(*resp))) <= 0) {
+    while ((got = vemb_v16_client_poll(ring, wire, sizeof(wire))) <= 0) {
         polls++;
         if ((polls & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (empty_polls) *empty_polls += polls;
@@ -809,7 +1018,7 @@ static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
         __asm__ volatile("" ::: "memory");
     }
     if (empty_polls) *empty_polls += polls;
-    return got == (int)sizeof(*resp) ? 0 : -1;
+    return vemb_v16_resp_decode(resp, wire, (size_t)got);
 }
 
 static int send_channel_req(bench_node_channel_t *node,
@@ -2150,7 +2359,8 @@ static void print_stats_delta_node(uint32_t node_index,
 static int fetch_stats_for_node(const bench_cfg_t *cfg,
                                 uint32_t node_index,
                                 vemb_v16_stats_t *stats) {
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
+        cfg->aeron_control_tcp)
         return fetch_stats_tcp(cfg, node_index, stats);
     return fetch_stats(cfg->socket_paths[node_index], stats);
 }
@@ -2158,7 +2368,8 @@ static int fetch_stats_for_node(const bench_cfg_t *cfg,
 static int close_all_for_node(const bench_cfg_t *cfg,
                               uint32_t node_index,
                               uint64_t *closed) {
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
+        cfg->aeron_control_tcp)
         return close_all_channels_tcp(cfg, node_index, closed);
     return close_all_channels(cfg->socket_paths[node_index], closed);
 }
@@ -2166,7 +2377,8 @@ static int close_all_for_node(const bench_cfg_t *cfg,
 static void close_node_channel(const char *socket_path,
                                bench_node_channel_t *node) {
     if (!node) return;
-    if (node->transport_type == VEMB_V16_TRANSPORT_TCP) {
+    if (node->transport_type == VEMB_V16_TRANSPORT_TCP ||
+        node->control_tcp) {
         if (node->net_fd >= 0) {
             vemb_v16_net_write_frame(node->net_fd,
                                      VEMB_V16_NET_CLOSE,
@@ -2207,9 +2419,12 @@ static int setup_node_channel(const bench_cfg_t *cfg,
     memset(node, 0, sizeof(*node));
     node->net_fd = -1;
     node->transport_type = cfg->transport_type;
+    node->control_tcp = cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
+        cfg->aeron_control_tcp;
     node->tcp_host = tcp_host_for_node(cfg, node_index);
     node->tcp_port = tcp_port_for_node(cfg, node_index);
     node->timeout_ms = cfg->timeout_ms;
+    int remote_path = !aeron_endpoint_is_local(node->tcp_host);
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (alloc_tcp_channel(cfg, node_index, &node->desc, &node->net_fd) != 0) {
             close_node_channel(cfg->socket_paths[node_index], node);
@@ -2218,7 +2433,10 @@ static int setup_node_channel(const bench_cfg_t *cfg,
         return 0;
     }
     const char *socket_path = cfg->socket_paths[node_index];
-    if (alloc_channel_path(socket_path, cfg, &node->desc) != 0 ||
+    int alloc_rc = cfg->aeron_control_tcp ?
+        alloc_aeron_channel_tcp(cfg, node_index, remote_path, &node->desc) :
+        alloc_channel_path(socket_path, cfg, &node->desc);
+    if (alloc_rc != 0 ||
         open_ring(node->desc.request_ring_name,
                   node->desc.request_ring_slot_size,
                   &node->req_ring) != 0 ||
@@ -2432,6 +2650,7 @@ int main(int argc, char **argv) {
         .timeout_ms = 10000,
         .pipeline = 1,
         .transport_type = VEMB_V16_TRANSPORT_AERON,
+        .aeron_control_tcp = 1,
         .tcp_port = VEMB_V16_TCP_PORT,
         .vsim_key2_owner = VSIM_KEY2_OWNER_SAME,
     };
@@ -2471,6 +2690,17 @@ int main(int argc, char **argv) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_TCP;
             } else {
                 fprintf(stderr, "invalid transport: %s\n", transport);
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--aeron-control") && i + 1 < argc) {
+            const char *control = argv[++i];
+            if (!strcmp(control, "tcp")) {
+                cfg.aeron_control_tcp = 1;
+            } else if (!strcmp(control, "uds")) {
+                cfg.aeron_control_tcp = 0;
+            } else {
+                fprintf(stderr, "invalid aeron control: %s\n", control);
                 return 1;
             }
         }
@@ -2531,7 +2761,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
             return 0;
         }
         else {
@@ -2568,6 +2798,11 @@ int main(int argc, char **argv) {
         if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP) {
             if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
                 fprintf(stderr, "tcp multi-node requires --endpoints HOST:PORT[,HOST:PORT...]\n");
+                return 1;
+            }
+        } else if (cfg.aeron_control_tcp) {
+            if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
+                fprintf(stderr, "aeron tcp control requires --endpoints HOST:PORT[,HOST:PORT...]\n");
                 return 1;
             }
         } else if (!cfg.socket_paths[n][0]) {

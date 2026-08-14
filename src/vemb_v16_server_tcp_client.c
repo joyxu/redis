@@ -45,9 +45,9 @@ static int stc_open_warm_region(const vemb_v16_channel_desc_t *desc) {
 
     int fd = -1;
     if (desc->warm_backend_type == VEMB_V16_REGION_LOCAL_SHM) {
-        fd = shm_open(desc->vector_region_name, O_RDONLY, 0666);
+        fd = shm_open(desc->vector_region_name, O_RDWR, 0666);
     } else if (desc->warm_backend_type == VEMB_V16_REGION_UB) {
-        fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
+        fd = open(desc->vector_region_name, O_RDWR);
     } else {
         return -1;
     }

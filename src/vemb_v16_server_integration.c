@@ -23,6 +23,11 @@ int vemb_v16_cross_node_aeron_enabled(void) {
     return server.vemb_v16_cross_node_aeron_enabled;
 }
 
+static int vemb_v16_aeron_tcp_control_enabled(void) {
+    return server.vemb_v16_aeron_control &&
+           !strcmp(server.vemb_v16_aeron_control, "tcp");
+}
+
 #include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -93,6 +98,29 @@ int vemb_v16_server_integration_init(void) {
         vemb_v16_storage_ctx_destroy(storage);
         return -1;
     }
+    if (vemb_v16_proxy_set_aeron_ub_path(
+            server.vemb_v16_proxy,
+            server.vemb_v16_aeron_ub_path &&
+            server.vemb_v16_aeron_ub_path[0] ?
+                server.vemb_v16_aeron_ub_path :
+                VEMB_V16_DEFAULT_AERON_UB_PATH) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_proxy_set_aeron_ub_path failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
+    if (vemb_v16_proxy_set_aeron_response_ub_path(
+            server.vemb_v16_proxy,
+            server.vemb_v16_aeron_response_ub_path &&
+            server.vemb_v16_aeron_response_ub_path[0] ?
+                server.vemb_v16_aeron_response_ub_path :
+                VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16_proxy_set_aeron_response_ub_path failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
     g_vemb_storage = storage;
 
     if (server.vemb_v16_supernode_workers > 0) {
@@ -118,53 +146,52 @@ int vemb_v16_server_integration_init(void) {
             return -1;
         }
     }
+    if (vemb_v16_proxy_set_batch_request_size(
+            server.vemb_v16_proxy,
+            (uint32_t)server.vemb_v16_batch_request_size) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16_proxy_set_batch_request_size failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
 
-    /* Transport selection.
-     *   --vemb-v16-tcp-port N  → pure-TCP datapath on port N (no sniff/UDS)
-     *   "sniff" (default)      → UDS + Redis-port sniff (fd inject)
-     *   "aeron"                → UDS only for SHM/Aeron datapath */
-    if (server.vemb_v16_tcp_port > 0) {
-        const char *tcp_host = server.vemb_v16_tcp_host && server.vemb_v16_tcp_host[0]
-            ? server.vemb_v16_tcp_host : "0.0.0.0";
-        if (vemb_v16_proxy_enable_tcp(server.vemb_v16_proxy,
-                                      tcp_host,
-                                      (uint16_t)server.vemb_v16_tcp_port) != 0) {
-            serverLog(LL_WARNING, "vemb_v16_proxy_enable_tcp failed: %s:%d",
-                      tcp_host, server.vemb_v16_tcp_port);
+    /* Transport selection. Aeron TCP control is received by Redis' existing
+     * TCP accept loop and handed to the proxy after ATTACH sniffing, so the
+     * proxy must not bind a second listener on the Redis port. */
+    const char *vemb_transport =
+        (server.vemb_v16_transport && server.vemb_v16_transport[0])
+            ? server.vemb_v16_transport : "sniff";
+
+    if (!strcmp(vemb_transport, "aeron")) {
+        int control_rc = vemb_v16_aeron_tcp_control_enabled() ?
+            vemb_v16_proxy_enable_aeron_tcp_inject_only(server.vemb_v16_proxy) :
+            vemb_v16_proxy_enable_uds(server.vemb_v16_proxy);
+        if (control_rc != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 aeron control setup failed: control=%s",
+                      server.vemb_v16_aeron_control ?
+                          server.vemb_v16_aeron_control : "(null)");
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
             server.vemb_v16_proxy = NULL;
             return -1;
         }
-        /* TCP mode is mutually exclusive with UDS+sniff — the proxy assert
-         * enforces uds_enabled != tcp_enabled. */
+        serverLog(LL_NOTICE, "VEMB V16 Aeron control enabled: %s ub_path=%s",
+                  vemb_v16_aeron_tcp_control_enabled() ? "tcp/redis-listener" :
+                      VEMB_V16_UDS_PATH,
+                  server.vemb_v16_aeron_ub_path ?
+                      server.vemb_v16_aeron_ub_path :
+                      VEMB_V16_DEFAULT_AERON_UB_PATH);
     } else {
-        const char *vemb_transport =
-            (server.vemb_v16_transport && server.vemb_v16_transport[0])
-                ? server.vemb_v16_transport : "sniff";
-
-        /* Enable UDS listener so direct VEMB V16 clients can connect. */
-        if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
-            serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
+        if (vemb_v16_proxy_enable_tcp_inject_only(server.vemb_v16_proxy) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16_proxy_enable_tcp_inject_only failed");
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
             server.vemb_v16_proxy = NULL;
             return -1;
         }
-        serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
-
-        /* Enable inject pipe for Redis-port sniff (fd steal).  Skipped in
-         * pure "aeron" mode. */
-        if (strcmp(vemb_transport, "aeron") != 0) {
-            if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
-                serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
-                vemb_v16_proxy_destroy(server.vemb_v16_proxy);
-                server.vemb_v16_proxy = NULL;
-                return -1;
-            }
-            serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
-                      vemb_transport);
-        } else {
-            serverLog(LL_NOTICE, "VEMB V16 transport=aeron: TCP sniff accepts control frames; data clients use UDS/UB rings");
-        }
+        serverLog(LL_NOTICE,
+                  "VEMB V16 TCP data path enabled through Redis listening ports");
     }
 
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
@@ -205,9 +232,9 @@ int vemb_v16_server_integration_init(void) {
 
 /* Try to steal a new connection for cross-node aeron ATTACH.
  *
- * Peeks the first 24 bytes; if they exactly match VEMB_V16_AERON_ATTACH_MAGIC,
- * consumes those bytes and hands the fd to vemb_v16_aeron_attach_handle_fd
- * (which performs a synchronous request/response exchange then closes fd).
+ * Peeks the first 24 bytes; if they exactly match a v1 or v2 ATTACH magic,
+ * consumes those bytes and hands the fd to the matching handler (which
+ * performs a synchronous request/response exchange then closes fd).
  * The ATTACH magic's first 4 bytes are "VEMB" (0x424d4556), which is
  * different from VEMB_V16_MAGIC (0x56313645 = "VEmb"), so no collision with
  * the normal VEMB sniff path.
@@ -221,7 +248,10 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     /* Cross-node aeron is opt-in via --vemb-v16-cross-node-aeron yes.
      * When disabled, never peek for the ATTACH magic — falls through
      * to the normal VEMB/RESP sniff path (pre-cross-node behavior). */
-    if (!server.vemb_v16_cross_node_aeron_enabled) return 0;
+    if (!vemb_v16_aeron_tcp_control_enabled() ||
+        !server.vemb_v16_transport ||
+        strcmp(server.vemb_v16_transport, "aeron") != 0)
+        return 0;
 
     /* Peek 24 bytes without consuming. If not yet available, brief poll
      * — cross-node ATTACH is a control-plane op (channel setup, once per
@@ -239,8 +269,11 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     if (n < (ssize_t)sizeof(magic_buf))
         return 0;
 
-    if (memcmp(magic_buf, VEMB_V16_AERON_ATTACH_MAGIC,
-               VEMB_V16_AERON_ATTACH_MAGIC_LEN) != 0)
+    int is_v1 = memcmp(magic_buf, VEMB_V16_AERON_ATTACH_MAGIC,
+                       VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0;
+    int is_v2 = memcmp(magic_buf, VEMB_V16_AERON_ATTACH_V2_MAGIC,
+                       VEMB_V16_AERON_ATTACH_V2_MAGIC_LEN) == 0;
+    if (!is_v1 && !is_v2)
         return 0;
 
     /* ATTACH magic matched. Consume the 24-byte magic from the socket
@@ -259,14 +292,16 @@ static int vemb_try_aeron_attach_steal(connection *conn) {
     conn->fd = -1;
 
     serverLog(LL_NOTICE,
-              "VEMB V16 AERON ATTACH on fd %d, dispatching to attach_handle_fd",
-              fd);
+              "VEMB V16 AERON ATTACH v%d on fd %d, dispatching to handler",
+              is_v2 ? 2 : 1, fd);
 
-    int rc = vemb_v16_aeron_attach_handle_fd(server.vemb_v16_proxy, fd);
+    int rc = is_v2 ?
+        vemb_v16_aeron_attach_v2_handle_fd(server.vemb_v16_proxy, fd) :
+        vemb_v16_aeron_attach_handle_fd(server.vemb_v16_proxy, fd);
     if (rc != 0) {
         serverLog(LL_WARNING,
-                  "VEMB V16 AERON ATTACH handle_fd rejected fd %d (rc=%d)",
-                  fd, rc);
+                  "VEMB V16 AERON ATTACH v%d handler rejected fd %d (rc=%d)",
+                  is_v2 ? 2 : 1, fd, rc);
     }
 
     /* handle_fd always closes fd (success or error) per the protocol
@@ -413,7 +448,9 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
              * RESP here would silently swallow the ATTACH.
              * Skipped when cross-node aeron is disabled (pre-cross-node
              * behavior: anything non-VEMB_V16_MAGIC falls through to RESP). */
-            if (server.vemb_v16_cross_node_aeron_enabled &&
+            if (vemb_v16_aeron_tcp_control_enabled() &&
+                server.vemb_v16_transport &&
+                !strcmp(server.vemb_v16_transport, "aeron") &&
                 memcmp(buf, VEMB_V16_AERON_ATTACH_MAGIC, 4) == 0) {
                 if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)
                     return 2;

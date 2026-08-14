@@ -112,7 +112,6 @@ int main(int argc, char **argv) {
      * The SHM ring is SPSC + finite; backpressure naturally caps in-flight.
      * Interleave publish + poll so the proxy threads stay fed. */
     const uint32_t WINDOW = 128;
-    size_t wire_len = vemb_v16_req_handle_len();
     uint32_t next_publish = 1;       /* next req_id to publish */
     uint32_t next_expect  = 1;       /* next req_id we want to consume (in-order) */
     uint32_t verified     = 0;
@@ -134,7 +133,11 @@ int main(int argc, char **argv) {
             req->dim          = dim;
             req->vector_bytes = dim * sizeof(float);
             memcpy(req->key, key, key_len);
-            if (vemb_v16_aeron_publish_request(ch, req, (uint32_t)wire_len) != 0) {
+            uint8_t wire[VEMB_V16_AERON_REQ_WIRE_MAX_LEN];
+            size_t wire_len = 0;
+            if (vemb_v16_req_encode(wire, sizeof(wire), req, &wire_len) != 0 ||
+                vemb_v16_aeron_publish_request(ch, wire,
+                                                (uint32_t)wire_len) != 0) {
                 /* Ring full — break to drain */
                 break;
             }

@@ -209,6 +209,7 @@ void vemb_v16_supernode_handle_base_job(vemb_v16_supernode_ctx_t *ctx,
         .req_id = job->req_id,
         .channel_index = job->channel_index,
         .channel_id = job->channel_id,
+        .batch_token = job->batch_token,
         .key_hash = job->key_hash,
     };
     vemb_v16_publish_completion(ctx, &completion);
@@ -226,6 +227,7 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
         .req_id = job->req_id,
         .channel_index = job->channel_index,
         .channel_id = job->channel_id,
+        .batch_token = job->batch_token,
         .key_hash = job->key_hash,
         .dim = vemb_job->dim,
         .vector_bytes = vemb_job->vector_bytes,
@@ -289,6 +291,11 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                       &redirect_info)) {
             completion_set_moved(&completion, &redirect_info);
         } else {
+            serverLog(LL_WARNING,
+                      "vemb_v16 handle miss: req_id=%u batch_token=%llu hash=%llu key=%.*s rc=%d",
+                      job->req_id, (unsigned long long)job->batch_token,
+                      (unsigned long long)job->key_hash, (int)vemb_job->key_len,
+                      vemb_job->key, handle_rc);
             completion.status = VEMB_V16_STATUS_NOT_FOUND;
         }
     } else {
@@ -361,6 +368,7 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
         .req_id = job->req_id,
         .channel_index = job->channel_index,
         .channel_id = job->channel_id,
+        .batch_token = job->batch_token,
         .key_hash = job->key_hash,
         .dim = vsim_job->dim,
         .vector_bytes = vsim_job->vector_bytes,
@@ -486,6 +494,7 @@ void vemb_v16_supernode_handle_vrem_job(vemb_v16_supernode_ctx_t *ctx,
         .req_id = job->req_id,
         .channel_index = job->channel_index,
         .channel_id = job->channel_id,
+        .batch_token = job->batch_token,
         .key_hash = job->key_hash,
         .dim = vrem_job->dim,
         .vector_bytes = vrem_job->vector_bytes,
@@ -601,6 +610,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
         .req_id = job->req_id,
         .channel_index = job->channel_index,
         .channel_id = job->channel_id,
+        .batch_token = job->batch_token,
         .key_hash = job->key_hash,
         .dim = vadd_job->dim,
         .vector_bytes = vadd_job->vector_bytes,

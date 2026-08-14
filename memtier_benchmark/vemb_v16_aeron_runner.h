@@ -24,7 +24,7 @@
 #include "obj_gen.h"
 
 /*
- * Side-channel Aeron (UDS + POSIX SHM SPSC ring) runner.
+ * Side-channel Aeron (TCP control + UB-backed SPSC ring) runner.
  *
  * Bypasses memtier's libevent stack and runs the same wire protocol as
  * benchmark/vemb_v16_bench --transport aeron, but reuses memtier's
@@ -40,12 +40,12 @@
  * (run_benchmark) proceeds to its normal Totals/JSON/HDR output.
  *
  * Returns: populated run_stats on success, exit(1) on unrecoverable setup
- * failure (UDS missing, channel alloc rejected, etc.). Per-op errors are
+ * failure (TCP control missing, channel alloc rejected, etc.). Per-op errors are
  * recorded inside the stats, not fatal.
  */
 run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen);
 
-/* Called by main() after arg parse. Default mode = "aeron" (UDS+SHM).
+/* Called by main() after arg parse. Default mode = "aeron" (TCP+UB).
  * For cross-node mode, endpoint = "host:port". */
 void vemb_v16_aeron_set_transport(const std::string &mode,
                                   const std::string &endpoint);

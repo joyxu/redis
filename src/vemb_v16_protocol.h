@@ -2,8 +2,10 @@
 #define __VEMB_V16_PROTOCOL_H
 
 #include "macro.h"
+#include "vemb_v16_cacheline.h"
 #include "vemb_v16_hash.h"
 #include "vemb_v16_peer_view_map.h"
+#include "vemb_v16_util.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -16,6 +18,8 @@
 #define VEMB_V16_TCP_HOST "127.0.0.1"
 #define VEMB_V16_TCP_PORT 6391
 #define VEMB_V16_SHM_PREFIX "vemb_v16"
+#define VEMB_V16_DEFAULT_AERON_UB_PATH "/dev/obmm_shmdev1"
+#define VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH "/dev/obmm_shmdev2"
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
 #ifndef VEMB_V16_MAX_CHANNELS
@@ -37,6 +41,9 @@
 #define VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN 32u
 #define VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN 105u
 #define VEMB_V16_RESP_ENCODED_BASE_LEN 6u
+#define VEMB_V16_AERON_REQ_WIRE_MAX_LEN \
+    (24u + 4u + VEMB_V16_MAX_KEY_LEN + VEMB_V16_MAX_DIM * sizeof(float))
+#define VEMB_V16_AERON_RESP_WIRE_MAX_LEN 64u
 #define vemb_v16_alloc_req_encoded_len() VEMB_V16_ALLOC_REQ_ENCODED_LEN
 #define vemb_v16_net_status_encoded_len() VEMB_V16_NET_STATUS_ENCODED_LEN
 #define vemb_v16_epoch_control_req_encoded_len() \
@@ -706,6 +713,14 @@ static inline size_t vemb_v16_req_handle_len(void) {
 
 static inline size_t vemb_v16_req_inline_len(uint32_t vector_bytes) {
     return offsetof(vemb_v16_req_t, vector) + (size_t)vector_bytes;
+}
+
+/* Aeron slots carry the compact protocol frame, not the internal request
+ * struct. The largest frame is VADD/VSIM_INLINE with a maximum-length key. */
+static inline uint32_t vemb_v16_aeron_req_slot_size(uint32_t dim) {
+    size_t payload = 24u + 4u + VEMB_V16_MAX_KEY_LEN +
+        (size_t)dim * sizeof(float);
+    return (uint32_t)align_up_size(payload, CACHELINE_SIZE);
 }
 
 static inline void vemb_v16_proto_put_u8(uint8_t **p, uint8_t v) {
@@ -1882,6 +1897,13 @@ static inline size_t vemb_v16_resp_encoded_len_for_fields(uint8_t status,
 
 static inline size_t vemb_v16_resp_encoded_len(const vemb_v16_resp_t *resp) {
     return vemb_v16_resp_encoded_len_for_fields(resp->status, resp->op);
+}
+
+static inline uint32_t vemb_v16_aeron_resp_slot_size(void) {
+    return (uint32_t)align_up_size(
+        vemb_v16_resp_encoded_len_for_fields(VEMB_V16_STATUS_OK,
+                                             VEMB_V16_OP_VEMB_HANDLE),
+        CACHELINE_SIZE);
 }
 
 static inline int vemb_v16_resp_encode(uint8_t *dst,

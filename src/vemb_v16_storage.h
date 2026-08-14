@@ -297,21 +297,22 @@ sve_operation_stats_t *vemb_v16_storage_sve_stats(vemb_v16_storage_ctx_t *storag
 void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
                                         vemb_v16_channel_desc_t *desc);
 
-/* Allocate two adjacent ring regions in a free UB shmdev for cross-node
- * aeron transport. Returns:
- *   0  on success — fills out_shmdev_path, out_req_off, out_resp_off
+/* Allocate request and response ring regions from independent UB paths for
+ * cross-node aeron transport. Returns:
+ *   0  on success — fills both paths and offsets
  *  -1  no free shmdev slot
  *  -2  shmdev open/mmap failed
  * Caller must NOT munmap the returned regions until channel close (the
  * server's proxy holds the mapping for the channel lifetime).
  *
- * Layout within a shmdev:
- *   [req_ring bytes][resp_ring bytes]
  * Both rings are zero-initialized by this call. */
-int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
+int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
+                                         const char *response_ub_path,
+                                         uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
-                                         char out_shmdev_path[256],
+                                         char out_request_shmdev_path[256],
+                                         char out_response_shmdev_path[256],
                                          uint64_t *out_req_off,
                                          uint64_t *out_resp_off,
                                          void **out_req_mapping,
@@ -322,6 +323,32 @@ int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
 /* Release a shmdev channel allocation. Safe to call with NULL mapping. */
 void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
                                          void *resp_mapping, size_t resp_bytes);
+
+typedef struct vemb_v16_aeron_batch_channel_allocation {
+    char request_path[256];
+    char response_path[256];
+    uint64_t request_desc_off;
+    uint64_t request_arena_off;
+    uint64_t response_desc_off;
+    uint64_t response_arena_off;
+    void *request_desc_mapping;
+    void *request_arena_mapping;
+    void *response_desc_mapping;
+    void *response_arena_mapping;
+    size_t request_desc_bytes;
+    size_t request_arena_bytes;
+    size_t response_desc_bytes;
+    size_t response_arena_bytes;
+} vemb_v16_aeron_batch_channel_allocation_t;
+
+/* Allocate the four UB regions for one v2 batch channel atomically. The
+ * descriptor regions are initialized as fixed-slot SPSC rings; the arenas
+ * are raw contiguous storage for batch frames. */
+int vemb_v16_storage_alloc_aeron_batch_channel(
+    const char *request_ub_path, const char *response_ub_path,
+    uint32_t descriptor_slot_size, uint32_t descriptor_slots,
+    uint32_t request_arena_bytes, uint32_t response_arena_bytes,
+    vemb_v16_aeron_batch_channel_allocation_t *out);
 
 int vemb_v16_storage_vector_slice(vemb_v16_storage_ctx_t *storage,
                                   vemb_v16_resp_t *resp,
@@ -542,11 +569,11 @@ int vemb_v16_storage_migration_write_blocked_info(
     tlc_core_key_migration_info_t *info,
     vemb_v16_migration_outbox_stats_t *outbox_stats);
 
-/* Cross-node ATTACH support: return first local manifest region that has
- * a non-empty client_path, or NULL if none configured. The returned
- * pointer is valid for the storage's lifetime (do not free). */
+/* Aeron ATTACH support: return the first local warm region using its
+ * server-side path. Local clients may mmap SHM or UB directly; remote
+ * clients accept only UB and map it to their local UB view. */
 const vemb_v16_manifest_region_t *
-vemb_v16_storage_first_local_region_with_client_path(
+vemb_v16_storage_first_local_region(
     const vemb_v16_storage_ctx_t *storage);
 
 #endif

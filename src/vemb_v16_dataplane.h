@@ -23,6 +23,7 @@ typedef struct vemb_v16_job_base {
     uint64_t channel_id;
     uint64_t key_hash;
     uint64_t topology_epoch;
+    uint64_t batch_token;
 } vemb_v16_job_base_t;
 
 typedef enum vemb_v16_job_pool_type {
@@ -122,6 +123,7 @@ typedef struct vemb_v16_completion {
     uint32_t channel_index;
     uint32_t dim;
     uint64_t channel_id;
+    uint64_t batch_token;
     uint64_t key_hash;
     uint64_t vector_offset;
     uint32_t vector_bytes;

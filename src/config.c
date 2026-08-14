@@ -18,6 +18,7 @@
 #include "cluster.h"
 #include "connection.h"
 #include "bio.h"
+#include "vemb_v16_protocol.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -2373,6 +2374,14 @@ static int isValidVembV16Transport(char *val, const char **err) {
     return 1;
 }
 
+static int isValidVembV16AeronControl(char *val, const char **err) {
+    if (strcmp(val, "tcp") && strcmp(val, "uds")) {
+        *err = "vemb-v16-aeron-control must be 'tcp' or 'uds'";
+        return 0;
+    }
+    return 1;
+}
+
 static int isValidAOFfilename(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appendfilename can't be empty";
@@ -3319,9 +3328,13 @@ standardConfig static_configs[] = {
     createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),
     createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-batch-request-size", NULL, MODIFIABLE_CONFIG, 1, VEMB_V16_BATCH_REQUEST_SIZE_MAX, server.vemb_v16_batch_request_size, VEMB_V16_BATCH_REQUEST_SIZE_DEFAULT, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-transport", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_transport, "sniff", isValidVembV16Transport, NULL),
     createIntConfig("vemb-v16-tcp-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.vemb_v16_tcp_port, 0, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-tcp-host", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_tcp_host, NULL, NULL, NULL),
+    createStringConfig("vemb-v16-aeron-control", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_control, "tcp", isValidVembV16AeronControl, NULL),
+    createStringConfig("vemb-v16-aeron-ub-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_ub_path, VEMB_V16_DEFAULT_AERON_UB_PATH, NULL, NULL),
+    createStringConfig("vemb-v16-aeron-response-ub-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_response_ub_path, VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH, NULL, NULL),
     createBoolConfig("vemb-v16-cross-node-aeron", NULL, IMMUTABLE_CONFIG, server.vemb_v16_cross_node_aeron_enabled, 0, NULL, NULL),
 
     /* Special configs */

@@ -22,6 +22,13 @@
 #define VEMB_V16_PROXY_IO_STATE_CLOSING (1u << 31)
 
 typedef struct vemb_v16_channel vemb_v16_channel_t;
+struct batch_request_view;
+
+/* Called only by the v2 request poll path with a live batch channel, a
+ * decoded request view, and a valid proxy I/O worker id. */
+int vemb_v16_proxy_handle_batch_request(
+    vemb_v16_channel_t *ch, const struct batch_request_view *view,
+    uint32_t proxy_io_worker_id);
 
 typedef struct vemb_v16_transport_listener {
     const char *name;
@@ -40,8 +47,11 @@ uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch);
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
+const char *vemb_v16_proxy_aeron_ub_path(vemb_v16_proxy_t *proxy);
+const char *vemb_v16_proxy_aeron_response_ub_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);
+uint32_t vemb_v16_proxy_data_transport(vemb_v16_proxy_t *proxy);
 
 size_t vemb_v16_tcp_input_pending_bytes(vemb_v16_channel_t *ch);
 size_t vemb_v16_tcp_input_tailroom(vemb_v16_channel_t *ch);
@@ -99,16 +109,16 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
  *   resp_ring   - already-mmaped shmdev resp ring
  *   req_slot    - req ring slot size
  *   resp_slot   - resp ring slot size
- *   shmdev_path - shmdev path (logged for diagnostics)
- *   req_off     - byte offset of req_ring within shmdev (logged)
- *   resp_off    - byte offset of resp_ring within shmdev (logged)
+ *   req_path/resp_path - paths (logged for diagnostics)
+ *   req_off/resp_off  - byte offsets within their respective paths
  *   out_channel_id - receives the assigned channel id
  * Returns 0 on success. The proxy adopts the ring mappings (does NOT
  * munmap them - caller's storage layer owns that). */
 int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
                                              void *req_ring, void *resp_ring,
                                              uint32_t req_slot, uint32_t resp_slot,
-                                             const char *shmdev_path,
+                                             const char *req_path,
+                                             const char *resp_path,
                                              uint64_t req_off, uint64_t resp_off,
                                              uint64_t *out_channel_id);
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy,
