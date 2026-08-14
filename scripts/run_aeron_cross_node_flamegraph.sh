@@ -32,7 +32,7 @@ NUM_KEYS="${NUM_KEYS:-100000}"
 KEY_PATTERN="${KEY_PATTERN:-R:R}"
 ZIPF_S="${ZIPF_S:-}"
 RUN_ID="${RUN_ID:-aeron_cross_$(date +%Y%m%d_%H%M%S)}"
-KEY_PREFIX="${KEY_PREFIX:-vemb-cross-flame-${RUN_ID}:}"
+KEY_PREFIX="${KEY_PREFIX:-item:}"
 
 THREADS="${THREADS:-64}"
 CLIENTS="${CLIENTS:-4}"
@@ -45,7 +45,7 @@ PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_QUEUE_BATCH="${PROXY_QUEUE_BATCH:-$BATCH_REQUEST_SIZE}"
 PIO="${PIO:-21}"
 SNW="${SNW:-21}"
-SERVER_CPU_MASK="${SERVER_CPU_MASK:-0-47}"
+SERVER_CPU_MASK="${SERVER_CPU_MASK:-0-15}"
 CLIENT_CPU_MASK="${CLIENT_CPU_MASK:-96-191}"
 
 TEST_TIME="${TEST_TIME:-30}"
@@ -92,7 +92,7 @@ Important environment variables:
   SERVER_NODE CLIENT_NODE SSH_USER SSH_PORT SERVER_ROOT CLIENT_ROOT SERVER_IP PORT
   SERVER_MANIFEST SERVER_REQUEST_UB_PATH SERVER_RESPONSE_UB_PATH SERVER_WARM_UB_PATH
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
-  NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX DIM MAX_VECTORS
+  NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
   THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES
   PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
@@ -753,6 +753,105 @@ END {
 awk 'NR == 2 && $1 != "" { found = 1 } END { exit !found }' \
     "$run/client.l1_summary.tsv"
 
+# Keep the benchmark result separate from the L1/resource summary.  The
+# workload's Totals row is the authoritative logical-operation rate; leader
+# and follower counters are exported with the same effective duration so the
+# two rates can be compared without mixing nominal test time and drain time.
+awk -v test_time="$test_time" -v run_label="$run_label" '
+function metric(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        if ($i ~ ("^" name "=")) {
+            split($i, pair, "=")
+            return pair[2]
+        }
+    }
+    return 0
+}
+function status_metric(name,    i, token, prefix) {
+    prefix = "status[" name "="
+    for (i = 1; i <= NF; i++) {
+        if (index($i, prefix) == 1) {
+            token = substr($i, length(prefix) + 1)
+            sub(/\].*$/, "", token)
+            return token
+        }
+    }
+    return 0
+}
+function emit(name, value) {
+    printf "%-32s\t%20s\n", name, value
+}
+function emitf(name, format, value) {
+    emit(name, sprintf(format, value))
+}
+BEGIN {
+    OFS = "\t"
+}
+/^Totals[[:space:]]/ {
+    qps = $2
+    hits_sec = $3
+    misses_sec = $4
+    avg_lat_ms = $5
+    p50_ms = $6
+    p99_ms = $7
+    p99_9_ms = $8
+    kb_sec = $9
+    have_totals = 1
+}
+/^\[aeron\] w[0-9]+ batch-session:/ {
+    leaders += metric("leaders")
+    followers += metric("followers")
+    frames += metric("frames")
+    server_items += metric("unique_items")
+}
+/^\[aeron\] w[0-9]+ done:/ {
+    logical_ops += metric("ops_done")
+    publish_fail += metric("publish_fail")
+    unmatched += metric("unmatched")
+    status_ok += status_metric("ok")
+    status_notfound += status_metric("nf")
+    status_err += status_metric("err")
+    status_other += status_metric("other")
+}
+END {
+    if (!have_totals || qps <= 0 || logical_ops <= 0)
+        exit 1
+    duration_sec = logical_ops / qps
+    leader_sec = leaders / duration_sec
+    follower_sec = followers / duration_sec
+    leader_ratio = logical_ops > 0 ? leaders * 100 / logical_ops : 0
+    printf "%-32s\t%20s\n", "metric", "value"
+    emit("test_time_sec", test_time)
+    emitf("effective_duration_sec", "%.6f", duration_sec)
+    emitf("logical_ops", "%.0f", logical_ops)
+    emitf("qps_ops_sec", "%.6f", qps)
+    emitf("hits_sec", "%.6f", hits_sec)
+    emitf("misses_sec", "%.6f", misses_sec)
+    emitf("avg_lat_ms", "%.6f", avg_lat_ms)
+    emitf("p50_ms", "%.6f", p50_ms)
+    emitf("p99_ms", "%.6f", p99_ms)
+    emitf("p99_9_ms", "%.6f", p99_9_ms)
+    emitf("kb_sec", "%.6f", kb_sec)
+    emitf("leaders", "%.0f", leaders)
+    emitf("leader_per_sec", "%.6f", leader_sec)
+    emitf("followers", "%.0f", followers)
+    emitf("follower_per_sec", "%.6f", follower_sec)
+    emitf("leaders_plus_followers", "%.0f", leaders + followers)
+    emitf("leaders_plus_followers_per_sec", "%.6f", leader_sec + follower_sec)
+    emitf("leader_ratio_pct", "%.6f", leader_ratio)
+    emitf("frames", "%.0f", frames)
+    emitf("server_items", "%.0f", server_items)
+    emitf("publish_fail", "%.0f", publish_fail)
+    emitf("unmatched", "%.0f", unmatched)
+    emitf("status_ok", "%.0f", status_ok)
+    emitf("status_notfound", "%.0f", status_notfound)
+    emitf("status_err", "%.0f", status_err)
+    emitf("status_other", "%.0f", status_other)
+}
+' "$run/client.workload.log" >"$run/client.workload.summary.tsv"
+awk 'NR == 2 && $1 != "" { found = 1 } END { exit !found }' \
+    "$run/client.workload.summary.tsv"
+
 perf script -i "$run/client.perf.data" >"$run/client.perf.script"
 grep -q '\[kernel.kallsyms\]' "$run/client.perf.script"
 grep -q 'memtier_benchmark' "$run/client.perf.script"
@@ -769,11 +868,12 @@ grep -q 'vemb-v16 cross-node cli' "$run/client.svg"
     printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s l1_entries=%s\n' \
         "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us" "$l1_entries"
     printf 'run_label=%s\n' "$run_label"
+    printf 'client_workload_summary=client.workload.summary.tsv\n'
     cat "$root/.vemb_v16_build_stamp.client"
 } >"$run/client.meta.txt"
 tar -C "$run" -czf "$run/client_artifacts.tar.gz" \
     client.preflight.pidstat.txt client.preflight.cpu-blockers.tsv client.preflight.rss-blockers.tsv client.preflight.cpuset.tsv \
-    prefill.log client.workload.log client.l1_summary.tsv client.perf.data client.perf.script \
+    prefill.log client.workload.log client.workload.summary.tsv client.l1_summary.tsv client.perf.data client.perf.script \
     client.collapsed.txt client.svg client.meta.txt
 REMOTE_CLIENT_PERF
 
@@ -967,6 +1067,7 @@ test -s "$LOCAL_ROOT/server/server.svg"
 test -s "$LOCAL_ROOT/client/client.svg"
 test -s "$LOCAL_ROOT/server/server.perf.data"
 test -s "$LOCAL_ROOT/client/client.perf.data"
+test -s "$LOCAL_ROOT/client/client.workload.summary.tsv"
 test -s "$LOCAL_ROOT/server/server.cpu.process.tsv"
 test -s "$LOCAL_ROOT/server/server.cpu.cpuset.summary.tsv"
 test -s "$LOCAL_ROOT/server/server.cpu.summary.txt"
@@ -981,6 +1082,7 @@ printf 'server SVG: %s/server/server.svg\n' "$local_display"
 printf 'client SVG: %s/client/client.svg\n' "$local_display"
 printf 'server raw: %s/server/server.perf.data\n' "$local_display"
 printf 'client raw: %s/client/client.perf.data\n' "$local_display"
+printf 'client workload: %s/client/client.workload.summary.tsv\n' "$local_display"
 printf 'server CPU: %s/server/server.cpu.process.tsv\n' "$local_display"
 printf 'server CPU set: %s/server/server.cpu.cpuset.summary.tsv\n' "$local_display"
 printf '\n'

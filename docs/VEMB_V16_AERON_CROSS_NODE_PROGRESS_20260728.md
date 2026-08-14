@@ -3354,7 +3354,9 @@ L1 代码按以下阶段落地。每个阶段完成后单独形成 checkpoint，
   shared-vector read；两者不混入 L0 follower coalescing 收益。
 - `scripts/run_aeron_cross_node_flamegraph.sh` 增加 `L1_ENTRIES`（默认 0）并严格检查 `0` 或
   `4 * 2^k`。每次样本将该值写进 run label，采集 client max RSS，并在
-  `client.l1_summary.tsv` 归档 QPS/P99、全部 L1 指标、server items、UB read bytes 与 RSS；异常
+  `client.l1_summary.tsv` 归档 QPS/P99、全部 L1 指标、server items、UB read bytes 与 RSS；新增纵向
+  `client.workload.summary.tsv`，以 `metric<TAB>value` 逐行归档 QPS、avg/p50/p99/p99.9、命中/未命中速率、
+  有效统计窗口、logical ops，以及 L0 leader/follower 数和对应每秒速率；异常
   fallback、backpressure、read failure、非 OK、queue-full、all-pinned、storage exhaustion 或 stale ref
   直接使样本失败。脚本语法、dry-run、容量拒绝和 TSV 合成解析均已验证。
 - batch-wave 修复：第一次在 `PIO=12, SNW=12, server CPU=0-15` 的 L1 enabled uniform 样本中发现
@@ -3412,3 +3414,176 @@ L1 代码按以下阶段落地。每个阶段完成后单独形成 checkpoint，
 本节只定义 worker-local completed-vector cache。proxy L2 location cache、跨 worker shared cache、
 key-affine channel routing、`slot_meta` 校验，以及可写 workload 的 TTL/lease/invalidation 仍是后续独立
 阶段，不能随首版 L1 一起启用或宣称完成。
+
+## 22. Server CPU 不降 QPS 优化方向（2026-08-13，分析 checkpoint）
+
+本节统一记录 P0 lane 修复后的 CPU 优化方向。Uniform `R:R`、`100K`、`fanout≈1`、
+`L1_ENTRIES=0` 是当前最严格的裸 baseline：Batch-Agg 和 CLI Cache 仍存在，但随机 key 几乎没有
+重复 key，因此不能用 client 聚合解释吞吐。Zipf/L1 只用于验证空闲调度收益，不能替代该 baseline。
+
+### 22.1 度量口径和已完成 baseline
+
+每个 checkpoint 必须同时记录 logical QPS、server leaders/s、P99、server process cores、CPU/leader、
+PIO/SNW busy cores、lane queue depth 和完整错误计数。Uniform 的 server workload 主要由 leaders 构成；
+`followers/leaders≈0.000156`，所以 logical QPS 与物理 server item/s 基本相同。
+
+| PIO:SNW | logical QPS | leaders/s | P99 | server process cores | CPU/leader | 平均 fanout |
+|---:|---:|---:|---:|---:|---:|---:|
+| `4:4` | 5.972M | 5.976M | 1.607ms | 6.682 | 1.119us | 1.000155 |
+| `5:5` | 7.643M | 7.652M | 1.303ms | 8.383 | 1.097us | 1.000156 |
+| `6:6` | 8.143M | 8.149M | 1.119ms | 9.413 | 1.156us | 1.000156 |
+| `7:7` | 8.182M | 8.189M | 1.055ms | 10.724 | 1.310us | 1.000156 |
+| `8:8` | 8.160M | 8.163M | 1.031ms | 11.675 | 1.431us | 1.000156 |
+
+`6:6` 是当前权衡点：相对 `5:5` 仍有约 `6.54%` QPS 增益；`6:6 -> 7:7` 只有约 `0.48%`，
+但 CPU 增加约 `13.93%`；`8:8` QPS 反而下降约 `0.27%`。因此后续目标不是继续增加常驻线程，
+而是让固定 `PIO:SNW=1:1` 的额外 lane 在无工作时低成本等待，并降低每个物理 leader 的固定开销。
+
+### 22.2 Flamegraph 证据：扩线程后的主要成本
+
+`6:6` client SVG 中 `sve_streaming_load_f32` 约 `68%`、`batch_client_finish_group_shared` 约 `86%`、
+`batch_client_poll_v2_shared` 约 `87%`；`7:7`、`8:8` 的比例基本不变。每轮逻辑向量读取约为
+`9.8GB/s`（`leaders × dim300 × 4B / 30s`），说明增加 server worker 没有改变 client 向量完成路径
+的上限。该数值是逻辑读取带宽，不等同于硬件 DRAM/UB 带宽；若需确认物理带宽，应另采集平台 PMU。
+
+结合当前 UB 配置下的实测上限约 `10.7GB/s`，`8.1M QPS` 对应的逻辑向量读取量为
+`8.1M × 300 × 4B = 9.72GB/s`，约占该上限的 `90.8%`。因此，在当前配置和
+`DIM=300` 的 Uniform read workload 下，`8.1M QPS` 可以判断为已经非常接近把 UB
+有效带宽打满；剩余约 `0.98GB/s`（约 `9.2%`）不应解读为还有同等比例的可扩展空间。
+这里仍是按请求 payload 计算的逻辑带宽，未计入 UB 元数据、ring head/tail、响应描述符、
+对齐/缓存行放大及协议开销；`10.7GB/s` 也只是当前配置的实测 ceiling，不是设备规格或
+物理带宽饱和的证明。要确认硬件层是否饱和，需要补充平台 PMU/设备计数器或独立 UB
+带宽基准测试。
+
+server SVG/折叠栈显示 `6:6` 之后仍以固定调度路径为主：PIO pool 约 `59%`，SNW pool 约 `40%`；
+`drain_completions`、`vemb_v16_aeron_publish_batch_response`、`drain_shard_queues` 和
+`tlc_core_get_warm_location_raw` 是主要路径。到 `8:8`，PIO pool 升至约 `65%`，SNW pool 降至约 `34%`，
+但 QPS 没有增加，表明新增 CPU 主要支付轮询、队列扫描、completion egress 和调度固定成本。
+
+### 22.3 P0：稳定 owner，消除 lane 偏斜（DONE）
+
+P0 已由提交 `ffc91ec`（`fix(vemb-v16): stabilize batch lane ownership`）完成。v2 batch channel
+在 attach 时使用独立 `next_v2_lane_index` round-robin 分配 `proxy_io_worker_id` 和
+`supernode_worker_id`；snapshot、job shard、completion notify、SuperNode context 和 close/slot
+复用均使用稳定 owner。这样不再依赖相邻 v1 fallback channel 造成的偶数 index，也不需要用奇数 lane
+数掩盖偏斜。UT、server/benchmark build 和 `batch_close_drain_ut` 已通过；4:4--8:8 结果已归档在
+`VEMB_V16_AERON_LANE_SNAPSHOT_REPORT_20260811.md` 第 9 节。
+
+### 22.4 P1：固定 1:1 paired lane，空闲 SNW park
+
+固定模式为 `PIO_i -> job_queue_i -> SNW_i -> completion_queue_i -> PIO_i`。paired mode 必须在 attach
+时确定 owner 和 queue index，热路径直接访问对应 SPSC queue；`PIO!=SNW` 继续使用通用多队列扫描。
+
+Uniform 裸 baseline 下几乎每个 leader 都需要 SNW，park 只会减少短暂空闲和尾部 CPU，不能期待明显吞吐收益。
+Zipf/L1 下才是主要收益：PIO 继续负责 ingress/completion，SNW 在自己的 queue 为空时从 bounded spin 进入
+`futex_wait`，由对应 PIO publish 唤醒。必须保留 `job_notify_armed` 的 `arm -> recheck -> wait` 顺序、
+shutdown wake、SPSC ownership、job generation、backpressure 和 completion identity。
+
+P1 不创建/销毁线程、不动态迁移 channel；必须分别记录 `snw_busy_cores`、`snw_park_count`、
+`snw_wake_count`、park duration、wake-to-first-job latency、queue depth 和 CPU reservation。
+
+### 22.5 P2：PIO 按活跃度分级退避
+
+现有 PIO 在空 sweep 后固定 `256` 次 spin 再 `nanosleep(1us)`。保留忙 lane 的低延迟行为，只对同时满足
+“无 ingress、无 completion、无 pending batch”的 lane 逐级退避，例如 `spin -> 1us -> 2us -> 4us`，
+并在重新观察到 request/completion 后立即恢复。需要 hysteresis 和空 sweep/退避计数，避免边界流量抖动。
+
+跨机 UB 不能直接假设远端 futex 能唤醒 PIO。若后续引入共享 doorbell/sequence，只能作为唤醒提示；
+descriptor sequence、batch_id、完整 frame commit、release fence 和 visibility retry 仍是唯一消费条件，
+并保留周期性 full-scan watchdog。ready bitmap 的失败实验不能直接复用。
+
+### 22.6 P3：减少空闲 SNW 的计时开销
+
+SNW 空闲循环为维持约 `5us` spin window，每轮调用 monotonic 时间；历史 profile 中
+`getMonotonicNs_aarch64/__udivti3` 约占 `3--5%`。设计为每 `32/64` 次空轮询才读取一次时间，再决定
+进入现有 futex 路径；active job 的批量、顺序、超时和 owner 不变。该项优先于更复杂的通知改造，风险较低。
+
+### 22.7 P4：Uniform 成功 handle 的 response egress 快速路径
+
+server 热点包含 `drain_completions -> vemb_v16_aeron_publish_batch_response`。对固定格式、全为 OK
+`VEMB_HANDLE` 的 batch，设计直接写最终 response arena，消除临时 `64KiB` encode buffer 和二次 copy；
+mixed-status、迁移、MOVED/ASK、non-handle 继续走通用路径。必须保持 body-before-commit、release fence、
+descriptor/batch identity 和 client visibility retry。收益以 leaders/s、CPU/leader 和 publish cycles/item
+衡量，不能以 Zipf/L1 logical QPS 放大。
+
+### 22.8 P5：batch job，减少 per-item 调度固定成本
+
+当前每个 batch item 都承担 job ref、queue publish、状态转换、return ref 和 completion。中期可把一个 v2
+batch 作为单个调度 job，由 SNW 内部处理 item group，再返回每 item completion。必须保留 batch identity/
+generation、backpressure、channel ownership、迁移规则和错误定位；该项应独立 checkpoint，不与 P0/P1
+混合归因。
+
+### 22.9 不采用的方向与验收顺序
+
+- 不继续扩大默认 batch 到 `64/128`：已有 Uniform 全链路 batch=`64` 和 runtime `128` 样本 P99 明显恶化。
+- 不用奇数 lane 数掩盖 owner 偏斜；长期配置固定 `PIO:SNW=1:1`。
+- 不删除迁移 fence、tombstone、stale/duplicate/generation 检查、arena commit/fence 或 visibility retry。
+- 实施顺序：`P0 DONE -> P3 低风险计时优化 -> P1 paired SNW park -> P2 PIO 退避 -> P4 egress fast path -> P5 batch job`。
+- 每个优化单独重复至少 5 次，固定 workload、CPU mask、build stamp 和 30s 窗口；同时比较 logical QPS、leaders/s、
+  P99、process cores、CPU/leader、PIO/SNW busy cores、queue/park/wake 统计和完整错误计数。
+
+Uniform baseline 的接受门槛：leaders/s 不下降超过重复噪声，QPS 不下降超过 `2%`，P99 不恶化超过 `10%`，
+且 CPU/leader 下降。若 logical QPS 上升而 leaders/s 下降，只能归因于 client 聚合，不能宣称 server CPU 改善。
+
+### 22.10 落地断点与验收清单
+
+统一验收配置固定为 `PIO:SNW=6:6`、`100K` Uniform `R:R`、`t=64`、`c=4`、
+`pipeline=batch=32`、30 秒、server CPU `0-15`、CLI CPU `96-191`。每个 checkpoint 单独提交并至少
+重复 3 次；记录 logical QPS、leaders/s、P99、server process cores、CPU/leader、PIO/SNW busy cores、
+queue depth 及全部错误计数。对同 CPU mask 的 A/B，接受门槛为 QPS 不下降超过 `2%`、P99 不恶化超过
+`10%`、CPU/leader 下降，且 `fallback_v1`、publish failure、backpressure、stale response 和 handle read
+failure 均为 `0`。历史 `0-47` 结果不能和此处默认 `0-15` 的结果直接作 CPU 归因。
+
+| 状态 | Checkpoint | 落地范围 | 完成条件 |
+|---|---|---|---|
+| DONE | P0 stable owner | attach 时固定 v2 PIO/SNW owner、paired queue 选择 | `ffc91ec`；4:4--8:8 无 owner skew，见第 9 节 |
+| DONE | P3 SNW idle clock sampling | 空闲自旋每 32 轮才读取 monotonic clock；保留现有 `5us` spin window 与 futex wait/wake | `c20eeb7`；`vemb_v16_batch_close_drain_ut` PASS，`make -C src vemb_v16_server` PASS |
+| DONE | P3 `6:6` regression gate | `0-15` 下运行 3 个 30 秒样本；均无数据面错误 | QPS `9.454--9.649M`、P99 `1.023--1.031ms`、process cores `10.597--10.613`；详见下表 |
+| DONE | P3 same-mask A/B attribution | `0-47` 下以 P0 `ffc91ec` 对比 P3 `c20eeb7` 的 server | 同 workload、CPU mask、client source/artifact 与 build policy；单对比的 CPU/leader 下降 `4.63%`，详见下文 |
+| TODO | Metrics | 增加 PIO/SNW 私有空轮询、退避、park/wake、wake latency 与 queue-depth 统计，stop 后汇总 | 不对热路径增加每请求原子操作；统计可用于归因 |
+| TODO | P1 paired SNW park | 复用当前 1:1 pairing/futex 骨架，确认 paired mode 只检查对应 SPSC queue；按统计调 spin budget | 不创建/迁移线程；保留 arm -> recheck -> wait、shutdown wake 和 SPSC ownership |
+| TODO | P2 PIO adaptive backoff | 无 ingress/completion/pending batch 时 `spin -> 1us -> 2us -> 4us`，有工作立即复位 | 不依赖远端 UB futex/eventfd；保留 visibility retry 和周期性 full scan |
+| TODO | P4 handle response egress | all-OK `VEMB_HANDLE` batch 直接编码至 response arena，通用路径处理 mixed status/迁移/错误 | 保持 body-before-commit、release fence、descriptor/batch identity 与 client retry |
+| TODO | P5 batch job | 一个 v2 batch 对应一个调度 job，SNW 内部逐 item 执行并保持 item completion 语义 | 单独 UT/checkpoint；保留 backpressure、迁移、generation 与错误定位 |
+
+执行原则：P3、Metrics、P1、P2 优先减少空闲和扩 lane 的常驻 CPU；P4、P5 才直接降低满载
+`6:6` 的每 leader 固定 CPU。每完成一项，更新此表为 `DONE` 并写入 commit、测试命令与对照结果；未完成项
+保持 `TODO`，可从该表继续。
+
+**P3 `6:6` regression gate（2026-08-13，server `0-15`）：** 三轮均使用 `PIO=6`、`SNW=6`、
+`100K` Uniform `R:R`、`t=64`、`c=4`、`pipeline=batch=32`、30 秒，server `0-15`、CLI `96-191`。
+三轮的 `fallback_v1`、publish failure、flush backpressure、stale response 和 handle read failure 均为 `0`。
+
+| server CPU | run | QPS | P99 | server process cores | 单 core QPS | server leaders | CPU/leader | 产物 |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `0-15` | `r1` | 9.649157M | 1.023ms | 10.605 | 0.909869M | 289,767,204 | 1.097950us | [perf](../perf/p3_p6_s6_svr0-15_uniform_20260813_r1/) |
+| `0-15` | `r2` | 9.610068M | 1.023ms | 10.613 | 0.905500M | 288,311,288 | 1.104327us | [perf](../perf/p3_p6_s6_svr0-15_uniform_20260813_r2/) |
+| `0-15` | `r3` | 9.454456M | 1.031ms | 10.597 | 0.892182M | 283,776,658 | 1.120282us | [perf](../perf/p3_p6_s6_svr0-15_uniform_20260813_r3/) |
+| `0-47` | `r1` | 9.613668M | 1.023ms | 10.595 | 0.907378M | 288,559,793 | 1.101505us | [perf](../perf/p3_p6_s6_svr0-47_uniform_20260813_r1/) |
+
+`0-15` 三轮均值为 `9.571227M QPS`、`10.605` server process cores、`0.902517M` 单 core QPS、
+`1.107520us/leader`，证明 P3 在新的默认 CPU 集下没有功能或性能回归。
+
+**P3 same-mask A/B（2026-08-13，server `0-47`，单对）：** P0 的
+`p0_p6_s6_uniform_20260813` 与 P3 的 `p3_p6_s6_svr0-47_uniform_20260813_r1` 均使用
+`PIO=SNW=6`、`100K` Uniform `R:R`、`t=64`、`c=4`、`pipeline=batch=32`、30 秒、server `0-47`、
+CLI `96-191`，并使用相同的 `USE_SVE=yes`、`-O3 -flto` 与全部内部 batch=`32` 构建策略。两轮的
+client source hash、SDK archive hash 和 memtier artifact hash 完全相同；server 的 diff 相对
+`ffc91ec` 仅为 P3 提交 `c20eeb7` 在 `src/vemb_v16_proxy.c` 中的 9 行空闲 clock sampling，线程拓扑均为 `6` 个
+`vemb-sn-*` 加 `6` 个 `vemb-io-*`，两次 preflight CPU blocker 均为空，且数据面错误均为 `0`。
+
+| version | QPS | P99 | server process cores | 单 core QPS | server leaders | CPU/leader | 产物 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| P0 (`ffc91ec`) | 8.143054M | 1.119ms | 9.413 | 0.8652M | 244,481,989 | 1.155177us | [perf](../perf/p0_p6_s6_uniform_20260813/) |
+| P3 (`c20eeb7`) | 9.613668M | 1.023ms | 10.595 | 0.9074M | 288,559,793 | 1.101713us | [perf](../perf/p3_p6_s6_svr0-47_uniform_20260813_r1/) |
+| delta | +18.060% | -8.579% | +12.564% | +4.883% | +18.026% | -4.628% | - |
+
+因此 P3 已在该单对 same-mask A/B 中实现每 leader CPU 下降约 `4.63%`、单 core QPS 提升约
+`4.88%`，同时 QPS 和 P99 均改善。`server process cores` 从 `9.413` 增至 `10.595` 不是 P3 失效：
+P3 使同一进程在 30 秒内实际完成多 `18.03%` leaders，增加的总 CPU 小于完成量的增幅，故
+CPU/leader 下降。该优化也不只是删除时钟成本：连续 `32` 次空轮询才检查 `5us` deadline，短暂队列空窗
+可少一次 futex park/wake；这是保留原有 arm -> recheck -> futex wait 语义下的预期调度效应。
+
+火焰图与代码结论一致：`getMonotonicNs_aarch64` 从 `2.850%` 降至 `0.108%`，`__udivti3` 从
+`2.811%` 降至 `0.080%`，二者合计从 `5.661%` 降至 `0.188%`。该 same-mask 对比目前每侧仅一轮，
+所以 `4.63%` 是已验证的点估计；后续若要给出置信区间，再补 P0/P3 交错重复样本，而不需要改变当前归因。

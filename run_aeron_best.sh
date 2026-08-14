@@ -269,7 +269,7 @@ PREFILL_OPS=$(echo "$PREFILL_TOTALS" | awk '{print $2}')
 log "prefill done: ${PREFILL_OPS:-N/A} sets/sec"
 
 # === TSV header ===
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tops_per_core\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp99_9_ms\tkb_sec\tcores\tops_per_core\n" > "$TSV"
 
 # === Sweep ===
 for ((idx=0; idx<NCONFIGS; idx++)); do
@@ -299,15 +299,15 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
 
     totals=$(grep "^Totals" "$RAWDIR/t${t}_c${c}_p${p}.log" | tail -1)
-    read ops avg p50 p99 kb < <(
-        echo "$totals" | awk '{if(NF>=9) printf "%s %s %s %s %s", $2,$5,$6,$8,$9; else printf "0 NA NA NA NA"}'
+    read ops avg p50 p99 p999 kb < <(
+        echo "$totals" | awk '{if(NF>=9) printf "%s %s %s %s %s %s", $2,$5,$6,$7,$8,$9; else printf "0 NA NA NA NA NA"}'
     )
     OPS_PER_CORE=$(awk -v o="$ops" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0||o==0) print "NA"; else printf "%.0f", o/c }')
 
-    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$AERON_TRANSPORT" \
-        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$CPU_CORES" "$OPS_PER_CORE" >> "$TSV"
-    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE"
+        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" >> "$TSV"
+    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  p99.9=${p999}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE"
 done
 
 log "=== DONE ==="

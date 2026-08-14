@@ -192,3 +192,91 @@ response、handle/shared-vector read failure、L1 queue-full、all-pinned、key/
 
 本表是 L1 enabled-only 功能与资源验证：用户要求不跑 4-key，且当前分支没有开发 L1 的版本才是
 disabled 版本。因此不与本报告历史无 L1 lane 数据计算 A/B 性能收益，也不以该表改变原有 lane 数结论。
+
+## 9. P0 owner-skew 修复后跨节点 checkpoint
+
+本轮用于验证稳定 owner 分配修复。server 为 `192.168.90.111`、CLI 为 `192.168.90.112`，
+server CPU 集合 `0-47`、CLI CPU 集合 `96-191`；测试期间暂停 server 上的 `mutagen-agent`。
+保持 `100K`、Uniform `R:R`、`t=64`、`c=4`、`pipeline=32`、`batch=32` 和 30 秒 workload，
+server flamegraph 采样 25 秒，构建策略为 `USE_SVE=yes`、`-O3 -flto`，lane 统计配置为
+`PIO=4`、`SNW=4`。
+
+本 checkpoint 的 lane owner 修复代码提交为 `ffc91ec`（`fix(vemb-v16): stabilize batch lane ownership`）。
+该提交将 v2 batch channel 的 PIO/SNW owner 从 channel-table index 派生改为独立 round-robin 身份，
+并使 snapshot、job shard、completion notify 和 SuperNode context 使用稳定 owner。
+
+| 分布 | PIO:SNW | run | QPS | P99 | server process cores | 单 core QPS | leaders | followers | frames | 平均 fanout | 产物 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Uniform `R:R` | `4:4` | `p0_p4_s4_uniform_20260813` | 5.972484M | 1.607ms | 6.682 | 0.8938M | 179,282,823 | 27,865 | 5,603,459 | 1.000155 | [perf](../perf/p0_p4_s4_uniform_20260813/) |
+| Uniform `R:R` | `5:5` | `p0_p5_s5_uniform_20260813` | 7.643325M | 1.303ms | 8.383 | 0.9118M | 229,563,601 | 35,727 | 7,174,979 | 1.000156 | [perf](../perf/p0_p5_s5_uniform_20260813/) |
+| Uniform `R:R` | `6:6` | `p0_p6_s6_uniform_20260813` | 8.143054M | 1.119ms | 9.413 | 0.8652M | 244,481,989 | 38,107 | 7,641,253 | 1.000156 | [perf](../perf/p0_p6_s6_uniform_20260813/) |
+| Uniform `R:R` | `7:7` | `p0_p7_s7_uniform_20260813` | 8.181778M | 1.055ms | 10.724 | 0.7629M | 245,665,041 | 38,255 | 7,678,228 | 1.000156 | [perf](../perf/p0_p7_s7_uniform_20260813/) |
+| Uniform `R:R` | `8:8` | `p0_p8_s8_uniform_20260813` | 8.159588M | 1.031ms | 11.675 | 0.6989M | 244,903,120 | 38,128 | 7,654,414 | 1.000156 | [perf](../perf/p0_p8_s8_uniform_20260813/) |
+
+该样本 64/64 worker 完成，`publish_fail=0`、`unmatched=0`、`fallback_v1=0`、
+`flush_backpressure=0`、`shared_vector_read_failures=0`、`v2_stale_epochs=0`、
+`v2_stale_responses=0`、`handle_deref fail=0`，所有返回状态为 OK。Redis 进程在 30.004 秒窗口
+消耗 `200.490s` CPU（`6.682` core equivalent），CPU-set 总占用 `6.848` core equivalent。
+本轮 runner 未导出独立的 per-lane counter 表，因此 lane 请求/完成均衡性以稳定 owner 修复后的
+代码与全量 worker 成功计数作为 checkpoint，后续样本继续补充 per-lane 计数。
+
+`5:5` 同样为 64/64 worker 完成，`publish_ok=229,599,328` 与 `poll_got/ops_done` 完全相等；
+`publish_fail`、`unmatched`、`fallback_v1`、`flush_backpressure`、shared-vector read failure、
+stale epoch/response 和 handle dereference failure 均为 `0`。相较 `4:4`，QPS 提升约 `27.98%`，
+P99 降低约 `18.92%`，Redis process cores 增加约 `25.46%`；在当前 Uniform 场景下，`5:5` 的
+吞吐/CPU 比仍略高于 `4:4`，但两者均未达到历史 `12:12` 的吞吐水平。
+
+`6:6` 为 64/64 worker 完成，`publish_ok=244,520,096` 与 `poll_got/ops_done` 完全相等；
+`publish_fail`、`unmatched`、`fallback_v1`、`flush_backpressure`、shared-vector read failure、
+stale epoch/response 和 handle dereference failure 均为 `0`。相较 `5:5`，QPS 提升约 `6.54%`，
+P99 降低约 `14.11%`，Redis process cores 增加约 `12.29%`；吞吐继续上升，但单 core QPS 从
+`0.9118M` 降至 `0.8652M`，说明 CPU 扩容收益开始递减。
+
+`7:7` 为 64/64 worker 完成，`publish_ok=245,703,296` 与 `poll_got/ops_done` 完全相等；
+`publish_fail`、`unmatched`、`fallback_v1`、`flush_backpressure`、shared-vector read failure、
+stale epoch/response 和 handle dereference failure 均为 `0`。相较 `6:6`，QPS 仅提升约 `0.48%`，
+P99 降低约 `5.72%`，Redis process cores 增加约 `13.93%`，单 core QPS 降至 `0.7629M`；在
+Uniform workload 下，`7:7` 已接近吞吐平台区间，继续增加 lane 的 CPU 成本需要重点评估。
+
+`8:8` 为 64/64 worker 完成，`publish_ok=244,941,248` 与 `poll_got/ops_done` 完全相等；
+`publish_fail`、`unmatched`、`fallback_v1`、`flush_backpressure`、shared-vector read failure、
+stale epoch/response 和 handle dereference failure 均为 `0`。相较 `7:7`，QPS 下降约 `0.27%`，
+P99 仅降低约 `2.27%`，但 Redis process cores 增加约 `8.87%`，单 core QPS 降至 `0.6989M`；
+该结果确认 Uniform 场景的有效 lane 数在 `7` 附近达到平台，`8:8` 不具备 CPU/吞吐优势。
+
+### 9.1 P3 SNW idle clock sampling 同 mask A/B
+
+本段是在上述 P0 lane-owner 修复后，固定 `PIO:SNW=6:6` 的后续 CPU 优化结果。两轮均使用
+server `0-47`、CLI `96-191`、`100K` Uniform `R:R`、`t=64`、`c=4`、`pipeline=batch=32`、30 秒、
+`USE_SVE=yes`、`-O3 -flto` 及全部内部 batch=`32`。P0 为提交 `ffc91ec`；P3 为提交 `c20eeb7`
+（`perf(vemb-v16): sample idle SNW clock checks`），相对 P0 的 server 代码唯一差异为
+`src/vemb_v16_proxy.c`：SNW 在空闲自旋时每 `32` 轮才读取一次 monotonic clock，
+保持原有 `5us` spin window、`arm -> recheck -> futex wait` 和 wake 语义。两轮的 client source、SDK
+archive、memtier artifact 相同，server 线程拓扑均为 `6` 个 `vemb-sn-*` 加 `6` 个 `vemb-io-*`，
+preflight CPU blocker 和全部数据面错误均为 `0`。
+
+| version | PIO:SNW | run | QPS | P99 | server process cores | 单 core QPS | leaders | CPU/leader | 产物 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|
+| P0 (`ffc91ec`) | `6:6` | `p0_p6_s6_uniform_20260813` | 8.143054M | 1.119ms | 9.413 | 0.8652M | 244,481,989 | 1.155177us | [perf](../perf/p0_p6_s6_uniform_20260813/) |
+| P3 (`c20eeb7`) | `6:6` | `p3_p6_s6_svr0-47_uniform_20260813_r1` | 9.613668M | 1.023ms | 10.595 | 0.9074M | 288,559,793 | 1.101713us | [perf](../perf/p3_p6_s6_svr0-47_uniform_20260813_r1/) |
+| delta | - | - | +18.060% | -8.579% | +12.564% | +4.883% | +18.026% | -4.628% | - |
+
+结论：P3 已生效。尽管总 `server process cores` 随吞吐提高而增加，但完成的 leaders 增幅
+（`18.026%`）大于 CPU 增幅（`12.564%`），所以每 leader CPU 下降 `4.628%`、单 core QPS 提升
+`4.883%`；这正是固定 `6:6` 下的 CPU 效率改善。火焰图也直接验证了目标热点被消除：
+`getMonotonicNs_aarch64` 从 `2.850%` 降至 `0.108%`，`__udivti3` 从 `2.811%` 降至 `0.080%`，
+二者合计从 `5.661%` 降至 `0.188%`。该 A/B 每侧目前各一轮，百分比是同配置下的已验证点估计；
+后续补交错重复样本可给出置信区间，但不改变“`c20eeb7` 是唯一代码差异且已产生 CPU/leader 收益”的归因。
+
+### 9.2 当前 UB 带宽判断
+
+在当前 UB 配置下，实测有效带宽上限约为 `10.7GB/s`。峰值 `7:7` 样本在 30 秒内记录
+`shared_vector_bytes=294,798,049,200B`，即 vector load 为 `9.8266GB/s`；同一批处理路径的
+`frame_bytes=12,470,964,920B`，即 UB-based request/response channel 为 `0.4157GB/s`。二者合计
+约 `10.2423GB/s`，约为该有效上限的 `95.7%`。因此，`8.181778M QPS` 已非常接近当前配置的
+有效带宽上限，继续增加 lane 数不会带来线性吞吐增长，这也与 `7:7` 到 `8:8` 的平台/回落现象一致。
+
+该合计包含逻辑 vector payload 和日志记录的 batch request/response frame payload（含 frame
+header/commit），不包含 descriptor ring、缓存行/对齐放大及其他协议访问；因此它支持“接近打满
+当前有效带宽”的判断，但不能单独证明物理 UB/DRAM 链路已经饱和。后续如需确认硬件带宽利用率，
+应补充平台 PMU 或设备带宽计数器。
