@@ -3354,7 +3354,9 @@ L1 代码按以下阶段落地。每个阶段完成后单独形成 checkpoint，
   shared-vector read；两者不混入 L0 follower coalescing 收益。
 - `scripts/run_aeron_cross_node_flamegraph.sh` 增加 `L1_ENTRIES`（默认 0）并严格检查 `0` 或
   `4 * 2^k`。每次样本将该值写进 run label，采集 client max RSS，并在
-  `client.l1_summary.tsv` 归档 QPS/P99、全部 L1 指标、server items、UB read bytes 与 RSS；异常
+  `client.l1_summary.tsv` 归档 QPS/P99、全部 L1 指标、server items、UB read bytes 与 RSS；新增纵向
+  `client.workload.summary.tsv`，以 `metric<TAB>value` 逐行归档 QPS、avg/p50/p99/p99.9、命中/未命中速率、
+  有效统计窗口、logical ops，以及 L0 leader/follower 数和对应每秒速率；异常
   fallback、backpressure、read failure、非 OK、queue-full、all-pinned、storage exhaustion 或 stale ref
   直接使样本失败。脚本语法、dry-run、容量拒绝和 TSV 合成解析均已验证。
 - batch-wave 修复：第一次在 `PIO=12, SNW=12, server CPU=0-15` 的 L1 enabled uniform 样本中发现
