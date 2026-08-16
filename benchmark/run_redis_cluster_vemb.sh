@@ -196,14 +196,31 @@ prefill() {
 
 # ----------------------------------------------------------------------------
 snapshot_jiffies_node() {
-    local i=$1
+    local i=$1 port=$PORT
     ssh $SSH_OPTS "${NODES[$i]}" \
-        "total=0; \
-         for pid in \$(pgrep -x redis-server); do \
-             j=\$(awk '{s+=\$14+\$15} END{print s+0}' /proc/\$pid/task/*/stat 2>/dev/null); \
-             total=\$((total + \${j:-0})); \
-         done; \
-         echo \$total" \
+        "ut=0; st=0; for pid in \$(pgrep -x redis-server); do \
+             if tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null | grep -Eq \":${port}\$|:${port} \"; then \
+                 read u s < <(awk '{u+=\$14; s+=\$15} END{printf \"%d %d\", u+0, s+0}' /proc/\$pid/task/*/stat 2>/dev/null); \
+                 ut=\$((ut + \${u:-0})); st=\$((st + \${s:-0})); \
+             fi; \
+         done; echo \"\$ut \$st\"" \
+        2>/dev/null | tail -1
+}
+
+snapshot_si_node() {
+    local i=$1
+    ssh $SSH_OPTS "${NODES[$i]}" "awk '/^cpu /{print \$8}' /proc/stat 2>/dev/null" 2>/dev/null | tail -1
+}
+
+snapshot_rss_node() {
+    local i=$1 port=$PORT
+    ssh $SSH_OPTS "${NODES[$i]}" \
+        "rss=0; for pid in \$(pgrep -x redis-server); do \
+             if tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null | grep -Eq \":${port}\$|:${port} \"; then \
+                 r=\$(awk '/^VmRSS:/{print \$2+0}' /proc/\$pid/status 2>/dev/null); \
+                 rss=\$((rss + \${r:-0})); \
+             fi; \
+         done; echo \$rss" \
         2>/dev/null | tail -1
 }
 
@@ -215,9 +232,15 @@ run_one_config() {
     log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
 
     # jiffies before
-    local jb=0
+    local jb_ut=0 jb_st=0
     for ((i=0; i<NNODES; i++)); do
-        jb=$((jb + $(snapshot_jiffies_node $i)))
+        read u s < <(snapshot_jiffies_node $i)
+        jb_ut=$((jb_ut + ${u:-0})); jb_st=$((jb_st + ${s:-0}))
+    done
+    local si_b=0 rss_b=0
+    for ((i=0; i<NNODES; i++)); do
+        si_b=$((si_b + $(snapshot_si_node $i)))
+        rss_b=$((rss_b + $(snapshot_rss_node $i)))
     done
 
     # memtier cluster mode: VEMB __key__ elem0 raw
@@ -234,11 +257,21 @@ run_one_config() {
     fi
 
     # jiffies after
-    local ja=0
+    local ja_ut=0 ja_st=0
     for ((i=0; i<NNODES; i++)); do
-        ja=$((ja + $(snapshot_jiffies_node $i)))
+        read u s < <(snapshot_jiffies_node $i)
+        ja_ut=$((ja_ut + ${u:-0})); ja_st=$((ja_st + ${s:-0}))
     done
-    local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local si_a=0 rss_a=0
+    for ((i=0; i<NNODES; i++)); do
+        si_a=$((si_a + $(snapshot_si_node $i)))
+        rss_a=$((rss_a + $(snapshot_rss_node $i)))
+    done
+    local cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+    local rss=$(((rss_a + rss_b) / 2))
 
     # parse Totals (cluster mode has MOVED/ASK columns)
     local totals ops avg p50 p99 p999 kb
@@ -250,8 +283,8 @@ run_one_config() {
         }'
     )
 
-    printf "VEMB\tredis_cluster_4node\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" >> "$TSV"
+    printf "VEMB\tredis_cluster_4node\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
     log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
 }
 
@@ -300,7 +333,7 @@ prefill
 
 log "=== STEP 5: VEMB 17-config sweep ==="
 log "  MEMTIER_HOST=$MEMTIER_HOST  NUM_VSETS=$NUM_VSETS  DIM=$DIM"
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 for ((idx=0; idx<NCONFIGS; idx++)); do
     run_one_config $idx

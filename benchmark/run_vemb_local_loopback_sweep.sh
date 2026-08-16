@@ -129,6 +129,18 @@ snapshot_iowait() { awk '/^cpu /{print $6}' /proc/stat 2>/dev/null; }
 snapshot_si()     { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
 snapshot_hi()     { awk '/^cpu /{print $7}' /proc/stat 2>/dev/null; }
 
+# server RSS (KB) by port match (VmRSS sum across matched redis-server pids)
+snapshot_rss() {
+    local port=$1 rss=0
+    for pid in $(pgrep -x redis-server); do
+        if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
+            local r=$(awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null)
+            rss=$((rss + ${r:-0}))
+        fi
+    done
+    echo "$rss"
+}
+
 # ----------------------------------------------------------------------------
 wait_port(){
     local port=$1 count=0
@@ -335,6 +347,7 @@ run_one_config() {
     local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local rss=$(snapshot_rss $PORT)
 
     # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)
     local totals ops avg p50 p99 kb
@@ -353,10 +366,10 @@ run_one_config() {
         ops_note=" (÷2, 2-key equiv)"
         ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
     fi
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
-        "$core_ut" "$core_st" "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
-    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores(ut=$core_ut st=$core_st) iowait=$c_iowait si=$c_si hi=$c_hi"
+        "$core_ut" "$core_st" "$c_iowait" "$c_si" "$c_hi" "$rss" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores(ut=$core_ut st=$core_st) iowait=$c_iowait si=$c_si hi=$c_hi rss=${rss}KB"
     rm -f "$raw"
 }
 
@@ -367,7 +380,7 @@ log "=== ${OP_TYPE} 本地回环 sweep (${NCONFIGS} 档 × ${SERVERS_ONLY} serve
 log "TEST_TIME=${TEST_TIME}s/档, DIM=$DIM, TCP 127.0.0.1:$PORT"
 log "DIM=$DIM NUM_KEYS=$NUM_KEYS"
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tcore_ut\tcore_st\tiowait\tsi\thi\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tcore_ut\tcore_st\tiowait\tsi\thi\trss_kb\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then

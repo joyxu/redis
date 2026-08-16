@@ -119,17 +119,32 @@ op_key_range() {
 }
 
 # ----------------------------------------------------------------------------
-# SERVER 本地 jiffies helper (sum utime+stime across all TIDs)
+# SERVER 本地 jiffies helper (utime/stime split across all TIDs)
 snapshot_jiffies() {
-    local port=$1 total=0 j
+    local port=$1 ut=0 st=0
     for pid in $(pgrep -x redis-server); do
         if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
-            j=$(awk '{s+=$14+$15} END{print s+0}' /proc/$pid/task/*/stat 2>/dev/null)
-            total=$((total + ${j:-0}))
+            read u s < <(awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null)
+            ut=$((ut + ${u:-0})); st=$((st + ${s:-0}))
         fi
     done
-    echo $total
+    echo "$ut $st"
 }
+
+# server RSS (KB) by port match
+snapshot_rss() {
+    local port=$1 rss=0
+    for pid in $(pgrep -x redis-server); do
+        if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
+            local r=$(awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null)
+            rss=$((rss + ${r:-0}))
+        fi
+    done
+    echo "$rss"
+}
+
+# softirq from /proc/stat
+snapshot_si() { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
 
 wait_port() {
     local port=$1 count=0
@@ -307,10 +322,11 @@ run_one_config() {
     nohup sar -n DEV 1 $((TEST_TIME + 5)) > "$sar_log" 2>&1 &
     local sar_pid=$!
 
-    # === jiffies before ===
-    local jb=$(snapshot_jiffies $SERVER_PORT)
+    # === jiffies before (ut/st split) ===
+    local jb_ut jb_st
+    read jb_ut jb_st < <(snapshot_jiffies $SERVER_PORT)
     local jb_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
-    local jb_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
+    local jb_si=$(snapshot_si)
     local jb_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
     local jb_sec=$(date +%s)
 
@@ -324,17 +340,21 @@ run_one_config() {
             '$FIXED_VECTOR' $client_memtier $raw_remote $is_hpc_arg" 2>&1
     ssh "$CLIENT" "cat $raw_remote" > "$raw_local" 2>/dev/null || true
 
-    # === jiffies after ===
-    local ja=$(snapshot_jiffies $SERVER_PORT)
+    # === jiffies after (ut/st split) ===
+    local ja_ut ja_st
+    read ja_ut ja_st < <(snapshot_jiffies $SERVER_PORT)
     local ja_sec=$(date +%s)
     local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
-    local cores=$(awk -v d=$((ja - jb)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", (du+ds)/100.0/s}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local ja_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
-    local ja_si=$(awk '/^cpu /{print $8}' /proc/stat 2>/dev/null)
+    local ja_si=$(snapshot_si)
     local ja_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
     local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
     local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local rss=$(snapshot_rss $SERVER_PORT)
 
     # === sar %ifutil 解析 ===
     wait $sar_pid 2>/dev/null || true
@@ -360,10 +380,10 @@ run_one_config() {
         ops_note=" (÷2, 2-key equiv)"
         ops=$(awk "BEGIN {printf \"%.2f\", $ops/2}")
     fi
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" \
-        "$nic_util" "$c_iowait" "$c_si" "$c_hi" >> "$TSV"
-    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%  iowait=$c_iowait si=$c_si hi=$c_hi"
+        "$nic_util" "$c_iowait" "$core_ut" "$core_st" "$c_si" "$c_hi" "$rss" >> "$TSV"
+    log "    => ops/s=$ops$ops_note  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores(ut=$core_ut st=$core_st)  ${NIC_IFACE}_util=${nic_util}%  iowait=$c_iowait si=$c_si hi=$c_hi rss=${rss}KB"
     rm -f "$raw_local"
     ssh "$CLIENT" "rm -f $raw_remote" 2>/dev/null
 }
@@ -389,7 +409,7 @@ log "  ssh ok, memtier ok"
 log "deploying bench helper to $CLIENT..."
 deploy_bench_helper
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\tiowait\tsi\thi\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\tiowait\tcore_ut\tcore_st\tsi\thi\trss_kb\n" > "$TSV"
 
 for server_type in $SERVERS_ONLY; do
     if [ "$OP_TYPE" = "VEMB" ]; then

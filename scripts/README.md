@@ -134,7 +134,7 @@ batch 大小、测试时长、build policy 和源码 commit，只改变正在测
 | `PIO`, `SNW` | `21`, `21` | server proxy-IO 和 SuperNode worker 数。 |
 | `SERVER_CPU_MASK`, `CLIENT_CPU_MASK` | `0-15`, `96-191` | server/client 使用的 CPU 集合。 |
 | `SERVER_NODE`, `CLIENT_NODE` | `192.168.90.111`, `192.168.90.112` | 远端 server/client 节点。 |
-| `SSH_USER`, `SSH_PORT` | `root`, `22` | SSH 用户和端口。 |
+| `SSH_USER`, `SSH_PORT` | `root`, 空 | SSH 用户和端口；`SSH_PORT` 为空时不传 `-p`，直接使用 `~/.ssh/config` 中主机别名的端口配置。 |
 | `SERVER_ROOT`, `CLIENT_ROOT` | `/root/szz/codespace/hpc-redis` | 远端源码根目录。 |
 | `FLAMEGRAPH_DIR` | `/root/FlameGraph` | 远端 FlameGraph 工具目录。 |
 | `SERVER_MANIFEST` | `/tmp/vemb_perf_warm_111.yaml` | server warm-region manifest。 |
@@ -183,7 +183,7 @@ client workload、生成两端火焰图；除非设置 `KEEP_SERVER=1`，最后�
 | `server/server.svg` | 所有 Redis TID 的用户态/内核态火焰图。 |
 | `client/client.svg` | client 进程用户态/内核态火焰图。 |
 | `server/server.perf.data`, `client/client.perf.data` | 原始 perf 数据。 |
-| `server/server.cpu.process.tsv` | Redis process user/system/total core-equivalent CPU。 |
+| `server/server.cpu.process.tsv` | Redis process user/system/total core-equivalent CPU，含窗口末 VmRSS（`rss_kb`）与进程峰值 VmHWM（`rss_peak_kb`）。 |
 | `server/server.cpu.cpuset.summary.tsv` | 固定 CPU 集合的分类平均值和 core-equivalent。 |
 | `server/server.cpu.summary.txt` | 对齐后的 server CPU 人类可读表格。 |
 | `client/client.workload.summary.tsv` | 纵向、指标左对齐、value 右对齐的 workload 摘要。 |

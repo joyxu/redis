@@ -36,16 +36,14 @@ SERVER_LOG=/tmp/vemb_bench_${MANIFEST_NAME}_${TRANSPORT}.server.log
 BENCH_OUT=/tmp/vemb_bench_${MANIFEST_NAME}_${TRANSPORT}.stdout
 BENCH_ERR=/tmp/vemb_bench_${MANIFEST_NAME}_${TRANSPORT}.stderr
 
+# 读取 server pid 的 utime/stime 拆分（jiffies），输出 "ut st"
 get_cpu_jiffies() {
-    local pid=$1 sum=0 f rest
-    for f in /proc/$pid/task/*/stat; do
-        [ -r "$f" ] || continue
-        rest=$(sed 's/.*)//' "$f")
-        set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
-    done
-    echo "$sum"
+    local pid=$1
+    awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null
 }
+
+# softirq jiffies 全局快照
+snapshot_si() { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
 
 cleanup() {
     if [ -f "$PIDFILE" ]; then
@@ -207,7 +205,8 @@ PYEOF
 # ── bench ──
 echo ">>> bench: ${TRANSPORT} READ t=$T c=$C pipeline=$PIPELINE ${TEST_TIME}s..."
 SRV_PID=$(cat $PIDFILE 2>/dev/null)
-J0=$(get_cpu_jiffies "$SRV_PID")
+read J0_UT J0_ST < <(get_cpu_jiffies "$SRV_PID")
+J0_SI=$(snapshot_si)
 
 taskset -c "$CLIENT_MASK" $MEMTIER \
     --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} \
@@ -218,7 +217,8 @@ taskset -c "$CLIENT_MASK" $MEMTIER \
     --test-time=$TEST_TIME \
     >$BENCH_OUT 2>$BENCH_ERR
 
-J1=$(get_cpu_jiffies "$SRV_PID")
+read J1_UT J1_ST < <(get_cpu_jiffies "$SRV_PID")
+J1_SI=$(snapshot_si)
 
 # ── 汇总 ──
 echo ""
@@ -233,9 +233,14 @@ P50=$(echo "$BENCH_TOTALS" | awk '{print $6}')
 P99=$(echo "$BENCH_TOTALS" | awk '{print $8}')
 KBSEC=$(echo "$BENCH_TOTALS" | awk '{print $9}')
 
-CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME 'BEGIN{ if(d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v t=$TEST_TIME 'BEGIN{ if(d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v t=$TEST_TIME 'BEGIN{ if(d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+CPU_CORES=$(awk -v u="$CORE_UT" -v s="$CORE_ST" 'BEGIN{ if(u=="NA"||s=="NA") print "NA"; else printf "%.2f", u+s }')
 OPS_PER_CORE=$(awk -v o="$OPS_SEC" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0) print "NA"; else printf "%.0f", o/c }')
 GBSEC=$(awk -v k="$KBSEC" 'BEGIN{ printf "%.2f", k/1024/1024 }')
+C_SI=$(awk -v d=$((J1_SI - J0_SI)) -v t=$TEST_TIME 'BEGIN{ if(d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+RSS=$(awk '/^VmRSS:/{print $2}' /proc/$SRV_PID/status 2>/dev/null)
+[ -z "$RSS" ] && RSS="NA"
 
 DERF_OK=$(grep -oE "handle_deref\[ok=[0-9]+ fail=[0-9]+\]" "$BENCH_ERR" | \
           awk -F"ok=" '{split($2,a," "); sum+=a[1]} END {print sum+0}')
@@ -252,6 +257,9 @@ printf '  wire throughput : %s GB/sec\n' "$GBSEC"
 printf '  server CPU cores: %s  (over %ss)\n' "$CPU_CORES" "$TEST_TIME"
 printf '  ops/core/sec    : %s\n' "$OPS_PER_CORE"
 printf '  handle_deref    : ok=%s fail=%s\n' "$DERF_OK" "$DERF_FAIL"
+printf '  core_ut/st       : %s / %s\n' "$CORE_UT" "$CORE_ST"
+printf '  softirq          : %s\n' "$C_SI"
+printf '  rss              : %s KB\n' "$RSS"
 
 echo ""
 echo "  stdout: $BENCH_OUT"

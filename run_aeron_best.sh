@@ -143,14 +143,26 @@ check_ub_paths_in_use() {
 }
 
 get_cpu_jiffies() {
-    local pid=$1 sum=0 rest
+    # 输出 "ut st"（所有线程 utime/stime jiffies 分别求和）
+    local pid=$1 ut=0 st=0 rest
     for f in /proc/$pid/task/*/stat; do
         [ -r "$f" ] || continue
         rest=$(sed 's/.*)//' "$f")
         set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
+        ut=$(( ut + ${12:-0} ))
+        st=$(( st + ${13:-0} ))
     done
-    echo "$sum"
+    echo "$ut $st"
+}
+
+snapshot_si() {  # 全机 softirq jiffies (/proc/stat cpu 行第 8 列)
+    awk '/^cpu /{print $8}' /proc/stat 2>/dev/null
+}
+
+snapshot_rss() {  # pid 的 VmRSS KB
+    local rss
+    rss=$(awk '/^VmRSS:/{print $2}' /proc/$1/status 2>/dev/null)
+    echo "${rss:-0}"
 }
 
 cleanup() {
@@ -268,7 +280,7 @@ PREFILL_OPS=$(echo "$PREFILL_TOTALS" | awk '{print $2}')
 log "prefill done: ${PREFILL_OPS:-N/A} sets/sec"
 
 # === TSV header ===
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp99_9_ms\tkb_sec\tcores\tops_per_core\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp99_9_ms\tkb_sec\tcores\tops_per_core\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 # === Sweep ===
 for ((idx=0; idx<NCONFIGS; idx++)); do
@@ -276,8 +288,12 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
 
     SRV_PID=$(cat $PIDFILE 2>/dev/null)
-    J0=0
-    [ -n "$SRV_PID" ] && J0=$(get_cpu_jiffies "$SRV_PID")
+    J0_UT=0 J0_ST=0
+    if [ -n "$SRV_PID" ]; then
+        read J0_UT J0_ST < <(get_cpu_jiffies "$SRV_PID")
+    fi
+    JB_SI=$(snapshot_si)
+    JB_SI=${JB_SI:-0}
 
     if ! taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
         "${VEMB_MODE_ARGS[@]}" \
@@ -293,9 +309,17 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
         exit 1
     fi
 
-    J1=0
-    [ -n "$SRV_PID" ] && J1=$(get_cpu_jiffies "$SRV_PID")
-    CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    J1_UT=0 J1_ST=0
+    if [ -n "$SRV_PID" ]; then
+        read J1_UT J1_ST < <(get_cpu_jiffies "$SRV_PID")
+    fi
+    CPU_CORES=$(awk -v d=$(( (J1_UT - J0_UT) + (J1_ST - J0_ST) )) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    JA_SI=$(snapshot_si)
+    JA_SI=${JA_SI:-0}
+    C_SI=$(awk -v d=$((JA_SI - JB_SI)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    RSS_KB=$(snapshot_rss "$SRV_PID")
 
     totals=$(grep "^Totals" "$RAWDIR/t${t}_c${c}_p${p}.log" | tail -1)
     read ops avg p50 p99 p999 kb < <(
@@ -303,10 +327,10 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     )
     OPS_PER_CORE=$(awk -v o="$ops" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0||o==0) print "NA"; else printf "%.0f", o/c }')
 
-    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$AERON_TRANSPORT" \
-        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" >> "$TSV"
-    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  p99.9=${p999}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE"
+        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" "$CORE_UT" "$CORE_ST" "$C_SI" "$RSS_KB" >> "$TSV"
+    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  p99.9=${p999}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE  core_ut=$CORE_UT  core_st=$CORE_ST  si=$C_SI  rss=${RSS_KB}KB"
 done
 
 log "=== DONE ==="

@@ -99,7 +99,7 @@ ssh_run "$NODE0_HOST" "mkdir -p $REMOTE_DIR/$REMOTE_SUBDIR/raw"
 ssh_run "$NODE1_HOST" "mkdir -p $REMOTE_DIR/$REMOTE_SUBDIR/raw"
 
 # TSV 表头
-printf 'phase\tops_sec\thits\tp50_ms\tp99_ms\twall_s\tnote\n' > "$TSV"
+printf 'phase\tops_sec\thits\tp50_ms\tp99_ms\twall_s\tnote\tcore_ut\tcore_st\tsi\trss_kb\n' > "$TSV"
 
 # ============================================================================
 # Manifest：按 scripts/test_scale_host.md 记录的 UB 映射生成到远端产物目录
@@ -357,9 +357,50 @@ parse_bg_out() {
 
 # 把一段结果写 TSV 并打 log
 record_phase() {
-    local phase=$1 ops=$2 hits=$3 p50=$4 p99=$5 wall=$6 note=$7
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$phase" "$ops" "$hits" "$p50" "$p99" "$wall" "$note" >> "$TSV"
-    log "$phase: ops=$ops p99=$p99 wall=${wall}s ($note)"
+    local phase=$1 ops=$2 hits=$3 p50=$4 p99=$5 wall=$6 note=$7 cut=$8 sut=$9 si=${10} rss=${11}
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$phase" "$ops" "$hits" "$p50" "$p99" "$wall" "$note" "$cut" "$sut" "$si" "$rss" >> "$TSV"
+    log "$phase: ops=$ops p99=$p99 wall=${wall}s ($note) core_ut=$cut core_st=$sut si=$si rss=$rss"
+}
+
+# ── 双节点 server 资源采集 ──
+# 在指定 host 上找 server pid（按端口匹配），输出 "ut st si rss"
+# ut/st: 该 pid 所有 task 的 utime/stime jiffies 之和
+# si   : /proc/stat 的 softirq jiffies（全局）
+# rss  : 该 pid 的 VmRSS KB
+snap_host() {
+    local host=$1
+    ssh_run "$host" "
+        pid=\$(pgrep -f 'redis-server.*:$PORT' 2>/dev/null | head -1)
+        if [ -z \"\$pid\" ]; then echo '0 0 0 0'; exit 0; fi
+        ut=\$(awk '{u+=\$14} END{print u+0}' /proc/\$pid/task/*/stat 2>/dev/null)
+        st=\$(awk '{s+=\$15} END{print s+0}' /proc/\$pid/task/*/stat 2>/dev/null)
+        si=\$(awk '/^cpu /{print \$8}' /proc/stat 2>/dev/null)
+        rss=\$(awk '/^VmRSS:/{print \$2}' /proc/\$pid/status 2>/dev/null)
+        printf '%s %s %s %s' \"\${ut:-0}\" \"\${st:-0}\" \"\${si:-0}\" \"\${rss:-0}\"
+    "
+}
+
+# 双节点 snapshot：返回 "ut_sum st_sum si_sum rss_sum"（NODE0 + NODE1 求和）
+snap_both() {
+    local n0 n1
+    read -r n0_ut n0_st n0_si n0_rss < <(snap_host "$NODE0_HOST")
+    read -r n1_ut n1_st n1_si n1_rss < <(snap_host "$NODE1_HOST")
+    printf '%d %d %d %d' \
+        $((n0_ut + n1_ut)) $((n0_st + n1_st)) $((n0_si + n1_si)) $((n0_rss + n1_rss))
+}
+
+# 由 before/after 两份双节点 snapshot + wall 算出 4 个指标
+# 用法: compute_metrics <b_ut> <b_st> <b_si> <a_ut> <a_st> <a_si> <rss> <wall>
+# 输出: "core_ut core_st si rss"
+compute_metrics() {
+    local b_ut=$1 b_st=$2 b_si=$3 a_ut=$4 a_st=$5 a_si=$6 rss=$7 wall=$8
+    local core_ut core_st si
+    core_ut=$(awk -v d=$((a_ut - b_ut)) -v s=$wall 'BEGIN{ if(d<0||s<=0) print "NA"; else printf "%.2f", d/100.0/s }')
+    core_st=$(awk -v d=$((a_st - b_st)) -v s=$wall 'BEGIN{ if(d<0||s<=0) print "NA"; else printf "%.2f", d/100.0/s }')
+    si=$(awk -v d=$((a_si - b_si)) -v s=$wall 'BEGIN{ if(d<0||s<=0) print "NA"; else printf "%.2f", d/100.0/s }')
+    [ -z "$rss" ] && rss="NA"
+    printf '%s %s %s %s' "$core_ut" "$core_st" "$si" "$rss"
 }
 
 # 用 SET prefill PREFILL_KEYS 条向量到 node0
@@ -432,14 +473,18 @@ FINAL_ENDPOINTS="$NODE0_HOST:$PORT,$NODE1_HOST:$PORT"
 
 # 段1: baseline (active={0})
 log "段1: baseline VEMB read (${TEST_TIME}s)"
+read -r b_ut b_st b_si b_rss < <(snap_both)
 T0=$(date +%s)
 result=$(run_memtier "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_baseline.txt" "")
 T1=$(date +%s)
 read ops hits p50 p99 <<< "$result"
-record_phase "scaleout_baseline" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0}"
+read -r a_ut a_st a_si a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$b_ut" "$b_st" "$b_si" "$a_ut" "$a_st" "$a_si" "$a_rss" "$((T1-T0))")
+record_phase "scaleout_baseline" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0}" "$cut" "$sut" "$si" "$rss"
 
 # 段2: during scaleout (后台 memtier + 触发扩容)
 log "段2: during scaleout (background VEMB ${BG_TIME_SCALEOUT}s + topology change)"
+read -r d2_b_ut d2_b_st d2_b_si d2_b_rss < <(snap_both)
 run_memtier_bg "$NODE0_HOST" "$RAW_DIR/scaleout_during.txt" "$BG_TIME_SCALEOUT" \
     "--vemb-v16-client-topology --vemb-v16-topology-retry-limit=8" \
     "$FINAL_ENDPOINTS"
@@ -490,46 +535,60 @@ sleep 2  # 给 memtier 输出 Totals 的时间
 
 result=$(parse_bg_out "$NODE0_HOST" "$RAW_DIR/scaleout_during.txt")
 read ops hits p50 p99 <<< "$result"
-record_phase "during_scaleout" "$ops" "$hits" "${p50:-NA}" "${p99:-NA}" "$SCALEOUT_WALL" "active={0}->{0,1}, memtier-client-topology-retry, endpoints=$FINAL_ENDPOINTS"
+read -r d2_a_ut d2_a_st d2_a_si d2_a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$d2_b_ut" "$d2_b_st" "$d2_b_si" "$d2_a_ut" "$d2_a_st" "$d2_a_si" "$d2_a_rss" "$SCALEOUT_WALL")
+record_phase "during_scaleout" "$ops" "$hits" "${p50:-NA}" "${p99:-NA}" "$SCALEOUT_WALL" "active={0}->{0,1}, memtier-client-topology-retry, endpoints=$FINAL_ENDPOINTS" "$cut" "$sut" "$si" "$rss"
 
 ssh_run "$NODE0_HOST" "cat $COORD_OUT; echo '---'; cat $COORD_ERR 2>/dev/null" || true
 
 # 段3a: after scaleout, direct node0 read original keyspace
 log "段3a: after scaleout direct node0 old-key VEMB read (${TEST_TIME}s)"
+read -r d3a_b_ut d3a_b_st d3a_b_si d3a_b_rss < <(snap_both)
 T0=$(date +%s)
 result=$(run_memtier_target "$NODE0_HOST" "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_direct_node0_old_keys.txt" \
     "" 1 "$PREFILL_KEYS")
 T1=$(date +%s)
 read ops hits p50 p99 <<< "$result"
-record_phase "scaleout_after_direct_node0_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE0_HOST:$PORT, old_keys=1-$PREFILL_KEYS"
+read -r d3a_a_ut d3a_a_st d3a_a_si d3a_a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$d3a_b_ut" "$d3a_b_st" "$d3a_b_si" "$d3a_a_ut" "$d3a_a_st" "$d3a_a_si" "$d3a_a_rss" "$((T1-T0))")
+record_phase "scaleout_after_direct_node0_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE0_HOST:$PORT, old_keys=1-$PREFILL_KEYS" "$cut" "$sut" "$si" "$rss"
 
 # 段3b: after scaleout, direct node1 read original keyspace from node0 client
 log "段3b: after scaleout direct node1 old-key VEMB read (${TEST_TIME}s)"
+read -r d3b_b_ut d3b_b_st d3b_b_si d3b_b_rss < <(snap_both)
 T0=$(date +%s)
 result=$(run_memtier_target "$NODE0_HOST" "$NODE1_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_direct_node1_old_keys.txt" \
     "" 1 "$PREFILL_KEYS")
 T1=$(date +%s)
 read ops hits p50 p99 <<< "$result"
-record_phase "scaleout_after_direct_node1_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE1_HOST:$PORT from node0, old_keys=1-$PREFILL_KEYS"
+read -r d3b_a_ut d3b_a_st d3b_a_si d3b_a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$d3b_b_ut" "$d3b_b_st" "$d3b_b_si" "$d3b_a_ut" "$d3b_a_st" "$d3b_a_si" "$d3b_a_rss" "$((T1-T0))")
+record_phase "scaleout_after_direct_node1_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE1_HOST:$PORT from node0, old_keys=1-$PREFILL_KEYS" "$cut" "$sut" "$si" "$rss"
 
 # 段3c: after scaleout, client-topology read original migrated keyspace
 log "段3c: after scaleout client-topology old-key VEMB read (${TEST_TIME}s)"
+read -r d3c_b_ut d3c_b_st d3c_b_si d3c_b_rss < <(snap_both)
 T0=$(date +%s)
 result=$(run_memtier "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_old_keys.txt" \
     "--vemb-v16-client-topology" "$FINAL_ENDPOINTS" 1 "$PREFILL_KEYS")
 T1=$(date +%s)
 read ops hits p50 p99 <<< "$result"
-record_phase "scaleout_after_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, memtier-client-topology, old_keys=1-$PREFILL_KEYS, endpoints=$FINAL_ENDPOINTS"
+read -r d3c_a_ut d3c_a_st d3c_a_si d3c_a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$d3c_b_ut" "$d3c_b_st" "$d3c_b_si" "$d3c_a_ut" "$d3c_a_st" "$d3c_a_si" "$d3c_a_rss" "$((T1-T0))")
+record_phase "scaleout_after_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, memtier-client-topology, old_keys=1-$PREFILL_KEYS, endpoints=$FINAL_ENDPOINTS" "$cut" "$sut" "$si" "$rss"
 
 # 段3d: after scaleout, write/read new steady keyspace (active={0,1})
 log "段3d: after scaleout new-key VEMB read (${TEST_TIME}s)"
+read -r d3d_b_ut d3d_b_st d3d_b_si d3d_b_rss < <(snap_both)
 T0=$(date +%s)
 prefill_steady_data "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX" "$RAW_DIR/scaleout_after_prefill.txt"
 result=$(run_memtier "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after.txt" \
     "--vemb-v16-client-topology" "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
 T1=$(date +%s)
 read ops hits p50 p99 <<< "$result"
-record_phase "scaleout_after" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, memtier-client-topology, steady_keys=$STEADY_KEY_MIN-$STEADY_KEY_MAX, endpoints=$FINAL_ENDPOINTS"
+read -r d3d_a_ut d3d_a_st d3d_a_si d3d_a_rss < <(snap_both)
+read -r cut sut si rss < <(compute_metrics "$d3d_b_ut" "$d3d_b_st" "$d3d_b_si" "$d3d_a_ut" "$d3d_a_st" "$d3d_a_si" "$d3d_a_rss" "$((T1-T0))")
+record_phase "scaleout_after" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, memtier-client-topology, steady_keys=$STEADY_KEY_MIN-$STEADY_KEY_MAX, endpoints=$FINAL_ENDPOINTS" "$cut" "$sut" "$si" "$rss"
 
 # --- Phase 6: Cleanup ---
 log "Phase 6: Cleanup"

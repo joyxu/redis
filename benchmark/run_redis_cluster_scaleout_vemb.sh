@@ -307,15 +307,39 @@ prefill() {
 
 # ----------------------------------------------------------------------------
 snapshot_jiffies_all() {
+    local ut=0 st=0
+    for ((i=0; i<NNODES; i++)); do
+        local u s
+        read u s < <(ssh $SSH_OPTS "${NODES[$i]}" \
+            "ut=0; st=0; for pid in \$(pgrep -x redis-server); do \
+                 read uu ss < <(awk '{u+=\$14; s+=\$15} END{printf \"%d %d\", u+0, s+0}' /proc/\$pid/task/*/stat 2>/dev/null); \
+                 ut=\$((ut + \${uu:-0})); st=\$((st + \${ss:-0})); \
+             done; echo \"\$ut \$st\"" 2>/dev/null | tail -1)
+        ut=$((ut + ${u:-0})); st=$((st + ${s:-0}))
+    done
+    echo "$ut $st"
+}
+
+snapshot_si_all() {
     local total=0
     for ((i=0; i<NNODES; i++)); do
-        local j
-        j=$(ssh $SSH_OPTS "${NODES[$i]}" \
-            "total=0; for pid in \$(pgrep -x redis-server); do \
-                 jj=\$(awk '{s+=\$14+\$15} END{print s+0}' /proc/\$pid/task/*/stat 2>/dev/null); \
-                 total=\$((total + \${jj:-0})); \
-             done; echo \$total" 2>/dev/null | tail -1)
-        total=$((total + ${j:-0}))
+        local v
+        v=$(ssh $SSH_OPTS "${NODES[$i]}" "awk '/^cpu /{print \$8}' /proc/stat 2>/dev/null" 2>/dev/null | tail -1)
+        total=$((total + ${v:-0}))
+    done
+    echo $total
+}
+
+snapshot_rss_all() {
+    local total=0
+    for ((i=0; i<NNODES; i++)); do
+        local v
+        v=$(ssh $SSH_OPTS "${NODES[$i]}" \
+            "rss=0; for pid in \$(pgrep -x redis-server); do \
+                 r=\$(awk '/^VmRSS:/{print \$2+0}' /proc/\$pid/status 2>/dev/null); \
+                 rss=\$((rss + \${r:-0})); \
+             done; echo \$rss" 2>/dev/null | tail -1)
+        total=$((total + ${v:-0}))
     done
     echo $total
 }
@@ -402,23 +426,31 @@ log "=== STEP 4: prefill VEMB data ==="
 prefill
 
 # TSV 表头
-printf "phase\tmaster_count\tduration_s\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores_used\n" > "$TSV"
+printf "phase\tmaster_count\tduration_s\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores_used\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 # ----------------------------------------------------------------------------
 log "=== STEP 5: 段1 baseline (N_INIT=$N_INIT masters) ==="
-jb=$(snapshot_jiffies_all)
+read jb_ut jb_st < <(snapshot_jiffies_all)
+si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/01_baseline.log" $TEST_TIME "baseline"
-ja=$(snapshot_jiffies_all)
-cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+read ja_ut ja_st < <(snapshot_jiffies_all)
+si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/01_baseline.log")
-printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "baseline" "$N_INIT" "$TEST_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" >> "$TSV"
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "baseline" "$N_INIT" "$TEST_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" \
+    "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
 log "  => baseline: ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
 
 # ----------------------------------------------------------------------------
 log "=== STEP 6: 段2 during scaleout (扩容 N_INIT -> N_FINAL, memtier 后台持续打) ==="
 # 后台启动 memtier, 跑 DURING_TIME 秒 (期间完成 add-node + reshard)
-jb=$(snapshot_jiffies_all)
+read jb_ut jb_st < <(snapshot_jiffies_all)
+si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/02_during.log" $DURING_TIME "during-scaleout" &
 MEMTIER_PID=$!
 log "  memtier started in background (pid=$MEMTIER_PID), duration=$DURING_TIME s"
@@ -440,24 +472,37 @@ wait_cluster_stable 120
 # 等 memtier 跑完 (它还会跑一会儿, 让 DURING_TIME 涵盖整个扩容)
 log "  waiting for memtier to finish (pid=$MEMTIER_PID)..."
 wait $MEMTIER_PID
-ja=$(snapshot_jiffies_all)
-cores=$(awk -v d=$((ja - jb)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+read ja_ut ja_st < <(snapshot_jiffies_all)
+si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$DURING_TIME 'BEGIN{printf "%d", d/s}')
+rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/02_during.log")
-printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "during_scaleout" "${N_INIT}->${N_FINAL}" "$DURING_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" >> "$TSV"
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "during_scaleout" "${N_INIT}->${N_FINAL}" "$DURING_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" \
+    "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
 log "  => during_scaleout: ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores (over ${DURING_TIME}s)"
 
 check_cluster "after-scaleout"
 
 # ----------------------------------------------------------------------------
 log "=== STEP 7: 段3 after (N_FINAL=$N_FINAL masters, 稳态) ==="
-jb=$(snapshot_jiffies_all)
+read jb_ut jb_st < <(snapshot_jiffies_all)
+si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/03_after.log" $TEST_TIME "after"
-ja=$(snapshot_jiffies_all)
-cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+read ja_ut ja_st < <(snapshot_jiffies_all)
+si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/03_after.log")
-printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "after" "$N_FINAL" "$TEST_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" >> "$TSV"
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "after" "$N_FINAL" "$TEST_TIME" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$cores" \
+    "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
 log "  => after: ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
 
 log "=== DONE ==="

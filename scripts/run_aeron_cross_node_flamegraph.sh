@@ -579,6 +579,7 @@ command -v mpstat >/dev/null
 sample_server_process_cpu() {
     local run=$1 pid=$2 duration=$3
     local start_ns start_utime start_stime end_ns end_utime end_stime hz
+    local end_rss end_rss_peak
 
     read -r start_utime start_stime < <(awk '{ print $14, $15 }' "/proc/$pid/stat")
     start_ns="$(date +%s%N)"
@@ -588,9 +589,14 @@ sample_server_process_cpu() {
     sleep "$duration"
     read -r end_utime end_stime < <(awk '{ print $14, $15 }' "/proc/$pid/stat")
     end_ns="$(date +%s%N)"
+    # VmRSS at window end (matches the bench-end single-read convention used
+    # by the summary scripts) plus VmHWM peak over process lifetime.
+    end_rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    end_rss_peak="$(awk '/^VmHWM:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
     awk -v start_ns="$start_ns" -v end_ns="$end_ns" \
         -v start_utime="$start_utime" -v end_utime="$end_utime" \
-        -v start_stime="$start_stime" -v end_stime="$end_stime" -v hz="$hz" '
+        -v start_stime="$start_stime" -v end_stime="$end_stime" -v hz="$hz" \
+        -v end_rss="${end_rss:-NA}" -v end_rss_peak="${end_rss_peak:-NA}" '
     BEGIN {
         window_s = (end_ns - start_ns) / 1000000000
         user_s = (end_utime - start_utime) / hz
@@ -601,6 +607,8 @@ sample_server_process_cpu() {
         printf "user\t%.6f\t%.6f\n", user_s, user_s / window_s
         printf "system\t%.6f\t%.6f\n", system_s, system_s / window_s
         printf "total\t%.6f\t%.6f\n", total_s, total_s / window_s
+        printf "rss_kb\t%s\tNA\n", end_rss
+        printf "rss_peak_kb\t%s\tNA\n", end_rss_peak
     }' >"$run/server.cpu.process.tsv"
 }
 process_sampler_cmd="$(declare -f sample_server_process_cpu)"
@@ -961,16 +969,21 @@ process_window_s="$(awk -F '\t' '$1 == "window" { print $2 }' "$run/server.cpu.p
     printf 'Server CPU Summary\n'
     printf 'CPU set: %s (%s CPUs)\n\n' "$cpu_mask" "$cpu_count"
     printf 'Redis process CPU (%ss window)\n' "$process_window_s"
-    printf '%-8s %-36s %12s %12s\n' 'Metric' 'Description' 'Seconds' 'Core equiv'
-    printf '%-8s %-36s %12s %12s\n' '--------' '------------------------------------' '------------' '------------'
+    printf '%-12s %-36s %12s %12s\n' 'Metric' 'Description' 'Seconds' 'Core equiv'
+    printf '%-12s %-36s %12s %12s\n' '------------' '------------------------------------' '------------' '------------'
     awk -F '\t' '
     function description(metric) {
         if (metric == "user") return "Redis user-mode CPU"
         if (metric == "system") return "Redis kernel-mode CPU"
+        if (metric == "rss_kb") return "Redis VmRSS at window end (KB)"
+        if (metric == "rss_peak_kb") return "Redis VmHWM peak (KB)"
         return "Redis user + system"
     }
     NR > 1 && $1 != "window" {
-        printf "%-8s %-36s %12.3f %12.3f\n", $1, description($1), $2, $3
+        if ($1 == "rss_kb" || $1 == "rss_peak_kb")
+            printf "%-12s %-36s %12s %12s\n", $1, description($1), $2, "KB"
+        else
+            printf "%-12s %-36s %12.3f %12.3f\n", $1, description($1), $2, $3
     }' "$run/server.cpu.process.tsv"
     printf '\nCPU-set usage\n'
     printf '%-10s %-34s %12s %12s\n' 'Metric' 'Description' 'Avg %' 'Core equiv'

@@ -88,16 +88,30 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # ----------------------------------------------------------------------------
 # jiffies: node0=local, node1=ssh
 snapshot_jiffies_0() {
-    local total=0 j
+    local ut=0 st=0
     for pid in $(pgrep -x redis-server 2>/dev/null); do
-        j=$(awk '{s+=$14+$15} END{print s+0}' /proc/$pid/task/*/stat 2>/dev/null)
-        total=$((total + ${j:-0}))
+        read u s < <(awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null)
+        ut=$((ut + ${u:-0})); st=$((st + ${s:-0}))
     done
-    echo $total
+    echo "$ut $st"
 }
 snapshot_jiffies_1() {
     ssh $SSH_OPTS "$NODE1_SSH" \
-        "total=0; for pid in \$(pgrep -x redis-server); do j=\$(awk '{s+=\$14+\$15} END{print s+0}' /proc/\$pid/task/*/stat 2>/dev/null); total=\$((total + \${j:-0})); done; echo \$total" 2>/dev/null
+        "ut=0; st=0; for pid in \$(pgrep -x redis-server); do read u s < <(awk '{u+=\$14; s+=\$15} END{printf \"%d %d\", u+0, s+0}' /proc/\$pid/task/*/stat 2>/dev/null); ut=\$((ut + \${u:-0})); st=\$((st + \${s:-0})); done; echo \"\$ut \$st\"" 2>/dev/null
+}
+snapshot_si_0() { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
+snapshot_si_1() { ssh $SSH_OPTS "$NODE1_SSH" "awk '/^cpu /{print \$8}' /proc/stat 2>/dev/null" 2>/dev/null; }
+snapshot_rss_0() {
+    local rss=0
+    for pid in $(pgrep -x redis-server 2>/dev/null); do
+        local r=$(awk '/^VmRSS:/{print $2+0}' /proc/$pid/status 2>/dev/null)
+        rss=$((rss + ${r:-0}))
+    done
+    echo $rss
+}
+snapshot_rss_1() {
+    ssh $SSH_OPTS "$NODE1_SSH" \
+        "rss=0; for pid in \$(pgrep -x redis-server); do r=\$(awk '/^VmRSS:/{print \$2+0}' /proc/\$pid/status 2>/dev/null); rss=\$((rss + \${r:-0})); done; echo \$rss" 2>/dev/null
 }
 
 # ----------------------------------------------------------------------------
@@ -261,10 +275,11 @@ run_baseline() {
         local raw="/tmp/vsim2key_baseline_$$.log"
         log "  [baseline] t=$t c=$c p=$p"
 
-        local jb jb0 jb1 ja ja0 ja1
-        jb0=$(snapshot_jiffies_0)
-        jb1=$(snapshot_jiffies_1)
-        jb=$((jb0 + jb1))
+        local jb_ut0 jb_st0 jb_ut1 jb_st1 ja_ut0 ja_st0 ja_ut1 ja_st1
+        read jb_ut0 jb_st0 < <(snapshot_jiffies_0)
+        read jb_ut1 jb_st1 < <(snapshot_jiffies_1)
+        local si0=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
+        local rss0=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
 
         taskset -c 96-191 \
             $BASELINE_MEMTIER \
@@ -276,10 +291,15 @@ run_baseline() {
                 --test-time="$TEST_TIME" --hide-histogram \
                 > "$raw" 2>&1 || true
 
-        ja0=$(snapshot_jiffies_0)
-        ja1=$(snapshot_jiffies_1)
-        ja=$((ja0 + ja1))
-        local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        read ja_ut0 ja_st0 < <(snapshot_jiffies_0)
+        read ja_ut1 ja_st1 < <(snapshot_jiffies_1)
+        local si1=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
+        local rss1=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
+        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local si=$(awk -v d=$((si1 - si0)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+        local rss=$(((rss1 + rss0) / 2))
 
         # Parse Totals (cluster mode: NF>=9 with MOVED/ASK)
         local totals ops avg p50 p99 kb
@@ -295,8 +315,9 @@ run_baseline() {
         # VSIM_2KEY: 1 op = 1 VEMB fetch, need 2 per comparison → ÷2
         local ops_div2=$(awk "BEGIN {printf \"%.2f\", ${ops:-0}/2}")
 
-        printf "VSIM_2KEY\tbaseline\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$t" "$c" "$p" "$ops_div2" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
+        printf "VSIM_2KEY\tbaseline\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$t" "$c" "$p" "$ops_div2" "$avg" "$p50" "$p99" "$kb" "$cores" \
+            "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
         log "    => ops/s=$ops_div2 (÷2, raw=$ops)  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
     done
 
@@ -405,10 +426,11 @@ run_hpc() {
         local raw="/tmp/vsim2key_hpc_$$.log"
         log "  [hpc] t=$t c=$c p=$p"
 
-        local jb jb0 jb1 ja ja0 ja1
-        jb0=$(snapshot_jiffies_0)
-        jb1=$(snapshot_jiffies_1)
-        jb=$((jb0 + jb1))
+        local jb_ut0 jb_st0 jb_ut1 jb_st1 ja_ut0 ja_st0 ja_ut1 ja_st1
+        read jb_ut0 jb_st0 < <(snapshot_jiffies_0)
+        read jb_ut1 jb_st1 < <(snapshot_jiffies_1)
+        local si0=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
+        local rss0=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
 
         taskset -c 96-191 \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
@@ -420,10 +442,15 @@ run_hpc() {
                 --test-time="$TEST_TIME" --hide-histogram \
                 > "$raw" 2>&1
 
-        ja0=$(snapshot_jiffies_0)
-        ja1=$(snapshot_jiffies_1)
-        ja=$((ja0 + ja1))
-        local cores=$(awk -v d=$((ja - jb)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        read ja_ut0 ja_st0 < <(snapshot_jiffies_0)
+        read ja_ut1 ja_st1 < <(snapshot_jiffies_1)
+        local si1=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
+        local rss1=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
+        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+        local si=$(awk -v d=$((si1 - si0)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+        local rss=$(((rss1 + rss0) / 2))
 
         # Parse Totals
         local totals ops avg p50 p99 kb
@@ -437,8 +464,9 @@ run_hpc() {
         )
 
         rm -f "$raw"
-        printf "VSIM_2KEY\thpc\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$t" "$c" "$p" "${ops:-0}" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
+        printf "VSIM_2KEY\thpc\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$t" "$c" "$p" "${ops:-0}" "$avg" "$p50" "$p99" "$kb" "$cores" \
+            "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
         log "    => ops/s=${ops:-0}  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
     done
 
@@ -458,7 +486,7 @@ log "configs: $NCONFIGS  (TS=${TS[*]})"
 log "servers: $SERVERS_ONLY"
 log "output: $OUTDIR"
 
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 for st in $SERVERS_ONLY; do
     case $st in

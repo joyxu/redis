@@ -169,14 +169,27 @@ stop_servers() {
 # jiffies helper (sum utime+stime across all TIDs of redis-server on port)
 # ============================================================================
 snapshot_jiffies() {
-    local port=$1 total=0 j
+    local port=$1 ut=0 st=0
     for pid in $(pgrep -x redis-server); do
         if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
-            j=$(awk '{s+=$14+$15} END{print s+0}' /proc/$pid/task/*/stat 2>/dev/null)
-            total=$((total + ${j:-0}))
+            read u s < <(awk '{u+=$14; s+=$15} END{printf "%d %d", u+0, s+0}' /proc/$pid/task/*/stat 2>/dev/null)
+            ut=$((ut + ${u:-0})); st=$((st + ${s:-0}))
         fi
     done
-    echo $total
+    echo "$ut $st"
+}
+
+snapshot_si() { awk '/^cpu /{print $8}' /proc/stat 2>/dev/null; }
+
+snapshot_rss() {
+    local port=$1 rss=0
+    for pid in $(pgrep -x redis-server); do
+        if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${port}\$|:${port} "; then
+            local r=$(awk '/^VmRSS:/{print $2+0}' /proc/$pid/status 2>/dev/null)
+            rss=$((rss + ${r:-0}))
+        fi
+    done
+    echo $rss
 }
 
 # ============================================================================
@@ -210,8 +223,12 @@ run_one_config() {
     log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
 
     # === jiffies before ===
-    local j0_hw01=$(snapshot_jiffies $SERVER_PORT)
-    local j0_hw02=$(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    read j0_ut_hw01 j0_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
+    read j0_ut_hw02 j0_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    local si0_hw01=$(snapshot_si)
+    local si0_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
+    local rss0_hw01=$(snapshot_rss $SERVER_PORT)
+    local rss0_hw02=$(ssh HW02 "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
 
     # === SAR 双机同时启动 ===
     local sar01="$RAWDIR/sar_hw01_t${t}_c${c}_p${p}.log"
@@ -241,10 +258,19 @@ run_one_config() {
     wait $sar02_pid 2>/dev/null || true
 
     # === jiffies after ===
-    local j1_hw01=$(snapshot_jiffies $SERVER_PORT)
-    local j1_hw02=$(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
-    local cores01=$(awk -v d=$((j1_hw01 - j0_hw01)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local cores02=$(awk -v d=$((j1_hw02 - j0_hw02)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    read j1_ut_hw01 j1_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
+    read j1_ut_hw02 j1_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    local cores01=$(awk -v d=$(((j1_ut_hw01 + j1_st_hw01) - (j0_ut_hw01 + j0_st_hw01))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local cores02=$(awk -v d=$(((j1_ut_hw02 + j1_st_hw02) - (j0_ut_hw02 + j0_st_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local si1_hw01=$(snapshot_si)
+    local si1_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
+    local rss1_hw01=$(snapshot_rss $SERVER_PORT)
+    local rss1_hw02=$(ssh HW02 "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
+    # sum across both server nodes
+    local core_ut=$(awk -v d=$(((j1_ut_hw01 - j0_ut_hw01) + (j1_ut_hw02 - j0_ut_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local core_st=$(awk -v d=$(((j1_st_hw01 - j0_st_hw01) + (j1_st_hw02 - j0_st_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    local si=$(awk -v d=$(((si1_hw01 - si0_hw01) + (si1_hw02 - si0_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+    local rss=$((((rss1_hw01 + rss1_hw02) + (rss0_hw01 + rss0_hw02)) / 2))
 
     # === 解析吞吐 ===
     local totals=$(grep "^Totals" "$raw_local" 2>/dev/null | tail -1)
@@ -275,8 +301,9 @@ run_one_config() {
         nic02=$(awk -v iface="$HW02_NIC_IFACE" '$2==iface && NF>=9 {sum+=$NF; n++} END {if(n>0) printf "%.1f", sum/n; else print "N/A"}' "$sar02" 2>/dev/null)
     fi
 
-    printf "VEMB\tcluster_2node\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$t" "$c" "$p" "$ops" "$avg_lat" "$p50" "$p99" "$kb" "$cores01" "$cores02" "$nic01" "$nic02" >> "$TSV"
+    printf "VEMB\tcluster_2node\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$t" "$c" "$p" "$ops" "$avg_lat" "$p50" "$p99" "$kb" "$cores01" "$cores02" "$nic01" "$nic02" \
+        "$core_ut" "$core_st" "$si" "$rss" >> "$TSV"
     log "  => ops/s=$ops  avg=${avg_lat}ms  p50=${p50}ms  p99=${p99}ms  hw01_cores=$cores01  hw02_cores=$cores02  hw01_nic=${nic01}%  hw02_nic=${nic02}%"
 }
 
@@ -294,7 +321,7 @@ setup_client || exit 1
 deploy_hw02_manifest || exit 1
 
 # TSV header
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\thw01_cores\thw02_cores\thw01_nic_pct\thw02_nic_pct\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\thw01_cores\thw02_cores\thw01_nic_pct\thw02_nic_pct\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 # 主循环
 for ((idx=0; idx<NCONFIGS; idx++)); do

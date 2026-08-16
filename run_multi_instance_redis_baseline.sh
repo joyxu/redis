@@ -79,14 +79,30 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # jiffies (本机直接读 /proc)
 # ============================================================================
 get_jiffies() {
-    local pid=$1 s=0
+    # 输出 "ut st"（所有线程 utime/stime jiffies 分别求和）
+    local pid=$1 ut=0 st=0
     for f in /proc/$pid/task/*/stat; do
         [ -r "$f" ] || continue
         local r=$(sed 's/.*)//' "$f")
         set -- $r
-        s=$((s + ${12:-0} + ${13:-0}))
+        ut=$((ut + ${12:-0}))
+        st=$((st + ${13:-0}))
     done
-    echo $s
+    echo "$ut $st"
+}
+
+snapshot_si() {  # 全机 softirq jiffies (/proc/stat cpu 行第 8 列)
+    awk '/^cpu /{print $8}' /proc/stat 2>/dev/null
+}
+
+snapshot_rss() {  # 对给定 pid 求 VmRSS KB 之和
+    local pid rss total=0
+    for pid in "$@"; do
+        [ -n "$pid" ] || continue
+        rss=$(awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null)
+        total=$(( total + ${rss:-0} ))
+    done
+    echo "$total"
 }
 
 # ----------------------------------------------------------------------------
@@ -209,13 +225,14 @@ run_one_config() {
     prefill_all_instances
 
     # PIDs + J0
-    declare -a INSTANCE_PIDS J0_VALUES
+    declare -a INSTANCE_PIDS J0_UT_VALUES J0_ST_VALUES
     for i in $(seq 0 $((NUM_INSTANCES - 1))); do
         INSTANCE_PIDS[$i]=$(get_pid $i)
         if [ -n "${INSTANCE_PIDS[$i]}" ]; then
-            J0_VALUES[$i]=$(get_jiffies ${INSTANCE_PIDS[$i]})
+            read J0_UT_VALUES[$i] J0_ST_VALUES[$i] < <(get_jiffies ${INSTANCE_PIDS[$i]})
         else
-            J0_VALUES[$i]=0
+            J0_UT_VALUES[$i]=0
+            J0_ST_VALUES[$i]=0
             log "  WARN: no PID for inst $i"
         fi
     done
@@ -230,6 +247,8 @@ run_one_config() {
     [ "$LOCAL_BENCH" = "1" ] && bench_host="127.0.0.1" || bench_host="$SERVER_HOST"
 
     # Parallel memtier (每实例用同样的 t/c/p)
+    local jb_si ja_si c_si rss_kb
+    jb_si=$(snapshot_si)
     log "  launching $NUM_INSTANCES parallel memtier (per-inst: -t $t -c $c --pipeline=$p)"
     declare -a REMOTE_OUTS
     for i in $(seq 0 $((NUM_INSTANCES - 1))); do
@@ -262,8 +281,14 @@ run_one_config() {
     done
     wait
 
+    # softirq delta + server rss (VmRSS KB, 所有实例求和)
+    ja_si=$(snapshot_si)
+    ja_si=${ja_si:-0}
+    c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    rss_kb=$(snapshot_rss ${INSTANCE_PIDS[@]})
+
     # Collect per-instance + aggregate
-    local TOTAL_OPS=0 TOTAL_KB_SEC=0 AVG_LAT_SUM=0 P50_SUM=0 P99_SUM=0 VALID=0 TOTAL_CORES=0
+    local TOTAL_OPS=0 TOTAL_KB_SEC=0 AVG_LAT_SUM=0 P50_SUM=0 P99_SUM=0 VALID=0 TOTAL_CORES=0 TOTAL_UT=0 TOTAL_ST=0
     for i in $(seq 0 $((NUM_INSTANCES - 1))); do
         local local_out="$RAWDIR/inst${i}_t${t}_c${c}_p${p}.log"
         local remote_out="${REMOTE_OUTS[$i]}"
@@ -297,14 +322,19 @@ run_one_config() {
             log "  WARN: inst $i no Totals"
         fi
 
-        # cores via jiffies
+        # cores via jiffies (ut/st 拆分)
         local pid="${INSTANCE_PIDS[$i]}"
-        local inst_cores=0
+        local inst_cores=0 inst_ut=0 inst_st=0
         if [ -n "$pid" ]; then
-            local j1=$(get_jiffies $pid)
-            inst_cores=$(awk "BEGIN{ printf \"%.2f\", ($j1 - ${J0_VALUES[$i]:-0}) / 100.0 / $TEST_TIME }")
+            local j1_ut j1_st
+            read j1_ut j1_st < <(get_jiffies $pid)
+            inst_ut=$(awk -v d=$((j1_ut - ${J0_UT_VALUES[$i]:-0})) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+            inst_st=$(awk -v d=$((j1_st - ${J0_ST_VALUES[$i]:-0})) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+            inst_cores=$(awk -v u=$inst_ut -v v=$inst_st 'BEGIN{printf "%.2f", u + v}')
         fi
         TOTAL_CORES=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_CORES + $inst_cores }")
+        TOTAL_UT=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_UT + $inst_ut }")
+        TOTAL_ST=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_ST + $inst_st }")
 
         TOTAL_OPS=$((TOTAL_OPS + $(echo "$ops" | awk '{printf "%.0f", $1}')))
         TOTAL_KB_SEC=$((TOTAL_KB_SEC + $(echo "$kb" | awk '{printf "%.0f", $1}')))
@@ -325,9 +355,9 @@ run_one_config() {
         [ -z "$NIC_UTIL" ] && NIC_UTIL="N/A"
     fi
 
-    printf "VEMB\tbaseline_multi_inst\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$t" "$c" "$p" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P50" "$AVG_P99" "$TOTAL_KB_SEC" "$TOTAL_CORES" "$NIC_UTIL" >> "$TSV"
-    log "  => ops/s=$TOTAL_OPS  avg=${AVG_LAT}ms  p50=${AVG_P50}ms  p99=${AVG_P99}ms  cores=$TOTAL_CORES  ${NIC_IFACE}_util=${NIC_UTIL}%"
+    printf "VEMB\tbaseline_multi_inst\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$t" "$c" "$p" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P50" "$AVG_P99" "$TOTAL_KB_SEC" "$TOTAL_CORES" "$NIC_UTIL" "$TOTAL_UT" "$TOTAL_ST" "$c_si" "$rss_kb" >> "$TSV"
+    log "  => ops/s=$TOTAL_OPS  avg=${AVG_LAT}ms  p50=${AVG_P50}ms  p99=${AVG_P99}ms  cores=$TOTAL_CORES  ${NIC_IFACE}_util=${NIC_UTIL}%  core_ut=$TOTAL_UT  core_st=$TOTAL_ST  si=$c_si  rss=${rss_kb}KB"
 
     stop_all_instances
 }
@@ -355,7 +385,7 @@ fi
 # ============================================================================
 # TSV header + main sweep loop
 # ============================================================================
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 log "=== ${NCONFIGS}-档 sweep × ${NUM_INSTANCES} 实例 × io-threads=${IO_THREADS} (每档 restart) ==="
 log "  LOCAL_BENCH=$LOCAL_BENCH  RAW=$RAW  DIM=$DIM  NUM_KEYS=$NUM_KEYS  TEST_TIME=${TEST_TIME}s"

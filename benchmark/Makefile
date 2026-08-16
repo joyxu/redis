@@ -401,6 +401,26 @@ sve_streaming_load_f32_ut: sve_streaming_load_f32_ut.c ../src/sve_operation.c ..
 
 .PHONY: sve_streaming_load_f32_ut
 
+# /dev/obmm_shmdev* SVE read/write bandwidth benchmark (disjoint sub-regions
+# per thread to avoid SNP coherence overhead on writes).
+# 编译: make obmm_shmdev_bw_bench USE_SVE=yes
+OBMM_BW_BENCH_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11
+
+ifeq ($(USE_SVE),yes)
+    OBMM_BW_BENCH_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+obmm_shmdev_bw_bench: obmm_shmdev_bw_bench.c
+ifeq ($(USE_SVE),yes)
+	$(CC) $(OBMM_BW_BENCH_CFLAGS) -o $@ $< -lm -lpthread
+	@echo "✅ Built: $@"
+else
+	@echo "❌ obmm_shmdev_bw_bench requires USE_SVE=yes"
+	@exit 1
+endif
+
+.PHONY: obmm_shmdev_bw_bench
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
@@ -451,7 +471,7 @@ sve_gather_ub_bench: test_runtime_shim.c $(SVE_GATHER_SRCS)
 
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_f32_load_ut sve_gather_ub_bench vemb_v16_migration_outbox_ut
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_f32_load_ut sve_gather_ub_bench vemb_v16_migration_outbox_ut obmm_shmdev_bw_bench
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "Cleaned build artifacts"

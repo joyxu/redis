@@ -41,7 +41,7 @@ RAWDIR=$OUTDIR/raw
 mkdir -p "$RAWDIR"
 TSV=$OUTDIR/summary.tsv
 
-printf 'scene\tops_sec\thits\thit_rate\tp50_ms\tp99_ms\tcpu_cores\tmem_base_mb\tmem_peak_mb\n' > "$TSV"
+printf 'scene\tops_sec\thits\thit_rate\tp50_ms\tp99_ms\tcpu_cores\tmem_base_mb\tmem_peak_mb\tcore_ut\tcore_st\tsi\trss_kb\n' > "$TSV"
 
 log() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
@@ -76,14 +76,20 @@ start_server() {
 }
 
 get_cpu_jiffies() {
-    local pid=$1 sum=0 f rest
+    # 输出 "ut st"（所有线程 utime/stime jiffies 分别求和）
+    local pid=$1 ut=0 st=0 f rest
     for f in /proc/$pid/task/*/stat; do
         [ -r "$f" ] || continue
         rest=$(sed 's/.*)//' "$f")
         set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
+        ut=$(( ut + ${12:-0} ))
+        st=$(( st + ${13:-0} ))
     done
-    echo "$sum"
+    echo "$ut $st"
+}
+
+snapshot_si() {  # 全机 softirq jiffies (/proc/stat cpu 行第 8 列)
+    awk '/^cpu /{print $8}' /proc/stat 2>/dev/null
 }
 
 prefill() {
@@ -99,10 +105,12 @@ prefill() {
 run_mixed() {
     local scene=$1 ratio=$2 key_pat=$3 num_keys=$4 extra_flags=$5
     local raw=$RAWDIR/${scene}.txt
-    local j0 j1 cores
-    local mem_base_mb mem_peak_mb
+    local j0_ut j0_st j1_ut j1_st cores core_ut core_st
+    local mem_base_mb mem_peak_mb rss_kb
+    local si0 si1 c_si
 
-    j0=$(get_cpu_jiffies "$SERVER_PID")
+    read j0_ut j0_st < <(get_cpu_jiffies "$SERVER_PID")
+    si0=$(snapshot_si)
     mem_base_mb=$(awk '/^VmRSS:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
 
     numactl --membind=1 taskset -c $CLIENT_CPUSET $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
@@ -111,9 +119,15 @@ run_mixed() {
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$num_keys \
         --test-time=$TEST_TIME >"$raw" 2>&1
 
-    j1=$(get_cpu_jiffies "$SERVER_PID")
+    read j1_ut j1_st < <(get_cpu_jiffies "$SERVER_PID")
+    si1=$(snapshot_si)
     mem_peak_mb=$(awk '/^VmHWM:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
-    cores=$(awk -v d=$(( j1 - j0 )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
+    rss_kb=$(awk '/^VmRSS:/{print $2}' /proc/$SERVER_PID/status 2>/dev/null)
+    rss_kb=${rss_kb:-0}
+    cores=$(awk -v d=$(( (j1_ut - j0_ut) + (j1_st - j0_st) )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
+    core_ut=$(awk -v d=$(( j1_ut - j0_ut )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
+    core_st=$(awk -v d=$(( j1_st - j0_st )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
+    c_si=$(awk -v d=$(( ${si1:-0} - ${si0:-0} )) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
 
     local tot; tot=$(grep '^Totals' "$raw" | tail -1)
     local ops hits p50 p99
@@ -127,10 +141,10 @@ run_mixed() {
     local hit_rate
     hit_rate=$(awk -v o="$ops" -v h="$hits" 'BEGIN{ if(o>0) printf "%.1f%%", h/o*100; else print "N/A" }')
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$scene" "$ops" "$hits" "$hit_rate" "$p50" "$p99" "$cores" "$mem_base_mb" "$mem_peak_mb" >> "$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$scene" "$ops" "$hits" "$hit_rate" "$p50" "$p99" "$cores" "$mem_base_mb" "$mem_peak_mb" "$core_ut" "$core_st" "$c_si" "$rss_kb" >> "$TSV"
 
-    log "$scene: ops=$ops hits=$hits ($hit_rate) p50=$p50 p99=$p99 cores=$cores mem=$mem_base_mb/$mem_peak_mb MB"
+    log "$scene: ops=$ops hits=$hits ($hit_rate) p50=$p50 p99=$p99 cores=$cores mem=$mem_base_mb/$mem_peak_mb MB core_ut=$core_ut core_st=$core_st si=$c_si rss=${rss_kb}KB"
 }
 
 # ============================================================================
