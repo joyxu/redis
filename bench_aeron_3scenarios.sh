@@ -68,12 +68,21 @@ echo "============================================================"
 
 # ── 启动 server ──
 echo ">>> starting server..."
+# Aeron transport requires the explicit transport/aeron-control config so the
+# Redis listener accepts ATTACH frames (plain sniff mode ignores them).
+AERON_ARGS=""
+if [ "$TRANSPORT" = "aeron" ]; then
+    AERON_ARGS="--vemb-v16-transport aeron --vemb-v16-aeron-control tcp \
+        --vemb-v16-aeron-ub-path /dev/obmm_shmdev1 \
+        --vemb-v16-aeron-response-ub-path /dev/obmm_shmdev2"
+fi
 taskset -c "$SERVER_MASK" $REDIS \
     --port $PORT --bind 0.0.0.0 --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim $DIM \
     --vemb-v16-max-vectors $MAX_VECTORS \
     --vemb-v16-warm-regions-manifest "$MANIFEST" \
     --vemb-v16-reset-warm-regions yes \
+    $AERON_ARGS \
     --vemb-v16-proxy-io-threads 21 \
     --vemb-v16-supernode-workers 21 \
     --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
@@ -87,10 +96,12 @@ fi
 echo "    server up: pid=$(cat $PIDFILE)"
 sleep 1
 
-# ── prefill (TCP single-thread sequential) ──
-echo ">>> prefilling $NUM_KEYS keys via TCP..."
+# ── prefill (single-thread sequential, same transport as the benchmark;
+#    aeron-control servers only accept ATTACH frames on the TCP port, so a
+#    plain vemb_v16 TCP prefill would stall when TRANSPORT=aeron) ──
+echo ">>> prefilling $NUM_KEYS keys via ${TRANSPORT}..."
 PREFILL_OUT=$(taskset -c "$CLIENT_MASK" $MEMTIER \
-    --protocol vemb_v16 --vemb-v16-transport=tcp \
+    --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} \
     --vemb-v16-dim $DIM -s 127.0.0.1 -p $PORT \
     -t 1 -c 1 -n $NUM_KEYS --pipeline=32 \
     --ratio=1:0 --key-pattern=S:S \

@@ -377,7 +377,7 @@ snap_host() {
         st=\$(awk '{s+=\$15} END{print s+0}' /proc/\$pid/task/*/stat 2>/dev/null)
         si=\$(awk '/^cpu /{print \$8}' /proc/stat 2>/dev/null)
         rss=\$(awk '/^VmRSS:/{print \$2}' /proc/\$pid/status 2>/dev/null)
-        printf '%s %s %s %s' \"\${ut:-0}\" \"\${st:-0}\" \"\${si:-0}\" \"\${rss:-0}\"
+        printf '%s %s %s %s\n' \"\${ut:-0}\" \"\${st:-0}\" \"\${si:-0}\" \"\${rss:-0}\"
     "
 }
 
@@ -386,7 +386,7 @@ snap_both() {
     local n0 n1
     read -r n0_ut n0_st n0_si n0_rss < <(snap_host "$NODE0_HOST")
     read -r n1_ut n1_st n1_si n1_rss < <(snap_host "$NODE1_HOST")
-    printf '%d %d %d %d' \
+    printf '%d %d %d %d\n' \
         $((n0_ut + n1_ut)) $((n0_st + n1_st)) $((n0_si + n1_si)) $((n0_rss + n1_rss))
 }
 
@@ -400,7 +400,7 @@ compute_metrics() {
     core_st=$(awk -v d=$((a_st - b_st)) -v s=$wall 'BEGIN{ if(d<0||s<=0) print "NA"; else printf "%.2f", d/100.0/s }')
     si=$(awk -v d=$((a_si - b_si)) -v s=$wall 'BEGIN{ if(d<0||s<=0) print "NA"; else printf "%.2f", d/100.0/s }')
     [ -z "$rss" ] && rss="NA"
-    printf '%s %s %s %s' "$core_ut" "$core_st" "$si" "$rss"
+    printf '%s %s %s %s\n' "$core_ut" "$core_st" "$si" "$rss"
 }
 
 # 用 SET prefill PREFILL_KEYS 条向量到 node0

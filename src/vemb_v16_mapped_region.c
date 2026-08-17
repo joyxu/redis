@@ -122,8 +122,21 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
             return -1;
     } else {
         /* Keep UB mappings cacheable and consistent across same-host server
-         * and client views. */
+         * and client views. Noncacheable shmdev regions reject a plain
+         * O_RDWR open (EPERM); retry with O_SYNC for NC mapping semantics. */
         region->fd = open(path, O_RDWR);
+        if (region->fd < 0 && (errno == EPERM || errno == EACCES)) {
+            int saved_errno = errno;
+            region->fd = open(path, O_RDWR | O_SYNC);
+            if (region->fd >= 0) {
+                serverLog(LL_NOTICE,
+                          "vemb_v16 mapped region ub opened with O_SYNC: path=%s request_size=%zu offset=%llu first_error=%s",
+                          path,
+                          requested_size,
+                          (unsigned long long)mmap_offset,
+                          strerror(saved_errno));
+            }
+        }
         if (region->fd < 0) {
             serverLog(LL_WARNING,
                       "vemb_v16 mapped region ub open failed: path=%s request_size=%zu offset=%llu error=%s",

@@ -904,8 +904,10 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
                     control_path, cfg->vemb_v16_dim);
             }
             if (!all_channels[i]) {
-                benchmark_error_log("[aeron] open channel %u failed: %s\n",
-                                    i, strerror(errno));
+                benchmark_error_log(
+                    "[aeron] open channel %u failed: %s\n", i,
+                    errno ? strerror(errno)
+                          : "rejected by server (check server log for ATTACH/pool errors)");
                 for (uint32_t j = 0; j < i; j++) {
                     vemb_v16_aeron_close(all_channels[j]);
                     all_channels[j] = nullptr;

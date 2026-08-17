@@ -5109,32 +5109,66 @@ static int open_ub_path_spec(const char *path_spec, int open_flags,
     return -1;
 }
 
+static size_t shmdev_pool_probe_map_size(int fd) {
+    /* Devices may expose slightly less than the nominal 8 GiB region
+     * (observed ~8188 MiB). Probe downwards in 2 MiB steps so the pool
+     * adapts to the actual mappable size instead of failing outright. */
+    const size_t step = (2ull << 20);
+    const size_t floor_sz = (7ull << 30);
+    for (size_t sz = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
+         sz >= floor_sz; sz -= step) {
+        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p != MAP_FAILED) {
+            munmap(p, sz);
+            return sz;
+        }
+    }
+    return 0;
+}
+
 static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
                             const char *path_spec, int noncacheable) {
     if (pool->inited) return 0;
     char selected_path[256];
-    int fd = open_ub_path_spec(path_spec,
-                               O_RDWR | (noncacheable ? O_SYNC : 0),
+    /* The preferred mapping mode is the caller's hint; if the device
+     * rejects that mode (NC device with CC open or vice versa), retry
+     * with the other mode so the pool adapts to the device. */
+    const int modes[2] = { noncacheable ? O_SYNC : 0,
+                           noncacheable ? 0 : O_SYNC };
+    int fd = -1;
+    size_t map_size = 0;
+    int used_sync = 0;
+    for (int attempt = 0; attempt < 2 && map_size == 0; attempt++) {
+        fd = open_ub_path_spec(path_spec, O_RDWR | modes[attempt],
                                selected_path);
+        if (fd < 0) continue;
+        map_size = shmdev_pool_probe_map_size(fd);
+        if (map_size == 0) {
+            close(fd);
+            fd = -1;
+        } else {
+            used_sync = (modes[attempt] == O_SYNC);
+        }
+    }
     if (fd < 0) {
         serverLog(LL_WARNING, "aeron ub pool: no usable path in %s errno=%d (%s)",
                   path_spec, errno, strerror(errno));
         return -1;
     }
-    void *p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
+    void *p = mmap(NULL, map_size,
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
         serverLog(LL_WARNING,
                   "aeron ub pool: mmap %s size=%llu failed errno=%d (%s)",
                   selected_path,
-                  (unsigned long long)VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
+                  (unsigned long long)map_size,
                   errno, strerror(errno));
         close(fd);
         return -2;
     }
     pool->fd   = fd;
     pool->base = p;
-    pool->size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
+    pool->size = map_size;
     pool->bump = 0;
     strncpy(pool->path, selected_path, sizeof(pool->path) - 1);
     pool->path[sizeof(pool->path) - 1] = '\0';
@@ -5142,7 +5176,7 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
     serverLog(LL_NOTICE,
               "aeron ub pool ready: configured=%s selected=%s size=%zu mode=%s",
               path_spec, pool->path, pool->size,
-              noncacheable ? "NC" : "CC");
+              used_sync ? "NC" : "CC");
     return 0;
 }
 
