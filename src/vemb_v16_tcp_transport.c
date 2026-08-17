@@ -4,6 +4,7 @@
 #include "vemb_v16_aeron_attach.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
+#include "vemb_v16_proxy_types.h"
 #include "redisassert.h"
 #include "zmalloc.h"
 
@@ -1076,6 +1077,14 @@ static void tcp_handle_aeron_alloc_channel(vemb_v16_proxy_t *proxy,
         close(fd);
         return;
     }
+    if (unlikely(req.vector_dim != proxy->vector_dim)) {
+        serverLog(LL_WARNING,
+                  "aeron channel allocation rejected: client_dim=%u server_dim=%u",
+                  req.vector_dim, proxy->vector_dim);
+        tcp_write_status(fd, VEMB_V16_STATUS_ERR, 0);
+        close(fd);
+        return;
+    }
 
     vemb_v16_channel_desc_t desc;
     if (vemb_v16_proxy_alloc_shm_channel(proxy, &desc) != 0) {
@@ -1263,6 +1272,13 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     uint8_t payload[8];
     if (vemb_v16_net_read_full(fd, payload, sizeof(payload)) != 0 ||
         vemb_v16_alloc_req_decode(&req, payload, sizeof(payload)) != 0) {
+        close(fd);
+        return;
+    }
+    if (unlikely(req.vector_dim != proxy->vector_dim)) {
+        serverLog(LL_WARNING,
+                  "HELLO rejected: client_dim=%u server_dim=%u",
+                  req.vector_dim, proxy->vector_dim);
         close(fd);
         return;
     }

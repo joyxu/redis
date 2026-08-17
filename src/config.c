@@ -3322,7 +3322,7 @@ standardConfig static_configs[] = {
     /* VEMB V16 configs */
     createBoolConfig("vemb-v16-enabled", NULL, MODIFIABLE_CONFIG, server.vemb_v16_enabled, 0, NULL, NULL),
 
-    createIntConfig("vemb-v16-dim", NULL, MODIFIABLE_CONFIG, 1, 4096, server.vemb_v16_dim, 300, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-dim", NULL, IMMUTABLE_CONFIG, 0, VEMB_V16_MAX_DIM, server.vemb_v16_dim, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-max-vectors", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.vemb_v16_max_vectors, 131072, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-warm-regions-manifest", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_regions_manifest, NULL, NULL, NULL),
     createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),

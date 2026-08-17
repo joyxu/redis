@@ -1606,8 +1606,17 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                               const vemb_v16_warm_regions_manifest_t *manifest) {
     RETURN_IF(!out || !manifest ||
               vector_dim == 0 || vector_stride == 0 ||
+              vector_dim > VEMB_V16_MAX_DIM ||
+              vector_stride != vector_dim * sizeof(float) ||
               max_vectors == 0 || manifest->region_count == 0 ||
               manifest->region_count > VEMB_V16_MAX_MANIFEST_REGIONS, -1);
+
+    for (uint32_t i = 0; i < manifest->region_count; i++) {
+        const vemb_v16_manifest_region_t *region = &manifest->regions[i];
+        RETURN_IF(region->value_size != vector_stride ||
+                  region->region_bytes < region->value_size ||
+                  region->region_bytes % region->value_size != 0, -1);
+    }
 
     vemb_v16_storage_ctx_t *storage = zcalloc(sizeof(*storage));
     RETURN_IF(!storage, -1);

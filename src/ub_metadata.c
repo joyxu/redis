@@ -176,7 +176,7 @@ ub_vector_set_meta_t *ub_metadata_get_or_create_set(const char *key, size_t dim)
     if (de) {
         set = dictGetVal(de);
         pthread_rwlock_unlock(&g_ub_metadata.lock);
-        if (set && set->dim != dim) return NULL;
+        if (set && unlikely(set->dim != dim)) return NULL;
         return set;
     }
 

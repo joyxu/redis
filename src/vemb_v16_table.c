@@ -134,7 +134,7 @@ int vemb_v16_table_upsert(vemb_v16_table_t *table,
                           uint32_t vector_bytes,
                           uint32_t *row_id) {
     if (key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
-        vector_bytes != table->vector_stride ||
+        unlikely(vector_bytes != table->vector_stride) ||
         table->vector_region_size < (size_t)table->vector_stride * table->max_vectors) {
         return -1;
     }

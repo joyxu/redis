@@ -84,7 +84,7 @@ int vemb_v16_cli_tcp_vadd(int argc, char **argv) {
         char *endptr = NULL;
         vdim = strtoll(argv[idx + 1], &endptr, 10);
         if (endptr == argv[idx + 1] || *endptr != '\0' ||
-            vdim != (long long)g_cli_dim) {
+            unlikely(vdim != (long long)g_cli_dim)) {
             return -1;
         }
         int vec_consumed = 0;

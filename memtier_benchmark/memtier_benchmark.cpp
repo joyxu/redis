@@ -61,6 +61,7 @@
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "vemb_v16_protocol.h"
 #include "vemb_v16_aeron_runner.h"
 
 
@@ -905,9 +906,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     }
                     break;
                 }
-                case o_vemb_v16_dim:
-                    cfg->vemb_v16_dim = (uint32_t)strtoul(optarg, NULL, 10);
+                case o_vemb_v16_dim: {
+                    char *end = NULL;
+                    unsigned long value;
+                    errno = 0;
+                    value = strtoul(optarg, &end, 10);
+                    if (errno == ERANGE || end == optarg || *end != '\0' ||
+                        value == 0 || value > VEMB_V16_MAX_DIM) {
+                        fprintf(stderr,
+                                "error: --vemb-v16-dim must be in [1, %u]\n",
+                                VEMB_V16_MAX_DIM);
+                        return -1;
+                    }
+                    cfg->vemb_v16_dim = (uint32_t)value;
                     break;
+                }
                 case o_vemb_v16_handle:
                     /* VEMB_HANDLE is the default read mode; flag kept for
                      * script compatibility (hpc_redis_max_tput.sh passes it
@@ -1516,6 +1529,10 @@ int main(int argc, char *argv[])
     }
 
     config_init_defaults(&cfg);
+    if (cfg.protocol == PROTOCOL_VEMB_V16 && cfg.vemb_v16_dim == 0) {
+        benchmark_error_log("error: --vemb-v16-dim is required for vemb_v16 protocol\n");
+        return 1;
+    }
     log_level = cfg.debug;
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");

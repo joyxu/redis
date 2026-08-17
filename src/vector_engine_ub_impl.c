@@ -163,7 +163,7 @@ static int ub_engine_vadd(void *ctx, void *key, vector_data_t *vector,
 
     if (!addr_space) return C_ERR;
     if (!vector || cfg->vector_dimension <= 0) return C_ERR;
-    if (vector->dim != (size_t)cfg->vector_dimension) return C_ERR;
+    if (unlikely(vector->dim != (size_t)cfg->vector_dimension)) return C_ERR;
 
     set = ub_engine_get_or_create_set_meta(key, vector->dim, &key_tmp);
     if (!set) goto cleanup;
@@ -250,7 +250,7 @@ static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
     RETURN_IF(!query_vector || !results || !num_results || !addr_space, C_ERR);
 
     dim = (size_t)cfg->vector_dimension;
-    if (dim == 0 || query_vector->dim != dim) return C_ERR;
+    if (dim == 0 || unlikely(query_vector->dim != dim)) return C_ERR;
 
     if (addr_space->vector_stride_bytes == 0) return C_ERR;
 

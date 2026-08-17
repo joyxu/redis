@@ -27,7 +27,6 @@
 #include "sve_config.h"
 
 /* ---- Configuration ---- */
-#define SVE2_EMB_DIM          300
 #define SVE2_GEMM_TILE_M      8
 #define SVE2_GEMM_TILE_N      8
 #define SVE2_BATCH_MAX        64

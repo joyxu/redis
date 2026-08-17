@@ -126,7 +126,7 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
                                            completion->inline_vector,
                                            vector_bytes,
                                            &vector_len);
-    if (copy_rc != 0 || vector_len != vector_bytes) {
+    if (copy_rc != 0 || unlikely(vector_len != vector_bytes)) {
         vemb_v16_completion_release_inline_snapshot(completion);
         return -1;
     }
@@ -237,7 +237,8 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
     const char *err_reason = NULL;
     int migration_active = vemb_v16_storage_migration_active(storage);
     int needs_payload_snapshot = job->op == VEMB_V16_OP_VEMB_INLINE;
-    if (!job_shape_matches_tlc(vemb_job->dim, vemb_job->vector_bytes, tlc)) {
+    if (unlikely(!job_shape_matches_tlc(vemb_job->dim,
+                                        vemb_job->vector_bytes, tlc))) {
         completion.status = VEMB_V16_STATUS_ERR;
         err_reason = "shape_mismatch";
         goto finish_vemb_job;
@@ -377,7 +378,8 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
     vemb_v16_vector_handle_t handle = {0};
     int migration_active = vemb_v16_storage_migration_active(storage);
 
-    if (!job_shape_matches_tlc(vsim_job->dim, vsim_job->vector_bytes, tlc)) {
+    if (unlikely(!job_shape_matches_tlc(vsim_job->dim,
+                                        vsim_job->vector_bytes, tlc))) {
         completion.status = VEMB_V16_STATUS_ERR;
         goto finish_vsim_job;
     }
@@ -445,9 +447,9 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
                                           &handle2,
                                           &v2_bytes,
                                           &v2_len);
-    if (v1_rc != 0 || v2_rc != 0 ||
-        v1_len != vsim_job->vector_bytes ||
-        v2_len != vsim_job->vector_bytes) {
+    if (unlikely(v1_rc != 0 || v2_rc != 0 ||
+                 v1_len != vsim_job->vector_bytes ||
+                 v2_len != vsim_job->vector_bytes)) {
         serverLog(LL_WARNING,
                   "vemb_v16 vsim key-key vector slice failed: req_id=%u key_hash=%llu key2_hash=%llu region1=%u offset1=%llu bytes1=%u region2=%u offset2=%llu bytes2=%u expected_bytes=%u",
                   job->req_id,
@@ -619,7 +621,8 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
 
     if ((job->op == VEMB_V16_OP_VADD ||
          job->op == VEMB_V16_OP_VSIM_INLINE) &&
-        !job_shape_matches_tlc(vadd_job->dim, vadd_job->vector_bytes, tlc)) {
+        unlikely(!job_shape_matches_tlc(vadd_job->dim,
+                                        vadd_job->vector_bytes, tlc))) {
         completion.status = VEMB_V16_STATUS_ERR;
         err_reason = "shape_mismatch";
         goto finish_vadd_job;
@@ -745,10 +748,10 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
         } else {
             const uint8_t *stored_bytes = NULL;
             uint32_t stored_len = 0;
-            if (vemb_v16_tlc_vector_slice(tlc, &handle,
-                                          &stored_bytes,
-                                          &stored_len) != 0 ||
-                stored_len != vadd_job->vector_bytes) {
+            if (unlikely(vemb_v16_tlc_vector_slice(tlc, &handle,
+                                                   &stored_bytes,
+                                                   &stored_len) != 0 ||
+                         stored_len != vadd_job->vector_bytes)) {
                 completion.status = VEMB_V16_STATUS_ERR;
             } else {
                 const float *stored = (const float *)(const void *)stored_bytes;

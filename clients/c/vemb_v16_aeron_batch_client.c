@@ -246,7 +246,7 @@ static void batch_client_materialize_vector(
         return;
     view->attempted = 1;
     uint32_t expected_bytes = client->dim * (uint32_t)sizeof(float);
-    if (response->vector_bytes != expected_bytes)
+    if (unlikely(response->vector_bytes != expected_bytes))
         return;
     int bytes = vemb_v16_aeron_read_vector(client->legacy_channel,
                                             response->region_id,

@@ -85,7 +85,7 @@ appendonly no
 | 参数 | 取值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `vemb-v16-enabled` | yes / no | no | 总开关。开启后 Redis 端口同时承载 RESP 与 VEMB V16 嗅探二进制协议。 |
-| `vemb-v16-dim` | 1 – 4096 | 300 | 向量维度，需与客户端 SDK / `memtier_benchmark --vemb-v16-dim` 一致。 |
+| `vemb-v16-dim` | 0 – `VEMB_V16_MAX_DIM` | 无默认值 | 启用 VEMB V16 时必须显式设置，并需与客户端 SDK / `memtier_benchmark --vemb-v16-dim` 一致；启动后不可修改。 |
 | `vemb-v16-max-vectors` | ≥ 1 | 131072 | 预留向量槽位数。 |
 | `vemb-v16-warm-regions-manifest` | 路径 | 空 | 热区 manifest YAML，描述 region_id / path / mmap_offset / bytes / value_size 等。**必传**。 |
 | `vemb-v16-reset-warm-regions` | yes / no | no | 启动时是否重置热区（首次部署或切换拓扑时设为 yes）。 |

@@ -6,8 +6,8 @@
  * 3. Compare returned vector to expected (byte-exact)
  * 4. Tally region_id distribution (proves vnode ratio is real)
  *
- * Usage: sdk_multi_region_correctness [host] [port] [dim] [num_keys]
- * Defaults: 127.0.0.1 6390 300 10000
+ * Usage: sdk_multi_region_correctness [host] [port] <dim> [num_keys]
+ * Defaults: 127.0.0.1 6390 10000 (dim is required)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +18,6 @@
 #include "vemb_v16_client_sdk.h"
 #include "vemb_v16_hash.h"
 
-#define DEFAULT_DIM     300
 #define DEFAULT_KEYS    10000
 #define UDS_PATH        "/tmp/vemb_v16.sock"
 #define MAX_REGION_SLOTS 256
@@ -32,7 +31,11 @@ static void gen_expected_vector(float *vec, uint32_t dim, uint32_t key_idx) {
 int main(int argc, char **argv) {
     const char *host     = argc > 1 ? argv[1] : "127.0.0.1";
     uint16_t    port     = (uint16_t)(argc > 2 ? atoi(argv[2]) : 6390);
-    uint32_t    dim      = (uint32_t)(argc > 3 ? atoi(argv[3]) : DEFAULT_DIM);
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s [host] [port] <dim> [num_keys]\n", argv[0]);
+        return 2;
+    }
+    uint32_t    dim      = (uint32_t)atoi(argv[3]);
     uint32_t    num_keys = (uint32_t)(argc > 4 ? atoi(argv[4]) : DEFAULT_KEYS);
 
     if (dim == 0 || dim > VEMB_V16_MAX_DIM) {
@@ -164,7 +167,8 @@ int main(int argc, char **argv) {
         if (idx <= 3) {
             printf("  [debug] key=item:%u status=%u op=%u region_id=%u offset=%llu bytes=%u dim=%u\n",
                    idx, resp.status, resp.op, resp.region_id,
-                   (unsigned long long)resp.vector_offset, resp.vector_bytes);
+                   (unsigned long long)resp.vector_offset, resp.vector_bytes,
+                   resp.dim);
         }
 
         if (resp.status != VEMB_V16_STATUS_OK) {

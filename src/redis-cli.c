@@ -10,6 +10,7 @@
 
 #include "fmacros.h"
 #include "vemb_v16_cli_tcp.h"
+#include "vemb_v16_protocol.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -3066,7 +3067,16 @@ static int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i],"-3")) {
             config.resp3 = 1;
         } else if (!strcmp(argv[i],"--vemb-v16-dim") && !lastarg) {
-            config.vemb_v16_dim = atoi(argv[++i]);
+            char *end = NULL;
+            long value;
+            errno = 0;
+            value = strtol(argv[++i], &end, 10);
+            if (errno == ERANGE || end == argv[i] || *end != '\0' ||
+                value <= 0 || value > (long)VEMB_V16_MAX_DIM) {
+                fprintf(stderr, "Invalid --vemb-v16-dim value: %s\n", argv[i]);
+                exit(1);
+            }
+            config.vemb_v16_dim = (int)value;
         } else if (!strcmp(argv[i],"--vemb-v16-endpoints") && !lastarg) {
             config.vemb_v16_endpoints = strdup(argv[++i]);
         } else if (!strcmp(argv[i],"--show-pushes") && !lastarg) {
@@ -11053,9 +11063,7 @@ int main(int argc, char **argv) {
     /* Initialize VEMB V16 TCP fast path if --vemb-v16-dim is specified */
     if (config.vemb_v16_dim > 0) {
         config.vemb_v16_tcp_enabled = 1;
-        uint32_t dim = config.vemb_v16_dim > 0
-            ? (uint32_t)config.vemb_v16_dim
-            : 300;
+        uint32_t dim = (uint32_t)config.vemb_v16_dim;
         if (config.vemb_v16_endpoints && config.vemb_v16_endpoints[0]) {
             const char *epv[16];
             int ep_count = 0;

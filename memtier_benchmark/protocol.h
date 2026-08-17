@@ -233,7 +233,7 @@ protected:
     uint8_t m_next_request_flags;
 
 public:
-    vemb_v16_protocol(uint32_t dim = VEMB_V16_DEFAULT_DIM,
+    vemb_v16_protocol(uint32_t dim = 0,
                       uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS);
     virtual ~vemb_v16_protocol();
     virtual abstract_protocol* clone(void);

@@ -13,8 +13,8 @@
 
 #include "monotonic.h"
 #include "sve_operation.h"
+#include "vemb_v16_protocol.h"
 
-#define DEFAULT_DIM 300u
 #define DEFAULT_ROWS 131072u
 #define DEFAULT_BATCH 64u
 #define DEFAULT_ITERS 2000u
@@ -1073,7 +1073,7 @@ static void usage(const char *prog) {
             "\n"
             "Benchmark:\n"
             "  --rows <n>             vector rows (default: %u)\n"
-            "  --dim <n>              float dimensions per vector (default: %u)\n"
+            "  --dim <n>              required float dimensions per vector\n"
             "  --stride <bytes>       row stride (default: dim * sizeof(float))\n"
             "  --batch <n>            vectors per batch (default: %u)\n"
             "  --iters <n>            measurement iterations (default: %u)\n"
@@ -1087,7 +1087,6 @@ static void usage(const char *prog) {
             "  --fill                 write fixture vectors before reading (mock always fills)\n",
             prog,
             DEFAULT_ROWS,
-            DEFAULT_DIM,
             DEFAULT_BATCH,
             DEFAULT_ITERS,
             DEFAULT_WINDOW_LINES,
@@ -1098,7 +1097,7 @@ static void usage(const char *prog) {
 static int parse_args(int argc, char **argv, bench_opts_t *opts) {
     *opts = (bench_opts_t){
         .rows = DEFAULT_ROWS,
-        .dim = DEFAULT_DIM,
+        .dim = 0,
         .batch = DEFAULT_BATCH,
         .iters = DEFAULT_ITERS,
         .window_lines = DEFAULT_WINDOW_LINES,
@@ -1168,7 +1167,8 @@ static int parse_args(int argc, char **argv, bench_opts_t *opts) {
         }
     }
 
-    if (opts->dim == 0 || opts->rows == 0 || opts->batch == 0 || opts->iters == 0 ||
+    if (opts->dim == 0 || opts->dim > VEMB_V16_MAX_DIM ||
+        opts->rows == 0 || opts->batch == 0 || opts->iters == 0 ||
         opts->window_lines == 0)
         return -1;
     if (opts->batch > opts->rows)

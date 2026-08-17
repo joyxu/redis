@@ -2642,7 +2642,7 @@ int main(int argc, char **argv) {
     bench_cfg_t cfg = {
         .socket_path = VEMB_V16_UDS_PATH,
         .tcp_host = VEMB_V16_TCP_HOST,
-        .dim = VEMB_V16_DEFAULT_DIM,
+        .dim = 0,
         .prefill = 65536,
         .ops = 200000,
         .threads = 8,
@@ -2774,6 +2774,11 @@ int main(int argc, char **argv) {
         cfg.pipeline == 0 || cfg.pipeline > VEMB_V16_CLIENT_RING_SIZE ||
         cfg.node_count == 0 || cfg.node_count > VEMB_V16_BENCH_MAX_NODES) {
         fprintf(stderr, "invalid arguments\n");
+        return 1;
+    }
+    if (cfg.dim == 0 || cfg.dim > VEMB_V16_MAX_DIM) {
+        fprintf(stderr, "--dim is required and must be in [1, %u]\n",
+                VEMB_V16_MAX_DIM);
         return 1;
     }
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&

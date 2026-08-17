@@ -84,7 +84,8 @@ int vemb_v16_aeron_attach_v2_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
         read_full(fd, &req.max_batch_bytes, sizeof(req.max_batch_bytes)) != 0)
         return -1;
 
-    if (req.dim != proxy->vector_dim || req.requested_batch_size == 0 ||
+    if (unlikely(req.dim != proxy->vector_dim) ||
+        req.requested_batch_size == 0 ||
         vemb_v16_storage_migration_active(proxy->storage)) {
         serverLog(LL_WARNING,
                   "aeron v2 ATTACH rejected: dim=%u requested_batch_size=%u migration_active=%d",
@@ -192,8 +193,11 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
     if (read_full(fd, &req.resp_slot_size, sizeof(req.resp_slot_size)) != 0) return -1;
     if (read_full(fd, &req.flags, sizeof(req.flags)) != 0) return -1;
 
-    if (req.dim == 0 || req.dim > 65536u) {
-        serverLog(LL_WARNING, "aeron ATTACH rejected: dim=%u out of range", req.dim);
+    if (unlikely(req.dim == 0 || req.dim > VEMB_V16_MAX_DIM ||
+                 req.dim != proxy->vector_dim)) {
+        serverLog(LL_WARNING,
+                  "aeron ATTACH rejected: client_dim=%u server_dim=%u max_dim=%u",
+                  req.dim, proxy->vector_dim, VEMB_V16_MAX_DIM);
         vemb_v16_aeron_attach_resp_t rej;
         memset(&rej, 0, sizeof(rej));
         memcpy(rej.magic, VEMB_V16_AERON_ATTACHED_MAGIC,

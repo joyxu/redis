@@ -207,6 +207,14 @@ void vemb_v16_aeron_handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
     } else if (op == VEMB_V16_CTRL_ALLOC_CHANNEL) {
         vemb_v16_alloc_req_t req;
         GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+        if (unlikely(req.vector_dim != proxy->vector_dim)) {
+            serverLog(LL_WARNING,
+                      "UDS channel allocation rejected: client_dim=%u server_dim=%u",
+                      req.vector_dim, proxy->vector_dim);
+            uint8_t status = VEMB_V16_STATUS_ERR;
+            write_full(fd, &status, sizeof(status));
+            goto close_fd;
+        }
         vemb_v16_channel_desc_t desc;
         uint8_t status = vemb_v16_proxy_alloc_shm_channel(proxy, &desc) == 0 ? VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
         if (status != VEMB_V16_STATUS_OK)
