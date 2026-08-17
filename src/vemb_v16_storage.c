@@ -1614,8 +1614,19 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
         RETURN_IF(region->value_size != vector_stride ||
-                  region->region_bytes < region->value_size ||
-                  region->region_bytes % region->value_size != 0, -1);
+                  region->region_bytes < region->value_size, -1);
+        /* Capacity is floor(region_bytes / value_size); a non-multiple tail
+         * (e.g. 1 GiB region with value_size=1200) is not a config error. */
+        if (region->region_bytes % region->value_size != 0) {
+            serverLog(LL_NOTICE,
+                      "vemb_v16 warm region tail bytes ignored: region_id=%u "
+                      "region_bytes=%llu value_size=%u usable_slots=%llu",
+                      region->region_id,
+                      (unsigned long long)region->region_bytes,
+                      region->value_size,
+                      (unsigned long long)(region->region_bytes /
+                                           region->value_size));
+        }
     }
 
     vemb_v16_storage_ctx_t *storage = zcalloc(sizeof(*storage));

@@ -11,7 +11,7 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 HPC=${HPC:-$(dirname "$SCRIPT_DIR")}
-MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark}
+MEMTIER=${MEMTIER:-$(dirname $0)/../memtier_benchmark/memtier_benchmark}
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 CLEAR_UB=${CLEAR_UB:-/tmp/clear_ub_device}
 

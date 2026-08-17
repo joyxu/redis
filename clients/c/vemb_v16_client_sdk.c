@@ -261,12 +261,14 @@ ssize_t vemb_v16_serialize_hello(void *buf, size_t buf_cap,
     hdr->magic = VEMB_V16_MAGIC;
     hdr->version = VEMB_V16_VERSION;
     hdr->type = VEMB_V16_NET_HELLO;
-    hdr->payload_len = (uint32_t)sizeof(vemb_v16_alloc_req_t);
+    hdr->payload_len = VEMB_V16_ALLOC_REQ_ENCODED_LEN;
 
-    vemb_v16_alloc_req_t *req = (vemb_v16_alloc_req_t *)((char *)buf + sizeof(*hdr));
-    memset(req, 0, sizeof(*req));
-    req->vector_dim = vector_dim;
-    req->flags = flags;
+    /* Payload must be big-endian encoded to match the server's
+     * vemb_v16_alloc_req_decode; a native struct write sends little-endian
+     * and gets rejected as a dim mismatch. */
+    uint8_t *p = (uint8_t *)buf + sizeof(*hdr);
+    vemb_v16_proto_put_u32(&p, vector_dim);
+    vemb_v16_proto_put_u32(&p, flags);
 
     return (ssize_t)total;
 }
