@@ -32,7 +32,8 @@
 #define VEMB_V16_SDK_HASH_VNODES  10
 
 /* Encoded request buffer — large enough for any op:
- *   24 (base) + 4 (vector_bytes) + 128 (key) + 4096*4 (vector) = 16676
+ *   24 (base) + 4 (vector_bytes) + 128 (key) +
+ *   VEMB_V16_MAX_DIM*sizeof(float) (vector).
  * Round up to a safe upper bound. */
 #define VEMB_V16_SDK_ENC_BUF_LEN  (24u + 4u + VEMB_V16_MAX_KEY_LEN + \
                                    VEMB_V16_MAX_DIM * sizeof(float) + 64u)
@@ -644,6 +645,17 @@ static int sdk_backend_connect(sdk_backend_t *b, uint32_t dim, uint32_t timeout_
     vemb_v16_channel_desc_t desc;
     if (vemb_v16_channel_desc_decode(&desc, payload, hdr.payload_len) != 0) {
         close(fd); return -1;
+    }
+    if (unlikely(desc.vector_dim != dim ||
+                 desc.vector_stride != dim * sizeof(float) ||
+                 desc.request_ring_slot_size == 0 ||
+                 desc.response_ring_slot_size == 0)) {
+        fprintf(stderr,
+                "vemb_v16_client: WELCOME dimension mismatch: client_dim=%u "
+                "server_dim=%u stride=%u\n",
+                dim, desc.vector_dim, desc.vector_stride);
+        close(fd);
+        return -1;
     }
 
     b->fd         = fd;
@@ -1770,7 +1782,7 @@ int vemb_v16_client_vadd(vemb_v16_client_t *c,
                          const float *vector,
                          uint32_t dim)
 {
-    if (!c || !elem_name || !vector || dim != c->dim)
+    if (!c || !elem_name || !vector || unlikely(dim != c->dim))
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -1925,7 +1937,7 @@ int vemb_v16_client_vsim(vemb_v16_client_t *c,
                          float *out_score)
 {
     if (!c || !elem_name ||
-        !query_vector || dim != c->dim || !out_score)
+        !query_vector || unlikely(dim != c->dim) || !out_score)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -2294,7 +2306,7 @@ float *vemb_v16_parse_vector_csv(const char *str, uint32_t expected_dim)
     }
     free(copy);
 
-    if (parsed != expected_dim) {
+    if (unlikely(parsed != expected_dim)) {
         free(vec);
         return NULL;
     }
@@ -2571,6 +2583,11 @@ static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
     if (vemb_v16_net_read_full (fd, &status, sizeof(status)) != 0)    return -1;
     if (status != VEMB_V16_STATUS_OK)                                 return -1;
     if (vemb_v16_net_read_full (fd, desc,   sizeof(*desc))   != 0)    return -1;
+    if (unlikely(desc->vector_dim != dim ||
+                 desc->vector_stride != dim * sizeof(float) ||
+                 desc->request_ring_slot_size == 0 ||
+                 desc->response_ring_slot_size == 0))
+        return -1;
     return 0;
 }
 
@@ -3269,6 +3286,8 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
              (unsigned)port);
     ch->remote = 1;
     ch->desc.channel_id          = resp.channel_id;
+    ch->desc.vector_dim          = dim;
+    ch->desc.vector_stride       = dim * sizeof(float);
     ch->desc.request_ring_slot_size  = resp.req_slot_size;
     ch->desc.response_ring_slot_size = resp.resp_slot_size;
 

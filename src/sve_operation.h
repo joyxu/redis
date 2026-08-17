@@ -17,11 +17,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-/* ---- 配置常量 ---- */
-#ifndef SVE_EMBEDDING_DIM
-#define SVE_EMBEDDING_DIM 300
-#endif
-
 #ifndef SVE_OP_VECTOR_BITS
 #define SVE_OP_VECTOR_BITS 256
 #endif

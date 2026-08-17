@@ -14,18 +14,16 @@
  *       -o sdk_features_demo -lpthread
  *
  * 运行（前提：redis-server 已在 host:port 启动，--vemb-v16-dim = dim）：
- *   ./sdk_features_demo <subcmd> [host] [port] [dim]
- *   ./sdk_features_demo vemb_handle  127.0.0.1 6379 300
- *   ./sdk_features_demo ping_stats   127.0.0.1 6379 300
- *   ./sdk_features_demo pipeline     127.0.0.1 6379 300
+ *   ./sdk_features_demo <subcmd> <host> <port> <dim>
+ *   ./sdk_features_demo vemb_handle  127.0.0.1 6379 <dim>
+ *   ./sdk_features_demo ping_stats   127.0.0.1 6379 <dim>
+ *   ./sdk_features_demo pipeline     127.0.0.1 6379 <dim>
  */
 
 #include "vemb_v16_client_sdk.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define DIM_DEFAULT 300
 
 static void fill_vec(float *vec, uint32_t dim, float base)
 {
@@ -114,9 +112,11 @@ static int demo_pipeline(vemb_v16_client_t *c, uint32_t dim)
 
     /* 2) 批量 VEMB */
     const char *elems_vemb[3] = {"elem1", "elem2", "elem3"};
+    float vemb_vectors[3 * dim];
     vemb_v16_pipeline_resp_t resps[3];
     memset(resps, 0, sizeof(resps));
-    if (vemb_v16_client_vemb_pipeline(c, sets, elems_vemb, 3, resps, 16) != 0) {
+    if (vemb_v16_client_vemb_pipeline(c, sets, elems_vemb, 3,
+                                      vemb_vectors, resps, 16) != 0) {
         printf("VEMB pipeline failed\n");
         return 1;
     }
@@ -142,16 +142,21 @@ static int demo_pipeline(vemb_v16_client_t *c, uint32_t dim)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
+    if (argc < 5) {
         fprintf(stderr,
-                "usage: %s <vemb_handle|ping_stats|pipeline> [host] [port] [dim]\n",
+                "usage: %s <vemb_handle|ping_stats|pipeline> <host> <port> <dim>\n",
                 argv[0]);
         return 2;
     }
     const char *subcmd = argv[1];
-    const char *host   = (argc > 2) ? argv[2] : "127.0.0.1";
-    uint16_t port      = (uint16_t)((argc > 3) ? atoi(argv[3]) : 6379);
-    uint32_t dim       = (uint32_t)((argc > 4) ? atoi(argv[4]) : DIM_DEFAULT);
+    const char *host   = argv[2];
+    uint16_t port      = (uint16_t)atoi(argv[3]);
+    uint32_t dim       = (uint32_t)atoi(argv[4]);
+    if (port == 0 || dim == 0 || dim > VEMB_V16_MAX_DIM) {
+        fprintf(stderr, "invalid port or dim (dim range: 1..%u)\n",
+                VEMB_V16_MAX_DIM);
+        return 2;
+    }
 
     vemb_v16_client_t *c = vemb_v16_client_create(host, port, dim, 0);
     if (!c) {

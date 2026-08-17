@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     vemb_v16_storage_ctx_t *storage = NULL;
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     const char *warm_regions_manifest = NULL;
-    uint32_t dim = VEMB_V16_DEFAULT_DIM;
+    uint32_t dim = 0;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     uint32_t warm_region_id = 0;
     uint32_t warm_backend_type = VEMB_V16_REGION_UB;
@@ -158,7 +158,8 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (dim == 0 || dim > VEMB_V16_MAX_DIM) {
-        fprintf(stderr, "--dim must be in [1, %u]\n", VEMB_V16_MAX_DIM);
+        fprintf(stderr, "--dim is required and must be in [1, %u]\n",
+                VEMB_V16_MAX_DIM);
         goto cleanup;
     }
     if (max_vectors == 0) {

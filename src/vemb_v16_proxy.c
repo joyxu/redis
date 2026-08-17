@@ -1481,8 +1481,9 @@ static void vemb_v16_proxy_handle_request_ptr_batch_internal(
         }
 
         size_t min_len = vemb_v16_req_encoded_len(req);
-        if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
-            req->vector_bytes > sizeof(req->vector)) {
+        if (unlikely((size_t)req_len < min_len ||
+                     req->dim > VEMB_V16_MAX_DIM ||
+                     req->vector_bytes > sizeof(req->vector))) {
             publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
             continue;
         }
@@ -1557,8 +1558,9 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
     }
 
     size_t min_len = vemb_v16_req_encoded_len(req);
-    if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
-        req->vector_bytes > sizeof(req->vector)) {
+    if (unlikely((size_t)req_len < min_len ||
+                 req->dim > VEMB_V16_MAX_DIM ||
+                 req->vector_bytes > sizeof(req->vector))) {
         goto error_response;
     }
     if (publish_request_job(ch, req, key_len, proxy_io_worker_id) != 0) {

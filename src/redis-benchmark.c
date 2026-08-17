@@ -117,7 +117,7 @@ static struct config {
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
     int vemb_v16_enabled;        /* --vemb-v16-enabled */
-    int vemb_v16_dim;            /* --vemb-v16-dim, default 300 */
+    int vemb_v16_dim;            /* --vemb-v16-dim, required for VEMB V16 */
     int vemb_v16_op;             /* VEMB_OP_* selector */
     float *vemb_v16_query_vec;   /* shared VSIM query vector (config.vemb_v16_dim floats) */
 } config;
@@ -1745,11 +1745,16 @@ int parseOptions(int argc, char **argv) {
             }
         } else if (!strcmp(argv[i],"--vemb-v16-dim")) {
             if (lastarg) goto invalid;
-            config.vemb_v16_dim = atoi(argv[++i]);
-            if (config.vemb_v16_dim <= 0 || config.vemb_v16_dim > (int)VEMB_V16_MAX_DIM) {
+            char *end = NULL;
+            long value;
+            errno = 0;
+            value = strtol(argv[++i], &end, 10);
+            if (errno == ERANGE || end == argv[i] || *end != '\0' ||
+                value <= 0 || value > (long)VEMB_V16_MAX_DIM) {
                 fprintf(stderr, "Invalid --vemb-v16-dim value: %s\n", argv[i]);
                 exit(1);
             }
+            config.vemb_v16_dim = (int)value;
         } else if (!strcmp(argv[i],"--vemb-v16-op")) {
             if (lastarg) goto invalid;
             const char *opstr = argv[++i];
@@ -1883,7 +1888,7 @@ usage:
 " --seed <num>       Set the seed for random number generator. Default seed is based on time.\n"
 " --vemb-v16-enabled Speak the binary VEMB V16 protocol (HPC-Redis) instead of RESP.\n"
 "                    Requires --vemb-v16-dim and --vemb-v16-op.\n"
-" --vemb-v16-dim <n> Vector dimension (default 300). Mirrors server --vemb-v16-dim.\n"
+" --vemb-v16-dim <n> Required vector dimension. Mirrors server --vemb-v16-dim.\n"
 " --vemb-v16-op <s>  Operation: vadd|vemb|vsim|vrem. Implies --vemb-v16-enabled.\n"
 "                    VADD writes a random vector; VEMB reads inline; VSIM computes\n"
 "                    cosine similarity against a shared random query; VREM deletes.\n"
@@ -2016,13 +2021,20 @@ int main(int argc, char **argv) {
     config.enable_tracking = 0;
     config.resp3 = 0;
     config.vemb_v16_enabled = 0;
-    config.vemb_v16_dim = VEMB_V16_DEFAULT_DIM;
+    config.vemb_v16_dim = 0;
     config.vemb_v16_op = VEMB_OP_NONE;
     config.vemb_v16_query_vec = NULL;
 
     i = parseOptions(argc,argv);
     argc -= i;
     argv += i;
+
+    if (config.vemb_v16_enabled && config.vemb_v16_dim == 0) {
+        fprintf(stderr,
+                "VEMB V16 mode requires --vemb-v16-dim in [1, %u]\n",
+                VEMB_V16_MAX_DIM);
+        exit(1);
+    }
 
     tag = "";
 

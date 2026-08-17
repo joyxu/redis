@@ -8,10 +8,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-SERVER_NODE="${SERVER_NODE:-192.168.90.111}"
-CLIENT_NODE="${CLIENT_NODE:-192.168.90.112}"
+SERVER_NODE="${SERVER_NODE:-43.154.145.18}"
+CLIENT_NODE="${CLIENT_NODE:-43.154.145.18}"
 SSH_USER="${SSH_USER:-root}"
-SSH_PORT="${SSH_PORT:-22}"
+SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-8111}}"
+CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-8112}}"
 SERVER_ROOT="${SERVER_ROOT:-/root/szz/codespace/hpc-redis}"
 CLIENT_ROOT="${CLIENT_ROOT:-/root/szz/codespace/hpc-redis}"
 FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
@@ -69,8 +70,10 @@ LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/$RUN_ID}"
 
 SERVER_PEER="$SSH_USER@$SERVER_NODE"
 CLIENT_PEER="$SSH_USER@$CLIENT_NODE"
-SSH_OPTIONS=(-p "$SSH_PORT")
-SCP_OPTIONS=(-P "$SSH_PORT")
+SERVER_SSH_OPTIONS=(-p "$SERVER_SSH_PORT")
+CLIENT_SSH_OPTIONS=(-p "$CLIENT_SSH_PORT")
+SERVER_SCP_OPTIONS=(-P "$SERVER_SSH_PORT")
+CLIENT_SCP_OPTIONS=(-P "$CLIENT_SSH_PORT")
 server_started=0
 
 usage() {
@@ -83,13 +86,15 @@ Usage:
   KEY_PATTERN=Z:Z ZIPF_S=1.5 bash scripts/run_aeron_cross_node_flamegraph.sh
 
 The default is the validated 111 -> 112 setup:
-  server=192.168.90.111:6395, client=192.168.90.112
+  SSH server (111)=root@43.154.145.18:8111, client (112)=root@43.154.145.18:8112
+  server=192.168.90.111:6395, client=192.168.90.112 (internal network)
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
   server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
   client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev8
 
 Important environment variables:
-  SERVER_NODE CLIENT_NODE SSH_USER SSH_PORT SERVER_ROOT CLIENT_ROOT SERVER_IP PORT
+  SERVER_NODE CLIENT_NODE SSH_USER SERVER_SSH_PORT CLIENT_SSH_PORT SSH_PORT
+  SERVER_ROOT CLIENT_ROOT SERVER_IP PORT
   SERVER_MANIFEST SERVER_REQUEST_UB_PATH SERVER_RESPONSE_UB_PATH SERVER_WARM_UB_PATH
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
@@ -152,11 +157,11 @@ is_uint() {
 }
 
 server_ssh() {
-    ssh "${SSH_OPTIONS[@]}" "$SERVER_PEER" "$@"
+    ssh "${SERVER_SSH_OPTIONS[@]}" "$SERVER_PEER" "$@"
 }
 
 client_ssh() {
-    ssh "${SSH_OPTIONS[@]}" "$CLIENT_PEER" "$@"
+    ssh "${CLIENT_SSH_OPTIONS[@]}" "$CLIENT_PEER" "$@"
 }
 
 cleanup_server() {
@@ -249,7 +254,7 @@ run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_
 mkdir -p "$LOCAL_ROOT/server" "$LOCAL_ROOT/client"
 
 status "cross-node flamegraph run: $RUN_ID"
-status "server=$SERVER_PEER:$SERVER_ROOT client=$CLIENT_PEER:$CLIENT_ROOT"
+status "server=$SERVER_PEER:$SERVER_SSH_PORT:$SERVER_ROOT client=$CLIENT_PEER:$CLIENT_SSH_PORT:$CLIENT_ROOT"
 status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
 status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD local=$LOCAL_ROOT"
 
@@ -1067,10 +1072,10 @@ tar -C "$run" -czf "$run/server_artifacts.tar.gz" \
 REMOTE_SERVER_RENDER
 
 status "pulling complete remote artifacts"
-scp "${SCP_OPTIONS[@]}" \
+scp "${SERVER_SCP_OPTIONS[@]}" \
     "$SERVER_PEER:$REMOTE_RUN_DIR/server_artifacts.tar.gz" \
     "$LOCAL_ROOT/server/"
-scp "${SCP_OPTIONS[@]}" \
+scp "${CLIENT_SCP_OPTIONS[@]}" \
     "$CLIENT_PEER:$REMOTE_RUN_DIR/client_artifacts.tar.gz" \
     "$LOCAL_ROOT/client/"
 tar -xzf "$LOCAL_ROOT/server/server_artifacts.tar.gz" -C "$LOCAL_ROOT/server"

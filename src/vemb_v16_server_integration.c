@@ -44,9 +44,14 @@ static vemb_v16_storage_ctx_t *g_vemb_storage = NULL;
 int vemb_v16_server_integration_init(void) {
     if (!server.vemb_v16_enabled) return 0;
 
-    uint32_t dim = server.vemb_v16_dim > 0
-        ? (uint32_t)server.vemb_v16_dim
-        : VEMB_V16_DEFAULT_DIM;
+    if (server.vemb_v16_dim <= 0 ||
+        server.vemb_v16_dim > (int)VEMB_V16_MAX_DIM) {
+        serverLog(LL_WARNING,
+                  "VEMB V16 requires vemb-v16-dim in [1, %u]",
+                  VEMB_V16_MAX_DIM);
+        return -1;
+    }
+    uint32_t dim = (uint32_t)server.vemb_v16_dim;
     uint32_t max_vectors = server.vemb_v16_max_vectors > 0
         ? (uint32_t)server.vemb_v16_max_vectors
         : VEMB_V16_DEFAULT_MAX_VECTORS;

@@ -1226,8 +1226,8 @@ static int migration_delta_payload(
         delta->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE) {
         return 0;
     }
-    if (delta->value_size != tlc->value_size ||
-        delta->bytes != tlc->value_size ||
+    if (unlikely(delta->value_size != tlc->value_size ||
+                 delta->bytes != tlc->value_size) ||
         delta->local_slot == TLC_CORE_INVALID_SLOT ||
         delta->region_id == TLC_CORE_INVALID_REGION_ID) {
         return -1;
@@ -1254,8 +1254,8 @@ static int migration_snapshot_payload(
     *value_size = 0;
     if (snapshot->tombstone)
         return 0;
-    if (snapshot->value_size != tlc->value_size ||
-        snapshot->bytes != tlc->value_size ||
+    if (unlikely(snapshot->value_size != tlc->value_size ||
+                 snapshot->bytes != tlc->value_size) ||
         snapshot->local_slot == TLC_CORE_INVALID_SLOT ||
         snapshot->region_id == TLC_CORE_INVALID_REGION_ID) {
         return -1;

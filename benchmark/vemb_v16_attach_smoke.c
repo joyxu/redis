@@ -7,7 +7,16 @@
 int main(int argc, char **argv) {
     const char *host = argc > 1 ? argv[1] : "192.168.90.111";
     uint16_t port = argc > 2 ? (uint16_t)strtoul(argv[2], NULL, 10) : 6395u;
-    uint32_t dim = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 300u;
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <host> <port> <dim>\n", argv[0]);
+        return 2;
+    }
+    uint32_t dim = (uint32_t)strtoul(argv[3], NULL, 10);
+    if (dim == 0 || dim > VEMB_V16_MAX_DIM) {
+        fprintf(stderr, "invalid dim %u (range: 1..%u)\n",
+                dim, VEMB_V16_MAX_DIM);
+        return 2;
+    }
 
     vemb_v16_aeron_channel_t *first =
         vemb_v16_aeron_open_remote(host, port, dim);

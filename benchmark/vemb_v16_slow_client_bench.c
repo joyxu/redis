@@ -415,7 +415,7 @@ int main(int argc, char **argv) {
     bench_cfg_t cfg = {
         .host = VEMB_V16_TCP_HOST,
         .port = VEMB_V16_TCP_PORT,
-        .dim = VEMB_V16_DEFAULT_DIM,
+        .dim = 0,
         .prefill = 1024,
         .slow_ops = 8192,
         .probe_ops = 1000,
