@@ -2,10 +2,10 @@
 # Compare local code files with a peer and overwrite only files that differ.
 set -euo pipefail
 
-NODE="${NODE:-192.168.90.112}"
+NODE="${NODE:-43.154.145.18}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_ROOT="${REMOTE_ROOT:-/root/szz/codespace/hpc-redis}"
-SSH_PORT="${SSH_PORT:-22}"
+SSH_PORT="${SSH_PORT:-8112}"
 ALL_CODE=0
 DRY_RUN=0
 BUILD_TARGET=""
@@ -24,7 +24,7 @@ SCP_OPTIONS=(-q -P "$SSH_PORT" -o "ControlPath=$CONTROL_PATH")
 
 usage() {
     cat <<'USAGE'
-Usage: [NODE=IP] bash scripts/sync_changed_code_to_peer.sh [options]
+Usage: [NODE=HOST] bash scripts/sync_changed_code_to_peer.sh [options]
 
 Compare local code files with a peer using SHA-256, then overwrite only files
 whose content differs. No remote backup is created.
@@ -38,10 +38,10 @@ Options:
   -h, --help  Show this help.
 
 Defaults:
-  NODE        192.168.90.112
+  NODE        43.154.145.18 (112 external endpoint)
   SSH_USER    root
   REMOTE_ROOT /root/szz/codespace/hpc-redis
-  SSH_PORT    22
+  SSH_PORT    8112
 USAGE
 }
 
