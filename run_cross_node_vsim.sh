@@ -264,7 +264,7 @@ fi
 # 完成（progress 停在 100%），但收尾会把每个 op 的延迟逐行 dump（千万级 ops →
 # 数百 MB 日志 + 数分钟耗时），期间忽略 SIGTERM。-k 5：先 SIGTERM 给 5s 优雅退出
 # （足够写 Totals 行），仍不退就 SIGKILL 强杀。
-timeout -k 5 $((test_time + 20)) ./memtier_benchmark --protocol vemb_v16 --vemb-v16-dim "$dim" $vsim_flag \
+timeout -k 5 $((test_time + 60)) ./memtier_benchmark --protocol vemb_v16 --vemb-v16-dim "$dim" $vsim_flag \
     -s "$host" -p "$port" --test-time "$test_time" \
     -c "$clients" -t "$threads" --ratio=0:1 --pipeline="$pipeline" \
     --key-prefix="$key_prefix" --key-minimum="$key_min" --key-maximum="$key_max" \

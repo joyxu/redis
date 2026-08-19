@@ -225,6 +225,7 @@ run_one_config() {
     prefill_all_instances
 
     # PIDs + J0
+    JB_NS=$(date +%s%N)
     declare -a INSTANCE_PIDS J0_UT_VALUES J0_ST_VALUES
     for i in $(seq 0 $((NUM_INSTANCES - 1))); do
         INSTANCE_PIDS[$i]=$(get_pid $i)
@@ -282,9 +283,11 @@ run_one_config() {
     wait
 
     # softirq delta + server rss (VmRSS KB, 所有实例求和)
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐; 此处先算, 下方 si 与 per-instance 都用)
+    ELAPSED_NS=$(( $(date +%s%N) - JB_NS ))
     ja_si=$(snapshot_si)
     ja_si=${ja_si:-0}
-    c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     rss_kb=$(snapshot_rss ${INSTANCE_PIDS[@]})
 
     # Collect per-instance + aggregate
@@ -322,14 +325,14 @@ run_one_config() {
             log "  WARN: inst $i no Totals"
         fi
 
-        # cores via jiffies (ut/st 拆分)
+        # cores via jiffies (ut/st 拆分; ELAPSED_NS 已在上方统一计算)
         local pid="${INSTANCE_PIDS[$i]}"
         local inst_cores=0 inst_ut=0 inst_st=0
         if [ -n "$pid" ]; then
             local j1_ut j1_st
             read j1_ut j1_st < <(get_jiffies $pid)
-            inst_ut=$(awk -v d=$((j1_ut - ${J0_UT_VALUES[$i]:-0})) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-            inst_st=$(awk -v d=$((j1_st - ${J0_ST_VALUES[$i]:-0})) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+            inst_ut=$(awk -v d=$((j1_ut - ${J0_UT_VALUES[$i]:-0})) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+            inst_st=$(awk -v d=$((j1_st - ${J0_ST_VALUES[$i]:-0})) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
             inst_cores=$(awk -v u=$inst_ut -v v=$inst_st 'BEGIN{printf "%.2f", u + v}')
         fi
         TOTAL_CORES=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_CORES + $inst_cores }")

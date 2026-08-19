@@ -228,7 +228,13 @@ prefill() {
                 for (j=0; j<dim; j++) printf " %f", rand()*j*0.001;
                 printf " item:%d\n", i;
             }
-        }' | $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $SERVER_PORT --pipe >/dev/null 2>&1
+        }' | $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $SERVER_PORT --pipe >"$RAWDIR/${server_type}_${OP_TYPE}_prefill_pipe.log" 2>&1
+        local pipe_rc=$?
+        if [ $pipe_rc -ne 0 ]; then
+            # 不重试; 记录死亡原因 (pipefail 语义: awk=1 / cli=2 / signal=128+n)
+            log "  [$server_type] prefill pipe FAILED rc=$pipe_rc (see ${RAWDIR}/${server_type}_${OP_TYPE}_prefill_pipe.log)"
+            echo "[$(date '+%H:%M:%S')] $OP_TYPE $server_type prefill pipe rc=$pipe_rc" >> "$RAWDIR/prefill_failures.log"
+        fi
     fi
 
     if [ "$server_type" = "hpc" ]; then
@@ -293,7 +299,9 @@ case "$op_type" in
 esac
 cmd+=(--key-prefix="$prefix" --key-minimum="$kmin" --key-maximum="$kmax")
 
-timeout -k 5 $((test_time + 25)) "${cmd[@]}" > "$out_file" 2>&1 || true
+# memtier needs time to drain in-flight requests after test_time (e.g. baseline
+# VADD at high in-flight counts drains slowly), so keep a generous headroom.
+timeout -k 5 $((test_time + 60)) "${cmd[@]}" > "$out_file" 2>&1 || true
 BENCH_EOF
     ssh "$CLIENT" "chmod +x /tmp/$BENCH_HELPER_NAME" 2>/dev/null
 }
@@ -328,7 +336,7 @@ run_one_config() {
     local jb_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
     local jb_si=$(snapshot_si)
     local jb_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
-    local jb_sec=$(date +%s)
+    local jb_ns=$(date +%s%N)
 
     # === run memtier on CLIENT ===
     # is_hpc 通过位置参数 ${15} 传给 helper (ssh 不传环境变量)
@@ -343,17 +351,18 @@ run_one_config() {
     # === jiffies after (ut/st split) ===
     local ja_ut ja_st
     read ja_ut ja_st < <(snapshot_jiffies $SERVER_PORT)
-    local ja_sec=$(date +%s)
-    local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
-    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", (du+ds)/100.0/s}')
-    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_ns=$(date +%s%N)
+    local elapsed_ns=$((ja_ns - jb_ns > 0 ? ja_ns - jb_ns : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐: 分子分母同区间)
+    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", (du+ds)/100.0/(s/1000000000)}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local ja_iowait=$(awk '/^cpu /{print $6}' /proc/stat 2>/dev/null)
     local ja_si=$(snapshot_si)
     local ja_hi=$(awk '/^cpu /{print $7}' /proc/stat 2>/dev/null)
-    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local rss=$(snapshot_rss $SERVER_PORT)
 
     # === sar %ifutil 解析 ===

@@ -39,9 +39,9 @@ NNODES=${#NODES[@]}
 
 # === 路径 ===
 REDIS_DIR=${REDIS_DIR:-/root/gqs/codespace/redis-8.6.3}
-MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin/memtier_benchmark}
+MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/hpc-redis/memtier_benchmark/memtier_benchmark}
 DATA_DIR=${DATA_DIR:-/tmp/redis-cluster-data}
-MEMTIER_HOST=${MEMTIER_HOST:-HW06}
+MEMTIER_HOST=${MEMTIER_HOST:-HW04}
 
 # === cluster 参数 ===
 PORT=${PORT:-7000}           # master 端口
@@ -431,14 +431,18 @@ printf "phase\tmaster_count\tduration_s\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp9
 # ----------------------------------------------------------------------------
 log "=== STEP 5: 段1 baseline (N_INIT=$N_INIT masters) ==="
 read jb_ut jb_st < <(snapshot_jiffies_all)
+JB_NS=$(date +%s%N)
 si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/01_baseline.log" $TEST_TIME "baseline"
 read ja_ut ja_st < <(snapshot_jiffies_all)
+JA_NS=$(date +%s%N)
+ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+# core 分母 = 纳秒实测窗口 (与脚本13对齐)
 si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
-cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
 rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/01_baseline.log")
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
@@ -450,6 +454,7 @@ log "  => baseline: ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=
 log "=== STEP 6: 段2 during scaleout (扩容 N_INIT -> N_FINAL, memtier 后台持续打) ==="
 # 后台启动 memtier, 跑 DURING_TIME 秒 (期间完成 add-node + reshard)
 read jb_ut jb_st < <(snapshot_jiffies_all)
+JB_NS=$(date +%s%N)
 si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/02_during.log" $DURING_TIME "during-scaleout" &
 MEMTIER_PID=$!
@@ -473,11 +478,14 @@ wait_cluster_stable 120
 log "  waiting for memtier to finish (pid=$MEMTIER_PID)..."
 wait $MEMTIER_PID
 read ja_ut ja_st < <(snapshot_jiffies_all)
+JA_NS=$(date +%s%N)
+ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+# core 分母 = 纳秒实测窗口 (与脚本13对齐)
 si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
-cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$DURING_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-si=$(awk -v d=$((si_a - si_b)) -v s=$DURING_TIME 'BEGIN{printf "%d", d/s}')
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
 rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/02_during.log")
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
@@ -490,14 +498,18 @@ check_cluster "after-scaleout"
 # ----------------------------------------------------------------------------
 log "=== STEP 7: 段3 after (N_FINAL=$N_FINAL masters, 稳态) ==="
 read jb_ut jb_st < <(snapshot_jiffies_all)
+JB_NS=$(date +%s%N)
 si_b=$(snapshot_si_all); rss_b=$(snapshot_rss_all)
 run_memtier "$RAWDIR/03_after.log" $TEST_TIME "after"
 read ja_ut ja_st < <(snapshot_jiffies_all)
+JA_NS=$(date +%s%N)
+ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+# core 分母 = 纳秒实测窗口 (与脚本13对齐)
 si_a=$(snapshot_si_all); rss_a=$(snapshot_rss_all)
-cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+si=$(awk -v d=$((si_a - si_b)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
 rss=$(((rss_a + rss_b) / 2))
 read ops avg p50 p99 p999 kb < <(parse_memtier_totals "$RAWDIR/03_after.log")
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \

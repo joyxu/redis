@@ -289,6 +289,7 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
 
     SRV_PID=$(cat $PIDFILE 2>/dev/null)
     J0_UT=0 J0_ST=0
+    JB_NS=$(date +%s%N)
     if [ -n "$SRV_PID" ]; then
         read J0_UT J0_ST < <(get_cpu_jiffies "$SRV_PID")
     fi
@@ -310,15 +311,18 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     fi
 
     J1_UT=0 J1_ST=0
+    JA_NS=$(date +%s%N)
+    ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐)
     if [ -n "$SRV_PID" ]; then
         read J1_UT J1_ST < <(get_cpu_jiffies "$SRV_PID")
     fi
-    CPU_CORES=$(awk -v d=$(( (J1_UT - J0_UT) + (J1_ST - J0_ST) )) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
-    CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
-    CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    CPU_CORES=$(awk -v d=$(( (J1_UT - J0_UT) + (J1_ST - J0_ST) )) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
+    CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
+    CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
     JA_SI=$(snapshot_si)
     JA_SI=${JA_SI:-0}
-    C_SI=$(awk -v d=$((JA_SI - JB_SI)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    C_SI=$(awk -v d=$((JA_SI - JB_SI)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     RSS_KB=$(snapshot_rss "$SRV_PID")
 
     totals=$(grep "^Totals" "$RAWDIR/t${t}_c${c}_p${p}.log" | tail -1)
