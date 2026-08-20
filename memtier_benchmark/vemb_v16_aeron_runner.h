@@ -48,6 +48,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen);
 /* Called by main() after arg parse. Default mode = "aeron" (TCP+UB).
  * For cross-node mode, endpoint = "host:port". */
 void vemb_v16_aeron_set_transport(const std::string &mode,
-                                  const std::string &endpoint);
+                                  const std::string &endpoint,
+                                  bool control_uds = false);
 
 #endif /* VEMB_V16_AERON_RUNNER_H */

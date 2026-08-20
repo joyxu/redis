@@ -1000,14 +1000,17 @@ process_window_s="$(awk -F '\t' '$1 == "window" { print $2 }' "$run/server.cpu.p
         if (metric == "sys") return "Kernel-mode execution"
         if (metric == "iowait") return "Waiting for I/O"
         if (metric == "irq") return "Hardware interrupt"
-        if (metric == "soft") return "Software interrupt (si)"
+        if (metric == "soft") return "Software interrupt"
         if (metric == "steal") return "Hypervisor steal time"
         if (metric == "guest") return "Guest execution"
         if (metric == "gnice") return "Niced guest execution"
         return "All non-idle time"
     }
     NR > 1 {
-        printf "%-10s %-34s %12.3f %12.3f\n", $1, description($1), $2, $3
+        label = $1
+        if (label == "irq") label = "irq (hi)"
+        else if (label == "soft") label = "soft (si)"
+        printf "%-10s %-34s %12.3f %12.3f\n", label, description($1), $2, $3
     }' "$run/server.cpu.cpuset.summary.tsv"
 } >"$run/server.cpu.summary.txt"
 

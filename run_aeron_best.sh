@@ -264,6 +264,7 @@ SRV_PID=$(cat "$PIDFILE" 2>/dev/null)
 echo ""
 echo "=== prefill: $NUM_KEYS keys, dim=$DIM server=$SERVER_HOST:$PORT ==="
 if ! taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
+        --vemb-v16-aeron-control="$AERON_CONTROL" \
     "${VEMB_MODE_ARGS[@]}" \
     "${VEMB_ENDPOINT_ARGS[@]}" \
     --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
@@ -296,7 +297,12 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     JB_SI=$(snapshot_si)
     JB_SI=${JB_SI:-0}
 
-    if ! taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
+    # memtier 后台启动 + server CPU 0.2s 采样: 稳态 cores 用 TEST_TIME 滑窗 p95 速率,
+    # 排除 memtier attach/detach channel 阶段 (通道多时可达数十秒, server 近乎空闲,
+    # 会把全程平均 cores 稀释腰斩; ops_sec 是 memtier 自身 30s 稳态窗口值, 两者需同口径)
+    SAMP_FILE="$RAWDIR/t${t}_c${c}_p${p}.samples"
+    taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
+        --vemb-v16-aeron-control="$AERON_CONTROL" \
         "${VEMB_MODE_ARGS[@]}" \
         "${VEMB_ENDPOINT_ARGS[@]}" \
         --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
@@ -304,7 +310,21 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
         --ratio=0:1 --key-pattern=R:R \
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
         --test-time=$TEST_TIME \
-        > "$RAWDIR/t${t}_c${c}_p${p}.log" 2>&1; then
+        > "$RAWDIR/t${t}_c${c}_p${p}.log" 2>&1 &
+    MT_PID=$!
+    ( while kill -0 $MT_PID 2>/dev/null; do
+          if [ -n "$SRV_PID" ] && [ -d /proc/$SRV_PID ]; then
+              read SU SS < <(get_cpu_jiffies "$SRV_PID")
+              printf "%s %s %s %s\n" "$(date +%s%N)" "$SU" "$SS" "$(snapshot_si)"
+          fi
+          sleep 0.2
+      done ) > "$SAMP_FILE" 2>/dev/null &
+    SAMP_PID=$!
+    wait $MT_PID
+    MT_RC=$?
+    kill $SAMP_PID 2>/dev/null
+    wait $SAMP_PID 2>/dev/null
+    if [ $MT_RC -ne 0 ]; then
         echo "FAIL: Aeron workload failed: t=$t c=$c pipeline=$p"
         tail -80 "$RAWDIR/t${t}_c${c}_p${p}.log" 2>/dev/null
         exit 1
@@ -323,6 +343,34 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     JA_SI=$(snapshot_si)
     JA_SI=${JA_SI:-0}
     C_SI=$(awk -v d=$((JA_SI - JB_SI)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+
+    # 稳态口径: TEST_TIME 滑窗速率的 p95 (samples 不足时回退全程平均)
+    if [ -s "$SAMP_FILE" ]; then
+        awk -v tt=$TEST_TIME '
+            { ns[NR]=$1; u[NR]=$2; s[NR]=$3; si[NR]=$4; n=NR }
+            END {
+                ttns = tt * 1e9; j = 1
+                for (i = 1; i <= n; i++) {
+                    while (j <= n && ns[j] - ns[i] < ttns) j++
+                    if (j > n) break
+                    dur = (ns[j] - ns[i]) / 1e9
+                    if (dur <= 0) continue
+                    du = (u[j] - u[i]) / 100 / dur
+                    ds = (s[j] - s[i]) / 100 / dur
+                    dsi = (si[j] - si[i]) / 100 / dur
+                    if (du >= 0 && ds >= 0) printf "%.3f %.3f %.3f %.3f\n", du + ds, du, ds, dsi
+                }
+            }' "$SAMP_FILE" | sort -rn > "$SAMP_FILE.rates"
+        NRATE=$(wc -l < "$SAMP_FILE.rates")
+        if [ "$NRATE" -ge 10 ]; then
+            K=$(( NRATE / 20 )); [ $K -lt 1 ] && K=1
+            read ST_CORES ST_UT ST_ST ST_SI < <(sed -n "${K}p" "$SAMP_FILE.rates")
+            CPU_CORES=$(printf "%.2f" "$ST_CORES")
+            CORE_UT=$(printf "%.2f" "$ST_UT")
+            CORE_ST=$(printf "%.2f" "$ST_ST")
+            C_SI=$(printf "%.2f" "$ST_SI")
+        fi
+    fi
     RSS_KB=$(snapshot_rss "$SRV_PID")
 
     totals=$(grep "^Totals" "$RAWDIR/t${t}_c${c}_p${p}.log" | tail -1)

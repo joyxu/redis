@@ -43,9 +43,12 @@
  * Default = "aeron" preserves existing loopback behavior. */
 static std::string g_aeron_transport_mode = "aeron";
 static std::string g_aeron_remote_endpoint;  /* "host:port" for cross-node */
+static bool g_aeron_control_uds = false;  /* control plane: 0=tcp://, 1=UDS path */
 
 void vemb_v16_aeron_set_transport(const std::string &mode,
-                                  const std::string &endpoint) {
+                                  const std::string &endpoint,
+                                  bool control_uds) {
+    g_aeron_control_uds = control_uds;
     g_aeron_transport_mode = mode;
     g_aeron_remote_endpoint = endpoint;
 }
@@ -832,7 +835,12 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
 
     char control_endpoint[320];
     const char *control_path = NULL;
-    if (cfg->server && cfg->server[0] && cfg->port != 0) {
+    if (g_aeron_control_uds) {
+        /* UDS control plane: pass the socket path; SDK's
+         * vemb_v16_aeron_control_connect treats non-tcp:// strings as UDS. */
+        snprintf(control_endpoint, sizeof(control_endpoint), "%s", VEMB_V16_UDS_PATH);
+        control_path = control_endpoint;
+    } else if (cfg->server && cfg->server[0] && cfg->port != 0) {
         snprintf(control_endpoint,
                  sizeof(control_endpoint),
                  "tcp://%s:%u",

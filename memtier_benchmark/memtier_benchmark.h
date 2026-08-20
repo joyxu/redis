@@ -107,6 +107,7 @@ struct benchmark_config {
     struct arbitrary_command_list* arbitrary_commands;
     const char *hdr_prefix;
     uint32_t vemb_v16_dim;
+    int vemb_v16_aeron_control_uds;  /* aeron control plane: 0=tcp (default), 1=uds */
     bool     vemb_v16_handle;
     bool     vemb_v16_vsim;
     bool     vemb_v16_vsim_key_key;

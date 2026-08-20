@@ -2741,21 +2741,30 @@ static int vemb_v16_aeron_ring_open(const char *name,
     char *end = NULL;
     mmap_offset = strtoull(offset_marker + 4, &end, 10);
     if (end == offset_marker + 4 || *end != '\0') return -1;
-    /* Same-host Aeron uses the UB device directly with O_RDWR. */
-    int fd = open(path, O_RDWR);
-    if (fd < 0) return -1;
+    /* Same-host Aeron uses the UB device directly. The ring region may live
+     * on a cacheable or non-cacheable shmdev; try plain O_RDWR first and
+     * retry with O_SYNC when the kernel rejects the cacheable mapping
+     * (EPERM) so both device flavors work (mirrors server-side pool logic). */
     size_t bytes = vemb_v16_client_ring_bytes(slot_size);
     long page_size = sysconf(_SC_PAGESIZE);
     uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
     uint64_t aligned_offset = mmap_offset & ~page_mask;
     size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
-    void *base = mmap(NULL,
-                      bytes + offset_delta,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED,
-                      fd,
-                      (off_t)aligned_offset);
-    close(fd);
+    void *base = MAP_FAILED;
+    const int open_modes[2] = { 0, O_SYNC };
+    for (size_t attempt = 0;
+         attempt < sizeof(open_modes) / sizeof(open_modes[0]) && base == MAP_FAILED;
+         attempt++) {
+        int fd = open(path, O_RDWR | open_modes[attempt]);
+        if (fd < 0) continue;
+        base = mmap(NULL,
+                    bytes + offset_delta,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    fd,
+                    (off_t)aligned_offset);
+        close(fd);
+    }
     if (base == MAP_FAILED) return -1;
     *out = (vemb_v16_client_ring_t *)((uint8_t *)base + offset_delta);
     return 0;

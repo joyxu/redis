@@ -433,6 +433,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_command_ratio,
         o_vemb_v16_dim,
         o_vemb_v16_handle,
+        o_vemb_v16_aeron_control,
         o_vemb_v16_vsim,
         o_vemb_v16_vsim_key_key,
         o_vemb_v16_vrem,
@@ -525,6 +526,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "command-ratio",              1, 0, o_command_ratio },
         { "vemb-v16-dim",               1, 0, o_vemb_v16_dim },
         { "vemb-v16-handle",            0, 0, o_vemb_v16_handle },
+        { "vemb-v16-aeron-control",     1, 0, o_vemb_v16_aeron_control },
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
         { "vemb-v16-vsim-key-key",      0, 0, o_vemb_v16_vsim_key_key },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
@@ -929,6 +931,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                      * when VEMB_READ_MODE=vector-handle). No-op here. */
                     cfg->vemb_v16_handle = true;
                     break;
+case o_vemb_v16_aeron_control:
+            if (!strcmp(optarg, "uds")) {
+                cfg->vemb_v16_aeron_control_uds = 1;
+            } else if (!strcmp(optarg, "tcp")) {
+                cfg->vemb_v16_aeron_control_uds = 0;
+            } else {
+                fprintf(stderr, "error: --vemb-v16-aeron-control must be tcp or uds\n");
+                exit(1);
+            }
+            break;
                 case o_vemb_v16_vsim:
                     cfg->vemb_v16_vsim = true;
                     break;
@@ -1325,7 +1337,7 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
             fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (use aeron-cross-node)\n");
             exit(1);
         }
-        vemb_v16_aeron_set_transport(mode, endpoint);
+        vemb_v16_aeron_set_transport(mode, endpoint, cfg->vemb_v16_aeron_control_uds != 0);
         fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged (mode=%s)\n",
                 run_id, mode);
         return vemb_v16_aeron_run(cfg, obj_gen);
