@@ -69,10 +69,8 @@ public:
 
 class vemb_v16_multi_client : public client {
 protected:
-    std::vector<key_index_pool*> m_key_index_pools;
     std::vector<std::string> m_endpoints;
     std::vector<const char*> m_endpoint_ptrs;
-    int m_create_request_depth;
     bool m_topology_valid;
     vemb_v16_client_topology_t m_topology;
     int m_owner_to_conn[VEMB_V16_TOPOLOGY_MAX_OWNERS];
@@ -111,7 +109,6 @@ public:
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id, unsigned long long* key_index);
 
     // client manager api's
-    virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp,
                                  request *request, protocol_response *response);

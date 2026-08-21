@@ -26,13 +26,17 @@ SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev4}"
 CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev7}"
 CLIENT_RESPONSE_UB_PATH="${CLIENT_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}"
 CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev8}"
+CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/vemb_v16_ub_peer_view_112_to_111.yaml}"
+CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
+CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
+AERON_UB_CACHEABLE="${AERON_UB_CACHEABLE:-0}"
 
 DIM="${DIM:-300}"
 MAX_VECTORS="${MAX_VECTORS:-131072}"
 NUM_KEYS="${NUM_KEYS:-100000}"
 KEY_PATTERN="${KEY_PATTERN:-R:R}"
 ZIPF_S="${ZIPF_S:-}"
-RUN_ID="${RUN_ID:-aeron_cross_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-}"
 KEY_PREFIX="${KEY_PREFIX:-item:}"
 
 THREADS="${THREADS:-64}"
@@ -54,6 +58,7 @@ SERVER_FLAME_DURATION="${SERVER_FLAME_DURATION:-25}"
 FREQ="${FREQ:-99}"
 EVENT="${EVENT:-cycles}"
 BUILD="${BUILD:-verify}"
+PROFILE="${PROFILE:-1}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
 REQUIRE_VEMB_THREAD_SAMPLES="${REQUIRE_VEMB_THREAD_SAMPLES:-1}"
 MAX_FOREIGN_CPU_PCT="${MAX_FOREIGN_CPU_PCT:-10}"
@@ -64,9 +69,13 @@ KILL_OPENCODE="${KILL_OPENCODE:-1}"
 KILL_MUTAGEN="${KILL_MUTAGEN:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
+case "$AERON_UB_CACHEABLE" in
+  0) AERON_UB_CACHEABLE_CONFIG=no ;;
+  1) AERON_UB_CACHEABLE_CONFIG=yes ;;
+  *) echo "ERROR: AERON_UB_CACHEABLE must be 0 or 1" >&2; exit 2 ;;
+esac
+
 REMOTE_TMP_ROOT="${REMOTE_TMP_ROOT:-/tmp}"
-REMOTE_RUN_DIR="${REMOTE_RUN_DIR:-$REMOTE_TMP_ROOT/$RUN_ID}"
-LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/$RUN_ID}"
 
 SERVER_PEER="$SSH_USER@$SERVER_NODE"
 CLIENT_PEER="$SSH_USER@$CLIENT_NODE"
@@ -91,26 +100,31 @@ The default is the validated 111 -> 112 setup:
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
   server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
   client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev8
+  peer-view=CLI@112 -> owner 0@111, using examples/vemb_v16_ub_peer_view_112_to_111.yaml
 
 Important environment variables:
   SERVER_NODE CLIENT_NODE SSH_USER SERVER_SSH_PORT CLIENT_SSH_PORT SSH_PORT
   SERVER_ROOT CLIENT_ROOT SERVER_IP PORT
   SERVER_MANIFEST SERVER_REQUEST_UB_PATH SERVER_RESPONSE_UB_PATH SERVER_WARM_UB_PATH
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
+  CLIENT_PEER_VIEW_MANIFEST CLIENT_PEER_VIEW_HOST CLIENT_PEER_VIEW_OWNER_ID
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
   THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES
   PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
-  TEST_TIME SERVER_FLAME_DURATION FREQ EVENT
+  TEST_TIME SERVER_FLAME_DURATION FREQ EVENT PROFILE=0|1
   MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_CPUSET_BUSY_PCT MAX_FOREIGN_RSS_MB
   KILL_OPENCODE=0|1 KILL_MUTAGEN=0|1
-  BUILD=verify|build KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
+  BUILD=verify|build PROFILE=0|1 KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
 
 BUILD=verify requires current O3/LTO/SVE build stamps. BUILD=build force-builds
 the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run. The
 three server-internal batch macros default to BATCH_REQUEST_SIZE and are
 recorded in the server build stamp.
+
+PROFILE=0 runs the same prefill and workload without client/server perf or SVG
+generation. It still captures the server process and CPU-set utilization.
 
 Use KEY_PATTERN=R:R for uniform random reads. Use KEY_PATTERN=Z:Z together
 with a positive ZIPF_S such as 1.0, 1.2, or 1.5 for the documented Zipf hot-key
@@ -157,11 +171,23 @@ is_uint() {
 }
 
 server_ssh() {
-    ssh "${SERVER_SSH_OPTIONS[@]}" "$SERVER_PEER" "$@"
+    ssh "${SERVER_SSH_OPTIONS[@]}" "$SERVER_PEER" "$@" 2>&1 |
+        sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'
 }
 
 client_ssh() {
-    ssh "${CLIENT_SSH_OPTIONS[@]}" "$CLIENT_PEER" "$@"
+    ssh "${CLIENT_SSH_OPTIONS[@]}" "$CLIENT_PEER" "$@" 2>&1 |
+        sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'
+}
+
+server_scp() {
+    scp "${SERVER_SCP_OPTIONS[@]}" "$@" 2>&1 |
+        sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'
+}
+
+client_scp() {
+    scp "${CLIENT_SCP_OPTIONS[@]}" "$@" 2>&1 |
+        sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'
 }
 
 cleanup_server() {
@@ -198,6 +224,8 @@ fi
 
 [ "$BUILD" = verify ] || [ "$BUILD" = build ] ||
     die "BUILD must be verify or build"
+[ "$PROFILE" = 0 ] || [ "$PROFILE" = 1 ] ||
+    die "PROFILE must be 0 or 1"
 [ "$KEEP_SERVER" = 0 ] || [ "$KEEP_SERVER" = 1 ] ||
     die "KEEP_SERVER must be 0 or 1"
 [ "$REQUIRE_VEMB_THREAD_SAMPLES" = 0 ] || [ "$REQUIRE_VEMB_THREAD_SAMPLES" = 1 ] ||
@@ -246,17 +274,28 @@ if [ "$KEY_PATTERN" = Z:Z ]; then
 fi
 
 pattern_label="${KEY_PATTERN//:/}"
+run_distribution=uniform
+case "$KEY_PATTERN" in
+    S:S) run_distribution=sequential ;;
+    Z:Z) run_distribution="zipf${ZIPF_S}" ;;
+esac
 if [ "$KEY_PATTERN" = Z:Z ]; then
     pattern_label="Z${ZIPF_S}"
 fi
+if [ -z "$RUN_ID" ]; then
+    RUN_ID="p${PIO}_s${SNW}_svr${SERVER_CPU_MASK}_${run_distribution}_$(date +%Y%m%d_%H%M%S)"
+fi
+REMOTE_RUN_DIR="${REMOTE_RUN_DIR:-$REMOTE_TMP_ROOT/$RUN_ID}"
+LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/$RUN_ID}"
 run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_l1${L1_ENTRIES}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
 
 mkdir -p "$LOCAL_ROOT/server" "$LOCAL_ROOT/client"
 
 status "cross-node flamegraph run: $RUN_ID"
-status "server=$SERVER_PEER:$SERVER_SSH_PORT:$SERVER_ROOT client=$CLIENT_PEER:$CLIENT_SSH_PORT:$CLIENT_ROOT"
+status "server=$SERVER_PEER:$SERVER_SSH_PORT:$SERVER_ROOT"
+status "client=$CLIENT_PEER:$CLIENT_SSH_PORT:$CLIENT_ROOT"
 status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
-status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD local=$LOCAL_ROOT"
+status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD profile=$PROFILE local=$LOCAL_ROOT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     status "DRY_RUN=1; no SSH, build, benchmark, or perf command was executed"
@@ -427,7 +466,7 @@ server_ssh bash -s -- \
     "$SERVER_ROOT" "$REMOTE_RUN_DIR" "$PORT" "$SERVER_IP" "$SERVER_MANIFEST" \
     "$SERVER_REQUEST_UB_PATH" "$SERVER_RESPONSE_UB_PATH" "$SERVER_WARM_UB_PATH" \
     "$DIM" "$MAX_VECTORS" "$BATCH_REQUEST_SIZE" "$PIO" "$SNW" \
-    "$SERVER_CPU_MASK" <<'REMOTE_SERVER_START'
+    "$SERVER_CPU_MASK" "$AERON_UB_CACHEABLE_CONFIG" <<'REMOTE_SERVER_START'
 set -euo pipefail
 
 root=$1
@@ -444,6 +483,7 @@ batch_size=${11}
 proxy_io_threads=${12}
 supernode_workers=${13}
 cpu_mask=${14}
+ub_cacheable=${15}
 
 mkdir -p "$run"
 pidfile="$run/server.pid"
@@ -471,9 +511,10 @@ setsid -f taskset -c "$cpu_mask" ./src/redis-server \
     --vemb-v16-max-vectors "$max_vectors" \
     --vemb-v16-warm-regions-manifest "$manifest" \
     --vemb-v16-reset-warm-regions yes \
-    --vemb-v16-transport aeron --vemb-v16-aeron-control tcp \
+    --vemb-v16-transport aeron \
     --vemb-v16-aeron-ub-path "$request_path" \
     --vemb-v16-aeron-response-ub-path "$response_path" \
+    --aeron-ub-cacheable "$ub_cacheable" \
     --vemb-v16-proxy-io-threads "$proxy_io_threads" \
     --vemb-v16-supernode-workers "$supernode_workers" \
     --vemb-v16-batch-request-size "$batch_size" \
@@ -498,7 +539,9 @@ status "preflighting client UB paths and prefilling $NUM_KEYS vectors"
 client_ssh bash -s -- \
     "$CLIENT_ROOT" "$REMOTE_RUN_DIR" "$SERVER_IP" "$PORT" "$NUM_KEYS" \
     "$KEY_PREFIX" "$DIM" "$BATCH_REQUEST_SIZE" "$CLIENT_CPU_MASK" \
-    "$CLIENT_REQUEST_UB_PATH" "$CLIENT_RESPONSE_UB_PATH" "$CLIENT_WARM_UB_PATH" <<'REMOTE_PREFILL'
+    "$CLIENT_REQUEST_UB_PATH" "$CLIENT_RESPONSE_UB_PATH" "$CLIENT_WARM_UB_PATH" \
+    "$CLIENT_PEER_VIEW_MANIFEST" "$CLIENT_PEER_VIEW_HOST" "$CLIENT_PEER_VIEW_OWNER_ID" \
+    "$AERON_UB_CACHEABLE" <<'REMOTE_PREFILL'
 set -euo pipefail
 
 root=$1
@@ -512,7 +555,16 @@ batch_size=$8
 cpu_mask=$9
 shift 9
 
-for path in "$@"; do
+request_path=$1
+response_path=$2
+warm_path=$3
+peer_view_manifest=$4
+peer_view_host=$5
+peer_view_owner_id=$6
+ub_cacheable=$7
+export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
+
+for path in "$request_path" "$response_path" "$warm_path"; do
     [ -e "$path" ] || { echo "missing UB path: $path" >&2; exit 1; }
     holders="$(lsof -t "$path" 2>/dev/null || true)"
     [ -z "$holders" ] || {
@@ -520,6 +572,10 @@ for path in "$@"; do
         exit 1
     }
 done
+[ -r "$peer_view_manifest" ] || {
+    echo "missing client peer-view manifest: $peer_view_manifest" >&2
+    exit 1
+}
 
 mkdir -p "$run"
 cd "$root/memtier_benchmark"
@@ -528,7 +584,10 @@ taskset -c "$cpu_mask" ./memtier_benchmark \
     --threads=1 --clients=1 --pipeline="$batch_size" --requests="$keys" \
     --ratio=1:0 --key-prefix="$prefix" --key-minimum=1 --key-maximum="$keys" \
     --key-pattern=S:S --vemb-v16-dim="$dim" \
-    --vemb-v16-transport=aeron-cross-node --hide-histogram \
+    --vemb-v16-transport=aeron \
+    --vemb-v16-ub-peer-view-manifest="$peer_view_manifest" \
+    --vemb-v16-ub-peer-view-client-host="$peer_view_host" \
+    --vemb-v16-ub-peer-view-owner-id="$peer_view_owner_id" --hide-histogram \
     >"$run/prefill.log" 2>&1
 
 ! grep -q 'Connection error' "$run/prefill.log"
@@ -536,10 +595,11 @@ awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/prefill.log"
 REMOTE_PREFILL
 
-status "starting all-TID server perf sampling"
-server_ssh bash -s -- \
-    "$REMOTE_RUN_DIR" "$PIO" "$SNW" \
-    "$SERVER_FLAME_DURATION" "$FREQ" "$EVENT" <<'REMOTE_SERVER_PERF_START'
+if [ "$PROFILE" = 1 ]; then
+    status "starting all-TID server perf sampling"
+    server_ssh bash -s -- \
+        "$REMOTE_RUN_DIR" "$PIO" "$SNW" \
+        "$SERVER_FLAME_DURATION" "$FREQ" "$EVENT" <<'REMOTE_SERVER_PERF_START'
 set -euo pipefail
 
 run=$1
@@ -569,6 +629,9 @@ echo $! >"$run/server.perf.pid"
 printf 'server_pid=%s io_threads=%s sn_threads=%s perf_pid=%s\n' \
     "$pid" "$io" "$sn" "$(cat "$run/server.perf.pid")"
 REMOTE_SERVER_PERF_START
+else
+    status "PROFILE=0; skipping server perf sampling"
+fi
 
 status "starting server CPU-set sampling on $SERVER_CPU_MASK"
 server_ssh bash -s -- \
@@ -628,12 +691,18 @@ REMOTE_SERVER_CPU_START
 
 zipf_s_arg="${ZIPF_S:--}"
 
-status "running CLI workload under perf on $CLIENT_NODE"
+if [ "$PROFILE" = 1 ]; then
+    status "running CLI workload under perf on $CLIENT_NODE:$CLIENT_SSH_PORT"
+else
+    status "running CLI workload without perf on $CLIENT_NODE:$CLIENT_SSH_PORT"
+fi
 client_ssh bash -s -- \
     "$CLIENT_ROOT" "$REMOTE_RUN_DIR" "$SERVER_IP" "$PORT" "$NUM_KEYS" \
     "$KEY_PATTERN" "$zipf_s_arg" "$KEY_PREFIX" "$DIM" "$THREADS" "$CLIENTS" \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" "$TEST_TIME" \
-    "$CLIENT_CPU_MASK" "$FREQ" "$EVENT" "$FLAMEGRAPH_DIR" "$run_label" <<'REMOTE_CLIENT_PERF'
+    "$CLIENT_CPU_MASK" "$FREQ" "$EVENT" "$FLAMEGRAPH_DIR" "$run_label" "$PROFILE" \
+    "$CLIENT_PEER_VIEW_MANIFEST" "$CLIENT_PEER_VIEW_HOST" "$CLIENT_PEER_VIEW_OWNER_ID" \
+    "$AERON_UB_CACHEABLE" <<'REMOTE_CLIENT_PERF'
 set -euo pipefail
 
 root=$1
@@ -660,11 +729,97 @@ freq=${18}
 event=${19}
 flamegraph_dir=${20}
 run_label=${21}
+profile=${22}
+peer_view_manifest=${23}
+peer_view_host=${24}
+peer_view_owner_id=${25}
+ub_cacheable=${26}
+export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
+
+[ "$profile" = 0 ] || [ "$profile" = 1 ] || exit 1
+
+print_client_workload_key_results() {
+    awk '
+function metric(name,    i, pair) {
+    for (i = 1; i <= NF; i++) {
+        if ($i ~ ("^" name "=")) {
+            split($i, pair, "=")
+            return pair[2]
+        }
+    }
+    return ""
+}
+function emit(label, value) {
+    if (value == "")
+        printf "[%s] %s\n", stamp, label
+    else
+        printf "[%s] %s: %s\n", stamp, label, value
+}
+BEGIN {
+    stamp = strftime("%F %T")
+}
+/^Totals[[:space:]]/ {
+    qps = $2
+    avg_lat_ms = $7
+    p50_ms = $8
+    p99_ms = $9
+    have_totals = 1
+}
+/^\[common-core\] cache-summary:/ {
+    cache_enabled = metric("enabled")
+    cache_scope = metric("scope")
+    cache_entries = metric("entries_per_client")
+    immutable_snapshot = metric("immutable_snapshot")
+    have_cache_summary = 1
+}
+/^l1_client_max_rss_kib=/ {
+    split($0, pair, "=")
+    client_max_rss_kib = pair[2]
+    have_rss = 1
+}
+/^\[common-core\] w[0-9]+ done:/ {
+    logical_ops += metric("ops_done")
+    leaders += metric("leaders")
+    followers += metric("followers")
+    unmatched += metric("unmatched")
+    status_ok += metric("status_ok")
+    status_notfound += metric("status_nf")
+    status_err += metric("status_err")
+    materialized_ok += metric("materialized_ok")
+    materialized_fail += metric("materialized_fail")
+}
+END {
+    if (!have_totals || !have_cache_summary || !have_rss || leaders <= 0)
+        exit 1
+    emit("workload key results", "")
+    emit("qps_ops_sec", sprintf("%.6f", qps))
+    emit("avg_lat_ms", sprintf("%.6f", avg_lat_ms))
+    emit("p50_ms", sprintf("%.6f", p50_ms))
+    emit("p99_ms", sprintf("%.6f", p99_ms))
+    emit("logical_ops", sprintf("%.0f", logical_ops))
+    emit("fanout", sprintf("%.6f", (leaders + followers) / leaders))
+    emit("status_ok", sprintf("%.0f", status_ok))
+    emit("status_notfound", sprintf("%.0f", status_notfound))
+    emit("status_err", sprintf("%.0f", status_err))
+    emit("materialized_ok", sprintf("%.0f", materialized_ok))
+    emit("materialized_fail", sprintf("%.0f", materialized_fail))
+    emit("unmatched", sprintf("%.0f", unmatched))
+    emit("cache_entries", cache_entries)
+    emit("cache_enabled", cache_enabled)
+    emit("cache_scope", cache_scope)
+    emit("immutable_snapshot", immutable_snapshot)
+    emit("client_max_rss_kib", client_max_rss_kib)
+}
+' "$1"
+}
 
 mkdir -p "$run"
 [ -x "$root/memtier_benchmark/memtier_benchmark" ] || exit 1
-[ -x "$flamegraph_dir/stackcollapse-perf.pl" ] || exit 1
-[ -x "$flamegraph_dir/flamegraph.pl" ] || exit 1
+if [ "$profile" = 1 ]; then
+    [ -x "$flamegraph_dir/stackcollapse-perf.pl" ] || exit 1
+    [ -x "$flamegraph_dir/flamegraph.pl" ] || exit 1
+fi
+[ -r "$peer_view_manifest" ] || exit 1
 
 zipf_args=()
 if [ "$pattern" = Z:Z ]; then
@@ -696,31 +851,42 @@ timed_workload_cmd='run_timed_workload() {
     return "$status"
 }
 run_timed_workload "$@"'
-perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
-    /bin/bash -c "$timed_workload_cmd" bash "$cpu_mask" ./memtier_benchmark \
-        --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port" \
-        --threads="$threads" --clients="$clients" --pipeline="$pipeline" \
-        --ratio=0:1 --key-minimum=1 --key-maximum="$keys" \
-        --key-pattern="$pattern" --key-prefix="$prefix" --vemb-v16-dim="$dim" \
-        --vemb-v16-handle --vemb-v16-transport=aeron-cross-node \
-        --vemb-v16-batch-request-size="$batch_size" \
-        --vemb-v16-batch-max-delay-us="$max_delay_us" \
-        --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}" \
-        >"$run/client.workload.log" 2>&1
+workload_cmd=(
+    /bin/bash -c "$timed_workload_cmd" bash "$cpu_mask" ./memtier_benchmark
+    --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port"
+    --threads="$threads" --clients="$clients" --pipeline="$pipeline"
+    --ratio=0:1 --key-minimum=1 --key-maximum="$keys"
+    --key-pattern="$pattern" --key-prefix="$prefix" --vemb-v16-dim="$dim"
+    --vemb-v16-handle --vemb-v16-transport=aeron
+    --vemb-v16-ub-peer-view-manifest="$peer_view_manifest"
+    --vemb-v16-ub-peer-view-client-host="$peer_view_host"
+    --vemb-v16-ub-peer-view-owner-id="$peer_view_owner_id"
+    --vemb-v16-batch-request-size="$batch_size"
+    --vemb-v16-batch-max-delay-us="$max_delay_us"
+    --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}"
+)
+if [ "$profile" = 1 ]; then
+    perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
+        "${workload_cmd[@]}" >"$run/client.workload.log" 2>&1
+else
+    "${workload_cmd[@]}" >"$run/client.workload.log" 2>&1
+fi
 
 if grep -q 'Connection error' "$run/client.workload.log"; then
     echo 'ERROR: client workload reported a connection error' >&2
     exit 1
 fi
-grep -q 'all workers joined' "$run/client.workload.log"
-if grep -Eq 'fallback_v1=[1-9]|flush_backpressure=[1-9]|shared_vector_read_failures=[1-9]|status\[.*(nf|err|other)=[1-9]|handle_deref\[.*fail=[1-9]|l1_queue_full_fallbacks=[1-9]|l1_all_pinned=[1-9]|l1_(key|vector)_storage_exhausted=[1-9]|l1_stale_ref=[1-9]' \
+grep -q '^\[common-core\] all workers joined$' "$run/client.workload.log"
+if grep -Eq 'status_(nf|err)=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' \
     "$run/client.workload.log"; then
     echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
     exit 1
 fi
 awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/client.workload.log"
-grep -q '^\[aeron\] l1-summary:' "$run/client.workload.log"
+grep -q '^\[common-core\] cache-summary:' "$run/client.workload.log"
+print_client_workload_key_results "$run/client.workload.log" \
+    >"$run/client.workload.key-results.txt"
 
 rss_kib="$(awk -F= '/^l1_client_max_rss_kib=/ { value=$2 } END { if (value == "") exit 1; print value }' "$run/client.workload.log")"
 awk -v entries="$l1_entries" -v rss_kib="$rss_kib" '
@@ -733,60 +899,32 @@ function metric(name,    i, pair) {
     }
     return "NA"
 }
-BEGIN {
-    OFS = "\t"
-    print "l1_entries\tops_sec\tp99_ms\tl1_hit\tl1_miss\tl1_insert\tl1_evict\tl1_hit_ratio\tl1_vector_bytes\tl1_ub_read_bytes_saved\tlocal_completion_count\tserver_items\tub_read_bytes\tclient_max_rss_kib"
-}
+BEGIN { OFS = "\t"; print "cache_entries\tops_sec\tp99_ms\tcache_enabled\tcache_scope\tclient_max_rss_kib" }
 /^Totals/ {
     ops_sec = $2
-    p99_ms = $7
+    p99_ms = $9
     have_totals = 1
 }
-/^\[aeron\] l1-summary:/ {
-    l1_hit = metric("l1_hit")
-    l1_miss = metric("l1_miss")
-    l1_insert = metric("l1_insert")
-    l1_evict = metric("l1_evict")
-    l1_hit_ratio = metric("l1_hit_ratio")
-    l1_vector_bytes = metric("l1_vector_bytes")
-    l1_ub_read_bytes_saved = metric("l1_ub_read_bytes_saved")
-    local_completion_count = metric("local_completion_count")
-    server_items = metric("server_items")
-    ub_read_bytes = metric("ub_read_bytes")
-    have_l1_summary = 1
+/^\[common-core\] cache-summary:/ {
+    cache_enabled = metric("enabled")
+    cache_scope = metric("scope")
+    have_cache_summary = 1
 }
 END {
-    if (have_totals && have_l1_summary) {
-        print entries, ops_sec, p99_ms, l1_hit, l1_miss, l1_insert, l1_evict, \
-            l1_hit_ratio, l1_vector_bytes, l1_ub_read_bytes_saved, \
-            local_completion_count, server_items, ub_read_bytes, rss_kib
-    }
+    if (have_totals && have_cache_summary)
+        print entries, ops_sec, p99_ms, cache_enabled, cache_scope, rss_kib
 }
 ' "$run/client.workload.log" >"$run/client.l1_summary.tsv"
 awk 'NR == 2 && $1 != "" { found = 1 } END { exit !found }' \
     "$run/client.l1_summary.tsv"
 
-# Keep the benchmark result separate from the L1/resource summary.  The
-# workload's Totals row is the authoritative logical-operation rate; leader
-# and follower counters are exported with the same effective duration so the
-# two rates can be compared without mixing nominal test time and drain time.
+# Totals 是权威逻辑操作速率；common core 的逐 worker 状态用于核对最终完成结果。
 awk -v test_time="$test_time" -v run_label="$run_label" '
 function metric(name,    i, pair) {
     for (i = 1; i <= NF; i++) {
         if ($i ~ ("^" name "=")) {
             split($i, pair, "=")
             return pair[2]
-        }
-    }
-    return 0
-}
-function status_metric(name,    i, token, prefix) {
-    prefix = "status[" name "="
-    for (i = 1; i <= NF; i++) {
-        if (index($i, prefix) == 1) {
-            token = substr($i, length(prefix) + 1)
-            sub(/\].*$/, "", token)
-            return token
         }
     }
     return 0
@@ -804,99 +942,100 @@ BEGIN {
     qps = $2
     hits_sec = $3
     misses_sec = $4
-    avg_lat_ms = $5
-    p50_ms = $6
-    p99_ms = $7
-    p99_9_ms = $8
-    kb_sec = $9
+    moved_sec = $5
+    ask_sec = $6
+    avg_lat_ms = $7
+    p50_ms = $8
+    p99_ms = $9
+    kb_sec = $11
     have_totals = 1
 }
-/^\[aeron\] w[0-9]+ batch-session:/ {
+/^\[common-core\] w[0-9]+ done:/ {
+    logical_ops += metric("ops_done")
     leaders += metric("leaders")
     followers += metric("followers")
-    frames += metric("frames")
-    server_items += metric("unique_items")
-}
-/^\[aeron\] w[0-9]+ done:/ {
-    logical_ops += metric("ops_done")
-    publish_fail += metric("publish_fail")
     unmatched += metric("unmatched")
-    status_ok += status_metric("ok")
-    status_notfound += status_metric("nf")
-    status_err += status_metric("err")
-    status_other += status_metric("other")
+    status_ok += metric("status_ok")
+    status_notfound += metric("status_nf")
+    status_err += metric("status_err")
+    materialized_ok += metric("materialized_ok")
+    materialized_fail += metric("materialized_fail")
 }
 END {
-    if (!have_totals || qps <= 0 || logical_ops <= 0)
+    if (!have_totals || qps <= 0 || logical_ops <= 0 || leaders <= 0)
         exit 1
     duration_sec = logical_ops / qps
-    leader_sec = leaders / duration_sec
-    follower_sec = followers / duration_sec
-    leader_ratio = logical_ops > 0 ? leaders * 100 / logical_ops : 0
     printf "%-32s\t%20s\n", "metric", "value"
     emit("test_time_sec", test_time)
     emitf("effective_duration_sec", "%.6f", duration_sec)
     emitf("logical_ops", "%.0f", logical_ops)
+    emitf("fanout", "%.6f", (leaders + followers) / leaders)
     emitf("qps_ops_sec", "%.6f", qps)
     emitf("hits_sec", "%.6f", hits_sec)
     emitf("misses_sec", "%.6f", misses_sec)
+    emitf("moved_sec", "%.6f", moved_sec)
+    emitf("ask_sec", "%.6f", ask_sec)
     emitf("avg_lat_ms", "%.6f", avg_lat_ms)
     emitf("p50_ms", "%.6f", p50_ms)
     emitf("p99_ms", "%.6f", p99_ms)
-    emitf("p99_9_ms", "%.6f", p99_9_ms)
     emitf("kb_sec", "%.6f", kb_sec)
-    emitf("leaders", "%.0f", leaders)
-    emitf("leader_per_sec", "%.6f", leader_sec)
-    emitf("followers", "%.0f", followers)
-    emitf("follower_per_sec", "%.6f", follower_sec)
-    emitf("leaders_plus_followers", "%.0f", leaders + followers)
-    emitf("leaders_plus_followers_per_sec", "%.6f", leader_sec + follower_sec)
-    emitf("leader_ratio_pct", "%.6f", leader_ratio)
-    emitf("frames", "%.0f", frames)
-    emitf("server_items", "%.0f", server_items)
-    emitf("publish_fail", "%.0f", publish_fail)
     emitf("unmatched", "%.0f", unmatched)
     emitf("status_ok", "%.0f", status_ok)
     emitf("status_notfound", "%.0f", status_notfound)
     emitf("status_err", "%.0f", status_err)
-    emitf("status_other", "%.0f", status_other)
+    emitf("materialized_ok", "%.0f", materialized_ok)
+    emitf("materialized_fail", "%.0f", materialized_fail)
 }
 ' "$run/client.workload.log" >"$run/client.workload.summary.tsv"
 awk 'NR == 2 && $1 != "" { found = 1 } END { exit !found }' \
     "$run/client.workload.summary.tsv"
 
-perf script -i "$run/client.perf.data" >"$run/client.perf.script"
-grep -q '\[kernel.kallsyms\]' "$run/client.perf.script"
-grep -q 'memtier_benchmark' "$run/client.perf.script"
-"$flamegraph_dir/stackcollapse-perf.pl" "$run/client.perf.script" \
-    >"$run/client.collapsed.txt"
-"$flamegraph_dir/flamegraph.pl" \
-    --title "vemb-v16 cross-node cli $run_label" \
-    --subtitle "process user+kernel; client_cpu=${cpu_mask}; event=${event}@${freq}Hz" \
-    "$run/client.collapsed.txt" >"$run/client.svg"
-grep -q 'vemb-v16 cross-node cli' "$run/client.svg"
+if [ "$profile" = 1 ]; then
+    perf script -i "$run/client.perf.data" >"$run/client.perf.script"
+    grep -q '\[kernel.kallsyms\]' "$run/client.perf.script"
+    grep -q 'memtier_benchmark' "$run/client.perf.script"
+    "$flamegraph_dir/stackcollapse-perf.pl" "$run/client.perf.script" \
+        >"$run/client.collapsed.txt"
+    "$flamegraph_dir/flamegraph.pl" \
+        --title "vemb-v16 cross-node cli $run_label" \
+        --subtitle "process user+kernel; client_cpu=${cpu_mask}; event=${event}@${freq}Hz" \
+        "$run/client.collapsed.txt" >"$run/client.svg"
+    grep -q 'vemb-v16 cross-node cli' "$run/client.svg"
+fi
 {
     printf 'host=%s\n' "$(hostname)"
-    printf 'role=client\nmode=process user+kernel\nevent=%s\nfrequency_hz=%s\n' "$event" "$freq"
+    if [ "$profile" = 1 ]; then
+        printf 'role=client\nmode=process user+kernel\nevent=%s\nfrequency_hz=%s\n' "$event" "$freq"
+    else
+        printf 'role=client\nprofile=disabled\n'
+    fi
     printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s l1_entries=%s\n' \
         "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us" "$l1_entries"
     printf 'run_label=%s\n' "$run_label"
     printf 'client_workload_summary=client.workload.summary.tsv\n'
     cat "$root/.vemb_v16_build_stamp.client"
 } >"$run/client.meta.txt"
-tar -C "$run" -czf "$run/client_artifacts.tar.gz" \
-    client.preflight.pidstat.txt client.preflight.cpu-blockers.tsv client.preflight.rss-blockers.tsv client.preflight.cpuset.tsv \
-    prefill.log client.workload.log client.workload.summary.tsv client.l1_summary.tsv client.perf.data client.perf.script \
-    client.collapsed.txt client.svg client.meta.txt
+client_artifacts=(
+    client.preflight.pidstat.txt client.preflight.cpu-blockers.tsv client.preflight.rss-blockers.tsv client.preflight.cpuset.tsv
+    prefill.log client.workload.log client.workload.summary.tsv client.workload.key-results.txt client.l1_summary.tsv client.meta.txt
+)
+if [ "$profile" = 1 ]; then
+    client_artifacts+=(client.perf.data client.perf.script client.collapsed.txt client.svg)
+fi
+tar -C "$run" -czf "$run/client_artifacts.tar.gz" "${client_artifacts[@]}"
 REMOTE_CLIENT_PERF
 
-status "rendering and validating all-TID server flamegraph"
+if [ "$PROFILE" = 1 ]; then
+    status "rendering and validating all-TID server flamegraph"
+else
+    status "finalizing server CPU summaries without perf artifacts"
+fi
 server_ssh bash -s -- \
     "$SERVER_ROOT" "$REMOTE_RUN_DIR" "$FLAMEGRAPH_DIR" "$SERVER_FLAME_DURATION" \
     "$FREQ" "$EVENT" "$NUM_KEYS" "$KEY_PATTERN" "$THREADS" "$CLIENTS" \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" \
     "$PROXY_REQUEST_BATCH" "$PROXY_RESPONSE_BATCH" "$PROXY_QUEUE_BATCH" \
-    "$REQUIRE_VEMB_THREAD_SAMPLES" "$SERVER_CPU_MASK" "$run_label" <<'REMOTE_SERVER_RENDER'
+    "$REQUIRE_VEMB_THREAD_SAMPLES" "$SERVER_CPU_MASK" "$run_label" "$PROFILE" <<'REMOTE_SERVER_RENDER'
 set -euo pipefail
 
 root=$1
@@ -918,6 +1057,9 @@ proxy_queue_batch=${16}
 require_vemb=${17}
 cpu_mask=${18}
 run_label=${19}
+profile=${20}
+
+[ "$profile" = 0 ] || [ "$profile" = 1 ] || exit 1
 
 mpstat_pid="$(cat "$run/server.cpu.mpstat.pid")"
 for _ in $(seq 1 100); do
@@ -1014,44 +1156,50 @@ process_window_s="$(awk -F '\t' '$1 == "window" { print $2 }' "$run/server.cpu.p
     }' "$run/server.cpu.cpuset.summary.tsv"
 } >"$run/server.cpu.summary.txt"
 
-perf_pid="$(cat "$run/server.perf.pid")"
-for _ in $(seq 1 100); do
-    kill -0 "$perf_pid" 2>/dev/null || break
-    sleep 0.1
-done
-! kill -0 "$perf_pid" 2>/dev/null || {
-    echo "server perf is still running" >&2
-    exit 1
-}
+if [ "$profile" = 1 ]; then
+    perf_pid="$(cat "$run/server.perf.pid")"
+    for _ in $(seq 1 100); do
+        kill -0 "$perf_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    ! kill -0 "$perf_pid" 2>/dev/null || {
+        echo "server perf is still running" >&2
+        exit 1
+    }
 
-[ -x "$flamegraph_dir/stackcollapse-perf.pl" ] || exit 1
-[ -x "$flamegraph_dir/flamegraph.pl" ] || exit 1
-perf script -i "$run/server.perf.data" >"$run/server.perf.script"
-grep -q '\[kernel.kallsyms\]' "$run/server.perf.script"
-grep -q 'redis-server' "$run/server.perf.script"
-if [ "$require_vemb" = 1 ]; then
-    grep -q '^vemb-sn-' "$run/server.perf.script"
-    grep -q 'supernode_pool_thread_main' "$run/server.perf.script"
-    grep -q 'proxy_io_pool_thread_main' "$run/server.perf.script"
-fi
-"$flamegraph_dir/stackcollapse-perf.pl" "$run/server.perf.script" \
-    >"$run/server.collapsed.txt"
-awk '{ sub(/^[^;]+;/, "all;redis-server;"); print }' \
-    "$run/server.collapsed.txt" >"$run/server.process.collapsed.txt"
-"$flamegraph_dir/flamegraph.pl" \
-    --title "vemb-v16 cross-node server $run_label" \
-    --subtitle "all server TIDs user+kernel; server_cpu=${cpu_mask}; event=${event}@${freq}Hz" \
-    "$run/server.process.collapsed.txt" >"$run/server.svg"
-grep -q 'vemb-v16 cross-node server' "$run/server.svg"
-if [ "$require_vemb" = 1 ]; then
-    grep -q 'supernode_pool_thread_main' "$run/server.svg"
-    grep -q 'proxy_io_pool_thread_main' "$run/server.svg"
+    [ -x "$flamegraph_dir/stackcollapse-perf.pl" ] || exit 1
+    [ -x "$flamegraph_dir/flamegraph.pl" ] || exit 1
+    perf script -i "$run/server.perf.data" >"$run/server.perf.script"
+    grep -q '\[kernel.kallsyms\]' "$run/server.perf.script"
+    grep -q 'redis-server' "$run/server.perf.script"
+    if [ "$require_vemb" = 1 ]; then
+        grep -q '^vemb-sn-' "$run/server.perf.script"
+        grep -q 'supernode_pool_thread_main' "$run/server.perf.script"
+        grep -q 'proxy_io_pool_thread_main' "$run/server.perf.script"
+    fi
+    "$flamegraph_dir/stackcollapse-perf.pl" "$run/server.perf.script" \
+        >"$run/server.collapsed.txt"
+    awk '{ sub(/^[^;]+;/, "all;redis-server;"); print }' \
+        "$run/server.collapsed.txt" >"$run/server.process.collapsed.txt"
+    "$flamegraph_dir/flamegraph.pl" \
+        --title "vemb-v16 cross-node server $run_label" \
+        --subtitle "all server TIDs user+kernel; server_cpu=${cpu_mask}; event=${event}@${freq}Hz" \
+        "$run/server.process.collapsed.txt" >"$run/server.svg"
+    grep -q 'vemb-v16 cross-node server' "$run/server.svg"
+    if [ "$require_vemb" = 1 ]; then
+        grep -q 'supernode_pool_thread_main' "$run/server.svg"
+        grep -q 'proxy_io_pool_thread_main' "$run/server.svg"
+    fi
 fi
 ! grep -q 'vemb_v16 handle miss' "$run/server.log"
 {
     printf 'host=%s\n' "$(hostname)"
-    printf 'role=server\nmode=all redis-server TIDs user+kernel\nevent=%s\nfrequency_hz=%s\nduration_s=%s\n' \
-        "$event" "$freq" "$duration"
+    if [ "$profile" = 1 ]; then
+        printf 'role=server\nmode=all redis-server TIDs user+kernel\nevent=%s\nfrequency_hz=%s\nduration_s=%s\n' \
+            "$event" "$freq" "$duration"
+    else
+        printf 'role=server\nprofile=disabled\n'
+    fi
     printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s\n' \
         "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us"
     printf 'server_internal_batches=request=%s response=%s queue=%s supernode=%s\n' \
@@ -1061,34 +1209,42 @@ fi
     printf 'server_process_cpu_tsv=server.cpu.process.tsv\n'
     printf 'server_cpuset_cpu_tsv=server.cpu.cpuset.summary.tsv\n'
     printf 'server_cpu_summary=server.cpu.summary.txt\n'
-    printf 'vemb_sn_comm_samples=%s\n' "$(grep -c '^vemb-sn-' "$run/server.perf.script" || true)"
-    printf 'supernode_entry_samples=%s\n' "$(grep -c 'supernode_pool_thread_main' "$run/server.perf.script" || true)"
-    printf 'proxy_entry_samples=%s\n' "$(grep -c 'proxy_io_pool_thread_main' "$run/server.perf.script" || true)"
+    if [ "$profile" = 1 ]; then
+        printf 'vemb_sn_comm_samples=%s\n' "$(grep -c '^vemb-sn-' "$run/server.perf.script" || true)"
+        printf 'supernode_entry_samples=%s\n' "$(grep -c 'supernode_pool_thread_main' "$run/server.perf.script" || true)"
+        printf 'proxy_entry_samples=%s\n' "$(grep -c 'proxy_io_pool_thread_main' "$run/server.perf.script" || true)"
+    fi
     cat "$root/.vemb_v16_build_stamp.server"
 } >"$run/server.meta.txt"
-tar -C "$run" -czf "$run/server_artifacts.tar.gz" \
-    server.preflight.pidstat.txt server.preflight.cpu-blockers.tsv server.preflight.rss-blockers.tsv server.preflight.cpuset.tsv \
-    server.pid server.log server.threads.txt server.perf.log server.perf.data \
-    server.perf.script server.collapsed.txt server.process.collapsed.txt server.svg server.meta.txt \
-    server.cpu.process.start server.cpu.process.tsv server.cpu.cpuset.mpstat.txt \
+server_artifacts=(
+    server.preflight.pidstat.txt server.preflight.cpu-blockers.tsv server.preflight.rss-blockers.tsv server.preflight.cpuset.tsv
+    server.pid server.log server.meta.txt server.cpu.process.start server.cpu.process.tsv server.cpu.cpuset.mpstat.txt
     server.cpu.process.sampler.log server.cpu.cpuset.summary.tsv server.cpu.summary.txt
+)
+if [ "$profile" = 1 ]; then
+    server_artifacts+=(server.threads.txt server.perf.log server.perf.data server.perf.script server.collapsed.txt server.process.collapsed.txt server.svg)
+fi
+tar -C "$run" -czf "$run/server_artifacts.tar.gz" "${server_artifacts[@]}"
 REMOTE_SERVER_RENDER
 
 status "pulling complete remote artifacts"
-scp "${SERVER_SCP_OPTIONS[@]}" \
+server_scp \
     "$SERVER_PEER:$REMOTE_RUN_DIR/server_artifacts.tar.gz" \
     "$LOCAL_ROOT/server/"
-scp "${CLIENT_SCP_OPTIONS[@]}" \
+client_scp \
     "$CLIENT_PEER:$REMOTE_RUN_DIR/client_artifacts.tar.gz" \
     "$LOCAL_ROOT/client/"
 tar -xzf "$LOCAL_ROOT/server/server_artifacts.tar.gz" -C "$LOCAL_ROOT/server"
 tar -xzf "$LOCAL_ROOT/client/client_artifacts.tar.gz" -C "$LOCAL_ROOT/client"
 
-test -s "$LOCAL_ROOT/server/server.svg"
-test -s "$LOCAL_ROOT/client/client.svg"
-test -s "$LOCAL_ROOT/server/server.perf.data"
-test -s "$LOCAL_ROOT/client/client.perf.data"
+if [ "$PROFILE" = 1 ]; then
+    test -s "$LOCAL_ROOT/server/server.svg"
+    test -s "$LOCAL_ROOT/client/client.svg"
+    test -s "$LOCAL_ROOT/server/server.perf.data"
+    test -s "$LOCAL_ROOT/client/client.perf.data"
+fi
 test -s "$LOCAL_ROOT/client/client.workload.summary.tsv"
+test -s "$LOCAL_ROOT/client/client.workload.key-results.txt"
 test -s "$LOCAL_ROOT/server/server.cpu.process.tsv"
 test -s "$LOCAL_ROOT/server/server.cpu.cpuset.summary.tsv"
 test -s "$LOCAL_ROOT/server/server.cpu.summary.txt"
@@ -1099,10 +1255,59 @@ else
     local_display="$LOCAL_ROOT"
 fi
 status "complete: $local_display"
-printf 'server SVG: %s/server/server.svg\n' "$local_display"
-printf 'client SVG: %s/client/client.svg\n' "$local_display"
-printf 'server raw: %s/server/server.perf.data\n' "$local_display"
-printf 'client raw: %s/client/client.perf.data\n' "$local_display"
+read -r cpu_user cpu_sys cpu_si cpu_total < <(
+    awk -F '\t' '
+    $1 == "usr" { user = $3 }
+    $1 == "sys" { sys = $3 }
+    $1 == "soft" { si = $3 }
+    $1 == "total" { total = $3 }
+    END {
+        if (user == "" || sys == "" || si == "" || total == "")
+            exit 1
+        print user, sys, si, total
+    }' "$LOCAL_ROOT/server/server.cpu.cpuset.summary.tsv")
+redis_process_cpu_total="$(awk -F '\t' '
+    $1 == "total" { value = $3 }
+    END { if (value == "") exit 1; print value }' \
+    "$LOCAL_ROOT/server/server.cpu.process.tsv")"
+key_results_stamp="$(date '+%F %T')"
+single_core_qps="$(awk -v redis_process_cpu_total="$redis_process_cpu_total" -v cpu_si="$cpu_si" '
+    $1 == "qps_ops_sec" {
+        denominator = redis_process_cpu_total + cpu_si
+        if (denominator <= 0)
+            exit 1
+        printf "%.6f", $2 / denominator
+        found = 1
+    }
+    END { exit !found }' "$LOCAL_ROOT/client/client.workload.summary.tsv")"
+key_results_tmp="$LOCAL_ROOT/client/client.workload.key-results.txt.tmp"
+awk -v stamp="$key_results_stamp" -v qps="$single_core_qps" '
+    { print }
+    / qps_ops_sec: / {
+        printf "[%s] single_core_qps: %s\n", stamp, qps
+        inserted = 1
+    }
+    END { exit !inserted }' "$LOCAL_ROOT/client/client.workload.key-results.txt" \
+    >"$key_results_tmp"
+mv "$key_results_tmp" "$LOCAL_ROOT/client/client.workload.key-results.txt"
+printf '[%s] cpu_user: %s core_equiv\n' "$key_results_stamp" "$cpu_user" \
+    >>"$LOCAL_ROOT/client/client.workload.key-results.txt"
+printf '[%s] cpu_sys: %s core_equiv\n' "$key_results_stamp" "$cpu_sys" \
+    >>"$LOCAL_ROOT/client/client.workload.key-results.txt"
+printf '[%s] cpu_si: %s core_equiv\n' "$key_results_stamp" "$cpu_si" \
+    >>"$LOCAL_ROOT/client/client.workload.key-results.txt"
+printf '[%s] cpu_total: %s core_equiv\n' "$key_results_stamp" "$cpu_total" \
+    >>"$LOCAL_ROOT/client/client.workload.key-results.txt"
+cat "$LOCAL_ROOT/client/client.workload.key-results.txt"
+printf '\n'
+if [ "$PROFILE" = 1 ]; then
+    printf 'server SVG: %s/server/server.svg\n' "$local_display"
+    printf 'client SVG: %s/client/client.svg\n' "$local_display"
+    printf 'server raw: %s/server/server.perf.data\n' "$local_display"
+    printf 'client raw: %s/client/client.perf.data\n' "$local_display"
+else
+    printf 'perf/SVG: disabled (PROFILE=0)\n'
+fi
 printf 'client workload: %s/client/client.workload.summary.tsv\n' "$local_display"
 printf 'server CPU: %s/server/server.cpu.process.tsv\n' "$local_display"
 printf 'server CPU set: %s/server/server.cpu.cpuset.summary.tsv\n' "$local_display"

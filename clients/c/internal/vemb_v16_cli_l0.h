@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "../vemb_v16_owner_session.h"
 #include "../../../src/vemb_v16_aeron_attach.h"
 #include "../../../src/vemb_v16_protocol.h"
 
@@ -50,6 +51,8 @@ typedef struct vemb_v16_cli_l0_batch_draft {
     uint32_t channel_index;
     uint32_t item_count;
     uint32_t oversized_entry_id;
+    /* Every v2 frame is homogeneous in the core-selected route identity. */
+    vemb_v16_owner_session_identity_t identity;
     uint32_t entry_ids[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
     const char *keys[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
     uint16_t key_lens[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
@@ -81,6 +84,16 @@ int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
                             uint64_t caller_cookie,
                             uint32_t *out_entry_id,
                             uint32_t *out_channel_index);
+
+/* Identity-aware form used by owner sessions after common-core routing. Two
+ * equal keys only coalesce when their owner, topology epoch and owner channel
+ * generation are identical. The legacy form above supplies an all-zero
+ * identity for existing single-endpoint callers. */
+int vemb_v16_cli_l0_submit_with_identity(
+    vemb_v16_cli_l0_t *l0, const char *final_key, uint16_t key_len,
+    uint64_t hash, uint64_t caller_cookie,
+    const vemb_v16_owner_session_identity_t *identity,
+    uint32_t *out_entry_id, uint32_t *out_channel_index);
 
 /* Builds a prefix of the pending queue that fits both limits. A nonzero
  * oversized_entry_id means the queue head cannot fit even as a one-item
@@ -133,9 +146,24 @@ int vemb_v16_cli_l0_mark_fallback_v1(vemb_v16_cli_l0_t *l0,
 int vemb_v16_cli_l0_get_group(vemb_v16_cli_l0_t *l0, uint32_t entry_id,
                                const char **out_key, uint16_t *out_key_len,
                                uint32_t *out_generation, uint8_t *out_state);
+void vemb_v16_cli_l0_get_group_identity(
+    const vemb_v16_cli_l0_t *l0, uint32_t entry_id,
+    vemb_v16_owner_session_identity_t *out);
+int vemb_v16_cli_l0_get_batch_identity(
+    const vemb_v16_cli_l0_t *l0, uint32_t channel_index, uint64_t batch_id,
+    vemb_v16_owner_session_identity_t *out);
+uint32_t vemb_v16_cli_l0_batch_item_count(
+    const vemb_v16_cli_l0_t *l0, uint32_t channel_index,
+    uint64_t batch_id);
 uint32_t vemb_v16_cli_l0_group_fanout_count(
     const vemb_v16_cli_l0_t *l0,
     const vemb_v16_cli_l0_completion_t *completion);
+
+/* Removes every group that has not reached a v2 publish record and fans out
+ * its cookies. Published groups remain owned by their batch records and must
+ * be resolved from the response path before the owner session can drain. */
+void vemb_v16_cli_l0_drain_pending(vemb_v16_cli_l0_t *l0,
+                                   vemb_v16_cli_l0_fanout_cb cb, void *priv);
 
 /* Finishes every group with the supplied callback. Used only after submit
  * has stopped, such as channel teardown. */

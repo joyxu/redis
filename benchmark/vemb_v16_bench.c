@@ -1,10 +1,17 @@
 #define _GNU_SOURCE
 
+/*
+ * Deprecated compatibility harness. Keep it for focused protocol smoke tests;
+ * all VEMB performance scripts must use memtier against redis-server.
+ */
+
 #include "../src/vemb_v16_client_topology.h"
 #include "../src/vemb_v16_aeron_attach.h"
 #include "../src/vemb_v16_client_ring.h"
 #include "../src/vemb_v16_net.h"
 #include "../src/vemb_v16_protocol.h"
+#include "../clients/c/vemb_v16_client_sdk.h"
+#include "../clients/c/vemb_v16_ub_peer_view.h"
 #include "../src/zmalloc.h"
 
 #include <errno.h>
@@ -22,7 +29,6 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -36,9 +42,7 @@ typedef struct bench_hash_node {
 } bench_hash_node_t;
 
 typedef struct bench_cfg {
-    const char *socket_path;
     const char *tcp_host;
-    char socket_paths[VEMB_V16_BENCH_MAX_NODES][VEMB_V16_BENCH_PATH_MAX];
     char tcp_hosts[VEMB_V16_BENCH_MAX_NODES][VEMB_V16_BENCH_PATH_MAX];
     uint16_t tcp_ports[VEMB_V16_BENCH_MAX_NODES];
     uint32_t node_count;
@@ -54,16 +58,21 @@ typedef struct bench_cfg {
     int mode;
     int hot_key_enabled;
     uint32_t hot_key_id;
+    int random_key_pattern;
     uint32_t timeout_ms;
     int pin_threads;
     uint32_t pipeline;
     uint32_t transport_type;
-    int aeron_control_tcp;
     uint16_t tcp_port;
     int vsim_key2_owner;
     int client_topology_enabled;
     int client_topology_valid;
     vemb_v16_client_topology_t client_topology;
+    const char *ub_peer_view_manifest_path;
+    const char *ub_peer_view_client_host;
+    uint32_t ub_peer_view_owner_id;
+    int ub_peer_view_ready;
+    vemb_v16_ub_peer_view_manifest_t ub_peer_view_manifest;
 } bench_cfg_t;
 
 typedef struct bench_region_map {
@@ -81,16 +90,22 @@ typedef struct bench_region_map {
 typedef struct bench_node_channel {
     vemb_v16_channel_desc_t desc;
     vemb_v16_client_ring_t *req_ring;
+    void *req_ring_mapping;
+    size_t req_ring_mapping_bytes;
     vemb_v16_client_ring_t *resp_ring;
+    void *resp_ring_mapping;
+    size_t resp_ring_mapping_bytes;
     int net_fd;
     uint32_t transport_type;
-    int control_tcp;
     const char *tcp_host;
     uint16_t tcp_port;
     uint32_t timeout_ms;
     bench_region_map_t warm_region;
     uint32_t warm_region_count;
     bench_region_map_t warm_regions[VEMB_V16_MAX_DESC_WARM_REGIONS];
+    vemb_v16_ub_peer_view_mapping_t request_peer_view;
+    vemb_v16_ub_peer_view_mapping_t response_peer_view;
+    vemb_v16_ub_peer_view_mapping_t warm_peer_view;
 } bench_node_channel_t;
 
 typedef struct worker_arg {
@@ -106,6 +121,9 @@ typedef struct worker_arg {
     uint64_t vsim_sent;
     uint64_t dual_write_sent;
     uint64_t stale_topology_refreshes;
+    uint64_t ask_redirects;
+    uint64_t moved_redirects;
+    uint64_t topology_refresh_calls;
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
     double score_sum;
@@ -130,8 +148,6 @@ enum {
     VSIM_KEY2_OWNER_REMOTE = 1,
 };
 
-static uint32_t g_control_timeout_ms = 10000;
-
 typedef struct pending_req {
     uint32_t op_index;
     uint32_t req_id;
@@ -142,12 +158,17 @@ typedef struct pending_req {
 } pending_req_t;
 
 static const char *mode_name(int mode);
-static void close_node_channel(const char *socket_path,
-                               bench_node_channel_t *node);
+static void close_node_channel(bench_node_channel_t *node);
 static int setup_node_channel(const bench_cfg_t *cfg,
                               uint32_t node_index,
                               int open_region,
                               bench_node_channel_t *node);
+static void print_stats_delta_node(uint32_t node_index,
+                                   const vemb_v16_stats_t *before,
+                                   const vemb_v16_stats_t *after);
+static int fetch_stats_for_node(const bench_cfg_t *cfg,
+                                uint32_t node_index,
+                                vemb_v16_stats_t *stats);
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -158,16 +179,6 @@ static uint64_t now_ns(void) {
 static int wait_timed_out(uint64_t start_ns, uint32_t timeout_ms) {
     if (timeout_ms == 0) return 0;
     return now_ns() - start_ns >= (uint64_t)timeout_ms * 1000000ULL;
-}
-
-static void set_fd_timeout(int fd) {
-    if (g_control_timeout_ms == 0) return;
-    struct timeval tv = {
-        .tv_sec = (time_t)(g_control_timeout_ms / 1000),
-        .tv_usec = (suseconds_t)((g_control_timeout_ms % 1000) * 1000),
-    };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 static int read_full(int fd, void *buf, size_t n) {
@@ -190,21 +201,6 @@ static int write_full(int fd, const void *buf, size_t n) {
     return 0;
 }
 
-static int connect_uds(const char *path) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    set_fd_timeout(fd);
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 static const char *tcp_host_for_node(const bench_cfg_t *cfg,
                                      uint32_t node_index);
 static uint16_t tcp_port_for_node(const bench_cfg_t *cfg,
@@ -225,58 +221,13 @@ static int aeron_attach_client_exchange(
     return 0;
 }
 
-/* The server returns its UB device view in ATTACH. On the paired client
- * node, server devices 1-4 are exposed as devices 5-8. Keep this mapping in
- * the client, alongside the SDK's cross-node path mapping. */
-static int map_remote_ub_path(const char *server_path,
-                              char *client_path,
-                              size_t client_path_cap) {
-    if (!server_path || !server_path[0] ||
-        !client_path || client_path_cap == 0)
-        return -1;
-    size_t source_len = strnlen(server_path, client_path_cap);
-    if (source_len >= client_path_cap)
-        return -1;
-    const char *marker = strstr(server_path, "obmm_shmdev");
-    if (!marker) {
-        memcpy(client_path, server_path, source_len + 1);
-        return 0;
-    }
-    const char *digits = marker + strlen("obmm_shmdev");
-    char *end = NULL;
-    unsigned long device_id = strtoul(digits, &end, 10);
-    if (end == digits || *end != '\0' || device_id < 1u || device_id > 4u) {
-        memcpy(client_path, server_path, source_len + 1);
-        return 0;
-    }
-    size_t prefix_len = (size_t)(digits - server_path);
-    int written = snprintf(client_path, client_path_cap, "%.*s%lu",
-                           (int)prefix_len, server_path, device_id + 4u);
-    return written >= 0 && (size_t)written < client_path_cap ? 0 : -1;
-}
-
-static int alloc_channel(const bench_cfg_t *cfg, vemb_v16_channel_desc_t *desc) {
-    int fd = connect_uds(cfg->socket_path);
-    if (fd < 0) return -1;
-    uint8_t op = VEMB_V16_CTRL_ALLOC_CHANNEL;
-    vemb_v16_alloc_req_t req = {.vector_dim = cfg->dim};
-    uint8_t status = VEMB_V16_STATUS_ERR;
-    if (write_full(fd, &op, sizeof(op)) != 0 ||
-        write_full(fd, &req, sizeof(req)) != 0 ||
-        read_full(fd, &status, sizeof(status)) != 0 ||
-        status != VEMB_V16_STATUS_OK ||
-        read_full(fd, desc, sizeof(*desc)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
 static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
                                    uint32_t node_index,
                                    int remote_path,
-                                   vemb_v16_channel_desc_t *desc) {
+                                   vemb_v16_channel_desc_t *desc,
+                                   vemb_v16_ub_peer_view_mapping_t *request_view,
+                                   vemb_v16_ub_peer_view_mapping_t *response_view,
+                                   vemb_v16_ub_peer_view_mapping_t *warm_view) {
     int fd = vemb_v16_net_connect(tcp_host_for_node(cfg, node_index),
                                   tcp_port_for_node(cfg, node_index),
                                   cfg->timeout_ms);
@@ -312,13 +263,22 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
     char client_request_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     char client_response_shmdev_path[VEMB_V16_AERON_SHMDEV_PATH_MAX];
     if (remote_path) {
-        if (map_remote_ub_path(resp.request_shmdev_path,
-                               client_request_shmdev_path,
-                               sizeof(client_request_shmdev_path)) != 0 ||
-            map_remote_ub_path(resp.response_shmdev_path,
-                               client_response_shmdev_path,
-                               sizeof(client_response_shmdev_path)) != 0)
+        if (!cfg->ub_peer_view_ready ||
+            vemb_v16_ub_peer_view_manifest_resolve(
+                &cfg->ub_peer_view_manifest, cfg->ub_peer_view_client_host,
+                cfg->ub_peer_view_owner_id,
+                VEMB_V16_UB_PEER_VIEW_V1_REQUEST_RING,
+                resp.request_shmdev_path, 0, request_view) != 0 ||
+            vemb_v16_ub_peer_view_manifest_resolve(
+                &cfg->ub_peer_view_manifest, cfg->ub_peer_view_client_host,
+                cfg->ub_peer_view_owner_id,
+                VEMB_V16_UB_PEER_VIEW_V1_RESPONSE_RING,
+                resp.response_shmdev_path, 0, response_view) != 0)
             return -1;
+        memcpy(client_request_shmdev_path, request_view->client_path,
+               sizeof(client_request_shmdev_path));
+        memcpy(client_response_shmdev_path, response_view->client_path,
+               sizeof(client_response_shmdev_path));
     } else {
         strncpy(client_request_shmdev_path, resp.request_shmdev_path,
                 sizeof(client_request_shmdev_path) - 1);
@@ -357,9 +317,14 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
         resp.warm_path[0] != '\0';
     if (warm_path_ok && remote_path &&
         resp.warm_backend_type == VEMB_V16_REGION_UB) {
-        warm_path_ok = map_remote_ub_path(resp.warm_path,
-                                          client_warm_path,
-                                          sizeof(client_warm_path)) == 0;
+        warm_path_ok = cfg->ub_peer_view_ready &&
+            vemb_v16_ub_peer_view_manifest_resolve(
+                &cfg->ub_peer_view_manifest, cfg->ub_peer_view_client_host,
+                cfg->ub_peer_view_owner_id, VEMB_V16_UB_PEER_VIEW_WARM_REGION,
+                resp.warm_path, 0, warm_view) == 0;
+        if (warm_path_ok)
+            memcpy(client_warm_path, warm_view->client_path,
+                   sizeof(client_warm_path));
     } else if (warm_path_ok) {
         strncpy(client_warm_path, resp.warm_path,
                 sizeof(client_warm_path) - 1);
@@ -376,14 +341,6 @@ static int alloc_aeron_channel_tcp(const bench_cfg_t *cfg,
                 sizeof(desc->warm_regions[0].path) - 1);
     }
     return 0;
-}
-
-static int alloc_channel_path(const char *socket_path,
-                              const bench_cfg_t *cfg,
-                              vemb_v16_channel_desc_t *desc) {
-    bench_cfg_t node_cfg = *cfg;
-    node_cfg.socket_path = socket_path;
-    return alloc_channel(&node_cfg, desc);
 }
 
 static const char *tcp_host_for_node(const bench_cfg_t *cfg,
@@ -546,60 +503,6 @@ static int close_all_channels_tcp(const bench_cfg_t *cfg,
     return 0;
 }
 
-static int fetch_stats(const char *socket_path, vemb_v16_stats_t *stats) {
-    int fd = connect_uds(socket_path);
-    if (fd < 0) return -1;
-    uint8_t op = VEMB_V16_CTRL_STATS;
-    uint8_t status = VEMB_V16_STATUS_ERR;
-    if (write_full(fd, &op, sizeof(op)) != 0 ||
-        read_full(fd, &status, sizeof(status)) != 0 ||
-        status != VEMB_V16_STATUS_OK ||
-        read_full(fd, stats, sizeof(*stats)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
-static int close_channel(const char *socket_path, uint64_t channel_id) {
-    int fd = connect_uds(socket_path);
-    if (fd < 0) return -1;
-    uint8_t op = VEMB_V16_CTRL_CLOSE_CHANNEL;
-    uint8_t status = VEMB_V16_STATUS_ERR;
-    if (write_full(fd, &op, sizeof(op)) != 0 ||
-        write_full(fd, &channel_id, sizeof(channel_id)) != 0 ||
-        read_full(fd, &status, sizeof(status)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return status == VEMB_V16_STATUS_OK ? 0 : -1;
-}
-
-static int close_channel_path(const char *socket_path, uint64_t channel_id) {
-    bench_cfg_t cfg = {.socket_path = socket_path};
-    return close_channel(cfg.socket_path, channel_id);
-}
-
-static int close_all_channels(const char *socket_path, uint64_t *closed) {
-    int fd = connect_uds(socket_path);
-    if (fd < 0) return -1;
-    uint8_t op = VEMB_V16_CTRL_CLOSE_ALL_CHANNELS;
-    uint8_t status = VEMB_V16_STATUS_ERR;
-    uint64_t n = 0;
-    if (write_full(fd, &op, sizeof(op)) != 0 ||
-        read_full(fd, &status, sizeof(status)) != 0 ||
-        status != VEMB_V16_STATUS_OK ||
-        read_full(fd, &n, sizeof(n)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    if (closed) *closed = n;
-    return 0;
-}
-
 static int client_topology_owners_fit_nodes(const bench_cfg_t *cfg) {
     const vemb_v16_client_topology_t *topology = &cfg->client_topology;
     for (uint32_t i = 0; i < topology->active_ring.owner_count; i++) {
@@ -623,41 +526,21 @@ static int apply_client_topology_endpoints(bench_cfg_t *cfg) {
         uint32_t owner = endpoint->owner_id;
         if (owner >= VEMB_V16_BENCH_MAX_NODES)
             return -1;
-        if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
-            if (endpoint->transport_type != VEMB_V16_TRANSPORT_TCP ||
-                endpoint->host[0] == '\0' ||
-                endpoint->tcp_port == 0) {
-                return -1;
-            }
-            strncpy(cfg->tcp_hosts[owner],
-                    endpoint->host,
-                    sizeof(cfg->tcp_hosts[owner]) - 1);
-            cfg->tcp_hosts[owner][sizeof(cfg->tcp_hosts[owner]) - 1] = '\0';
-            cfg->tcp_ports[owner] = endpoint->tcp_port;
-        } else {
-            if (endpoint->transport_type != VEMB_V16_TRANSPORT_AERON ||
-                (cfg->aeron_control_tcp &&
-                 (endpoint->host[0] == '\0' || endpoint->tcp_port == 0)) ||
-                (!cfg->aeron_control_tcp && endpoint->uds_path[0] == '\0')) {
-                return -1;
-            }
-            if (cfg->aeron_control_tcp) {
-                strncpy(cfg->tcp_hosts[owner], endpoint->host,
-                        sizeof(cfg->tcp_hosts[owner]) - 1);
-                cfg->tcp_hosts[owner][sizeof(cfg->tcp_hosts[owner]) - 1] = '\0';
-                cfg->tcp_ports[owner] = endpoint->tcp_port;
-            } else {
-                strncpy(cfg->socket_paths[owner], endpoint->uds_path,
-                        sizeof(cfg->socket_paths[owner]) - 1);
-                cfg->socket_paths[owner][sizeof(cfg->socket_paths[owner]) - 1] =
-                    '\0';
-            }
+        if ((cfg->transport_type == VEMB_V16_TRANSPORT_TCP &&
+             endpoint->transport_type != VEMB_V16_TRANSPORT_TCP) ||
+            (cfg->transport_type == VEMB_V16_TRANSPORT_AERON &&
+             endpoint->transport_type != VEMB_V16_TRANSPORT_AERON) ||
+            endpoint->host[0] == '\0' || endpoint->tcp_port == 0) {
+            return -1;
         }
+        strncpy(cfg->tcp_hosts[owner], endpoint->host,
+                sizeof(cfg->tcp_hosts[owner]) - 1);
+        cfg->tcp_hosts[owner][sizeof(cfg->tcp_hosts[owner]) - 1] = '\0';
+        cfg->tcp_ports[owner] = endpoint->tcp_port;
         if (owner + 1 > cfg->node_count)
             cfg->node_count = owner + 1;
     }
     if (cfg->node_count > 0) {
-        cfg->socket_path = cfg->socket_paths[0];
         cfg->tcp_host = cfg->tcp_hosts[0];
         cfg->tcp_port = cfg->tcp_ports[0];
     }
@@ -669,32 +552,9 @@ static int refresh_client_topology(bench_cfg_t *cfg) {
         return 0;
     vemb_v16_topology_control_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int rc;
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        rc = vemb_v16_client_topology_fetch_tcp(tcp_host_for_node(cfg, 0),
-                                                tcp_port_for_node(cfg, 0),
-                                                cfg->timeout_ms,
-                                                &cfg->client_topology,
-                                                &resp);
-    } else {
-        if (cfg->aeron_control_tcp) {
-            rc = vemb_v16_client_topology_fetch_tcp(
-                tcp_host_for_node(cfg, 0),
-                tcp_port_for_node(cfg, 0),
-                cfg->timeout_ms,
-                &cfg->client_topology,
-                &resp);
-            goto topology_fetched;
-        }
-        int fd = connect_uds(cfg->socket_paths[0]);
-        if (fd < 0)
-            return -1;
-        rc = vemb_v16_client_topology_fetch_uds_fd(fd,
-                                                   &cfg->client_topology,
-                                                   &resp);
-        close(fd);
-    }
-topology_fetched:
+    int rc = vemb_v16_client_topology_fetch_tcp(
+        tcp_host_for_node(cfg, 0), tcp_port_for_node(cfg, 0),
+        cfg->timeout_ms, &cfg->client_topology, &resp);
     if (rc != 0 ||
         apply_client_topology_endpoints(cfg) != 0 ||
         !client_topology_owners_fit_nodes(cfg)) {
@@ -740,6 +600,50 @@ static int open_ring(const char *name,
     return 0;
 }
 
+static int open_peer_view_ring(
+    const char *name, uint32_t slot_size,
+    const vemb_v16_ub_peer_view_mapping_t *peer_view,
+    void **out_mapping, size_t *out_mapping_bytes,
+    vemb_v16_client_ring_t **ring) {
+    const char *offset_marker = strstr(name, "@off");
+    if (!offset_marker || !peer_view || !peer_view->client_path[0] ||
+        !out_mapping || !out_mapping_bytes || !ring)
+        return -1;
+    char *end = NULL;
+    uint64_t offset = strtoull(offset_marker + 4, &end, 10);
+    if (end == offset_marker + 4 || *end != '\0')
+        return -1;
+    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
+    int map_from_start = peer_view->map_flags &
+        VEMB_V16_UB_PEER_VIEW_MAP_F_FROM_START;
+    if (map_from_start &&
+        (offset > SIZE_MAX || bytes > SIZE_MAX - (size_t)offset))
+        return -1;
+    uint64_t mapping_offset = map_from_start ? 0 : offset;
+    size_t mapping_bytes = bytes + (map_from_start ? (size_t)offset : 0);
+    int flags = O_RDWR;
+    if (peer_view->cache_policy == VEMB_V16_UB_PEER_VIEW_NONCACHEABLE)
+        flags |= O_SYNC;
+    int fd = open(peer_view->client_path, flags);
+    if (fd < 0)
+        return -1;
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
+    uint64_t aligned_offset = mapping_offset & ~page_mask;
+    size_t offset_delta = (size_t)(mapping_offset - aligned_offset);
+    void *base = mmap(NULL, mapping_bytes + offset_delta,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                      (off_t)aligned_offset);
+    close(fd);
+    if (base == MAP_FAILED)
+        return -1;
+    *out_mapping = base;
+    *out_mapping_bytes = mapping_bytes + offset_delta;
+    *ring = (vemb_v16_client_ring_t *)((uint8_t *)base + offset_delta +
+        (map_from_start ? (size_t)offset : 0));
+    return 0;
+}
+
 static int aeron_endpoint_is_local(const char *host) {
     return host && (!strcmp(host, "127.0.0.1") ||
                     !strcmp(host, "localhost") ||
@@ -753,6 +657,8 @@ static int open_warm_region_desc(uint32_t region_id,
                                  uint32_t value_size,
                                  uint32_t max_vectors,
                                  const char *path,
+                                 uint32_t map_flags,
+                                 uint32_t cache_policy,
                                  bench_region_map_t *region) {
     if (!path || !region)
         return -1;
@@ -760,7 +666,10 @@ static int open_warm_region_desc(uint32_t region_id,
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM) {
         fd = shm_open(path, O_RDWR, 0666);
     } else if (backend_type == VEMB_V16_REGION_UB) {
-        fd = open(path, O_RDWR);
+        int flags = O_RDWR;
+        if (cache_policy == VEMB_V16_UB_PEER_VIEW_NONCACHEABLE)
+            flags |= O_SYNC;
+        fd = open(path, flags);
     } else {
         return -1;
     }
@@ -770,9 +679,17 @@ static int open_warm_region_desc(uint32_t region_id,
         (size_t)value_size * max_vectors;
     long page_size = sysconf(_SC_PAGESIZE);
     uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
-    uint64_t aligned_offset = mmap_offset & ~page_mask;
-    size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
-    size_t map_size = size + offset_delta;
+    int map_from_start = map_flags & VEMB_V16_UB_PEER_VIEW_MAP_F_FROM_START;
+    if (map_from_start &&
+        (mmap_offset > SIZE_MAX || size > SIZE_MAX - (size_t)mmap_offset)) {
+        close(fd);
+        return -1;
+    }
+    uint64_t mapping_offset = map_from_start ? 0 : mmap_offset;
+    uint64_t aligned_offset = mapping_offset & ~page_mask;
+    size_t offset_delta = (size_t)(mapping_offset - aligned_offset);
+    size_t map_size = size + offset_delta +
+        (map_from_start ? (size_t)mmap_offset : 0);
     void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fd,
                      (off_t)aligned_offset);
     close(fd);
@@ -785,7 +702,8 @@ static int open_warm_region_desc(uint32_t region_id,
     region->mmap_aligned_offset = aligned_offset;
     region->mapping_bytes = map_size;
     region->mapping_addr = ptr;
-    region->mapped_addr = (uint8_t *)ptr + offset_delta;
+    region->mapped_addr = (uint8_t *)ptr + offset_delta +
+        (map_from_start ? (size_t)mmap_offset : 0);
     return 0;
 }
 
@@ -800,6 +718,8 @@ static int open_warm_region(const vemb_v16_channel_desc_t *desc,
                                  desc->vector_stride,
                                  desc->max_vectors,
                                  desc->vector_region_name,
+                                 0,
+                                 VEMB_V16_UB_PEER_VIEW_CACHEABLE,
                                  region);
 }
 
@@ -822,6 +742,8 @@ static int open_warm_regions(const vemb_v16_channel_desc_t *desc,
                                        desc->vector_stride,
                                        desc->max_vectors,
                                        desc->warm_regions[i].path,
+                                       node->warm_peer_view.map_flags,
+                                       node->warm_peer_view.cache_policy,
                                        &node->warm_regions[i]);
         }
         if (rc != 0)
@@ -922,6 +844,23 @@ static uint32_t workload_keyspace(const bench_cfg_t *cfg) {
     if (cfg && cfg->keyspace)
         return cfg->keyspace;
     return cfg ? cfg->prefill : 0;
+}
+
+static const char *workload_key_pattern(const bench_cfg_t *cfg) {
+    return cfg->random_key_pattern ? "random" : "sequential";
+}
+
+static uint32_t workload_key_id(const bench_cfg_t *cfg, uint32_t global_id) {
+    uint32_t keyspace = workload_keyspace(cfg);
+    if (!cfg->random_key_pattern)
+        return keyspace ? global_id % keyspace : global_id;
+
+    uint64_t mixed = (uint64_t)global_id + 0x9e3779b97f4a7c15ULL;
+    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+    mixed ^= mixed >> 31;
+    uint32_t key_id = (uint32_t)(mixed ^ (mixed >> 32));
+    return keyspace ? key_id % keyspace : key_id;
 }
 
 static uint32_t choose_vsim_key2_id(const bench_cfg_t *cfg,
@@ -1227,7 +1166,7 @@ static void close_client_topology_channels(bench_cfg_t *cfg,
         return;
     for (uint32_t n = 0; n < *node_count && n < cfg->node_count; n++) {
         if (node_channel_open(&nodes[n]))
-            close_node_channel(cfg->socket_paths[n], &nodes[n]);
+            close_node_channel(&nodes[n]);
     }
     *node_count = 0;
 }
@@ -1239,7 +1178,7 @@ static int reconnect_client_topology_channel(bench_cfg_t *cfg,
                                              int open_region) {
     if (!cfg || !nodes || !node_count || node_index >= cfg->node_count)
         return -1;
-    close_node_channel(cfg->socket_paths[node_index], &nodes[node_index]);
+    close_node_channel(&nodes[node_index]);
     if (setup_node_channel(cfg, node_index, open_region, &nodes[node_index]) != 0)
         return -1;
     if (node_index + 1 > *node_count)
@@ -1699,6 +1638,315 @@ static int prefill_multi(bench_cfg_t *cfg,
     return 0;
 }
 
+/* The benchmark supplies workload only. Topology, owner routing, redirect
+ * retry and data-channel ownership belong exclusively to the SDK common
+ * core. Every configured TCP endpoint is a bootstrap seed, never a data
+ * backend selection. */
+static vemb_v16_client_t *open_common_core_client(const bench_cfg_t *cfg)
+{
+    char seed_storage[VEMB_V16_BENCH_MAX_NODES]
+                     [VEMB_V16_BENCH_PATH_MAX + 8];
+    const char *seeds[VEMB_V16_BENCH_MAX_NODES];
+
+    for (uint32_t i = 0; i < cfg->node_count; i++) {
+        int written = snprintf(seed_storage[i], sizeof(seed_storage[i]),
+                               "%s:%u", tcp_host_for_node(cfg, i),
+                               (unsigned)tcp_port_for_node(cfg, i));
+        if (written < 0 || (size_t)written >= sizeof(seed_storage[i]))
+            return NULL;
+        seeds[i] = seed_storage[i];
+    }
+
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, (int)cfg->node_count, cfg->dim, cfg->timeout_ms);
+    if (!client)
+        return NULL;
+    if ((cfg->ub_peer_view_manifest_path || cfg->ub_peer_view_client_host) &&
+        (!cfg->ub_peer_view_manifest_path ||
+         !cfg->ub_peer_view_client_host ||
+         vemb_v16_client_configure_ub_peer_view(
+             client, cfg->ub_peer_view_manifest_path,
+             cfg->ub_peer_view_client_host) != 0)) {
+        vemb_v16_client_destroy(client);
+        return NULL;
+    }
+    if (vemb_v16_client_topology_refresh(client) != 0) {
+        vemb_v16_client_destroy(client);
+        return NULL;
+    }
+    return client;
+}
+
+static int common_core_read_vector(vemb_v16_client_t *client,
+                                   const char *key,
+                                   float *out_vector,
+                                   uint32_t dim,
+                                   uint64_t *read_bytes)
+{
+    uint64_t offset = 0;
+    uint32_t bytes = 0;
+    uint32_t response_dim = 0;
+    int rc = vemb_v16_client_vemb_handle(client, NULL, key,
+                                         &offset, &bytes, &response_dim,
+                                         NULL);
+    if (rc != 0 || response_dim != dim || bytes != dim * sizeof(float) ||
+        vemb_v16_client_read_vector(client, offset, bytes,
+                                    out_vector, dim) != 0) {
+        return -1;
+    }
+    *read_bytes += bytes;
+    return 0;
+}
+
+static int common_core_prefill(const bench_cfg_t *cfg)
+{
+    vemb_v16_client_t *client = open_common_core_client(cfg);
+    float *vector = zmalloc((size_t)cfg->dim * sizeof(*vector));
+    char key[VEMB_V16_MAX_KEY_LEN];
+    uint64_t start = now_ns();
+
+    if (!client || !vector) {
+        vemb_v16_client_destroy(client);
+        zfree(vector);
+        return -1;
+    }
+    for (uint32_t i = 0; i < cfg->prefill; i++) {
+        make_key(key, sizeof(key), i);
+        fill_vector(vector, cfg->dim, i);
+        if (vemb_v16_client_vadd(client, NULL, key, vector, cfg->dim) != 0) {
+            fprintf(stderr, "prefill common-core write failed at item=%u\n", i);
+            vemb_v16_client_destroy(client);
+            zfree(vector);
+            return -1;
+        }
+        if ((i + 1) % 10000 == 0)
+            printf("[prefill] inserted=%u elapsed=%.3fs\n",
+                   i + 1, (double)(now_ns() - start) / 1e9);
+    }
+    if (cfg->prefill > 0)
+        printf("[prefill] inserted=%u elapsed=%.3fs\n",
+               cfg->prefill, (double)(now_ns() - start) / 1e9);
+    vemb_v16_client_destroy(client);
+    zfree(vector);
+    return 0;
+}
+
+static void *common_core_worker_main(void *arg)
+{
+    worker_arg_t *w = arg;
+#ifdef __linux__
+    if (w->cfg.pin_threads) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET((w->tid * 2 + 3) % 64, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
+#endif
+
+    vemb_v16_client_t *client = open_common_core_client(&w->cfg);
+    float *vector = zmalloc((size_t)w->cfg.dim * sizeof(*vector));
+    char key[VEMB_V16_MAX_KEY_LEN];
+    uint64_t start = now_ns();
+
+    if (!client || !vector) {
+        w->fail = w->cfg.ops;
+        vemb_v16_client_destroy(client);
+        zfree(vector);
+        w->ns = now_ns() - start;
+        atomic_store_explicit(&w->done, 1, memory_order_release);
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < w->cfg.ops &&
+                         !atomic_load_explicit(&w->stop,
+                                               memory_order_acquire); i++) {
+        uint32_t global_id = i + (uint32_t)w->tid * w->cfg.ops;
+        uint32_t key_id = workload_key_id(&w->cfg, global_id);
+        int mixed_write = w->cfg.mode == MODE_MIXED_80R20W &&
+                          (i % 5u) == 0;
+        int rc = -1;
+
+        if (w->cfg.hot_key_enabled)
+            key_id = w->cfg.hot_key_id;
+        if (w->cfg.mode == MODE_PING) {
+            rc = vemb_v16_client_ping(client);
+        } else if (w->cfg.mode == MODE_VADD || mixed_write) {
+            uint32_t write_key_id = mixed_write ? key_id :
+                (w->cfg.keyspace ? key_id : global_id + 100000000u);
+            make_key(key, sizeof(key), write_key_id);
+            fill_vector(vector, w->cfg.dim, global_id);
+            rc = vemb_v16_client_vadd(client, NULL, key, vector, w->cfg.dim);
+            w->vadd_sent++;
+        } else if (w->cfg.mode == MODE_VREM) {
+            make_key(key, sizeof(key), key_id);
+            rc = vemb_v16_client_vrem(client, NULL, key);
+            w->vadd_sent++;
+        } else if (w->cfg.mode == MODE_VSIM_INLINE) {
+            float score = 0.0f;
+            make_key(key, sizeof(key), key_id);
+            fill_vector(vector, w->cfg.dim, global_id + 0x9e3779b9u);
+            rc = vemb_v16_client_vsim(client, NULL, key, vector,
+                                      w->cfg.dim, &score);
+            if (rc == 0)
+                w->score_sum += score;
+            w->vsim_sent++;
+        } else if (w->cfg.mode == MODE_VEMB_HANDLE ||
+                   w->cfg.mode == MODE_MIXED_80R20W) {
+            make_key(key, sizeof(key), key_id);
+            rc = common_core_read_vector(client, key, vector, w->cfg.dim,
+                                         &w->read_bytes);
+            w->vemb_sent++;
+        } else if (w->cfg.mode == MODE_VEMB_INLINE) {
+            uint32_t response_dim = 0;
+            make_key(key, sizeof(key), key_id);
+            rc = vemb_v16_client_vemb_vector(client, NULL, key, vector,
+                                              w->cfg.dim, &response_dim);
+            if (rc == 0 && response_dim == w->cfg.dim)
+                w->read_bytes += w->cfg.dim * sizeof(*vector);
+            else if (rc == 0)
+                rc = -1;
+            w->vemb_sent++;
+        }
+
+        if (rc == 0)
+            w->ok++;
+        else
+            w->fail++;
+    }
+
+    vemb_v16_redirect_stats_t redirect_stats;
+    vemb_v16_client_get_redirect_stats(client, &redirect_stats);
+    w->ask_redirects = redirect_stats.ask_redirects;
+    w->moved_redirects = redirect_stats.moved_redirects;
+    w->stale_topology_refreshes = redirect_stats.stale_topology_responses;
+    w->topology_refresh_calls = redirect_stats.topology_refresh_calls;
+    vemb_v16_client_destroy(client);
+    zfree(vector);
+    w->ns = now_ns() - start;
+    atomic_store_explicit(&w->done, 1, memory_order_release);
+    return NULL;
+}
+
+static int run_common_core_once(bench_cfg_t cfg)
+{
+    if (cfg.pipeline != 1) {
+        fprintf(stderr, "common-core benchmark currently requires --pipeline 1\n");
+        return 1;
+    }
+    if (cfg.mode == MODE_VSIM_KEY_KEY) {
+        fprintf(stderr, "vsim-key-key is not yet available through the common SDK core\n");
+        return 1;
+    }
+
+    printf("[setup] bootstrap=tcp topology-data=owner-fixed mode=%s dim=%u prefill=%u keyspace=%u key-pattern=%s ops/thread=%u threads=%d pipeline=%u pin=%s\n",
+           mode_name(cfg.mode), cfg.dim, cfg.prefill, workload_keyspace(&cfg),
+           workload_key_pattern(&cfg), cfg.ops, cfg.threads, cfg.pipeline,
+           cfg.pin_threads ? "yes" : "no");
+    if (cfg.prefill && cfg.mode != MODE_PING && common_core_prefill(&cfg) != 0) {
+        fprintf(stderr, "common-core prefill failed\n");
+        return 1;
+    }
+
+    vemb_v16_stats_t before[VEMB_V16_BENCH_MAX_NODES] = {{0}};
+    vemb_v16_stats_t after[VEMB_V16_BENCH_MAX_NODES] = {{0}};
+    for (uint32_t n = 0; n < cfg.node_count; n++) {
+        if (fetch_stats_for_node(&cfg, n, &before[n]) != 0)
+            fprintf(stderr, "warning: fetch stats before run failed for node=%u\n", n);
+    }
+
+    worker_arg_t *args = zcalloc_num((size_t)cfg.threads, sizeof(*args));
+    pthread_t *threads = zcalloc_num((size_t)cfg.threads, sizeof(*threads));
+    if (!args || !threads) {
+        zfree(args);
+        zfree(threads);
+        return 1;
+    }
+    for (int i = 0; i < cfg.threads; i++) {
+        args[i].tid = i;
+        args[i].cfg = cfg;
+        atomic_init(&args[i].stop, 0);
+        atomic_init(&args[i].done, 0);
+    }
+
+    uint64_t start = now_ns();
+    printf("[run] common-core mode=%s threads=%d requests=%llu\n",
+           mode_name(cfg.mode), cfg.threads,
+           (unsigned long long)cfg.ops * (unsigned long long)cfg.threads);
+    fflush(stdout);
+    for (int i = 0; i < cfg.threads; i++)
+        pthread_create(&threads[i], NULL, common_core_worker_main, &args[i]);
+
+    uint64_t join_start = now_ns();
+    int timed_out = 0;
+    for (;;) {
+        int done = 0;
+        for (int i = 0; i < cfg.threads; i++)
+            done += atomic_load_explicit(&args[i].done, memory_order_acquire);
+        if (done == cfg.threads)
+            break;
+        if (wait_timed_out(join_start, cfg.timeout_ms)) {
+            fprintf(stderr, "run timeout: done_workers=%d/%d timeout_ms=%u\n",
+                    done, cfg.threads, cfg.timeout_ms);
+            timed_out = 1;
+            for (int i = 0; i < cfg.threads; i++)
+                atomic_store_explicit(&args[i].stop, 1, memory_order_release);
+            break;
+        }
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+    }
+    for (int i = 0; i < cfg.threads; i++)
+        pthread_join(threads[i], NULL);
+
+    uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0;
+    uint64_t vadd_sent = 0, vsim_sent = 0, ask_redirects = 0;
+    uint64_t moved_redirects = 0, stale_refreshes = 0, refresh_calls = 0;
+    uint64_t max_ns = 0;
+    double score_sum = 0.0;
+    for (int i = 0; i < cfg.threads; i++) {
+        ok += args[i].ok;
+        fail += args[i].fail;
+        read_bytes += args[i].read_bytes;
+        vemb_sent += args[i].vemb_sent;
+        vadd_sent += args[i].vadd_sent;
+        vsim_sent += args[i].vsim_sent;
+        ask_redirects += args[i].ask_redirects;
+        moved_redirects += args[i].moved_redirects;
+        stale_refreshes += args[i].stale_topology_refreshes;
+        refresh_calls += args[i].topology_refresh_calls;
+        score_sum += args[i].score_sum;
+        if (args[i].ns > max_ns)
+            max_ns = args[i].ns;
+    }
+    uint64_t wall = now_ns() - start;
+    uint64_t total_ops = ok + fail;
+    printf("[done] mode=%s threads=%d ok=%llu fail=%llu qps=%.2f avg_thread_ns/op=%.1f read_bytes=%llu\n",
+           mode_name(cfg.mode), cfg.threads, (unsigned long long)ok,
+           (unsigned long long)fail,
+           total_ops ? (double)total_ops / ((double)wall / 1e9) : 0.0,
+           total_ops ? (double)max_ns / total_ops : 0.0,
+           (unsigned long long)read_bytes);
+    printf("[common-core] ask=%llu moved=%llu stale=%llu topology_refresh=%llu\n",
+           (unsigned long long)ask_redirects,
+           (unsigned long long)moved_redirects,
+           (unsigned long long)stale_refreshes,
+           (unsigned long long)refresh_calls);
+    if (vemb_sent || vadd_sent || vsim_sent) {
+        printf("[client] sent_vemb=%llu sent_vadd=%llu sent_vsim=%llu score_sum=%.6f\n",
+               (unsigned long long)vemb_sent, (unsigned long long)vadd_sent,
+               (unsigned long long)vsim_sent, score_sum);
+    }
+    for (uint32_t n = 0; n < cfg.node_count; n++) {
+        if (fetch_stats_for_node(&cfg, n, &after[n]) == 0)
+            print_stats_delta_node(n, &before[n], &after[n]);
+        else
+            fprintf(stderr, "warning: fetch stats after run failed for node=%u\n", n);
+    }
+    zfree(args);
+    zfree(threads);
+    return fail == 0 && !timed_out ? 0 : 1;
+}
+
 static void *worker_main(void *arg) {
     worker_arg_t *w = arg;
 #ifdef __linux__
@@ -1741,13 +1989,12 @@ static void *worker_main(void *arg) {
     uint32_t pending_count = 0;
     while (completed < w->cfg.ops &&
            !atomic_load_explicit(&w->stop, memory_order_acquire)) {
-        uint32_t keyspace = workload_keyspace(&w->cfg);
-        while (sent < w->cfg.ops && pending_count < pipeline) {
+            while (sent < w->cfg.ops && pending_count < pipeline) {
             if (atomic_load_explicit(&w->stop, memory_order_acquire))
                 break;
             uint32_t i = sent;
             uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
-            uint32_t key_id = keyspace ? global_id % keyspace : global_id;
+            uint32_t key_id = workload_key_id(&w->cfg, global_id);
             if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
             size_t req_len = vemb_v16_req_handle_len();
             int send_failed = 0;
@@ -2203,30 +2450,6 @@ static int parse_thread_list(const bench_cfg_t *cfg, int **threads_out) {
     return count;
 }
 
-static int parse_socket_list(bench_cfg_t *cfg, const char *arg) {
-    if (!cfg || !arg || !arg[0])
-        return -1;
-    cfg->node_count = 0;
-    const char *p = arg;
-    while (*p) {
-        if (cfg->node_count >= VEMB_V16_BENCH_MAX_NODES)
-            return -1;
-        const char *comma = strchr(p, ',');
-        size_t len = comma ? (size_t)(comma - p) : strlen(p);
-        if (len == 0 || len >= VEMB_V16_BENCH_PATH_MAX)
-            return -1;
-        memcpy(cfg->socket_paths[cfg->node_count], p, len);
-        cfg->socket_paths[cfg->node_count][len] = '\0';
-        cfg->node_count++;
-        if (!comma) break;
-        p = comma + 1;
-    }
-    if (cfg->node_count == 0)
-        return -1;
-    cfg->socket_path = cfg->socket_paths[0];
-    return build_hash_ring(cfg);
-}
-
 static int parse_endpoint_list(bench_cfg_t *cfg, const char *arg) {
     if (!cfg || !arg || !arg[0])
         return -1;
@@ -2359,51 +2582,45 @@ static void print_stats_delta_node(uint32_t node_index,
 static int fetch_stats_for_node(const bench_cfg_t *cfg,
                                 uint32_t node_index,
                                 vemb_v16_stats_t *stats) {
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
-        cfg->aeron_control_tcp)
-        return fetch_stats_tcp(cfg, node_index, stats);
-    return fetch_stats(cfg->socket_paths[node_index], stats);
+    return fetch_stats_tcp(cfg, node_index, stats);
 }
 
 static int close_all_for_node(const bench_cfg_t *cfg,
                               uint32_t node_index,
                               uint64_t *closed) {
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
-        cfg->aeron_control_tcp)
-        return close_all_channels_tcp(cfg, node_index, closed);
-    return close_all_channels(cfg->socket_paths[node_index], closed);
+    return close_all_channels_tcp(cfg, node_index, closed);
 }
 
-static void close_node_channel(const char *socket_path,
-                               bench_node_channel_t *node) {
+static void close_node_channel(bench_node_channel_t *node) {
     if (!node) return;
-    if (node->transport_type == VEMB_V16_TRANSPORT_TCP ||
-        node->control_tcp) {
-        if (node->net_fd >= 0) {
-            vemb_v16_net_write_frame(node->net_fd,
-                                     VEMB_V16_NET_CLOSE,
-                                     0,
-                                     node->desc.channel_id,
-                                     0,
-                                     NULL,
-                                     0);
-            close(node->net_fd);
-        }
-        if (node->desc.channel_id)
-            close_channel_tcp(node->tcp_host,
-                              node->tcp_port,
-                              node->timeout_ms,
-                              node->desc.channel_id);
-    } else if (node->desc.channel_id) {
-        close_channel_path(socket_path, node->desc.channel_id);
+    if (node->net_fd >= 0) {
+        vemb_v16_net_write_frame(node->net_fd,
+                                 VEMB_V16_NET_CLOSE,
+                                 0,
+                                 node->desc.channel_id,
+                                 0,
+                                 NULL,
+                                 0);
+        close(node->net_fd);
     }
+    if (node->desc.channel_id)
+        close_channel_tcp(node->tcp_host,
+                          node->tcp_port,
+                          node->timeout_ms,
+                          node->desc.channel_id);
     if (node->req_ring) {
-        munmap(node->req_ring,
-               vemb_v16_client_ring_bytes(node->desc.request_ring_slot_size));
+        if (node->req_ring_mapping)
+            munmap(node->req_ring_mapping, node->req_ring_mapping_bytes);
+        else
+            munmap(node->req_ring,
+                   vemb_v16_client_ring_bytes(node->desc.request_ring_slot_size));
     }
     if (node->resp_ring) {
-        munmap(node->resp_ring,
-               vemb_v16_client_ring_bytes(node->desc.response_ring_slot_size));
+        if (node->resp_ring_mapping)
+            munmap(node->resp_ring_mapping, node->resp_ring_mapping_bytes);
+        else
+            munmap(node->resp_ring,
+                   vemb_v16_client_ring_bytes(node->desc.response_ring_slot_size));
     }
     close_warm_regions(node);
     memset(node, 0, sizeof(*node));
@@ -2419,41 +2636,56 @@ static int setup_node_channel(const bench_cfg_t *cfg,
     memset(node, 0, sizeof(*node));
     node->net_fd = -1;
     node->transport_type = cfg->transport_type;
-    node->control_tcp = cfg->transport_type == VEMB_V16_TRANSPORT_TCP ||
-        cfg->aeron_control_tcp;
     node->tcp_host = tcp_host_for_node(cfg, node_index);
     node->tcp_port = tcp_port_for_node(cfg, node_index);
     node->timeout_ms = cfg->timeout_ms;
     int remote_path = !aeron_endpoint_is_local(node->tcp_host);
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (alloc_tcp_channel(cfg, node_index, &node->desc, &node->net_fd) != 0) {
-            close_node_channel(cfg->socket_paths[node_index], node);
+            close_node_channel(node);
             return -1;
         }
         return 0;
     }
-    const char *socket_path = cfg->socket_paths[node_index];
-    int alloc_rc = cfg->aeron_control_tcp ?
-        alloc_aeron_channel_tcp(cfg, node_index, remote_path, &node->desc) :
-        alloc_channel_path(socket_path, cfg, &node->desc);
-    if (alloc_rc != 0 ||
+    int alloc_rc = alloc_aeron_channel_tcp(cfg, node_index, remote_path,
+                                           &node->desc,
+                                           &node->request_peer_view,
+                                           &node->response_peer_view,
+                                           &node->warm_peer_view);
+    if (alloc_rc != 0) {
+        close_node_channel(node);
+        return -1;
+    }
+    int request_open_rc = remote_path ?
+        open_peer_view_ring(node->desc.request_ring_name,
+                            node->desc.request_ring_slot_size,
+                            &node->request_peer_view,
+                            &node->req_ring_mapping,
+                            &node->req_ring_mapping_bytes,
+                            &node->req_ring) :
         open_ring(node->desc.request_ring_name,
-                  node->desc.request_ring_slot_size,
-                  &node->req_ring) != 0 ||
+                  node->desc.request_ring_slot_size, &node->req_ring);
+    int response_open_rc = remote_path ?
+        open_peer_view_ring(node->desc.response_ring_name,
+                            node->desc.response_ring_slot_size,
+                            &node->response_peer_view,
+                            &node->resp_ring_mapping,
+                            &node->resp_ring_mapping_bytes,
+                            &node->resp_ring) :
         open_ring(node->desc.response_ring_name,
-                  node->desc.response_ring_slot_size,
-                  &node->resp_ring) != 0) {
-        close_node_channel(socket_path, node);
+                  node->desc.response_ring_slot_size, &node->resp_ring);
+    if (request_open_rc != 0 || response_open_rc != 0) {
+        close_node_channel(node);
         return -1;
     }
     if (open_region && open_warm_regions(&node->desc, node) != 0) {
-        close_node_channel(socket_path, node);
+        close_node_channel(node);
         return -1;
     }
     return 0;
 }
 
-static int run_once(bench_cfg_t cfg) {
+static int __attribute__((unused)) run_legacy_transport_once(bench_cfg_t cfg) {
     bench_node_channel_t pre_nodes[VEMB_V16_BENCH_MAX_NODES];
     memset(pre_nodes, 0, sizeof(pre_nodes));
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
@@ -2470,7 +2702,7 @@ static int run_once(bench_cfg_t cfg) {
     }
     if (cfg.client_topology_enabled) {
         if (mode_has_write(cfg.mode) && cfg.pipeline != 1) {
-            fprintf(stderr, "--client-topology write modes require --pipeline 1\n");
+            fprintf(stderr, "legacy transport write modes require --pipeline 1\n");
             return 1;
         }
         if (refresh_client_topology(&cfg) != 0) {
@@ -2484,29 +2716,30 @@ static int run_once(bench_cfg_t cfg) {
                cfg.client_topology.standby_ring.owner_count,
                cfg.client_topology.flags);
     }
-    printf("[setup] transport=%s mode=%s dim=%u prefill=%u keyspace=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
+    printf("[setup] transport=%s mode=%s dim=%u prefill=%u keyspace=%u key-pattern=%s ops/thread=%u threads=%d pipeline=%u pin=%s\n",
            vemb_v16_transport_name(cfg.transport_type),
            mode_name(cfg.mode), cfg.dim, cfg.prefill,
-           workload_keyspace(&cfg), cfg.ops, cfg.threads, cfg.pipeline,
+           workload_keyspace(&cfg), workload_key_pattern(&cfg), cfg.ops,
+           cfg.threads, cfg.pipeline,
            cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING) {
         for (uint32_t n = 0; n < cfg.node_count; n++) {
             if (setup_node_channel(&cfg, n, 0, &pre_nodes[n]) != 0) {
                 fprintf(stderr, "failed to setup prefill channel node=%u\n", n);
                 for (uint32_t c = 0; c < cfg.node_count; c++)
-                    close_node_channel(cfg.socket_paths[c], &pre_nodes[c]);
+                    close_node_channel(&pre_nodes[c]);
                 return 1;
             }
         }
         if (prefill_multi(&cfg, pre_nodes, cfg.node_count) != 0) {
             fprintf(stderr, "prefill failed\n");
             for (uint32_t n = 0; n < cfg.node_count; n++)
-                close_node_channel(cfg.socket_paths[n], &pre_nodes[n]);
+                close_node_channel(&pre_nodes[n]);
             return 1;
         }
     }
     for (uint32_t n = 0; n < cfg.node_count; n++)
-        close_node_channel(cfg.socket_paths[n], &pre_nodes[n]);
+        close_node_channel(&pre_nodes[n]);
     printf("[run] preparing mode=%s threads=%d ops/thread=%u timeout_ms=%u\n",
            mode_name(cfg.mode), cfg.threads, cfg.ops, cfg.timeout_ms);
     fflush(stdout);
@@ -2630,8 +2863,7 @@ static int run_once(bench_cfg_t cfg) {
     }
     for (int i = 0; i < cfg.threads; i++) {
         for (uint32_t n = 0; n < args[i].node_count; n++)
-            close_node_channel(args[i].cfg.socket_paths[n],
-                               &args[i].nodes[n]);
+            close_node_channel(&args[i].nodes[n]);
     }
     zfree(args);
     zfree(threads);
@@ -2640,7 +2872,6 @@ static int run_once(bench_cfg_t cfg) {
 
 int main(int argc, char **argv) {
     bench_cfg_t cfg = {
-        .socket_path = VEMB_V16_UDS_PATH,
         .tcp_host = VEMB_V16_TCP_HOST,
         .dim = 0,
         .prefill = 65536,
@@ -2650,33 +2881,17 @@ int main(int argc, char **argv) {
         .timeout_ms = 10000,
         .pipeline = 1,
         .transport_type = VEMB_V16_TRANSPORT_AERON,
-        .aeron_control_tcp = 1,
         .tcp_port = VEMB_V16_TCP_PORT,
         .vsim_key2_owner = VSIM_KEY2_OWNER_SAME,
     };
     cfg.node_count = 1;
-    strncpy(cfg.socket_paths[0], cfg.socket_path, sizeof(cfg.socket_paths[0]) - 1);
     strncpy(cfg.tcp_hosts[0], cfg.tcp_host, sizeof(cfg.tcp_hosts[0]) - 1);
     cfg.tcp_ports[0] = cfg.tcp_port;
     build_hash_ring(&cfg);
     signal(SIGPIPE, SIG_IGN);
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
-            cfg.socket_path = argv[++i];
-            cfg.node_count = 1;
-            strncpy(cfg.socket_paths[0], cfg.socket_path,
-                    sizeof(cfg.socket_paths[0]) - 1);
-            cfg.socket_paths[0][sizeof(cfg.socket_paths[0]) - 1] = '\0';
-            build_hash_ring(&cfg);
-        }
-        else if (!strcmp(argv[i], "--sockets") && i + 1 < argc) {
-            if (parse_socket_list(&cfg, argv[++i]) != 0) {
-                fprintf(stderr, "invalid socket list\n");
-                return 1;
-            }
-        }
-        else if (!strcmp(argv[i], "--endpoints") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--endpoints") && i + 1 < argc) {
             if (parse_endpoint_list(&cfg, argv[++i]) != 0) {
                 fprintf(stderr, "invalid endpoint list\n");
                 return 1;
@@ -2693,17 +2908,6 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        else if (!strcmp(argv[i], "--aeron-control") && i + 1 < argc) {
-            const char *control = argv[++i];
-            if (!strcmp(control, "tcp")) {
-                cfg.aeron_control_tcp = 1;
-            } else if (!strcmp(control, "uds")) {
-                cfg.aeron_control_tcp = 0;
-            } else {
-                fprintf(stderr, "invalid aeron control: %s\n", control);
-                return 1;
-            }
-        }
         else if ((!strcmp(argv[i], "--host") ||
                   !strcmp(argv[i], "--tcp-host")) && i + 1 < argc) {
             cfg.tcp_host = argv[++i];
@@ -2715,6 +2919,12 @@ int main(int argc, char **argv) {
                   !strcmp(argv[i], "--tcp-port")) && i + 1 < argc) {
             cfg.tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
             cfg.tcp_ports[0] = cfg.tcp_port;
+        }
+        else if (!strcmp(argv[i], "--ub-peer-view-manifest") && i + 1 < argc) {
+            cfg.ub_peer_view_manifest_path = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--ub-peer-view-client-host") && i + 1 < argc) {
+            cfg.ub_peer_view_client_host = argv[++i];
         }
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -2730,6 +2940,17 @@ int main(int argc, char **argv) {
             cfg.hot_key_enabled = 1;
             cfg.hot_key_id = (uint32_t)strtoul(argv[++i], NULL, 10);
         }
+        else if (!strcmp(argv[i], "--key-pattern") && i + 1 < argc) {
+            const char *pattern = argv[++i];
+            if (!strcmp(pattern, "sequential")) {
+                cfg.random_key_pattern = 0;
+            } else if (!strcmp(pattern, "random")) {
+                cfg.random_key_pattern = 1;
+            } else {
+                fprintf(stderr, "invalid --key-pattern: %s\n", pattern);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--pin")) {
             cfg.pin_threads = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -2740,13 +2961,6 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--no-pin")) {
             cfg.pin_threads = 0;
-        }
-        else if (!strcmp(argv[i], "--client-topology")) {
-            cfg.client_topology_enabled = 1;
-        }
-        else if (!strcmp(argv[i], "--no-client-topology")) {
-            cfg.client_topology_enabled = 0;
-            cfg.client_topology_valid = 0;
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--vsim-key2-owner") && i + 1 < argc) {
@@ -2761,7 +2975,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
+            printf("usage: %s [--endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--key-pattern sequential|random] [--ops N] [--timeout-ms N] [--pipeline 1] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--ub-peer-view-manifest FILE --ub-peer-view-client-host HOST] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline]\n", argv[0]);
             return 0;
         }
         else {
@@ -2769,7 +2983,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    g_control_timeout_ms = cfg.timeout_ms;
     if (cfg.mode < 0 ||
         cfg.pipeline == 0 || cfg.pipeline > VEMB_V16_CLIENT_RING_SIZE ||
         cfg.node_count == 0 || cfg.node_count > VEMB_V16_BENCH_MAX_NODES) {
@@ -2782,36 +2995,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
-        mode_is_read(cfg.mode) &&
-        cfg.mode != MODE_VEMB_INLINE &&
-        cfg.mode != MODE_MIXED_80R20W) {
-        fprintf(stderr, "tcp transport read modes require --mode vemb-inline or --mode mixed-80r20w\n");
-        return 1;
-    }
-    if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
-        cfg.mode == MODE_VEMB_INLINE) {
-        fprintf(stderr, "vemb-inline requires --transport tcp\n");
-        return 1;
-    }
-    if (cfg.client_topology_enabled &&
-        mode_has_write(cfg.mode) &&
-        cfg.pipeline != 1) {
-        fprintf(stderr, "--client-topology write modes require --pipeline 1\n");
+        cfg.mode == MODE_VEMB_HANDLE) {
+        fprintf(stderr,
+                "--transport tcp does not support --mode vemb-handle; use vemb-inline\n");
         return 1;
     }
     for (uint32_t n = 0; n < cfg.node_count; n++) {
-        if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP) {
-            if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
-                fprintf(stderr, "tcp multi-node requires --endpoints HOST:PORT[,HOST:PORT...]\n");
-                return 1;
-            }
-        } else if (cfg.aeron_control_tcp) {
-            if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
-                fprintf(stderr, "aeron tcp control requires --endpoints HOST:PORT[,HOST:PORT...]\n");
-                return 1;
-            }
-        } else if (!cfg.socket_paths[n][0]) {
-            fprintf(stderr, "aeron multi-node requires --sockets PATH[,PATH...]\n");
+        if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
+            fprintf(stderr, "transport control requires --endpoints HOST:PORT[,HOST:PORT...]\n");
             return 1;
         }
     }
@@ -2832,7 +3023,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < thread_count; i++) {
         bench_cfg_t run_cfg = cfg;
         run_cfg.threads = thread_list[i];
-        ret = run_once(run_cfg);
+        ret = run_common_core_once(run_cfg);
         if (ret != 0) break;
     }
     zfree(thread_list);

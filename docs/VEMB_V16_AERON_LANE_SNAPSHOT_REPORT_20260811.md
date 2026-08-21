@@ -268,15 +268,24 @@ preflight CPU blocker 和全部数据面错误均为 `0`。
 二者合计从 `5.661%` 降至 `0.188%`。该 A/B 每侧目前各一轮，百分比是同配置下的已验证点估计；
 后续补交错重复样本可给出置信区间，但不改变“`c20eeb7` 是唯一代码差异且已产生 CPU/leader 收益”的归因。
 
-### 9.2 当前 UB 带宽判断
+### 9.2 重构完成后的 `7:7` checkpoint
 
-在当前 UB 配置下，实测有效带宽上限约为 `10.7GB/s`。峰值 `7:7` 样本在 30 秒内记录
-`shared_vector_bytes=294,798,049,200B`，即 vector load 为 `9.8266GB/s`；同一批处理路径的
-`frame_bytes=12,470,964,920B`，即 UB-based request/response channel 为 `0.4157GB/s`。二者合计
-约 `10.2423GB/s`，约为该有效上限的 `95.7%`。因此，`8.181778M QPS` 已非常接近当前配置的
-有效带宽上限，继续增加 lane 数不会带来线性吞吐增长，这也与 `7:7` 到 `8:8` 的平台/回落现象一致。
+代码重构完成后，在默认的 server `0-15`、CLI `96-191` CPU 集合上执行一轮跨节点回归。
+配置为 `100K` Uniform `R:R`、`t=64`、`c=4`、`pipeline=batch=32`、30 秒 workload、25 秒
+flamegraph，`PIO:SNW=7:7`，全部 server 内部 batch=`32`。两端 build stamp 均通过；client
+source SHA-256 为 `6daea9b14a1e6478772bdb4300a535f4f7f772d31b512cf964953795a3c8224c`，server source
+SHA-256 为 `5e9259b2e6c4047831c9e7230f4e70d5b8ebc3a9d70c995c6df4d4de7d8d2086`。
 
-该合计包含逻辑 vector payload 和日志记录的 batch request/response frame payload（含 frame
-header/commit），不包含 descriptor ring、缓存行/对齐放大及其他协议访问；因此它支持“接近打满
-当前有效带宽”的判断，但不能单独证明物理 UB/DRAM 链路已经饱和。后续如需确认硬件带宽利用率，
-应补充平台 PMU 或设备带宽计数器。
+| 分布 | PIO:SNW | run | QPS | P99 | Redis process cores | 单核 QPS | leaders | followers | 平均 fanout | 产物 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Uniform `R:R` | `7:7` | `p7_s7_svr0-15_uniform_20260819_152126` | 10.997948M | 0.927ms | 11.784030 | 0.932478M | 352,422,751 | 54,777 | 1.000155 | [perf](../perf/p7_s7_svr0-15_uniform_20260819_152126/) |
+
+64/64 worker 正常完成，`status_nf`、`status_err`、`materialized_fail` 与 `unmatched` 全为 `0`；
+所有 `352,477,528` logical operations 均成功 materialize。CPU-set 的 user/sys/si/total 分别为
+`11.598000`、`0.337300`、`0.010300`、`12.077800` core-equivalent。表中的单核 QPS 使用当前
+控制台口径，即 `QPS / (Redis process total 11.784030 + CPU-set si 0.010300)`，而不是历史表中
+仅按 Redis process cores 计算的口径，不能与旧表的单核 QPS 直接作定量 A/B。
+
+该点验证完整重构后的数据面、计数和 flamegraph 产物均正常，且 QPS/P99 保持在当前 `7:7` 配置的
+可用水平；它不是与重构前同一代码和环境的交错重复对照，因此不把这一轮单点作为严格“无性能退化”的
+统计结论。

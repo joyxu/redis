@@ -24,24 +24,10 @@
 #include "obj_gen.h"
 
 /*
- * Side-channel Aeron (TCP control + UB-backed SPSC ring) runner.
- *
- * Bypasses memtier's libevent stack and runs the same wire protocol as
- * benchmark/vemb_v16_bench --transport aeron, but reuses memtier's
- * run_stats / HDR histogram / Totals output.
- *
- * Thread/channel mapping:
- *   -t N          -> N worker pthreads
- *   -c M          -> M channels per worker (total N*M channels)
- *   --pipeline P  -> per-channel outstanding-req cap
- *
- * Mode is derived from cfg (ratio/vsim/vrem flags), mirroring the memtier
- * TCP path's protocol.cpp dispatch. Returns a populated run_stats; caller
- * (run_benchmark) proceeds to its normal Totals/JSON/HDR output.
- *
- * Returns: populated run_stats on success, exit(1) on unrecoverable setup
- * failure (TCP control missing, channel alloc rejected, etc.). Per-op errors are
- * recorded inside the stats, not fatal.
+ * Memtier workload/statistics adapter over the VEMB SDK common core.
+ * TCP bootstrap/control plus local or peer-view UB resources are selected by
+ * topology and SDK transport resolution; this runner never opens or polls a
+ * data-plane channel itself.
  */
 run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen);
 

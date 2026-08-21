@@ -1,0 +1,61 @@
+# Client-local view for a same-host Aeron deployment.
+# Every provider path is intentionally identical to the client path; the
+# client still resolves all v1/v2 resources through the same peer-view ABI.
+version: 1
+peer_views:
+  - client_host: local
+    owner_id: 0
+    resource_role: v1_request_ring
+    resource_id: local-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: v1_response_ring
+    resource_id: local-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev3
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: warm_region
+    resource_id: local-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: v2_request_descriptor
+    resource_id: local-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: v2_request_arena
+    resource_id: local-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: v2_response_descriptor
+    resource_id: local-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev3
+    map_from_start: true
+  - client_host: local
+    owner_id: 0
+    resource_role: v2_response_arena
+    resource_id: local-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev3
+    map_from_start: true

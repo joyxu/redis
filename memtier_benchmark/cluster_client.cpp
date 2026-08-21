@@ -506,7 +506,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
 /////////////////////////////////////////////////////////////////////////
 
 vemb_v16_multi_client::vemb_v16_multi_client(client_group* group) : client(group),
-    m_create_request_depth(0), m_topology_valid(false),
+    m_topology_valid(false),
     m_topology_refresh_event(NULL), m_topology_refresh_count(0),
     m_topology_stale_retry_count(0), m_topology_moved_retry_count(0),
     m_topology_ask_retry_count(0)
@@ -531,6 +531,13 @@ vemb_v16_multi_client::vemb_v16_multi_client(client_group* group) : client(group
         if (s != start) {
             m_endpoints.push_back(std::string(start, s - start));
         }
+    } else {
+        char endpoint[320];
+        int written = snprintf(endpoint, sizeof(endpoint), "%s:%u",
+                               m_config->server, m_config->port);
+        if (written > 0 && (size_t)written < sizeof(endpoint)) {
+            m_endpoints.push_back(endpoint);
+        }
     }
 
     for (size_t i = 0; i < m_endpoints.size(); i++) {
@@ -540,11 +547,8 @@ vemb_v16_multi_client::vemb_v16_multi_client(client_group* group) : client(group
 
 int vemb_v16_multi_client::fetch_topology(void)
 {
-    if (!m_config->vemb_v16_client_topology) {
-        return 0;
-    }
     if (m_endpoint_ptrs.empty()) {
-        benchmark_error_log("error: --vemb-v16-client-topology requires --vemb-v16-endpoints.\n");
+        benchmark_error_log("error: no VEMB TCP bootstrap endpoint is configured.\n");
         return -1;
     }
 
@@ -575,9 +579,6 @@ int vemb_v16_multi_client::fetch_topology(void)
 
 int vemb_v16_multi_client::build_topology_owner_map(void)
 {
-    if (!m_config->vemb_v16_client_topology) {
-        return 0;
-    }
     if (!m_topology_valid) {
         return -1;
     }
@@ -623,12 +624,6 @@ int vemb_v16_multi_client::build_topology_owner_map(void)
 int vemb_v16_multi_client::route_key_to_backend(const char *key,
                                                 int *backend_idx)
 {
-    if (!m_config->vemb_v16_client_topology) {
-        return vemb_v16_route_key(m_endpoint_ptrs.data(),
-                                  (int)m_endpoint_ptrs.size(),
-                                  key, backend_idx);
-    }
-
     uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     uint32_t owner = vemb_v16_topology_ring_owner(&m_topology.active_ring,
                                                   key_hash);
@@ -653,7 +648,7 @@ int vemb_v16_multi_client::route_owner_to_backend(uint32_t owner,
 
 void vemb_v16_multi_client::apply_topology_epoch(void)
 {
-    if (!m_config->vemb_v16_client_topology || !m_topology_valid) {
+    if (!m_topology_valid) {
         return;
     }
 
@@ -705,8 +700,7 @@ void vemb_v16_multi_client::topology_refresh_cb(evutil_socket_t fd,
 
 void vemb_v16_multi_client::schedule_topology_refresh(void)
 {
-    if (!m_config->vemb_v16_client_topology || !m_topology_refresh_event ||
-        finished()) {
+    if (!m_topology_refresh_event || finished()) {
         return;
     }
 
@@ -757,10 +751,6 @@ bool vemb_v16_multi_client::retry_topology_response(
         protocol_response *response)
 {
     (void)conn_id;
-    if (!m_config->vemb_v16_client_topology) {
-        return false;
-    }
-
     uint8_t status = response->get_vemb_v16_status();
     if (status != VEMB_V16_STATUS_STALE_TOPOLOGY &&
         status != VEMB_V16_STATUS_MOVED &&
@@ -825,10 +815,6 @@ vemb_v16_multi_client::~vemb_v16_multi_client()
         event_free(m_topology_refresh_event);
         m_topology_refresh_event = NULL;
     }
-    for (unsigned int i = 0; i < m_key_index_pools.size(); i++) {
-        delete m_key_index_pools[i];
-    }
-    m_key_index_pools.clear();
 }
 
 shard_connection* vemb_v16_multi_client::create_shard_connection(abstract_protocol* abs_protocol)
@@ -839,12 +825,6 @@ shard_connection* vemb_v16_multi_client::create_shard_connection(abstract_protoc
     assert(sc != NULL);
 
     m_connections.push_back(sc);
-
-    key_index_pool* key_idx_pool = new key_index_pool;
-    assert(key_idx_pool != NULL);
-
-    m_key_index_pools.push_back(key_idx_pool);
-    assert(m_connections.size() == m_key_index_pools.size());
 
     return sc;
 }
@@ -876,11 +856,6 @@ bool vemb_v16_multi_client::connect_shard_connection(shard_connection* sc,
                                                      const char* address,
                                                      unsigned short port)
 {
-    if (m_key_index_pools[sc->get_id()]->size()) {
-        key_index_pool empty_queue;
-        std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
-    }
-
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
     sc->set_address_port(address, port_str);
@@ -914,10 +889,6 @@ bool vemb_v16_multi_client::connect_shard_connection(shard_connection* sc,
 
 int vemb_v16_multi_client::connect(void)
 {
-    if (m_endpoint_ptrs.empty()) {
-        return client::connect();
-    }
-
     if (fetch_topology() != 0) {
         return -1;
     }
@@ -930,9 +901,6 @@ int vemb_v16_multi_client::connect(void)
     unsigned short port;
     if (!vemb_parse_endpoint(m_endpoint_ptrs[0], host, sizeof(host), &port))
         return -1;
-
-    key_index_pool* main_pool = new key_index_pool;
-    m_key_index_pools.push_back(main_pool);
 
     if (!connect_shard_connection(main_sc, host, port)) {
         return -1;
@@ -953,14 +921,12 @@ int vemb_v16_multi_client::connect(void)
         return -1;
     }
     apply_topology_epoch();
-    if (m_config->vemb_v16_client_topology) {
-        m_topology_refresh_event =
-            evtimer_new(m_event_base, topology_refresh_cb, this);
-        if (!m_topology_refresh_event) {
-            return -1;
-        }
-        schedule_topology_refresh();
+    m_topology_refresh_event =
+        evtimer_new(m_event_base, topology_refresh_cb, this);
+    if (!m_topology_refresh_event) {
+        return -1;
     }
+    schedule_topology_refresh();
 
     return 0;
 }
@@ -989,18 +955,7 @@ get_key_response vemb_v16_multi_client::get_key_for_conn(unsigned int command_in
                                                           unsigned int conn_id,
                                                           unsigned long long* key_index)
 {
-    if (!m_key_index_pools[conn_id]->empty()) {
-        *key_index = m_key_index_pools[conn_id]->front();
-        m_obj_gen->generate_key(*key_index);
-        m_key_index_pools[conn_id]->pop();
-        return available_for_conn;
-    }
-
-    /* Generate a key and route it to the correct backend.  If the routed
-     * backend is disconnected, retry a few times so that a single failed
-     * endpoint cannot deadlock the client.  When we queue a key for another
-     * backend, wake that backend up so it can drain its queue even if no
-     * response is currently pending on it. */
+    /* Generate a key that belongs to this connection's current owner. */
     for (int retry = 0; retry < 16; retry++) {
         client::get_key_for_conn(command_index, conn_id, key_index);
 
@@ -1013,61 +968,9 @@ get_key_response vemb_v16_multi_client::get_key_for_conn(unsigned int command_in
         if ((unsigned int)backend_idx == conn_id) {
             return available_for_conn;
         }
-
-        if (m_config->vemb_v16_client_topology) {
-            continue;
-        }
-
-        if (m_connections[backend_idx]->get_connection_state() == conn_disconnected) {
-            continue;
-        }
-
-        key_index_pool* key_idx_pool = m_key_index_pools[backend_idx];
-        if (key_idx_pool->size() >= KEY_INDEX_QUEUE_MAX_SIZE)
-            return not_available;
-
-        key_idx_pool->push(command_index);
-        key_idx_pool->push(*key_index);
-
-        /* Wake the target connection so it can drain the newly queued key.
-         * Guard recursion depth to avoid unbounded stack in pathological
-         * cross-routing cases. */
-        if (m_create_request_depth < 4) {
-            m_connections[backend_idx]->wake_pipeline();
-        }
-
-        return available_for_other_conn;
     }
 
     return not_available;
-}
-
-void vemb_v16_multi_client::create_request(struct timeval timestamp, unsigned int conn_id)
-{
-    m_create_request_depth++;
-
-    if (m_key_index_pools[conn_id]->empty()) {
-        client::create_request(timestamp, conn_id);
-        m_create_request_depth--;
-        return;
-    }
-
-    unsigned int pool_size = m_key_index_pools[conn_id]->size();
-    unsigned int command_index = m_key_index_pools[conn_id]->front();
-    m_key_index_pools[conn_id]->pop();
-
-    if (m_config->arbitrary_commands->is_defined())
-        client::create_arbitrary_request(command_index, timestamp, conn_id);
-    else if (command_index == SET_CMD_IDX)
-        create_set_request(timestamp, conn_id);
-    else if (command_index == GET_CMD_IDX)
-        create_get_request(timestamp, conn_id);
-    else
-        assert(!"Unexpected command index");
-
-    assert(m_key_index_pools[conn_id]->size() == pool_size - 2);
-
-    m_create_request_depth--;
 }
 
 bool vemb_v16_multi_client::hold_pipeline(unsigned int conn_id)
@@ -1076,27 +979,17 @@ bool vemb_v16_multi_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
-    /* A connection with queued keys must be allowed to drain them even after
-     * the global request budget has been consumed, otherwise cross-routed keys
-     * deadlock and the benchmark never finishes. */
-    if (!m_key_index_pools[conn_id]->empty()) {
-        return false;
-    }
-
-    if (m_config->vemb_v16_client_topology) {
-        bool owns_active_owner = false;
-        for (uint32_t i = 0; i < m_topology.active_ring.owner_count; i++) {
-            uint32_t owner = m_topology.active_ring.owners[i];
-            if (owner < VEMB_V16_TOPOLOGY_MAX_OWNERS &&
-                m_owner_to_conn[owner] == (int)conn_id) {
-                owns_active_owner = true;
-                break;
-            }
-        }
-        if (!owns_active_owner) {
-            return true;
+    bool owns_active_owner = false;
+    for (uint32_t i = 0; i < m_topology.active_ring.owner_count; i++) {
+        uint32_t owner = m_topology.active_ring.owners[i];
+        if (owner < VEMB_V16_TOPOLOGY_MAX_OWNERS &&
+            m_owner_to_conn[owner] == (int)conn_id) {
+            owns_active_owner = true;
+            break;
         }
     }
+    if (!owns_active_owner)
+        return true;
 
     if (m_config->requests && m_reqs_generated >= m_config->requests) {
         return true;

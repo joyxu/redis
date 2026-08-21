@@ -7,11 +7,12 @@
 #include "vemb_v16_util.h"
 
 /* =====================================================================
- *  Cross-node Aeron ATTACH protocol
+ *  Client-side peer-view Aeron ATTACH protocol
  * =====================================================================
  *
- * Lets a remote client (HW02) open an aeron channel on a remote server
- * (HW01) via TCP, when UDS is not reachable (AF_LOCAL = single-host).
+ * Lets a client open an Aeron channel on a server via TCP when the data-plane
+ * UB resource is resolved by the client's peer-view manifest. The same ABI
+ * serves local and remote deployments; only provider/client paths differ.
  *
  * Wire format (all integers little-endian, raw struct — no RESP):
  *

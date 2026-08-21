@@ -20,15 +20,17 @@ int main(int argc, char **argv)
 
     const char *host = "127.0.0.1";
     uint16_t port = 6391;
+    char seed[80];
+    snprintf(seed, sizeof(seed), "%s:%u", host, port);
+    const char *seeds[] = {seed};
 
     /* ========== TCP Client ========== */
-    vemb_v16_client_t *client = vemb_v16_client_create(host, port, DIM, 0);
+    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, DIM, 0);
     if (!client) {
         fprintf(stderr, "failed to connect to %s:%u\n", host, port);
         return 1;
     }
-    printf("connected to %s:%u, dim=%u, fd=%d\n",
-           host, port, DIM, vemb_v16_client_fd(client));
+    printf("configured bootstrap seed %s:%u, dim=%u\n", host, port, DIM);
 
     /* 1. VADD — write a vector */
     float vec[DIM];

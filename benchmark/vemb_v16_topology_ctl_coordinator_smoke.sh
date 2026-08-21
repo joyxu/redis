@@ -28,10 +28,10 @@ NET_TOPOLOGY_RESPONSE = 0x14
 NET_SCALEOUT_LOCAL_DONE = 0x1B
 NET_SCALEOUT_LOCAL_DONE_RESPONSE = 0x1C
 STATUS_OK = 0
-TOPOLOGY_REQ_SIZE = 12512
-TOPOLOGY_RESP_SIZE = 12520
-SCALEOUT_LOCAL_DONE_REQ_SIZE = 64
-SCALEOUT_LOCAL_DONE_RESP_SIZE = 40
+TOPOLOGY_REQ_SIZE = 424
+TOPOLOGY_RESP_SIZE = 41
+SCALEOUT_LOCAL_DONE_REQ_SIZE = 56
+SCALEOUT_LOCAL_DONE_RESP_SIZE = 29
 
 hits = []
 errors = []
@@ -84,10 +84,10 @@ def serve_one(owner, port):
             payload = read_full(conn, payload_len)
             if magic != MAGIC or version != VERSION:
                 raise RuntimeError("bad topology frame header")
-            epoch = struct.unpack_from("<Q", payload, 0)[0]
-            active_count = struct.unpack_from("<I", payload, 16)[0]
-            standby_count = struct.unpack_from("<I", payload, 20)[0]
-            endpoint_count = struct.unpack_from("<I", payload, 544)[0]
+            epoch = struct.unpack_from(">Q", payload, 0)[0]
+            active_count = struct.unpack_from(">I", payload, 16)[0]
+            standby_count = struct.unpack_from(">I", payload, 20)[0]
+            endpoint_count = struct.unpack_from(">I", payload, 48)[0]
             hits.append(
                 {
                     "owner": owner,
@@ -152,7 +152,7 @@ else:
     raise SystemExit(f"coordinator did not listen\nstdout:\n{out}\nstderr:\n{err}")
 
 payload = struct.pack(
-    "<QQQIIIIIIIII",
+    ">QQQIIIIIIII",
     23,
     24,
     23,
@@ -164,8 +164,7 @@ payload = struct.pack(
     0,
     0,
     0,
-    0,
-) + b"\0" * 4
+)
 assert len(payload) == SCALEOUT_LOCAL_DONE_REQ_SIZE
 
 with socket.create_connection(("127.0.0.1", COORD_PORT), timeout=2) as sock:
@@ -182,7 +181,11 @@ with socket.create_connection(("127.0.0.1", COORD_PORT), timeout=2) as sock:
         or payload_len != SCALEOUT_LOCAL_DONE_RESP_SIZE
         or resp[0] != STATUS_OK
     ):
-        raise SystemExit("coordinator callback ack was not OK")
+        raise SystemExit(
+            "coordinator callback ack was not OK: "
+            f"magic={magic:#x} version={version} type={frame_type:#x} "
+            f"payload_len={payload_len} status={resp[0] if resp else None}"
+        )
 
 out, err = proc.communicate(timeout=15)
 for t in threads:

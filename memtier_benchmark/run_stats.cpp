@@ -1426,8 +1426,8 @@ void run_stats::print(FILE *out, benchmark_config *config,
         print_missess_sec_column(table);
     }
 
-    // Moved & ASK column (also used by VEMB V16 topology-aware retries)
-    if (config->cluster_mode || config->vemb_v16_client_topology) {
+    // Moved & ASK column (also used by automatic VEMB V16 topology retries)
+    if (config->cluster_mode || config->protocol == PROTOCOL_VEMB_V16) {
         print_moved_sec_column(table);
         print_ask_sec_column(table);
     }

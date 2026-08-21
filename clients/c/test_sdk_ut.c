@@ -189,9 +189,12 @@ static int test_serialize_hello_normal(void) {
     ASSERT_EQ_U64(hdr->channel_id, 0u);
     ASSERT_EQ_UINT(hdr->req_id, 0u);
 
-    vemb_v16_alloc_req_t *req = (vemb_v16_alloc_req_t *)(buf + sizeof(*hdr));
-    ASSERT_EQ_UINT(req->vector_dim, 300u);
-    ASSERT_EQ_UINT(req->flags, 0x01u);
+    vemb_v16_alloc_req_t req;
+    ASSERT_TRUE(vemb_v16_alloc_req_decode(&req,
+                                          (const uint8_t *)buf + sizeof(*hdr),
+                                          hdr->payload_len) == 0);
+    ASSERT_EQ_UINT(req.vector_dim, 300u);
+    ASSERT_EQ_UINT(req.flags, 0x01u);
     return 0;
 }
 
@@ -199,9 +202,12 @@ static int test_serialize_hello_minimal(void) {
     char buf[64];
     ssize_t n = vemb_v16_serialize_hello(buf, sizeof(buf), 1, 0);
     ASSERT_TRUE(n > 0);
-    vemb_v16_alloc_req_t *req = (vemb_v16_alloc_req_t *)(buf + sizeof(vemb_v16_net_hdr_t));
-    ASSERT_EQ_UINT(req->vector_dim, 1u);
-    ASSERT_EQ_UINT(req->flags, 0u);
+    vemb_v16_alloc_req_t req;
+    ASSERT_TRUE(vemb_v16_alloc_req_decode(&req,
+                                          (const uint8_t *)buf + sizeof(vemb_v16_net_hdr_t),
+                                          vemb_v16_alloc_req_encoded_len()) == 0);
+    ASSERT_EQ_UINT(req.vector_dim, 1u);
+    ASSERT_EQ_UINT(req.flags, 0u);
     return 0;
 }
 
@@ -222,6 +228,37 @@ static int test_serialize_hello_buf_too_small(void) {
 static int test_serialize_hello_buf_zero(void) {
     ssize_t n = vemb_v16_serialize_hello(NULL, 0, 300, 0);
     ASSERT_EQ_SSIZE(n, -1);
+    return 0;
+}
+
+/* ===================================================================== */
+/* vemb_v16_parse_response identity                                      */
+/* ===================================================================== */
+
+static int test_parse_response_rejects_req_id_mismatch(void) {
+    uint8_t buf[sizeof(vemb_v16_net_hdr_t) + 64] = {0};
+    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)buf;
+    vemb_v16_resp_t wire_resp = {
+        .status = VEMB_V16_STATUS_OK,
+        .op = VEMB_V16_OP_PING,
+        .req_id = 12,
+    };
+    size_t payload_len = 0;
+
+    ASSERT_TRUE(vemb_v16_resp_encode(buf + sizeof(*hdr),
+                                      sizeof(buf) - sizeof(*hdr),
+                                      &wire_resp, &payload_len) == 0);
+    hdr->magic = VEMB_V16_MAGIC;
+    hdr->version = VEMB_V16_VERSION;
+    hdr->type = VEMB_V16_NET_RESPONSE;
+    hdr->payload_len = (uint32_t)payload_len;
+    hdr->channel_id = 42;
+    hdr->req_id = 11;
+
+    vemb_v16_resp_t decoded;
+    ASSERT_EQ_SSIZE(vemb_v16_parse_response(buf,
+                                             sizeof(*hdr) + payload_len,
+                                             &decoded, NULL), -1);
     return 0;
 }
 
@@ -347,93 +384,6 @@ static int test_serialize_vadd_buf_too_small(void) {
     float vec[300];
     memset(vec, 0, sizeof(vec));
     ssize_t n = vemb_v16_serialize_vadd(buf, sizeof(buf), 0, 0, "k", 1, vec, 300);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-/* ===================================================================== */
-/* vemb_v16_serialize_vemb                                               */
-/* ===================================================================== */
-
-static int test_serialize_vemb_normal(void) {
-    char buf[2048];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf),
-                                        0xABCD, 99,
-                                        "myset\0myelem", 12,
-                                        300);
-    ASSERT_TRUE(n > 0);
-
-    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)buf;
-    ASSERT_EQ_UINT(hdr->type, (uint16_t)VEMB_V16_NET_REQUEST);
-    ASSERT_EQ_U64(hdr->channel_id, 0xABCDu);
-    ASSERT_EQ_UINT(hdr->req_id, 99u);
-
-    /* Compact VEMB_HANDLE: decode payload instead of struct overlay. */
-    vemb_v16_req_t req;
-    ASSERT_TRUE(vemb_v16_req_decode(&req,
-                                    (const uint8_t *)buf + sizeof(*hdr),
-                                    hdr->payload_len) == 0);
-    ASSERT_EQ_UINT(req.op, (uint8_t)VEMB_V16_OP_VEMB_HANDLE);
-    ASSERT_EQ_UINT(req.key_len, 12u);
-    ASSERT_MEMEQ(req.key, "myset\0myelem", 12);
-    ASSERT_EQ_UINT(req.dim, 300u);
-
-    /* 24B base + 12B key = 36 */
-    ASSERT_EQ_UINT(hdr->payload_len, 36u);
-    return 0;
-}
-
-static int test_serialize_vemb_null_key(void) {
-    char buf[2048];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, NULL, 4, 300);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-static int test_serialize_vemb_zero_key_len(void) {
-    char buf[2048];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, "", 0, 300);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-static int test_serialize_vemb_key_too_long(void) {
-    char buf[2048];
-    char key[VEMB_V16_MAX_KEY_LEN];
-    memset(key, 'k', sizeof(key));
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, key, (uint32_t)sizeof(key), 300);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-static int test_serialize_vemb_zero_dim(void) {
-    char buf[2048];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, "k", 1, 0);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-static int test_serialize_vemb_dim_too_large(void) {
-    char buf[2048];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, "k", 1, VEMB_V16_MAX_DIM + 1);
-    ASSERT_EQ_SSIZE(n, -1);
-    return 0;
-}
-
-static int test_serialize_vemb_buf_exact(void) {
-    /* Compact VEMB_HANDLE payload = 24B base + key_len.
-     * For key_len=1: 24 + 1 = 25 */
-    size_t need = sizeof(vemb_v16_net_hdr_t) + 24u + 1u;
-    char *buf = malloc(need);
-    ssize_t n = vemb_v16_serialize_vemb(buf, need, 0, 0, "k", 1, 300);
-    ASSERT_EQ_SSIZE(n, (ssize_t)need);
-    free(buf);
-    return 0;
-}
-
-static int test_serialize_vemb_buf_too_small(void) {
-    char buf[sizeof(vemb_v16_net_hdr_t)];
-    ssize_t n = vemb_v16_serialize_vemb(buf, sizeof(buf), 0, 0, "k", 1, 300);
     ASSERT_EQ_SSIZE(n, -1);
     return 0;
 }
@@ -628,6 +578,7 @@ int main(void)
     RUN(serialize_hello_buf_exact);
     RUN(serialize_hello_buf_too_small);
     RUN(serialize_hello_buf_zero);
+    RUN(parse_response_rejects_req_id_mismatch);
 
     RUN(serialize_vadd_normal);
     RUN(serialize_vadd_max_dim);
@@ -639,15 +590,6 @@ int main(void)
     RUN(serialize_vadd_dim_too_large);
     RUN(serialize_vadd_buf_exact);
     RUN(serialize_vadd_buf_too_small);
-
-    RUN(serialize_vemb_normal);
-    RUN(serialize_vemb_null_key);
-    RUN(serialize_vemb_zero_key_len);
-    RUN(serialize_vemb_key_too_long);
-    RUN(serialize_vemb_zero_dim);
-    RUN(serialize_vemb_dim_too_large);
-    RUN(serialize_vemb_buf_exact);
-    RUN(serialize_vemb_buf_too_small);
 
     RUN(murmur3_empty);
     RUN(murmur3_single_char);

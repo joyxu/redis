@@ -10,6 +10,7 @@
 
 typedef struct vemb_v16_ub_rpc_ring_config {
     uint32_t backend_type;
+    uint32_t cache_policy;
     uint64_t mmap_offset;
     char path[256];
 } vemb_v16_ub_rpc_ring_config_t;

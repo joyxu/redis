@@ -435,7 +435,21 @@ static int ring_config_valid(const vemb_v16_ub_rpc_ring_config_t *config) {
     return config &&
            (config->backend_type == VEMB_V16_REGION_LOCAL_SHM ||
             config->backend_type == VEMB_V16_REGION_UB) &&
+           (config->cache_policy == VEMB_V16_UB_CACHE_POLICY_CACHEABLE ||
+            config->cache_policy == VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE) &&
            config->path[0] != '\0';
+}
+
+static int peer_config_valid(const vemb_v16_ub_rpc_peer_t *peer) {
+    if (!peer || !ring_config_valid(&peer->request) ||
+        !ring_config_valid(&peer->response) ||
+        !ring_config_valid(&peer->inbound_request) ||
+        !ring_config_valid(&peer->outbound_response)) {
+        return 0;
+    }
+    /* Imported UB views may be NC in every direction. The manifest is the
+     * deployment authority for cache policy; retain only shape validation. */
+    return 1;
 }
 
 static int ring_open(vemb_v16_ub_rpc_ring_t *ring,
@@ -452,6 +466,7 @@ static int ring_open(vemb_v16_ub_rpc_ring_t *ring,
     ring->bytes = rpc_ring_bytes(slot_size);
     if (vemb_v16_mapped_region_open(&ring->mapping,
                                     config->backend_type,
+                                    config->cache_policy,
                                     config->path,
                                     config->mmap_offset,
                                     ring->bytes) != 0) {
@@ -481,6 +496,7 @@ static int ring_reset(const vemb_v16_ub_rpc_ring_config_t *config,
     size_t bytes = rpc_ring_bytes(slot_size);
     if (vemb_v16_mapped_region_open(&mapping,
                                     config->backend_type,
+                                    config->cache_policy,
                                     config->path,
                                     config->mmap_offset,
                                     bytes) != 0) {
@@ -1036,6 +1052,8 @@ static void *listener_main(void *arg) {
 
 static int peer_open(vemb_v16_ub_rpc_peer_state_t *dst,
                      const vemb_v16_ub_rpc_peer_t *src) {
+    if (!peer_config_valid(src))
+        return -1;
     memset(dst, 0, sizeof(*dst));
     dst->request.mapping.fd = -1;
     dst->response.mapping.fd = -1;

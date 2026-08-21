@@ -264,7 +264,6 @@ start_live_workload() {
         --threads "$LIVE_THREADS" \
         --pipeline 1 \
         --mode "$LIVE_MODE" \
-        --client-topology \
         --timeout-ms "$LIVE_TIMEOUT_MS" > "$out" 2>&1 &
     LIVE_PID="$!"
     sleep 0.3
@@ -359,7 +358,6 @@ PREFILL_OUT="$TMPDIR/prefill.out"
     --threads 1 \
     --pipeline 1 \
     --mode vadd \
-    --client-topology \
     --timeout-ms 10000 > "$PREFILL_OUT" 2>&1
 if ! grep -q "\\[prefill\\] inserted=${PREFILL}" "$PREFILL_OUT"; then
     printf '[fail] prefill did not insert expected keys\n' >&2
@@ -429,7 +427,6 @@ RUN_OUT="$TMPDIR/post_cutover.out"
     --threads 1 \
     --pipeline 1 \
     --mode vadd \
-    --client-topology \
     --timeout-ms 10000 > "$RUN_OUT" 2>&1
 
 fail_count="$(sed -n 's/.* fail=\([0-9][0-9]*\) .*/\1/p' "$RUN_OUT" | tail -1)"

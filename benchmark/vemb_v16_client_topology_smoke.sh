@@ -115,7 +115,6 @@ BENCH_OUT="$TMPDIR/bench.out"
     --threads 1 \
     --pipeline 1 \
     --mode vadd \
-    --client-topology \
     --timeout-ms 5000 > "$BENCH_OUT" 2>&1
 
 fail_count="$(sed -n 's/.* fail=\([0-9][0-9]*\) .*/\1/p' "$BENCH_OUT" | tail -1)"

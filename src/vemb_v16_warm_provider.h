@@ -27,6 +27,7 @@ typedef struct vemb_v16_warm_provider {
 int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
                                 uint32_t region_id,
                                 uint32_t backend_type,
+                                uint32_t cache_policy,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 uint32_t value_size,

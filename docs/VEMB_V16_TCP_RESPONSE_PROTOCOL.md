@@ -82,7 +82,7 @@ base
 
 No extra metadata.
 
-#### `VEMB_HANDLE`, `VEMB_INLINE`
+#### `VEMB_INLINE`
 
 ```text
 base | vector_bytes:u32 | vector_offset:u64 | region_id:u32 | local_slot:u32 | owner_generation:u64
@@ -153,8 +153,6 @@ Encoded response metadata sizes:
   - `10B`
 - `VSIM_*` success
   - `10B`
-- `VEMB_HANDLE` success
-  - `34B`
 - `VEMB_INLINE` success metadata
   - `34B`
   - plus appended inline vector payload bytes
@@ -164,5 +162,4 @@ Compared with the previous fixed `56B` metadata response:
 - ack/error saves `50B`
 - redirect saves `46B`
 - `VSIM_*` saves `46B`
-- `VEMB_*` handle metadata saves `22B`
-
+- `VEMB_INLINE` metadata saves `22B`

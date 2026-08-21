@@ -12,12 +12,31 @@
 # 所有产物（yaml、log、tsv、raw）写 benchmark/results/scaleout/<run_id>/ 下，不放 /tmp。
 set -euo pipefail
 
+# TCP uses the established VEMB memtier path. UB dispatches to the matching
+# three-stage memtier runner, using Aeron and its mandatory client peer-view
+# manifest for the UB data plane.
+DATA_TRANSPORT="${DATA_TRANSPORT:-tcp}"
+case "$DATA_TRANSPORT" in
+    tcp) ;;
+    ub)
+        exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/vemb_v16_scaleout_ub_cluster_111_to_112.sh"
+        ;;
+    *)
+        echo "DATA_TRANSPORT must be tcp or ub: $DATA_TRANSPORT" >&2
+        exit 2
+        ;;
+esac
+
 # ============================================================================
 # 网络拓扑
 # ============================================================================
 NODE0_HOST="${NODE0_HOST:-192.168.1.111}"
 NODE1_HOST="${NODE1_HOST:-192.168.1.112}"
 SSH_USER="${SSH_USER:-root}"
+NODE0_SSH_HOST="${NODE0_SSH_HOST:-43.154.145.18}"
+NODE0_SSH_PORT="${NODE0_SSH_PORT:-8111}"
+NODE1_SSH_HOST="${NODE1_SSH_HOST:-43.154.145.18}"
+NODE1_SSH_PORT="${NODE1_SSH_PORT:-8112}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 # memtier 执行节点 (client 负载机, 与 server 分离以排除 client 干扰)
@@ -93,8 +112,30 @@ PREFILL_LOG="$REMOTE_DIR/$REMOTE_SUBDIR/prefill.log"
 RAW_DIR="$REMOTE_DIR/$REMOTE_SUBDIR/raw"
 
 # 工具函数
-ssh_run() { ssh -p 22 "${SSH_USER}@$1" "${@:2}"; }
+ssh_run() {
+    local node_host=$1
+    shift
+    local ssh_host ssh_port
+    case "$node_host" in
+        "$NODE0_HOST")
+            ssh_host=$NODE0_SSH_HOST
+            ssh_port=$NODE0_SSH_PORT
+            ;;
+        "$NODE1_HOST")
+            ssh_host=$NODE1_SSH_HOST
+            ssh_port=$NODE1_SSH_PORT
+            ;;
+        *)
+            echo "unknown scaleout node: $node_host" >&2
+            return 2
+            ;;
+    esac
+    ssh -p "$ssh_port" "${SSH_USER}@$ssh_host" "$@"
+}
 log() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+summary_row() {
+    printf '%-32s %-15s %-10s %-10s %-8s %s\n' "$@"
+}
 
 # 在两个节点上提前创建子目录
 ssh_run "$NODE0_HOST" "mkdir -p $REMOTE_DIR/$REMOTE_SUBDIR/raw"
@@ -114,6 +155,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: $PAYLOAD_LOCAL_PATH
+remote_meta_cache_policy: cacheable
 remote_meta_mmap_offset: $REMOTE_META_MMAP_OFFSET
 remote_meta_entries: $MAX_VECTORS
 remote_meta_buckets: $((MAX_VECTORS * 2))
@@ -123,6 +165,7 @@ warm_regions:
   - region_id: 100
     provider: ub
     path: $PAYLOAD_LOCAL_PATH
+    cache_policy: cacheable
     mmap_offset: 0
     bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
@@ -136,6 +179,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: $PAYLOAD_LOCAL_PATH
+remote_meta_cache_policy: cacheable
 remote_meta_mmap_offset: $REMOTE_META_MMAP_OFFSET
 remote_meta_entries: $MAX_VECTORS
 remote_meta_buckets: $((MAX_VECTORS * 2))
@@ -145,6 +189,7 @@ warm_regions:
   - region_id: 101
     provider: ub
     path: $PAYLOAD_LOCAL_PATH
+    cache_policy: cacheable
     mmap_offset: 0
     bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
@@ -153,6 +198,7 @@ warm_regions:
   - region_id: 100
     provider: ub
     path: $PAYLOAD_PEER_PATH
+    cache_policy: noncacheable
     mmap_offset: 0
     bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
@@ -163,6 +209,7 @@ remote_meta_views:
   - owner_id: 0
     provider: ub
     path: $PAYLOAD_PEER_PATH
+    cache_policy: noncacheable
     mmap_offset: $REMOTE_META_MMAP_OFFSET
     entries: $MAX_VECTORS
     buckets: $((MAX_VECTORS * 2))
@@ -170,13 +217,17 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 0
     provider: ub
-    request_path: $REQUEST_LOCAL_PATH
+    request_path: $REQUEST_PEER_PATH
+    request_cache_policy: noncacheable
     request_mmap_offset: 8388608
-    response_path: $RESPONSE_PEER_PATH
+    response_path: $RESPONSE_LOCAL_PATH
+    response_cache_policy: cacheable
     response_mmap_offset: 16777216
-    inbound_request_path: $REQUEST_PEER_PATH
+    inbound_request_path: $REQUEST_LOCAL_PATH
+    inbound_request_cache_policy: cacheable
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: $RESPONSE_LOCAL_PATH
+    outbound_response_path: $RESPONSE_PEER_PATH
+    outbound_response_cache_policy: noncacheable
     outbound_response_mmap_offset: 16777216
 YAML"
 
@@ -189,6 +240,7 @@ warm_regions:
   - region_id: 101
     provider: ub
     path: $PAYLOAD_PEER_PATH
+    cache_policy: noncacheable
     mmap_offset: 0
     bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
@@ -199,6 +251,7 @@ remote_meta_views:
   - owner_id: 1
     provider: ub
     path: $PAYLOAD_PEER_PATH
+    cache_policy: noncacheable
     mmap_offset: $REMOTE_META_MMAP_OFFSET
     entries: $MAX_VECTORS
     buckets: $((MAX_VECTORS * 2))
@@ -206,13 +259,17 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 1
     provider: ub
-    request_path: $REQUEST_LOCAL_PATH
+    request_path: $REQUEST_PEER_PATH
+    request_cache_policy: noncacheable
     request_mmap_offset: 8388608
-    response_path: $RESPONSE_PEER_PATH
+    response_path: $RESPONSE_LOCAL_PATH
+    response_cache_policy: cacheable
     response_mmap_offset: 16777216
-    inbound_request_path: $REQUEST_PEER_PATH
+    inbound_request_path: $REQUEST_LOCAL_PATH
+    inbound_request_cache_policy: cacheable
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: $RESPONSE_LOCAL_PATH
+    outbound_response_path: $RESPONSE_PEER_PATH
+    outbound_response_cache_policy: noncacheable
     outbound_response_mmap_offset: 16777216
 YAML"
 }
@@ -240,7 +297,10 @@ start_node() {
 # 停指定节点上的集成 redis-server（按端口匹配）
 stop_node() {
     local host=$1
-    ssh_run "$host" "pkill -9 -f 'redis-server.*:$PORT' 2>/dev/null || true; pkill -9 -f 'vemb_v16_topology_ctl.*$COORD_PORT' 2>/dev/null || true; sleep 0.5" || true
+    ssh_run "$host" "for port in $PORT $COORD_PORT; do \
+        pids=\$(ss -ltnp \"sport = :\$port\" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u); \
+        [ -z \"\$pids\" ] || kill -9 \$pids; \
+    done; sleep 0.5" || true
 }
 
 verify_remote_prereqs() {
@@ -290,7 +350,7 @@ run_memtier() {
         --key-minimum=$key_min --key-maximum=$key_max \
         --test-time=$tt $extra >$outfile 2>&1" || true
     local tot; tot=$(ssh_run "$host" "grep '^Totals' $outfile 2>/dev/null | tail -1")
-    local ops hits p50 p99
+    local ops p50 p99
     ops=$(echo "$tot" | awk '{print $2}')
     hits=$(echo "$tot" | awk '{print $3}')
     p50=$(echo "$tot" | awk '{print $(NF-3)}')
@@ -344,7 +404,7 @@ stop_memtier_bg() {
 # 从后台 memtier 日志提取 Totals（与 baseline/after 口径一致；不回退瞬时速率）
 parse_bg_out() {
     local host=$1 outfile=$2
-    local tot ops hits p50 p99
+    local tot ops p50 p99
     # memtier 偶尔在 sleep 后才 flush Totals，给 15s 重试窗口
     local i
     for i in $(seq 1 15); do
@@ -354,18 +414,17 @@ parse_bg_out() {
     done
     if [ -z "$tot" ]; then
         echo "ERROR: no Totals in $outfile (memtier killed?)" >&2
-        echo "0 0 NA NA"
+        echo "0 NA NA"
         return 1
     fi
     ops=$(echo "$tot" | awk '{print $2}')
-    hits=$(echo "$tot" | awk '{print $3}')
     p50=$(echo "$tot" | awk '{print $(NF-3)}')
     p99=$(echo "$tot" | awk '{print $(NF-2)}')
     [ -z "$ops" ] && ops=0
-    echo "$ops $hits $p50 $p99"
+    echo "$ops $p50 $p99"
 }
 
-# 把一段结果写 TSV 并打 log
+# 把一段结果写入固定宽度汇总表并打 log
 record_phase() {
     local phase=$1 ops=$2 hits=$3 p50=$4 p99=$5 wall=$6 note=$7 cut=$8 sut=$9 si=${10} rss=${11}
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -433,7 +492,7 @@ prefill_steady_data() {
     log "Prefilling post-cutover steady keyspace ($count vectors, endpoints=$endpoints)"
     ssh_run "$MEMTIER_HOST" "mkdir -p $(dirname $outfile); numactl --membind=1 taskset -c 96-191 \
         $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-        --vemb-v16-client-topology --vemb-v16-endpoints=$endpoints \
+        --vemb-v16-endpoints=$endpoints \
         -t 32 -c 4 --pipeline=32 \
         --ratio=1:0 --key-pattern=S:S --key-prefix=item: \
         --key-minimum=$key_min --key-maximum=$key_max -n $count \
@@ -459,6 +518,8 @@ log "Phase 2: Start servers (node0, node1)"
 start_node "$NODE0_HOST" "$NODE0_MANIFEST" "$NODE0_LOG" 1
 wait_port "$NODE0_HOST" || { echo "FAIL: node0 not listening"; exit 1; }
 
+# Reset now owns only local warm/meta resources and this node's NC producers;
+# peer CC views are never reset.
 start_node "$NODE1_HOST" "$NODE1_MANIFEST" "$NODE1_LOG" 1
 wait_port "$NODE1_HOST" || { echo "FAIL: node1 not listening"; exit 1; }
 sleep 2

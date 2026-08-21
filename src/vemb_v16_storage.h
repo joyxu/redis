@@ -49,6 +49,8 @@ typedef struct vemb_v16_manifest_region {
     uint32_t has_is_local;
     uint32_t weight;
     uint32_t value_size;
+    uint32_t cache_policy;
+    uint32_t has_cache_policy;
     uint64_t mmap_offset;
     uint64_t region_bytes;
     char path[256];
@@ -66,6 +68,8 @@ typedef struct vemb_v16_manifest_remote_meta_view {
     uint32_t bucket_count;
     uint32_t set_count;
     uint32_t ways;
+    uint32_t cache_policy;
+    uint32_t has_cache_policy;
     uint64_t mmap_offset;
     char path[256];
 } vemb_v16_manifest_remote_meta_view_t;
@@ -89,6 +93,8 @@ typedef struct vemb_v16_warm_regions_manifest {
     uint32_t remote_meta_bucket_count;
     uint32_t remote_meta_set_count;
     uint32_t remote_meta_ways;
+    uint32_t remote_meta_cache_policy;
+    uint32_t has_remote_meta_cache_policy;
     uint64_t remote_meta_mmap_offset;
     char remote_meta_path[256];
     uint32_t job_plane_backend_type;
@@ -298,7 +304,9 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
                                         vemb_v16_channel_desc_t *desc);
 
 /* Allocate request and response ring regions from independent UB paths for
- * cross-node aeron transport. Returns:
+ * Aeron transport. The external deployment boundary selects each ring's
+ * cache policy; imported dev5..8/dev13..16 views may be noncacheable in both
+ * directions. Returns:
  *   0  on success — fills both paths and offsets
  *  -1  no free shmdev slot
  *  -2  shmdev open/mmap failed
@@ -308,6 +316,7 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
  * Both rings are zero-initialized by this call. */
 int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
                                          const char *response_ub_path,
+                                         uint32_t response_cache_policy,
                                          uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
@@ -346,6 +355,7 @@ typedef struct vemb_v16_aeron_batch_channel_allocation {
  * are raw contiguous storage for batch frames. */
 int vemb_v16_storage_alloc_aeron_batch_channel(
     const char *request_ub_path, const char *response_ub_path,
+    uint32_t response_cache_policy,
     uint32_t descriptor_slot_size, uint32_t descriptor_slots,
     uint32_t request_arena_bytes, uint32_t response_arena_bytes,
     vemb_v16_aeron_batch_channel_allocation_t *out);

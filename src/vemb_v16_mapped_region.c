@@ -17,6 +17,39 @@ static uint64_t page_align_down(uint64_t value) {
     return value & ~page_mask;
 }
 
+static int open_ub_with_fallback(const char *path, int *used_sync) {
+    int fd = open(path, O_RDWR);
+    if (fd >= 0) {
+        *used_sync = 0;
+        return fd;
+    }
+    if (errno != EPERM && errno != EACCES)
+        return -1;
+    fd = open(path, O_RDWR | O_SYNC);
+    if (fd >= 0)
+        *used_sync = 1;
+    return fd;
+}
+
+static void *map_ub_with_fallback(const char *path, int *fd,
+                                  size_t bytes, uint64_t offset,
+                                  int *used_sync) {
+    void *mapping = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, *fd, (off_t)offset);
+    if (mapping != MAP_FAILED)
+        return mapping;
+    if (errno != EPERM && errno != EACCES)
+        return MAP_FAILED;
+
+    close(*fd);
+    *fd = open(path, O_RDWR | O_SYNC);
+    if (*fd < 0)
+        return MAP_FAILED;
+    *used_sync = 1;
+    return mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                MAP_SHARED, *fd, (off_t)offset);
+}
+
 static int open_or_attach_local_shm(vemb_v16_mapped_region_t *region,
                                     const char *path,
                                     size_t required_size,
@@ -98,6 +131,7 @@ static int open_or_attach_local_shm(vemb_v16_mapped_region_t *region,
 
 int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 uint32_t backend_type,
+                                uint32_t cache_policy,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 size_t requested_size) {
@@ -109,43 +143,35 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
     RETURN_IF(region->backend_type != VEMB_V16_REGION_LOCAL_SHM &&
               region->backend_type != VEMB_V16_REGION_UB,
               -1);
+    (void)cache_policy;
+    region->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     region->requested_size = requested_size;
     region->mmap_offset = mmap_offset;
     region->mmap_aligned_offset = page_align_down(mmap_offset);
     memcpy(region->path, path, strlen(path) + 1);
 
     int created = 0;
+    int used_sync = 0;
     if (region->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
         RETURN_IF(path[0] != '/', -1);
         size_t required_size = requested_size + (size_t)mmap_offset;
         if (open_or_attach_local_shm(region, path, required_size, &created) != 0)
             return -1;
     } else {
-        /* Keep UB mappings cacheable and consistent across same-host server
-         * and client views. Noncacheable shmdev regions reject a plain
-         * O_RDWR open (EPERM); retry with O_SYNC for NC mapping semantics. */
-        region->fd = open(path, O_RDWR);
-        if (region->fd < 0 && (errno == EPERM || errno == EACCES)) {
-            int saved_errno = errno;
-            region->fd = open(path, O_RDWR | O_SYNC);
-            if (region->fd >= 0) {
-                serverLog(LL_NOTICE,
-                          "vemb_v16 mapped region ub opened with O_SYNC: path=%s request_size=%zu offset=%llu first_error=%s",
-                          path,
-                          requested_size,
-                          (unsigned long long)mmap_offset,
-                          strerror(saved_errno));
-            }
-        }
+        region->fd = open_ub_with_fallback(path, &used_sync);
         if (region->fd < 0) {
             serverLog(LL_WARNING,
-                      "vemb_v16 mapped region ub open failed: path=%s request_size=%zu offset=%llu error=%s",
+                      "vemb_v16 mapped region ub open failed: path=%s access_mode=%u request_size=%zu offset=%llu error=%s",
                       path,
+                      region->cache_policy,
                       requested_size,
                       (unsigned long long)mmap_offset,
                       strerror(errno));
             return -1;
         }
+        region->cache_policy = used_sync ?
+            VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE :
+            VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
         struct stat st;
         if (fstat(region->fd, &st) == 0) {
             uint64_t required_size = mmap_offset + (uint64_t)requested_size;
@@ -165,16 +191,18 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
             }
             if (S_ISREG(st.st_mode)) {
                 serverLog(LL_NOTICE,
-                          "vemb_v16 mapped region ub file opened: path=%s fd=%d request_size=%zu offset=%llu open_size=%llu",
+                          "vemb_v16 mapped region ub file opened: path=%s access_mode=%u fd=%d request_size=%zu offset=%llu open_size=%llu",
                           path,
+                          region->cache_policy,
                           region->fd,
                           requested_size,
                           (unsigned long long)mmap_offset,
                           (unsigned long long)st.st_size);
             } else {
                 serverLog(LL_NOTICE,
-                          "vemb_v16 mapped region ub device opened: path=%s fd=%d request_size=%zu offset=%llu mode=%o",
+                          "vemb_v16 mapped region ub device opened: path=%s access_mode=%u fd=%d request_size=%zu offset=%llu mode=%o",
                           path,
+                          region->cache_policy,
                           region->fd,
                           requested_size,
                           (unsigned long long)mmap_offset,
@@ -193,13 +221,12 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
 
     size_t offset_delta = (size_t)(mmap_offset - region->mmap_aligned_offset);
     region->mapping_bytes = requested_size + offset_delta;
-    int mmap_flags = MAP_SHARED;
 #if defined(__linux__) && defined(MAP_HUGETLB)
     if (region->backend_type == VEMB_V16_REGION_UB) {
         region->mapping_addr = mmap(NULL,
                                     region->mapping_bytes,
                                     PROT_READ | PROT_WRITE,
-                                    mmap_flags | MAP_HUGETLB,
+                                    MAP_SHARED | MAP_HUGETLB,
                                     region->fd,
                                     (off_t)region->mmap_aligned_offset);
         if (region->mapping_addr == MAP_FAILED) {
@@ -222,12 +249,18 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
 #endif
 
     if (region->mapping_addr == MAP_FAILED) {
-        region->mapping_addr = mmap(NULL,
-                                    region->mapping_bytes,
-                                    PROT_READ | PROT_WRITE,
-                                    mmap_flags,
-                                    region->fd,
-                                    (off_t)region->mmap_aligned_offset);
+        if (region->backend_type == VEMB_V16_REGION_UB) {
+            region->mapping_addr = map_ub_with_fallback(
+                path, &region->fd, region->mapping_bytes,
+                region->mmap_aligned_offset, &used_sync);
+        } else {
+            region->mapping_addr = mmap(NULL, region->mapping_bytes,
+                                        PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, region->fd,
+                                        (off_t)region->mmap_aligned_offset);
+        }
+        if (used_sync)
+            region->cache_policy = VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE;
     }
     if (region->mapping_addr == MAP_FAILED) {
         serverLog(LL_WARNING,

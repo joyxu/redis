@@ -187,6 +187,7 @@ static void create_test_ub_region_file(const char *path,
     assert(ftruncate(fd, (off_t)total_bytes) == 0);
     close(fd);
     assert(vemb_v16_warm_region_layout_reset(VEMB_V16_REGION_UB,
+                                             VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                              path,
                                              0,
                                              region_id,
@@ -240,6 +241,55 @@ static void init_storage_runtime_fields(vemb_v16_storage_ctx_t *storage,
     storage->scaleout_auto_notify_seq = 0;
 }
 
+static void test_scaleout_local_done_wire_lengths(void) {
+    vemb_v16_scaleout_local_done_req_t req = {
+        .migration_topology_epoch = 23,
+        .cutover_topology_epoch = 24,
+        .notify_seq = 23,
+        .source_owner = 1,
+        .phase = VEMB_V16_STORAGE_SCALEOUT_NOTIFY_PENDING,
+        .pending_delta = 2,
+        .baseline_retry_pending = 3,
+        .migrating_key_count = 4,
+        .range_count = 5,
+    };
+    vemb_v16_scaleout_local_done_req_t decoded_req = {0};
+    uint8_t req_buf[VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN];
+    size_t req_len = 0;
+    assert(vemb_v16_scaleout_local_done_req_encode(req_buf,
+                                                    sizeof(req_buf),
+                                                    &req,
+                                                    &req_len) == 0);
+    assert(req_len == VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN);
+    assert(vemb_v16_scaleout_local_done_req_decode(&decoded_req,
+                                                    req_buf,
+                                                    req_len) == 0);
+    assert(decoded_req.notify_seq == req.notify_seq);
+    assert(decoded_req.range_count == req.range_count);
+
+    vemb_v16_scaleout_local_done_resp_t resp = {
+        .status = VEMB_V16_STATUS_OK,
+        .migration_topology_epoch = req.migration_topology_epoch,
+        .cutover_topology_epoch = req.cutover_topology_epoch,
+        .notify_seq = req.notify_seq,
+        .source_owner = req.source_owner,
+    };
+    vemb_v16_scaleout_local_done_resp_t decoded_resp = {0};
+    uint8_t resp_buf[VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN];
+    size_t resp_len = 0;
+    assert(vemb_v16_scaleout_local_done_resp_encode(resp_buf,
+                                                     sizeof(resp_buf),
+                                                     &resp,
+                                                     &resp_len) == 0);
+    assert(resp_len == VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN);
+    assert(vemb_v16_scaleout_local_done_resp_decode(&decoded_resp,
+                                                     resp_buf,
+                                                     resp_len) == 0);
+    assert(decoded_resp.status == VEMB_V16_STATUS_OK);
+    assert(decoded_resp.cutover_topology_epoch ==
+           req.cutover_topology_epoch);
+}
+
 static void fill_control_req(vemb_v16_migration_control_req_t *req,
                              const char *key,
                              uint64_t key_hash,
@@ -259,25 +309,10 @@ typedef struct control_thread_arg {
     int fd;
 } control_thread_arg_t;
 
-static void *aeron_control_thread_main(void *arg) {
-    control_thread_arg_t *control = arg;
-    vemb_v16_aeron_handle_control_fd(control->proxy, control->fd);
-    return NULL;
-}
-
 static void *tcp_control_thread_main(void *arg) {
     control_thread_arg_t *control = arg;
     vemb_v16_tcp_handle_fd(control->proxy, control->fd);
     return NULL;
-}
-
-static int start_aeron_control_thread(control_thread_arg_t *arg,
-                                      pthread_t *thread,
-                                      vemb_v16_proxy_t *proxy,
-                                      int fd) {
-    arg->proxy = proxy;
-    arg->fd = fd;
-    return pthread_create(thread, NULL, aeron_control_thread_main, arg);
 }
 
 static int start_tcp_control_thread(control_thread_arg_t *arg,
@@ -287,32 +322,6 @@ static int start_tcp_control_thread(control_thread_arg_t *arg,
     arg->proxy = proxy;
     arg->fd = fd;
     return pthread_create(thread, NULL, tcp_control_thread_main, arg);
-}
-
-static int uds_migration_control(vemb_v16_proxy_t *proxy,
-                                 uint8_t op,
-                                 const vemb_v16_migration_control_req_t *req,
-                                 vemb_v16_migration_control_resp_t *resp) {
-    int sv[2];
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
 }
 
 static int tcp_migration_control(vemb_v16_proxy_t *proxy,
@@ -365,33 +374,6 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
         rc = vemb_v16_migration_control_resp_decode(resp,
                                                     resp_buf,
                                                     hdr.payload_len);
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
-static int uds_migration_batch_control(
-        vemb_v16_proxy_t *proxy,
-        const vemb_v16_migration_control_batch_req_t *req,
-        vemb_v16_migration_control_batch_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING_BATCH;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -476,33 +458,6 @@ static void fill_range_control_req(
     req->shard_id = shard_id;
 }
 
-static int uds_migration_range_control(
-        vemb_v16_proxy_t *proxy,
-        uint8_t op,
-        const vemb_v16_migration_range_control_req_t *req,
-        vemb_v16_migration_range_control_resp_t *resp) {
-    int sv[2];
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
 static int tcp_migration_range_control(
         vemb_v16_proxy_t *proxy,
         uint8_t type,
@@ -554,56 +509,6 @@ static int tcp_migration_range_control(
         rc = vemb_v16_migration_range_control_resp_decode(resp,
                                                           resp_buf,
                                                           hdr.payload_len);
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
-static int uds_epoch_set(vemb_v16_proxy_t *proxy,
-                         const vemb_v16_epoch_control_req_t *req,
-                         vemb_v16_epoch_control_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_EPOCH_SET;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
-static int uds_epoch_get(vemb_v16_proxy_t *proxy,
-                         vemb_v16_epoch_control_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_EPOCH_GET;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -691,83 +596,6 @@ static void fill_topology_req(vemb_v16_topology_control_req_t *req,
            sizeof(uint32_t) * standby_owner_count);
 }
 
-static int uds_topology_set(vemb_v16_proxy_t *proxy,
-                            const vemb_v16_topology_control_req_t *req,
-                            vemb_v16_topology_control_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_TOPOLOGY_SET;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
-static int uds_topology_get(vemb_v16_proxy_t *proxy,
-                            vemb_v16_topology_control_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_TOPOLOGY_GET;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
-static int uds_peer_view_topology_set(
-        vemb_v16_proxy_t *proxy,
-        const vemb_v16_peer_view_topology_control_req_t *req,
-        vemb_v16_peer_view_topology_control_resp_t *resp) {
-    int sv[2];
-    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET;
-    control_thread_arg_t handler_arg;
-    pthread_t handler;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
-        return -1;
-    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
-        close(sv[0]);
-        close(sv[1]);
-        return -1;
-    }
-    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
-        close(sv[0]);
-        pthread_join(handler, NULL);
-        return -1;
-    }
-    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
-    close(sv[0]);
-    pthread_join(handler, NULL);
-    return rc;
-}
-
 static int tcp_topology_control(vemb_v16_proxy_t *proxy,
                                 uint8_t type,
                                 const vemb_v16_topology_control_req_t *req,
@@ -832,6 +660,41 @@ static int tcp_topology_control(vemb_v16_proxy_t *proxy,
                                                    resp_buf,
                                                    hdr.payload_len);
     free(resp_buf);
+    close(sv[0]);
+    pthread_join(handler, NULL);
+    return rc;
+}
+
+static int tcp_peer_view_topology_control(
+        vemb_v16_proxy_t *proxy,
+        const vemb_v16_peer_view_topology_control_req_t *req,
+        vemb_v16_peer_view_topology_control_resp_t *resp) {
+    int sv[2];
+    control_thread_arg_t handler_arg;
+    pthread_t handler;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return -1;
+    if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+    if (vemb_v16_net_write_frame(
+            sv[0], VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET, 0, 0, 0,
+            req, sizeof(*req)) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    int rc = vemb_v16_net_read_header(sv[0], &hdr);
+    if (rc == 0 &&
+        (hdr.type != VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE ||
+         hdr.payload_len != sizeof(*resp))) {
+        rc = -1;
+    }
+    if (rc == 0)
+        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -1029,7 +892,6 @@ static void run_vrem_job_with_flags(vemb_v16_storage_ctx_t *storage,
 static void test_proxy_migration_control_primitives(void) {
     enum { dim = 2, max_vectors = 4 };
     char manifest_path[128];
-    char uds_path[128];
     char shm1[64];
     char remote_meta_default[64];
     char req0_1[64];
@@ -1083,8 +945,6 @@ static void test_proxy_migration_control_primitives(void) {
 
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_migration_control_%ld.yaml", (long)getpid());
-    snprintf(uds_path, sizeof(uds_path),
-             "/tmp/vemb_v16_migration_control_%ld.sock", (long)getpid());
     snprintf(shm1, sizeof(shm1), "/v16ctlmr_%ld", (long)getpid());
     snprintf(remote_meta_default, sizeof(remote_meta_default),
              "/v16ctlmd_%ld", (long)getpid());
@@ -1095,7 +955,6 @@ static void test_proxy_migration_control_primitives(void) {
     snprintf(resp1_0, sizeof(resp1_0), "/v16ctl_%ld_resp_1_0",
              (long)getpid());
 
-    unlink(uds_path);
     cleanup_region_and_layout(shm1, 901);
     shm_unlink(remote_meta_default);
     shm_unlink(req0_1);
@@ -1151,7 +1010,6 @@ static void test_proxy_migration_control_primitives(void) {
                                                      max_vectors,
                                                      &manifest) == 0);
     assert(vemb_v16_proxy_create(&proxy,
-                                 uds_path,
                                  dim,
                                  max_vectors,
                                  storage,
@@ -1179,7 +1037,10 @@ static void test_proxy_migration_control_primitives(void) {
     epoch_req.current_topology_epoch = 3;
     epoch_req.min_write_epoch = 2;
     memset(&epoch_resp, 0, sizeof(epoch_resp));
-    assert(uds_epoch_set(proxy, &epoch_req, &epoch_resp) == 0);
+    assert(tcp_epoch_control(proxy,
+                             VEMB_V16_NET_EPOCH_SET,
+                             &epoch_req,
+                             &epoch_resp) == 0);
     assert(epoch_resp.status == VEMB_V16_STATUS_OK);
     assert(epoch_resp.current_topology_epoch == 3);
     assert(epoch_resp.min_write_epoch == 2);
@@ -1205,7 +1066,10 @@ static void test_proxy_migration_control_primitives(void) {
     assert(epoch_resp.min_write_epoch == 4);
 
     memset(&epoch_resp, 0, sizeof(epoch_resp));
-    assert(uds_epoch_get(proxy, &epoch_resp) == 0);
+    assert(tcp_epoch_control(proxy,
+                             VEMB_V16_NET_EPOCH_GET,
+                             NULL,
+                             &epoch_resp) == 0);
     assert(epoch_resp.status == VEMB_V16_STATUS_OK);
     assert(epoch_resp.current_topology_epoch == 4);
     assert(epoch_resp.min_write_epoch == 4);
@@ -1218,6 +1082,26 @@ static void test_proxy_migration_control_primitives(void) {
     assert(topology_resp.standby_owner_count == 2);
     assert_owner_list(topology_resp.active_owners, default_owners, 2);
     assert_owner_list(topology_resp.standby_owners, default_owners, 2);
+
+    /* A delayed candidate must not roll topology state back to an older
+     * epoch after a newer publish has already been accepted. */
+    fill_topology_req(&topology_req,
+                      3,
+                      3,
+                      VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED,
+                      default_owners,
+                      2,
+                      default_owners,
+                      2);
+    memset(&topology_resp, 0, sizeof(topology_resp));
+    assert(vemb_v16_proxy_topology_set(proxy,
+                                       &topology_req,
+                                       &topology_resp) != 0);
+    assert(topology_resp.status == VEMB_V16_STATUS_ERR);
+    assert(topology_resp.current_topology_epoch == 4);
+    assert(topology_resp.min_write_epoch == 4);
+    assert(topology_resp.active_owner_count == 2);
+    assert(topology_resp.standby_owner_count == 2);
 
     fill_topology_req(&topology_req,
                       5,
@@ -1276,7 +1160,10 @@ static void test_proxy_migration_control_primitives(void) {
     assert_owner_list(topology_resp.standby_owners, standby_owners, 3);
 
     memset(&topology_resp, 0, sizeof(topology_resp));
-    assert(uds_topology_get(proxy, &topology_resp) == 0);
+    assert(tcp_topology_control(proxy,
+                                VEMB_V16_NET_TOPOLOGY_GET,
+                                NULL,
+                                &topology_resp) == 0);
     assert(topology_resp.status == VEMB_V16_STATUS_OK);
     assert(topology_resp.active_owner_count == 2);
     assert(topology_resp.standby_owner_count == 3);
@@ -1284,7 +1171,10 @@ static void test_proxy_migration_control_primitives(void) {
     assert_owner_list(topology_resp.standby_owners, standby_owners, 3);
 
     memset(&topology_resp, 0, sizeof(topology_resp));
-    assert(uds_topology_set(proxy, &topology_req, &topology_resp) == 0);
+    assert(tcp_topology_control(proxy,
+                                VEMB_V16_NET_TOPOLOGY_SET,
+                                &topology_req,
+                                &topology_resp) == 0);
     assert(topology_resp.status == VEMB_V16_STATUS_OK);
     assert(topology_resp.active_owner_count == 2);
     assert(topology_resp.standby_owner_count == 3);
@@ -1465,8 +1355,8 @@ static void test_proxy_migration_control_primitives(void) {
                             &warm_slot) == 0);
 
     fill_control_req(&req, transport_key, transport_key_hash, 21, 1);
-    assert(uds_migration_control(proxy,
-                                 VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING,
+    assert(tcp_migration_control(proxy,
+                                 VEMB_V16_NET_MIGRATION_MARK_MIGRATING,
                                  &req,
                                  &resp) == 0);
     assert(resp.status == VEMB_V16_STATUS_OK);
@@ -1627,7 +1517,7 @@ static void test_proxy_migration_control_primitives(void) {
     assert(batch_resp.entries[2].topology_epoch == 32);
 
     memset(&batch_resp, 0, sizeof(batch_resp));
-    assert(uds_migration_batch_control(proxy, &batch_req, &batch_resp) == 0);
+    assert(tcp_migration_batch_control(proxy, &batch_req, &batch_resp) == 0);
     assert(batch_resp.status == VEMB_V16_STATUS_ERR);
     assert(batch_resp.entry_count == 3);
     assert(batch_resp.success_count == 2);
@@ -1650,7 +1540,6 @@ static void test_proxy_migration_control_primitives(void) {
     vemb_v16_storage_ctx_destroy(storage);
     assert(vemb_v16_storage_reset_manifest_regions(&manifest) == 0);
     unlink(manifest_path);
-    unlink(uds_path);
     shm_unlink(remote_meta_default);
     shm_unlink(req0_1);
     shm_unlink(req1_0);
@@ -1780,7 +1669,6 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
 static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     enum { dim = 2, max_vectors = 4, slots = 2 };
     char manifest_path[128];
-    char uds_path[108];
     char shm1[64];
     char combo_region[64];
     char remote_meta_default[64];
@@ -1796,9 +1684,6 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_combo_%ld.yaml",
              (long)getpid());
-    snprintf(uds_path, sizeof(uds_path),
-             "/tmp/vemb_v16_combo_%ld.sock",
-             (long)getpid());
     snprintf(shm1, sizeof(shm1), "/v16combo_r1_%ld", (long)getpid());
     snprintf(combo_region, sizeof(combo_region),
              "/tmp/v16combo_r2_%ld.ub",
@@ -1806,7 +1691,6 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     snprintf(remote_meta_default, sizeof(remote_meta_default),
              "/v16combo_meta_%ld", (long)getpid());
     unlink(manifest_path);
-    unlink(uds_path);
     cleanup_region_and_layout(shm1, 801);
     unlink(combo_region);
     shm_unlink(remote_meta_default);
@@ -1847,7 +1731,6 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
                                                      max_vectors,
                                                      &manifest) == 0);
     assert(vemb_v16_proxy_create(&proxy,
-                                 uds_path,
                                  dim,
                                  max_vectors,
                                  storage,
@@ -1888,7 +1771,7 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     req.topology_req.endpoints[0].tcp_port = 6399;
 
     memset(&resp, 0, sizeof(resp));
-    assert(uds_peer_view_topology_set(proxy, &req, &resp) == 0);
+    assert(tcp_peer_view_topology_control(proxy, &req, &resp) == 0);
     assert(resp.status == VEMB_V16_STATUS_OK);
     assert(resp.peer_view_map_status == VEMB_V16_STATUS_OK);
     assert(resp.topology_attempted == 1);
@@ -2541,6 +2424,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     }
     assert(source_storage.scaleout_auto_phase ==
            VEMB_V16_STORAGE_SCALEOUT_DONE);
+    assert(!vemb_v16_storage_migration_active(&source_storage));
 
     vemb_v16_storage_topology_get(&source_storage, &topology_resp);
     assert(topology_resp.status == VEMB_V16_STATUS_OK);
@@ -2881,6 +2765,14 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_GC);
     assert(info.target_owner == 1);
     assert(info.topology_epoch == 24);
+    assert(vemb_v16_storage_migration_mark_source_gc(&source_storage,
+                                                      key,
+                                                      (uint32_t)strlen(key),
+                                                      key_hash,
+                                                      24,
+                                                      1,
+                                                      &info) == 0);
+    assert(!vemb_v16_storage_migration_active(&source_storage));
 
     for (uint32_t i = 0; i < source_storage.migration_outbox_count; i++)
         vemb_v16_migration_outbox_destroy(
@@ -2988,7 +2880,6 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     char req_dest_source[64];
     char resp_source_dest[64];
     char resp_dest_source[64];
-    char source_proxy_uds_path[128];
     vemb_v16_ub_rpc_peer_t source_peer;
     vemb_v16_ub_rpc_peer_t dest_peer;
     const char *key = "supernode:migration-delta";
@@ -3086,13 +2977,10 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
              "/v16ctl_delta_%ld_resp_1_3", (long)getpid());
     snprintf(resp_dest_source, sizeof(resp_dest_source),
              "/v16ctl_delta_%ld_resp_3_1", (long)getpid());
-    snprintf(source_proxy_uds_path, sizeof(source_proxy_uds_path),
-             "/tmp/v16ctl_delta_%ld_source.sock", (long)getpid());
     cleanup_rpc_rings(req_source_dest,
                       req_dest_source,
                       resp_source_dest,
                       resp_dest_source);
-    unlink(source_proxy_uds_path);
 
     memset(source_region, 0, sizeof(source_region));
     memset(dest_region, 0, sizeof(dest_region));
@@ -3148,7 +3036,6 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(pthread_mutex_init(&dest_storage.migration_outbox_lock,
                               NULL) == 0);
     assert(vemb_v16_proxy_create(&source_proxy,
-                                 source_proxy_uds_path,
                                  dim,
                                  max_vectors,
                                  &source_storage,
@@ -3536,9 +3423,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
 
     fill_range_control_req(&range_req, 80, 0, 3, range_shard_id);
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER,
+               VEMB_V16_NET_MIGRATION_RANGE_BARRIER,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -3696,9 +3583,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
 
     fill_range_control_req(&range_req, 80, 81, 3, range_shard_id);
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC,
+               VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -3874,9 +3761,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
 
     fill_range_control_req(&range_req, 82, 83, 3, range_tcp_shard_id);
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER,
+               VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -4048,9 +3935,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
 
     fill_range_control_req(&range_req, 86, 0, 3, live_range_shard_id);
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER,
+               VEMB_V16_NET_MIGRATION_RANGE_BARRIER,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -4261,9 +4148,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     fill_range_control_req(&range_req, 84, 0, 3, large_range_shard_id);
     range_req.page_limit = large_range_page_limit;
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER,
+               VEMB_V16_NET_MIGRATION_RANGE_BARRIER,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -4312,9 +4199,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     uint32_t total_source_gc = 0;
     for (uint32_t page = 0; page < large_range_key_count; page++) {
         memset(&range_resp, 0, sizeof(range_resp));
-        assert(uds_migration_range_control(
+        assert(tcp_migration_range_control(
                    source_proxy,
-                   VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC,
+                   VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC,
                    &range_req,
                    &range_resp) == 0);
         assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -4332,9 +4219,9 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(total_source_gc == large_range_key_count);
     assert(range_resp.range_done == 1);
     memset(&range_resp, 0, sizeof(range_resp));
-    assert(uds_migration_range_control(
+    assert(tcp_migration_range_control(
                source_proxy,
-               VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC,
+               VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC,
                &range_req,
                &range_resp) == 0);
     assert(range_resp.status == VEMB_V16_STATUS_OK);
@@ -4801,7 +4688,6 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
 
     vemb_v16_proxy_destroy(source_proxy);
     source_proxy = NULL;
-    unlink(source_proxy_uds_path);
 
     for (uint32_t i = 0; i < source_storage.migration_outbox_count; i++)
         vemb_v16_migration_outbox_destroy(
@@ -5027,6 +4913,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
 int main(void) {
     monotonicInit();
 
+    test_scaleout_local_done_wire_lengths();
     test_proxy_migration_control_primitives();
     test_proxy_peer_view_topology_set_applies_mapping_first();
     test_storage_topology_auto_marks_migrating_keys();
