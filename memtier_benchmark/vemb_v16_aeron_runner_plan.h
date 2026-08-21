@@ -16,10 +16,10 @@ struct vemb_v16_aeron_runner_channel_plan {
 };
 
 static inline vemb_v16_aeron_runner_channel_plan
-vemb_v16_aeron_runner_plan_channels(bool cross_node, uint32_t set_ratio,
-                                    uint32_t get_ratio, bool vsim, bool vrem,
+vemb_v16_aeron_runner_plan_channels(uint32_t set_ratio, uint32_t get_ratio,
+                                    bool vsim, bool vrem,
                                     bool batch_disabled, uint32_t total_channels) {
-    bool batch_eligible = cross_node && get_ratio > 0 &&
+    bool batch_eligible = get_ratio > 0 &&
         set_ratio == 0 && !vsim && !vrem && !batch_disabled;
     bool batch_sessions_enabled = batch_eligible;
     return {

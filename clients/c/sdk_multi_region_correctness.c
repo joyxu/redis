@@ -19,7 +19,6 @@
 #include "vemb_v16_hash.h"
 
 #define DEFAULT_KEYS    10000
-#define UDS_PATH        "/tmp/vemb_v16.sock"
 #define MAX_REGION_SLOTS 256
 
 /* Deterministic vector from key index — identical to what TCP VADD writes. */
@@ -58,7 +57,10 @@ int main(int argc, char **argv) {
     printf("Phase 1: TCP prefill %u keys (dim=%u) to %s:%u\n",
            num_keys, dim, host, port);
 
-    vemb_v16_client_t *tcp = vemb_v16_client_create(host, port, dim, 10000);
+    char seed[80];
+    snprintf(seed, sizeof(seed), "%s:%u", host, port);
+    const char *seeds[] = {seed};
+    vemb_v16_client_t *tcp = vemb_v16_client_create(seeds, 1, dim, 10000);
     if (!tcp) {
         fprintf(stderr, "FAIL: TCP connect to %s:%u\n", host, port);
         return 1;
@@ -89,9 +91,12 @@ int main(int argc, char **argv) {
     /* ================================================================ */
     printf("Phase 2: Aeron VEMB_HANDLE read-back + content verification\n");
 
-    vemb_v16_aeron_channel_t *ch = vemb_v16_aeron_open(UDS_PATH, dim);
+    char control_endpoint[128];
+    snprintf(control_endpoint, sizeof(control_endpoint), "tcp://%s:%u",
+             host, (unsigned)port);
+    vemb_v16_aeron_channel_t *ch = vemb_v16_aeron_open(control_endpoint, dim);
     if (!ch) {
-        fprintf(stderr, "FAIL: Aeron open %s\n", UDS_PATH);
+        fprintf(stderr, "FAIL: Aeron open %s\n", control_endpoint);
         vemb_v16_client_destroy(tcp);
         return 1;
     }

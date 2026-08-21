@@ -1955,10 +1955,9 @@ struct redisServer {
     int vemb_v16_proxy_io_threads;
     int vemb_v16_batch_request_size;
     char *vemb_v16_transport;       /* "sniff" (default) or "aeron" */
-    char *vemb_v16_aeron_control;   /* "tcp" (default) or "uds" */
     char *vemb_v16_aeron_ub_path;   /* fixed UB device path for Aeron rings */
     char *vemb_v16_aeron_response_ub_path; /* response-ring UB device path */
-    int vemb_v16_cross_node_aeron_enabled;  /* cross-node ATTACH + ring ABI + backoff */
+    int vemb_v16_aeron_ub_cacheable; /* startup-only: local CC mapping override */
     vemb_v16_proxy_t *vemb_v16_proxy;
     pthread_t vemb_v16_proxy_thread;
     /* Networking */

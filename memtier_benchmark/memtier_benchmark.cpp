@@ -437,13 +437,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_vrem,
         o_vemb_v16_batch_disable,
         o_vemb_v16_endpoints,
-        o_vemb_v16_client_topology,
         o_vemb_v16_topology_refresh_ms,
         o_vemb_v16_topology_retry_limit,
         o_vemb_v16_batch_request_size,
         o_vemb_v16_batch_max_delay_us,
         o_vemb_v16_l1_entries,
         o_vemb_v16_transport,
+        o_vemb_v16_ub_peer_view_manifest,
+        o_vemb_v16_ub_peer_view_client_host,
+        o_vemb_v16_ub_peer_view_owner_id,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -528,13 +530,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
         { "vemb-v16-batch-disable",     0, 0, o_vemb_v16_batch_disable },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
-        { "vemb-v16-client-topology",   0, 0, o_vemb_v16_client_topology },
         { "vemb-v16-topology-refresh-ms", 1, 0, o_vemb_v16_topology_refresh_ms },
         { "vemb-v16-topology-retry-limit", 1, 0, o_vemb_v16_topology_retry_limit },
         { "vemb-v16-batch-request-size", 1, 0, o_vemb_v16_batch_request_size },
         { "vemb-v16-batch-max-delay-us", 1, 0, o_vemb_v16_batch_max_delay_us },
         { "vemb-v16-l1-entries",        1, 0, o_vemb_v16_l1_entries },
         { "vemb-v16-transport",         1, 0, o_vemb_v16_transport },
+        { "vemb-v16-ub-peer-view-manifest", 1, 0, o_vemb_v16_ub_peer_view_manifest },
+        { "vemb-v16-ub-peer-view-client-host", 1, 0, o_vemb_v16_ub_peer_view_client_host },
+        { "vemb-v16-ub-peer-view-owner-id", 1, 0, o_vemb_v16_ub_peer_view_owner_id },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { NULL,                         0, 0, 0 }
     };
@@ -939,9 +943,6 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_endpoints:
                     cfg->vemb_v16_endpoints = optarg;
                     break;
-                case o_vemb_v16_client_topology:
-                    cfg->vemb_v16_client_topology = true;
-                    break;
                 case o_vemb_v16_topology_refresh_ms:
                     cfg->vemb_v16_topology_refresh_ms = (unsigned int)atoi(optarg);
                     break;
@@ -981,13 +982,30 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 }
                 case o_vemb_v16_transport:
                     if (strcmp(optarg, "tcp") != 0 &&
-                        strcmp(optarg, "aeron") != 0 &&
-                        strcmp(optarg, "aeron-cross-node") != 0) {
-                        fprintf(stderr, "error: --vemb-v16-transport must be 'tcp', 'aeron', or 'aeron-cross-node' (got %s)\n", optarg);
+                        strcmp(optarg, "aeron") != 0) {
+                        fprintf(stderr, "error: --vemb-v16-transport must be 'tcp' or 'aeron' (got %s)\n", optarg);
                         return -1;
                     }
                     cfg->vemb_v16_transport = optarg;
                     break;
+                case o_vemb_v16_ub_peer_view_manifest:
+                    cfg->vemb_v16_ub_peer_view_manifest = optarg;
+                    break;
+                case o_vemb_v16_ub_peer_view_client_host:
+                    cfg->vemb_v16_ub_peer_view_client_host = optarg;
+                    break;
+                case o_vemb_v16_ub_peer_view_owner_id:
+                {
+                    errno = 0;
+                    unsigned long owner_id = strtoul(optarg, &endptr, 10);
+                    if (optarg[0] == '-' || endptr == optarg || *endptr != '\0' ||
+                        errno == ERANGE || owner_id > UINT32_MAX) {
+                        fprintf(stderr, "error: --vemb-v16-ub-peer-view-owner-id must be a uint32\n");
+                        return -1;
+                    }
+                    cfg->vemb_v16_ub_peer_view_owner_id = (uint32_t)owner_id;
+                    break;
+                }
                 case o_command_ratio: {
                     if (cfg->arbitrary_commands->size() == 0) {
                         fprintf(stderr, "error: no arbitrary command found.\n");
@@ -1187,16 +1205,18 @@ void usage() {
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
             "      --vemb-v16-batch-disable   Disable v2 batch only for VEMB_HANDLE A/B baselines\n"
             "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
-            "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
-            "      --vemb-v16-client-topology  Fetch server topology and route by active owner ring\n"
+            "      --vemb-v16-endpoints=LIST  Comma-separated TCP bootstrap/owner endpoint list for VEMB routing\n"
+            "                                 (without it, -s/-p is the single bootstrap endpoint)\n"
             "      --vemb-v16-topology-refresh-ms=N  Refresh VEMB topology every N ms (default 500)\n"
             "      --vemb-v16-topology-retry-limit=N  Retry VEMB topology transitions up to N times (default 8)\n"
             "      --vemb-v16-batch-request-size=N  Unique VEMB_HANDLE items per v2 batch frame (default 32)\n"
             "      --vemb-v16-batch-max-delay-us=N  Max delay before flushing an underfilled v2 batch (default 0: eager)\n"
             "      --vemb-v16-l1-entries=N  Per-worker completed-vector L1 entries (default 0: disabled)\n"
-            "      --vemb-v16-transport=tcp|aeron|aeron-cross-node  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
-            "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput;\n"
-            "                               aeron-cross-node uses TCP ATTACH + UB shmdev mmap for cross-node deploy)\n"
+            "      --vemb-v16-transport=tcp|aeron  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
+            "                               aeron uses TCP control + client-resolved UB SPSC rings)\n"
+            "      --vemb-v16-ub-peer-view-manifest=FILE            Required for aeron\n"
+            "      --vemb-v16-ub-peer-view-client-host=HOST         Required client host identity for the manifest\n"
+            "      --vemb-v16-ub-peer-view-owner-id=ID              Remote owner identity for the manifest\n"
             "\n"
             "WAIT Options:\n"
             "      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)\n"
@@ -1295,28 +1315,21 @@ void size_to_str(unsigned long int size, char *buf, int buf_len)
 
 run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
 {
-    /* Aeron side-channel: bypass libevent stack entirely. Treat nullptr as "tcp"
-     * (default) so existing invocations keep working.
-     * Both "aeron" (local UDS+SHM) and "aeron-cross-node" (TCP ATTACH + shmdev)
-     * go through the same runner; the runner branches on transport mode. */
+    /* All Aeron deployments use the same SDK common core. The mandatory
+     * client-side peer-view resolves both local and translated UB paths. */
     if (cfg->protocol == PROTOCOL_VEMB_V16 &&
         cfg->vemb_v16_transport &&
-        (strcmp(cfg->vemb_v16_transport, "aeron") == 0 ||
-         strcmp(cfg->vemb_v16_transport, "aeron-cross-node") == 0)) {
-        /* Wire CLI flags into runner globals before dispatch. */
-        const char *mode = cfg->vemb_v16_transport;
-        const char *endpoint = cfg->vemb_v16_endpoints ? cfg->vemb_v16_endpoints : "";
-        if (strcmp(mode, "aeron-cross-node") == 0 && endpoint[0] == '\0') {
-            fprintf(stderr, "error: --vemb-v16-endpoints=HOST:PORT required with --vemb-v16-transport=aeron-cross-node\n");
+        strcmp(cfg->vemb_v16_transport, "aeron") == 0) {
+        const char *peer_view_manifest = cfg->vemb_v16_ub_peer_view_manifest ?
+            cfg->vemb_v16_ub_peer_view_manifest : "";
+        const char *peer_view_client_host = cfg->vemb_v16_ub_peer_view_client_host ?
+            cfg->vemb_v16_ub_peer_view_client_host : "";
+        if (!peer_view_manifest[0] || !peer_view_client_host[0]) {
+            fprintf(stderr, "error: Aeron requires --vemb-v16-ub-peer-view-manifest and --vemb-v16-ub-peer-view-client-host\n");
             exit(1);
         }
-        if (strcmp(mode, "aeron") == 0 && endpoint[0] != '\0') {
-            fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (use aeron-cross-node)\n");
-            exit(1);
-        }
-        vemb_v16_aeron_set_transport(mode, endpoint);
-        fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged (mode=%s)\n",
-                run_id, mode);
+        fprintf(stderr, "[RUN #%u] VEMB common-core runner engaged (mode=aeron)\n",
+                run_id);
         return vemb_v16_aeron_run(cfg, obj_gen);
     }
 
@@ -1526,11 +1539,16 @@ int main(int argc, char *argv[])
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
+        return 1;
     }
 
     config_init_defaults(&cfg);
     if (cfg.protocol == PROTOCOL_VEMB_V16 && cfg.vemb_v16_dim == 0) {
         benchmark_error_log("error: --vemb-v16-dim is required for vemb_v16 protocol\n");
+        return 1;
+    }
+    if (cfg.protocol == PROTOCOL_VEMB_V16 && cfg.unix_socket) {
+        benchmark_error_log("error: VEMB V16 topology control requires a TCP bootstrap endpoint.\n");
         return 1;
     }
     log_level = cfg.debug;

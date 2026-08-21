@@ -158,7 +158,10 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    vemb_v16_client_t *c = vemb_v16_client_create(host, port, dim, 0);
+    char seed[80];
+    snprintf(seed, sizeof(seed), "%s:%u", host, port);
+    const char *seeds[] = {seed};
+    vemb_v16_client_t *c = vemb_v16_client_create(seeds, 1, dim, 0);
     if (!c) {
         fprintf(stderr, "connect failed: %s:%u\n", host, port);
         return 1;

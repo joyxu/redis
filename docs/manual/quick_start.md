@@ -147,8 +147,9 @@
 
    int main(void)
    {
-       /* 1. 建立连接（单端点，连接到本地 redis-server） */
-       vemb_v16_client_t *c = vemb_v16_client_create("127.0.0.1", 6379, DIM, 0);
+       /* 1. 配置 TCP bootstrap seed；数据 owner 由 topology 决定 */
+       const char *seeds[] = {"127.0.0.1:6379"};
+       vemb_v16_client_t *c = vemb_v16_client_create(seeds, 1, DIM, 0);
        if (!c) { fprintf(stderr, "connect failed\n"); return 1; }
 
        /* 2. 构造一个待写入的向量 */

@@ -15,9 +15,8 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Single SDK client handle. Multi-endpoint routing is owned by the SDK
- * (vemb_v16_client_create_multi builds a consistent-hash ring); redis-cli
- * just forwards operations and does not pick a backend itself. */
+/* Single SDK client handle. The SDK uses these TCP addresses only as
+ * bootstrap seeds; topology selects every data-plane owner channel. */
 static vemb_v16_client_t *g_client  = NULL;
 static uint32_t           g_cli_dim = 0;
 
@@ -29,7 +28,7 @@ int vemb_v16_cli_tcp_init_multi(const char **endpoints,
 
     vemb_v16_cli_tcp_cleanup();
 
-    g_client = vemb_v16_client_create_multi(endpoints, endpoint_count, dim, 0);
+    g_client = vemb_v16_client_create(endpoints, endpoint_count, dim, 0);
     if (!g_client) {
         fprintf(stderr, "vemb_v16_cli_tcp_init_multi: connect failed\n");
         return -1;

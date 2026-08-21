@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compare local code files with a peer and overwrite only files that differ.
+# Compare local code and deployment configuration with a peer, overwriting only
+# files that differ.
 set -euo pipefail
 
 NODE="${NODE:-43.154.145.18}"
@@ -17,8 +18,10 @@ case "$NODE" in
     *) PEER="$SSH_USER@$NODE" ;;
 esac
 
-CONTROL_PATH="${TMPDIR:-/tmp}/vemb_sync_${USER:-user}_$$_${RANDOM}"
-SSH_OPTIONS=(-q -p "$SSH_PORT" -o ControlMaster=auto -o ControlPersist=60 \
+# ControlPath is a Unix-domain socket. macOS TMPDIR is often long enough to
+# exceed the socket pathname limit before the per-run suffix is appended.
+CONTROL_PATH="/tmp/vemb_sync_${USER:-user}_$$_${RANDOM}"
+SSH_OPTIONS=(-p "$SSH_PORT" -o ControlMaster=auto -o ControlPersist=60 \
     -o "ControlPath=$CONTROL_PATH")
 SCP_OPTIONS=(-q -P "$SSH_PORT" -o "ControlPath=$CONTROL_PATH")
 
@@ -26,11 +29,11 @@ usage() {
     cat <<'USAGE'
 Usage: [NODE=HOST] bash scripts/sync_changed_code_to_peer.sh [options]
 
-Compare local code files with a peer using SHA-256, then overwrite only files
-whose content differs. No remote backup is created.
+Compare local code and deployment configuration with a peer using SHA-256,
+then overwrite only files whose content differs. No remote backup is created.
 
 Options:
-  --all-code  Compare every tracked/untracked code file, not only local changes.
+  --all-code  Compare every tracked/untracked sync file, not only local changes.
   --build TARGET  Force-rebuild TARGET after sync: server, client, or all.
   --verify-build TARGET  Verify TARGET's source/binary build stamp after sync.
   --verbose   Print files whose content already matches the peer.
@@ -70,9 +73,9 @@ done
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-is_code_file() {
+is_sync_file() {
     case "$1" in
-        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.inc|*.S|*.s|*.go|*.rs|*.java|*.py|*.pl|*.rb|*.sh|*.mk|Makefile|*/Makefile|GNUmakefile|*/GNUmakefile|CMakeLists.txt|*/CMakeLists.txt|meson.build|*/meson.build)
+        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.inc|*.S|*.s|*.go|*.rs|*.java|*.py|*.pl|*.rb|*.sh|*.mk|*.yaml|*.yml|Makefile|*/Makefile|GNUmakefile|*/GNUmakefile|CMakeLists.txt|*/CMakeLists.txt|meson.build|*/meson.build)
             return 0
             ;;
         *) return 1 ;;
@@ -112,7 +115,7 @@ synced_count=0
 
 while IFS= read -r rel_path; do
     [ -n "$rel_path" ] || continue
-    is_code_file "$rel_path" || continue
+    is_sync_file "$rel_path" || continue
     [ -f "$rel_path" ] || continue
 
     candidate_count=$((candidate_count + 1))

@@ -11,21 +11,11 @@ int vemb_v16_stc_vadd(const char *key, uint32_t key_len,
                       const float *vector, uint32_t dim,
                       vemb_v16_resp_t *resp);
 
-int vemb_v16_stc_vemb(const char *key, uint32_t key_len,
-                      int inline_vector,
-                      vemb_v16_resp_t *resp,
-                      uint8_t *out_vector, uint32_t out_vector_cap,
-                      uint32_t *out_vector_bytes);
-
 /* VSIM_INLINE — compute cosine similarity between stored vector and inline query vector */
 int vemb_v16_stc_vsim(const char *key, uint32_t key_len,
                       const float *query_vector, uint32_t dim,
                       vemb_v16_resp_t *resp);
 
 void vemb_v16_stc_cleanup(void);
-
-/* warm region access for zero-copy reads (inline_vector=0) */
-const uint8_t *vemb_v16_stc_get_warm_mapped_addr(void);
-uint64_t vemb_v16_stc_get_warm_region_bytes(void);
 
 #endif

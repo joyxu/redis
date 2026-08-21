@@ -11,6 +11,7 @@
 
 typedef struct vemb_v16_peer_view_ring_desc {
     uint32_t backend_type;
+    uint32_t cache_policy;
     uint64_t mmap_offset;
     char path[256];
 } vemb_v16_peer_view_ring_desc_t;
@@ -21,6 +22,7 @@ typedef struct vemb_v16_peer_view_region_desc {
     uint32_t home_ub_node_id;
     uint32_t weight;
     uint32_t value_size;
+    uint32_t cache_policy;
     uint64_t mmap_offset;
     uint64_t region_bytes;
     char path[256];
@@ -33,6 +35,7 @@ typedef struct vemb_v16_peer_view_remote_meta_desc {
     uint32_t bucket_count;
     uint32_t set_count;
     uint32_t ways;
+    uint32_t cache_policy;
     uint64_t mmap_offset;
     char path[256];
 } vemb_v16_peer_view_remote_meta_desc_t;

@@ -13,7 +13,6 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -32,7 +31,7 @@ typedef enum topology_ctl_action {
 
 typedef struct topology_ctl_cfg {
     uint32_t transport_type;
-    const char *socket_path;
+    uint32_t endpoint_transport_type;
     const char *host;
     uint16_t port;
     uint32_t timeout_ms;
@@ -68,36 +67,34 @@ typedef struct topology_ctl_cfg {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s --get|--set [--transport tcp|aeron] "
-            "[--host HOST --port PORT | --socket PATH] "
+            "usage: %s --get|--set [--ctl-endpoint tcp|aeron] [--data-endpoint tcp|aeron] "
+            "[--host HOST --port PORT] "
             "[--epoch N] [--min-write-epoch N] "
             "[--active 0,1] [--standby 0,1,2] [--dual-write] "
             "[--auto-scaleout] [--coordinated-scaleout] "
             "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT] "
-            "[--owner-sockets 0=PATH,1=PATH] "
-            "[--coordinator-endpoint HOST:PORT | --coordinator-socket PATH] "
+            "[--coordinator-endpoint HOST:PORT] "
             "[--vnode-count N] [--timeout-ms N]\n"
-            "       %s --set-with-peer-view-map FILE [--transport tcp|aeron] "
-            "[--host HOST --port PORT | --socket PATH] "
+            "       %s --set-with-peer-view-map FILE [--ctl-endpoint tcp|aeron] [--data-endpoint tcp|aeron] "
+            "[--host HOST --port PORT] "
             "[--epoch N] [--min-write-epoch N] "
             "[--active 0,1] [--standby 0,1,2] [--dual-write] "
             "[--auto-scaleout] [--coordinated-scaleout] "
             "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT] "
-            "[--owner-sockets 0=PATH,1=PATH] "
-            "[--coordinator-endpoint HOST:PORT | --coordinator-socket PATH] "
+            "[--coordinator-endpoint HOST:PORT] "
             "[--vnode-count N] [--timeout-ms N]\n"
             "       %s --range-barrier|--range-cutover|--range-source-gc|--range-wait-ready|--range-wait-cutover "
-            "[--transport tcp|aeron] [--host HOST --port PORT | --socket PATH] "
+            "[--ctl-endpoint tcp|aeron] [--host HOST --port PORT] "
             "--migration-epoch N [--cutover-epoch N] --target-owner N "
             "[--shard-id N] [--page-limit N] [--wait-ms N] [--poll-ms N] [--timeout-ms N]\n"
-            "       %s --coordinator-listen [--transport tcp|aeron] "
-            "[--host HOST --port PORT | --socket PATH] "
+            "       %s --coordinator-listen [--ctl-endpoint tcp|aeron] "
+            "[--host HOST --port PORT] "
             "--expected-sources 0,1 [--migration-epoch N] [--cutover-epoch N] "
             "[--active 0,1,2 | --standby 0,1,2] "
-            "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT | --owner-sockets 0=PATH,1=PATH] "
+            "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT] "
             "[--wait-ms N] [--timeout-ms N]\n"
             "       %s --apply-peer-view-map FILE [--attach-now] "
-            "[--transport tcp|aeron] [--host HOST --port PORT | --socket PATH] "
+            "[--ctl-endpoint tcp|aeron] [--host HOST --port PORT] "
             "[--timeout-ms N]\n",
             prog,
             prog,
@@ -175,6 +172,18 @@ static int parse_u32_value(const char *value, uint32_t *out) {
     return parse_u32_arg(value, out);
 }
 
+static int parse_ub_cache_policy_value(const char *value, uint32_t *out) {
+    if (!strcmp(value, "cacheable") || !strcmp(value, "cc")) {
+        *out = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+        return 0;
+    }
+    if (!strcmp(value, "noncacheable") || !strcmp(value, "nc")) {
+        *out = VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE;
+        return 0;
+    }
+    return -1;
+}
+
 static int parse_peer_view_ring_field(vemb_v16_peer_view_ring_desc_t *ring,
                                       const char *prefix,
                                       const char *key,
@@ -191,6 +200,8 @@ static int parse_peer_view_ring_field(vemb_v16_peer_view_ring_desc_t *ring,
     }
     if (!strcmp(suffix, "mmap_offset"))
         return parse_u64_value(value, &ring->mmap_offset);
+    if (!strcmp(suffix, "cache_policy"))
+        return parse_ub_cache_policy_value(value, &ring->cache_policy);
     return 1;
 }
 
@@ -349,6 +360,12 @@ static int parse_peer_view_map_file(
                     fclose(fp);
                     return -1;
                 }
+            } else if (!strcmp(key, "cache_policy")) {
+                if (parse_ub_cache_policy_value(value,
+                                                &current_region.cache_policy) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
             }
             continue;
         }
@@ -392,6 +409,12 @@ static int parse_peer_view_map_file(
                 }
             } else if (!strcmp(key, "ways")) {
                 if (parse_u32_value(value, &current_meta.ways) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "cache_policy")) {
+                if (parse_ub_cache_policy_value(value,
+                                                &current_meta.cache_policy) != 0) {
                     fclose(fp);
                     return -1;
                 }
@@ -546,32 +569,25 @@ static int parse_owner_endpoint_list(topology_ctl_cfg_t *cfg,
         };
         const char *value = eq + 1;
         size_t value_len = len - owner_len - 1;
-        if (transport_type == VEMB_V16_TRANSPORT_TCP) {
-            const char *colon = NULL;
-            for (const char *q = value; q < value + value_len; q++) {
-                if (*q == ':') colon = q;
-            }
-            if (!colon || colon == value || colon + 1 >= value + value_len)
-                return -1;
-            size_t host_len = (size_t)(colon - value);
-            size_t port_len = value_len - host_len - 1;
-            if (host_len >= sizeof(endpoint.host))
-                return -1;
-            char port_buf[16];
-            if (port_len >= sizeof(port_buf))
-                return -1;
-            memcpy(endpoint.host, value, host_len);
-            endpoint.host[host_len] = '\0';
-            memcpy(port_buf, colon + 1, port_len);
-            port_buf[port_len] = '\0';
-            if (parse_u16_arg(port_buf, &endpoint.tcp_port) != 0)
-                return -1;
-        } else {
-            if (value_len >= sizeof(endpoint.uds_path))
-                return -1;
-            memcpy(endpoint.uds_path, value, value_len);
-            endpoint.uds_path[value_len] = '\0';
+        const char *colon = NULL;
+        for (const char *q = value; q < value + value_len; q++) {
+            if (*q == ':') colon = q;
         }
+        if (!colon || colon == value || colon + 1 >= value + value_len)
+            return -1;
+        size_t host_len = (size_t)(colon - value);
+        size_t port_len = value_len - host_len - 1;
+        if (host_len >= sizeof(endpoint.host))
+            return -1;
+        char port_buf[16];
+        if (port_len >= sizeof(port_buf))
+            return -1;
+        memcpy(endpoint.host, value, host_len);
+        endpoint.host[host_len] = '\0';
+        memcpy(port_buf, colon + 1, port_len);
+        port_buf[port_len] = '\0';
+        if (parse_u16_arg(port_buf, &endpoint.tcp_port) != 0)
+            return -1;
         if (append_endpoint(cfg, &endpoint) != 0)
             return -1;
         if (!comma)
@@ -590,53 +606,26 @@ static int parse_coordinator_endpoint(topology_ctl_cfg_t *cfg,
            sizeof(cfg->coordinator_endpoint));
     cfg->coordinator_endpoint.owner_id = UINT32_MAX;
     cfg->coordinator_endpoint.transport_type = transport_type;
-    if (transport_type == VEMB_V16_TRANSPORT_TCP) {
-        const char *colon = strrchr(arg, ':');
-        if (!colon || colon == arg || colon[1] == '\0')
-            return -1;
-        size_t host_len = (size_t)(colon - arg);
-        if (host_len >= sizeof(cfg->coordinator_endpoint.host))
-            return -1;
-        char port_buf[16];
-        size_t port_len = strlen(colon + 1);
-        if (port_len >= sizeof(port_buf))
-            return -1;
-        memcpy(cfg->coordinator_endpoint.host, arg, host_len);
-        cfg->coordinator_endpoint.host[host_len] = '\0';
-        memcpy(port_buf, colon + 1, port_len);
-        port_buf[port_len] = '\0';
-        if (parse_u16_arg(port_buf,
-                          &cfg->coordinator_endpoint.tcp_port) != 0) {
-            return -1;
-        }
-    } else {
-        size_t path_len = strlen(arg);
-        if (path_len >= sizeof(cfg->coordinator_endpoint.uds_path))
-            return -1;
-        memcpy(cfg->coordinator_endpoint.uds_path, arg, path_len + 1);
+    const char *colon = strrchr(arg, ':');
+    if (!colon || colon == arg || colon[1] == '\0')
+        return -1;
+    size_t host_len = (size_t)(colon - arg);
+    if (host_len >= sizeof(cfg->coordinator_endpoint.host))
+        return -1;
+    char port_buf[16];
+    size_t port_len = strlen(colon + 1);
+    if (port_len >= sizeof(port_buf))
+        return -1;
+    memcpy(cfg->coordinator_endpoint.host, arg, host_len);
+    cfg->coordinator_endpoint.host[host_len] = '\0';
+    memcpy(port_buf, colon + 1, port_len);
+    port_buf[port_len] = '\0';
+    if (parse_u16_arg(port_buf,
+                      &cfg->coordinator_endpoint.tcp_port) != 0) {
+        return -1;
     }
     cfg->coordinator_endpoint_valid = 1;
     return 0;
-}
-
-static int connect_uds(const char *path, uint32_t timeout_ms) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    vemb_v16_net_set_timeouts(fd, timeout_ms);
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof(addr.sun_path)) {
-        close(fd);
-        return -1;
-    }
-    strcpy(addr.sun_path, path);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
 }
 
 static int topology_control_tcp(const topology_ctl_cfg_t *cfg,
@@ -698,24 +687,6 @@ static int topology_control_tcp(const topology_ctl_cfg_t *cfg,
     return 0;
 }
 
-static int topology_control_uds(const topology_ctl_cfg_t *cfg,
-                                const vemb_v16_topology_control_req_t *req,
-                                vemb_v16_topology_control_resp_t *resp) {
-    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
-    if (fd < 0)
-        return -1;
-    uint8_t op = req ? VEMB_V16_CTRL_TOPOLOGY_SET :
-                       VEMB_V16_CTRL_TOPOLOGY_GET;
-    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
-        (req && vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
 static int topology_control_endpoint(
         const topology_ctl_cfg_t *cfg,
         const vemb_v16_topology_endpoint_t *endpoint,
@@ -724,17 +695,12 @@ static int topology_control_endpoint(
     if (!cfg || !endpoint || !req || !resp)
         return -1;
     topology_ctl_cfg_t endpoint_cfg = *cfg;
-    endpoint_cfg.transport_type = endpoint->transport_type;
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        endpoint_cfg.host = endpoint->host;
-        endpoint_cfg.port = endpoint->tcp_port;
-        return topology_control_tcp(&endpoint_cfg, req, resp);
-    }
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-        endpoint_cfg.socket_path = endpoint->uds_path;
-        return topology_control_uds(&endpoint_cfg, req, resp);
-    }
-    return -1;
+    if (endpoint->transport_type != VEMB_V16_TRANSPORT_TCP &&
+        endpoint->transport_type != VEMB_V16_TRANSPORT_AERON)
+        return -1;
+    endpoint_cfg.host = endpoint->host;
+    endpoint_cfg.port = endpoint->tcp_port;
+    return topology_control_tcp(&endpoint_cfg, req, resp);
 }
 
 static int peer_view_map_control_tcp(
@@ -766,24 +732,6 @@ static int peer_view_map_control_tcp(
     return 0;
 }
 
-static int peer_view_map_control_uds(
-        const topology_ctl_cfg_t *cfg,
-        const vemb_v16_peer_view_map_req_t *req,
-        vemb_v16_peer_view_map_resp_t *resp) {
-    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
-    if (fd < 0)
-        return -1;
-    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_APPLY;
-    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
 static int peer_view_topology_control_tcp(
         const topology_ctl_cfg_t *cfg,
         const vemb_v16_peer_view_topology_control_req_t *req,
@@ -805,24 +753,6 @@ static int peer_view_topology_control_tcp(
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE ||
         hdr.payload_len != sizeof(*resp) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
-static int peer_view_topology_control_uds(
-        const topology_ctl_cfg_t *cfg,
-        const vemb_v16_peer_view_topology_control_req_t *req,
-        vemb_v16_peer_view_topology_control_resp_t *resp) {
-    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
-    if (fd < 0)
-        return -1;
-    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET;
-    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
         vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
         close(fd);
         return -1;
@@ -890,24 +820,6 @@ static int migration_range_control_tcp(
     return 0;
 }
 
-static int migration_range_control_uds(
-        const topology_ctl_cfg_t *cfg,
-        uint8_t op,
-        const vemb_v16_migration_range_control_req_t *req,
-        vemb_v16_migration_range_control_resp_t *resp) {
-    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
-    if (fd < 0)
-        return -1;
-    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
-        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
 static void print_owner_list(const char *name,
                              const uint32_t *owners,
                              uint32_t owner_count) {
@@ -937,30 +849,20 @@ static void print_response(const vemb_v16_topology_control_resp_t *resp) {
     if (resp->coordinator_endpoint_valid) {
         const vemb_v16_topology_endpoint_t *endpoint =
             &resp->coordinator_endpoint;
-        if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP) {
-            printf("coordinator_endpoint=transport:tcp host:%s port:%u\n",
-                   endpoint->host,
-                   endpoint->tcp_port);
-        } else if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-            printf("coordinator_endpoint=transport:uds socket:%s\n",
-                   endpoint->uds_path);
-        }
+        printf("coordinator_endpoint=transport:%s host:%s port:%u\n",
+               vemb_v16_transport_name(endpoint->transport_type),
+               endpoint->host,
+               endpoint->tcp_port);
     }
     printf("endpoint_count=%u\n", resp->endpoint_count);
     for (uint32_t i = 0; i < resp->endpoint_count; i++) {
         const vemb_v16_topology_endpoint_t *endpoint = &resp->endpoints[i];
-        if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP) {
-            printf("endpoint[%u]=owner:%u transport:tcp host:%s port:%u\n",
-                   i,
-                   endpoint->owner_id,
-                   endpoint->host,
-                   endpoint->tcp_port);
-        } else if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-            printf("endpoint[%u]=owner:%u transport:uds socket:%s\n",
-                   i,
-                   endpoint->owner_id,
-                   endpoint->uds_path);
-        }
+        printf("endpoint[%u]=owner:%u transport:%s host:%s port:%u\n",
+               i,
+               endpoint->owner_id,
+               vemb_v16_transport_name(endpoint->transport_type),
+               endpoint->host,
+               endpoint->tcp_port);
     }
 }
 
@@ -1079,24 +981,14 @@ static int send_range_control(
         topology_ctl_action_t action,
         const vemb_v16_migration_range_control_req_t *req,
         vemb_v16_migration_range_control_resp_t *resp) {
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        uint16_t type = VEMB_V16_NET_MIGRATION_RANGE_BARRIER;
-        if (action == TOPOLOGY_CTL_RANGE_CUTOVER ||
-            action == TOPOLOGY_CTL_RANGE_WAIT_CUTOVER) {
-            type = VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER;
-        } else if (action == TOPOLOGY_CTL_RANGE_SOURCE_GC) {
-            type = VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC;
-        }
-        return migration_range_control_tcp(cfg, type, req, resp);
-    }
-    uint8_t op = VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER;
+    uint16_t type = VEMB_V16_NET_MIGRATION_RANGE_BARRIER;
     if (action == TOPOLOGY_CTL_RANGE_CUTOVER ||
         action == TOPOLOGY_CTL_RANGE_WAIT_CUTOVER) {
-        op = VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER;
+        type = VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER;
     } else if (action == TOPOLOGY_CTL_RANGE_SOURCE_GC) {
-        op = VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC;
+        type = VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC;
     }
-    return migration_range_control_uds(cfg, op, req, resp);
+    return migration_range_control_tcp(cfg, type, req, resp);
 }
 
 static int run_range_action(const topology_ctl_cfg_t *cfg) {
@@ -1208,27 +1100,6 @@ static int run_range_action(const topology_ctl_cfg_t *cfg) {
     }
 }
 
-static int listen_uds(const char *path, int backlog) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    if (!path || strlen(path) >= sizeof(addr.sun_path)) {
-        close(fd);
-        return -1;
-    }
-    strcpy(addr.sun_path, path);
-    unlink(path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-        listen(fd, backlog > 0 ? backlog : 128) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 static int expected_source_index(const topology_ctl_cfg_t *cfg,
                                  uint32_t source_owner) {
     for (uint32_t i = 0; i < cfg->expected_source_count; i++) {
@@ -1328,30 +1199,6 @@ static int coordinator_handle_tcp_fd(const topology_ctl_cfg_t *cfg,
     return resp.status == VEMB_V16_STATUS_OK ? 0 : -1;
 }
 
-static int coordinator_handle_uds_fd(const topology_ctl_cfg_t *cfg,
-                                     int fd,
-                                     uint8_t *done,
-                                     uint32_t *done_count) {
-    vemb_v16_net_set_timeouts(fd, cfg->timeout_ms);
-    uint8_t op = 0;
-    vemb_v16_scaleout_local_done_req_t req;
-    vemb_v16_scaleout_local_done_resp_t resp;
-    memset(&req, 0, sizeof(req));
-    if (vemb_v16_net_read_full(fd, &op, sizeof(op)) != 0 ||
-        op != VEMB_V16_CTRL_SCALEOUT_LOCAL_DONE ||
-        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
-        coordinator_fill_resp(NULL, VEMB_V16_STATUS_ERR, &resp);
-    } else {
-        uint8_t status = coordinator_record_done(cfg,
-                                                 &req,
-                                                 done,
-                                                 done_count);
-        coordinator_fill_resp(&req, status, &resp);
-    }
-    (void)vemb_v16_net_write_full(fd, &resp, sizeof(resp));
-    return resp.status == VEMB_V16_STATUS_OK ? 0 : -1;
-}
-
 static const uint32_t *coordinator_full_active_owners(
         const topology_ctl_cfg_t *cfg,
         uint32_t *owner_count) {
@@ -1442,9 +1289,7 @@ static int coordinator_publish_full_active(const topology_ctl_cfg_t *cfg) {
 static int run_coordinator_listen(const topology_ctl_cfg_t *cfg) {
     if (!cfg || cfg->expected_source_count == 0)
         return 1;
-    int listen_fd = cfg->transport_type == VEMB_V16_TRANSPORT_TCP ?
-        vemb_v16_net_listen(cfg->host, cfg->port, 128) :
-        listen_uds(cfg->socket_path, 128);
+    int listen_fd = vemb_v16_net_listen(cfg->host, cfg->port, 128);
     if (listen_fd < 0) {
         fprintf(stderr, "coordinator listen failed\n");
         return 1;
@@ -1492,17 +1337,11 @@ static int run_coordinator_listen(const topology_ctl_cfg_t *cfg) {
                 break;
             break;
         }
-        if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
-            (void)coordinator_handle_tcp_fd(cfg, fd, done, &done_count);
-        } else {
-            (void)coordinator_handle_uds_fd(cfg, fd, done, &done_count);
-        }
+        (void)coordinator_handle_tcp_fd(cfg, fd, done, &done_count);
         close(fd);
     }
 
     close(listen_fd);
-    if (cfg->transport_type == VEMB_V16_TRANSPORT_AERON)
-        unlink(cfg->socket_path);
     if (done_count == cfg->expected_source_count) {
         printf("scaleout_all_sources_done=%u\n", done_count);
         return coordinator_publish_full_active(cfg) == 0 ? 0 : 1;
@@ -1516,7 +1355,7 @@ static int run_coordinator_listen(const topology_ctl_cfg_t *cfg) {
 int main(int argc, char **argv) {
     topology_ctl_cfg_t cfg = {
         .transport_type = VEMB_V16_TRANSPORT_TCP,
-        .socket_path = VEMB_V16_UDS_PATH,
+        .endpoint_transport_type = VEMB_V16_TRANSPORT_TCP,
         .host = VEMB_V16_TCP_HOST,
         .port = VEMB_V16_TCP_PORT,
         .timeout_ms = 5000,
@@ -1564,13 +1403,24 @@ int main(int argc, char **argv) {
             cfg.peer_view_map_req.flags |= VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
         } else if (!strcmp(argv[i], "--no-attach-now")) {
             cfg.peer_view_map_req.flags &= ~VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
-        } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
+        } else if ((!strcmp(argv[i], "--ctl-endpoint") ||
+                    !strcmp(argv[i], "--transport")) && i + 1 < argc) {
             const char *transport = argv[++i];
             if (!strcmp(transport, "tcp")) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_TCP;
-            } else if (!strcmp(transport, "aeron") ||
-                       !strcmp(transport, "uds")) {
+            } else if (!strcmp(transport, "aeron")) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_AERON;
+            } else {
+                usage(argv[0]);
+                return 1;
+            }
+        } else if ((!strcmp(argv[i], "--data-endpoint") ||
+                    !strcmp(argv[i], "--endpoint-transport")) && i + 1 < argc) {
+            const char *transport = argv[++i];
+            if (!strcmp(transport, "tcp")) {
+                cfg.endpoint_transport_type = VEMB_V16_TRANSPORT_TCP;
+            } else if (!strcmp(transport, "aeron")) {
+                cfg.endpoint_transport_type = VEMB_V16_TRANSPORT_AERON;
             } else {
                 usage(argv[0]);
                 return 1;
@@ -1584,8 +1434,6 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
-            cfg.socket_path = argv[++i];
         } else if (!strcmp(argv[i], "--epoch") && i + 1 < argc) {
             if (parse_u64_arg(argv[++i], &cfg.current_topology_epoch) != 0) {
                 usage(argv[0]);
@@ -1627,14 +1475,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--owner-endpoints") && i + 1 < argc) {
             if (parse_owner_endpoint_list(&cfg,
                                           argv[++i],
-                                          VEMB_V16_TRANSPORT_TCP) != 0) {
-                usage(argv[0]);
-                return 1;
-            }
-        } else if (!strcmp(argv[i], "--owner-sockets") && i + 1 < argc) {
-            if (parse_owner_endpoint_list(&cfg,
-                                          argv[++i],
-                                          VEMB_V16_TRANSPORT_AERON) != 0) {
+                                          cfg.endpoint_transport_type) != 0) {
                 usage(argv[0]);
                 return 1;
             }
@@ -1642,15 +1483,7 @@ int main(int argc, char **argv) {
                    i + 1 < argc) {
             if (parse_coordinator_endpoint(&cfg,
                                            argv[++i],
-                                           VEMB_V16_TRANSPORT_TCP) != 0) {
-                usage(argv[0]);
-                return 1;
-            }
-        } else if (!strcmp(argv[i], "--coordinator-socket") &&
-                   i + 1 < argc) {
-            if (parse_coordinator_endpoint(&cfg,
-                                           argv[++i],
-                                           VEMB_V16_TRANSPORT_AERON) != 0) {
+                                           cfg.transport_type) != 0) {
                 usage(argv[0]);
                 return 1;
             }
@@ -1734,9 +1567,8 @@ int main(int argc, char **argv) {
     }
     if (cfg.action == TOPOLOGY_CTL_APPLY_PEER_VIEW_MAP) {
         vemb_v16_peer_view_map_resp_t resp;
-        int rc = cfg.transport_type == VEMB_V16_TRANSPORT_TCP ?
-            peer_view_map_control_tcp(&cfg, &cfg.peer_view_map_req, &resp) :
-            peer_view_map_control_uds(&cfg, &cfg.peer_view_map_req, &resp);
+        int rc = peer_view_map_control_tcp(&cfg, &cfg.peer_view_map_req,
+                                           &resp);
         if (rc != 0) {
             fprintf(stderr, "peer view map apply failed\n");
             return 1;
@@ -1763,9 +1595,7 @@ int main(int argc, char **argv) {
         memset(&combo_resp, 0, sizeof(combo_resp));
         combo_req.peer_view_map_req = cfg.peer_view_map_req;
         combo_req.topology_req = *req_ptr;
-        int rc = cfg.transport_type == VEMB_V16_TRANSPORT_TCP ?
-            peer_view_topology_control_tcp(&cfg, &combo_req, &combo_resp) :
-            peer_view_topology_control_uds(&cfg, &combo_req, &combo_resp);
+        int rc = peer_view_topology_control_tcp(&cfg, &combo_req, &combo_resp);
         if (rc != 0) {
             fprintf(stderr, "peer view + topology control request failed\n");
             return 1;
@@ -1776,12 +1606,7 @@ int main(int argc, char **argv) {
 
     vemb_v16_topology_control_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    int rc;
-    if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP) {
-        rc = topology_control_tcp(&cfg, req_ptr, &resp);
-    } else {
-        rc = topology_control_uds(&cfg, req_ptr, &resp);
-    }
+    int rc = topology_control_tcp(&cfg, req_ptr, &resp);
     if (rc != 0) {
         fprintf(stderr, "topology control request failed\n");
         return 1;

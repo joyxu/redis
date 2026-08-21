@@ -8,26 +8,28 @@
 typedef struct vemb_v16_proxy vemb_v16_proxy_t;
 
 int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
-                          const char *uds_path,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
                           vemb_v16_storage_ctx_t *storage,
                           const vemb_v16_warm_regions_manifest_t *manifest);
-int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port);
 int vemb_v16_proxy_enable_aeron_tcp_control(vemb_v16_proxy_t *proxy,
                                             const char *host,
                                             uint16_t port);
-int vemb_v16_proxy_enable_aeron_tcp_inject_only(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_enable_aeron_tcp_inject_only(vemb_v16_proxy_t *proxy,
+                                                const char *host,
+                                                uint16_t port);
 int vemb_v16_proxy_set_aeron_ub_path(vemb_v16_proxy_t *proxy,
                                      const char *ub_path);
 int vemb_v16_proxy_set_aeron_response_ub_path(vemb_v16_proxy_t *proxy,
                                               const char *ub_path);
 uint32_t vemb_v16_proxy_data_transport(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy);
-int vemb_v16_proxy_enable_tcp_inject_only(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_enable_tcp_inject_only(vemb_v16_proxy_t *proxy,
+                                          const char *host,
+                                          uint16_t port);
 int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd);
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
                                         uint32_t threads);

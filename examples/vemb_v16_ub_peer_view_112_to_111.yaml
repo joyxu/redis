@@ -1,0 +1,61 @@
+# 固定 CLI@112 对 topology owner 0（运行在 111）的 UB 资源视图。
+# owner_id 是 topology 的逻辑身份，而不是主机编号 111。ATTACH offset 仍是
+# 每个 channel 动态返回的值；此文件只选择客户端可见设备及映射策略。
+version: 1
+peer_views:
+  - client_host: 112
+    owner_id: 0
+    resource_role: v1_request_ring
+    resource_id: owner111-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v1_response_ring
+    resource_id: owner111-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: warm_region
+    resource_id: owner111-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev4
+    client_path: /dev/obmm_shmdev8
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_request_descriptor
+    resource_id: owner111-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_request_arena
+    resource_id: owner111-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_response_descriptor
+    resource_id: owner111-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_response_arena
+    resource_id: owner111-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true

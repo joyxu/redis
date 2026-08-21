@@ -46,7 +46,6 @@ vemb_v16_client_ring_t *vemb_v16_channel_response_ring(vemb_v16_channel_t *ch);
 uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch);
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
-const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_aeron_ub_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_aeron_response_ub_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
@@ -123,6 +122,11 @@ int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
                                              uint64_t *out_channel_id);
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy,
                                        uint64_t channel_id);
+/* Reads the currently live UB allocation identity without allocating or
+ * closing a channel. Returns -1 when channel_id is stale or not UB-backed. */
+int vemb_v16_proxy_aeron_channel_resource_generation(
+    vemb_v16_proxy_t *proxy, uint64_t channel_id,
+    uint64_t *out_resource_generation);
 uint64_t vemb_v16_proxy_close_all_channels(vemb_v16_proxy_t *proxy);
 
 #endif

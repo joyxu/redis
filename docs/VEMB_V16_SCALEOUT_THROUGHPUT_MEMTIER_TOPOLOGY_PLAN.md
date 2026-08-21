@@ -6,9 +6,8 @@ topology-aware 能力。
 
 ## 背景
 
-当前 `memtier_benchmark --protocol vemb_v16 --vemb-v16-endpoints=a,b`
-只是按客户端本地 endpoint 列表做 hash 分流。它不知道 server 发布的
-VEMB V16 topology：
+VEMB V16 客户端必须按 server 发布的 topology 路由，而不是按本地 endpoint
+列表 hash 分流。它读取的 topology 为：
 
 - `current_topology_epoch`
 - `min_write_epoch`
@@ -70,23 +69,26 @@ VEMB V16 topology：
 
 不能再用“只连 node0”或“endpoint 数组 hash”代表扩容后稳态吞吐。
 
-## Memtier 功能规划
+## Memtier 路由契约
 
-### 新增参数
-
-建议新增：
+### 自动 topology
 
 ```text
---vemb-v16-client-topology
+--vemb-v16-endpoints=HOST:PORT[,HOST:PORT...]
 --vemb-v16-topology-refresh-ms=N
 --vemb-v16-topology-retry-limit=N
 ```
 
 语义：
 
-- 未指定 `--vemb-v16-client-topology` 时保留现有 endpoint-hash 行为。
-- 指定后，`--vemb-v16-endpoints` 只作为 bootstrap endpoint 列表。
-- 实际请求路由以 server topology 中的 owner endpoint 为准。
+- `--protocol vemb_v16` 总是启动时 fetch topology、按 active owner ring
+  路由，并在运行中 refresh/retry；不存在 endpoint-hash 回退。
+- `--vemb-v16-endpoints` 未指定时，`-s/-p` 是唯一 TCP bootstrap endpoint。
+- 当前 TCP memtier 实现复用该列表的连接，因此指定列表时必须包含 topology
+  中每个 active owner 的 TCP endpoint；动态连接广告 endpoint 属于后续 common
+  transport 接入范围。
+- `--cluster-mode` 是 Redis Cluster 兼容模式，不参与 VEMB 路由；它与
+  `--protocol vemb_v16` 不能组合。
 
 ### Topology 获取
 
@@ -110,7 +112,7 @@ src/vemb_v16_topology.c
 src/vemb_v16_topology.h
 ```
 
-需要注意：`benchmark/vemb_v16_bench --client-topology` 当前走原生
+需要注意：`benchmark/vemb_v16_bench` 默认通过 SDK common core 发送原生
 `VEMB_V16_NET_TOPOLOGY_GET` frame；集成 `redis-server` 下的 memtier
 路径如果不能直接发送该 frame，需要补一个 Redis/VEMB 协议可访问的 topology
 control 入口，或让 memtier 的 VEMB transport 能复用原生 topology control。
@@ -210,7 +212,6 @@ $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
 
 ```bash
 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-  --vemb-v16-client-topology \
   --vemb-v16-endpoints=$NODE0_HOST:$PORT,$NODE1_HOST:$PORT \
   --vemb-v16-topology-retry-limit=8 \
   --ratio=0:1 --key-pattern=R:R \
@@ -231,7 +232,6 @@ $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
 
 ```bash
 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-  --vemb-v16-client-topology \
   --vemb-v16-endpoints=$NODE0_HOST:$PORT,$NODE1_HOST:$PORT \
   --ratio=0:1 --key-pattern=R:R \
   --key-prefix=item: --key-minimum=1 --key-maximum=$PREFILL_KEYS \
@@ -283,7 +283,6 @@ FinalErrors/sec 接近 0
 ## 推荐 PR 拆分
 
 1. `feat(memtier): route vemb v16 by server topology`
-   - 新增 `--vemb-v16-client-topology`
    - fetch topology
    - read/write 按 active owner endpoint 路由
    - after 稳态通过
@@ -303,7 +302,6 @@ FinalErrors/sec 接近 0
 在 memtier 修复前，以下结果不能作为扩容后稳态吞吐结论：
 
 - after 只连接 node0
-- after 使用 `--vemb-v16-endpoints` 但没有 `--vemb-v16-client-topology`
 - during 将 `STALE/MOVED/ASK` 计为 miss/error
 
 这些结果只能用于暴露客户端路由问题，不能代表 VEMB V16 scaleout 后真实吞吐。
@@ -322,12 +320,11 @@ FinalErrors/sec 接近 0
    - 目的：避免集成 `redis-server` 在本地只有 UDS/Aeron enabled 时，把已经发布的
      TCP endpoint 覆盖成 UDS/Aeron endpoint，导致 TCP client topology fetch 失败。
 
-2. memtier 新增开关：
+2. memtier VEMB topology routing：
    - 文件：`memtier_benchmark/memtier_benchmark.h`
-   - 字段：`bool vemb_v16_client_topology`
    - 文件：`memtier_benchmark/memtier_benchmark.cpp`
-   - 参数：`--vemb-v16-client-topology`
-   - 默认关闭，保持原有 endpoint-hash 行为。
+   - `--protocol vemb_v16` 自动启用 server topology routing；没有
+     endpoint-hash 回退。
 
 3. memtier VEMB 多 endpoint 路由第一版：
    - 文件：`memtier_benchmark/cluster_client.h`
@@ -339,8 +336,8 @@ FinalErrors/sec 接近 0
    - 新增流程：
      - `fetch_topology()`：从 `--vemb-v16-endpoints` 第一个 endpoint 拉取 topology。
      - `build_topology_owner_map()`：把 topology 中 owner endpoint 映射到现有连接下标。
-     - `route_key_to_backend()`：开启 `--vemb-v16-client-topology` 后按
-       `active_ring + xxh3(key)` 选择 owner，再映射到连接。
+     - `route_key_to_backend()`：按 `active_ring + xxh3(key)` 选择 owner，
+       再映射到连接。
      - `apply_topology_epoch()`：把 fetch 到的 `current_topology_epoch` 写入每个
        `vemb_v16_protocol`。
    - 当前限制：第一版要求 topology 返回的每个 active owner endpoint 都已经出现在
@@ -371,10 +368,9 @@ FinalErrors/sec 接近 0
 
 7. scaleout throughput 脚本接入 memtier topology-aware：
    - 文件：`benchmark/hpc_redis_scaleout_throughput.sh`
-   - `during_scaleout` 后台 memtier 增加：
-     - `--vemb-v16-client-topology`
+   - `during_scaleout` 后台 memtier 指定：
      - `--vemb-v16-endpoints=$NODE0_HOST:$PORT,$NODE1_HOST:$PORT`
-   - `scaleout_after` 从临时 `vemb_v16_bench --client-topology` 切回
+   - `scaleout_after` 从 `vemb_v16_bench` 的 common-core 验证路径切回
      topology-aware memtier：
      - cutover 后先用 topology-aware memtier 预填 steady keyspace
      - 再用 topology-aware memtier 读 steady keyspace
@@ -391,8 +387,7 @@ FinalErrors/sec 接近 0
      - topology epoch 变化后重新 `apply_topology_epoch()`
      - epoch 变化后唤醒各连接 pipeline
    - 新增 topology-aware key 生成约束：
-     - 开启 `--vemb-v16-client-topology` 后，某连接只生成当前 active
-       ring 会路由到该连接 owner 的 key。
+     - VEMB client 某连接只生成当前 active ring 会路由到该连接 owner 的 key。
      - 避免 active={0} 启动阶段把属于 node0 的 key 排到 node1
        连接上，导致 cross-connection queueing 后无进展。
 
@@ -518,7 +513,7 @@ make -j
 - `autoreconf -ivf` 已通过，仅有老 autoconf 宏 warning。
 - `./configure` 已通过。
 - `make -j` 已通过，`memtier_benchmark/memtier_benchmark` 已成功链接。
-- `./memtier_benchmark --help` 已显示 `--vemb-v16-client-topology`。
+- `./memtier_benchmark --help` 已显示 VEMB endpoint、refresh 与 retry 参数。
 - 再次执行 `make -j` 显示 `Nothing to be done for all-am`。
 
 曾遇到并已修复的链接错误：
@@ -841,3 +836,16 @@ scaleout_baseline  ops=11494851.96 hits=11494851.96 p99=0.91900
 during_scaleout   ops=12219758.70 hits=12219360.20 p99=0.66964
 scaleout_after    ops=12345285.28 hits=12345285.28 p99=1.33402
 ```
+
+## 测试执行边界（强制）
+
+真实 UB cluster/扩容测试永不在开发机或其他本地机器上启动。测试进程、Redis
+server、coordinator、topology_ctl、CLI/memtier 以及 UB device 映射都必须运行在
+远端 111/112 节点；本机只允许执行源码同步、远端编译触发、脚本语法检查和结果
+拉取/分析。所有远端操作统一经跳板机 `43.154.145.18`（SSH 端口 `8111` 对应
+node0，`8112` 对应 node1）完成。
+
+每次重测前必须确认远端没有残留 runner、topology_ctl、coordinator、Redis 或
+memtier 进程，并且同一时刻只启动一个扩容 runner 实例。这里的“一个 runner”
+是一个扩容脚本实例，不限制该实例内部启动的 CLI/memtier worker、thread 或
+client 数量。

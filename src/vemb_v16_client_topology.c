@@ -6,8 +6,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 static int owner_subset(const vemb_v16_topology_ring_t *subset,
@@ -38,9 +36,6 @@ static int endpoint_valid(const vemb_v16_topology_endpoint_t *endpoint,
                endpoint->host[0] != '\0';
     }
     if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-        if (endpoint->uds_path[0] != '\0')
-            return endpoint_string_valid(endpoint->uds_path,
-                                         sizeof(endpoint->uds_path));
         return endpoint->tcp_port != 0 &&
                endpoint_string_valid(endpoint->host,
                                      sizeof(endpoint->host)) &&
@@ -189,50 +184,6 @@ int vemb_v16_client_topology_fetch_tcp(
     if (fd < 0)
         return -1;
     int rc = vemb_v16_client_topology_fetch_tcp_fd(fd, topology, raw_resp);
-    close(fd);
-    return rc;
-}
-
-int vemb_v16_client_topology_fetch_uds_fd(
-    int fd,
-    vemb_v16_client_topology_t *topology,
-    vemb_v16_topology_control_resp_t *raw_resp) {
-    if (fd < 0 || !topology)
-        return -1;
-    uint8_t op = VEMB_V16_CTRL_TOPOLOGY_GET;
-    vemb_v16_topology_control_resp_t resp;
-    memset(&resp, 0, sizeof(resp));
-    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
-        vemb_v16_net_read_full(fd, &resp, sizeof(resp)) != 0) {
-        return -1;
-    }
-    if (raw_resp)
-        *raw_resp = resp;
-    return vemb_v16_client_topology_from_response(&resp, topology);
-}
-
-int vemb_v16_client_topology_fetch_uds(
-    const char *socket_path,
-    vemb_v16_client_topology_t *topology,
-    vemb_v16_topology_control_resp_t *raw_resp) {
-    if (!socket_path || !socket_path[0])
-        return -1;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    if (strlen(socket_path) >= sizeof(addr.sun_path)) {
-        close(fd);
-        return -1;
-    }
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
-    }
-    int rc = vemb_v16_client_topology_fetch_uds_fd(fd, topology, raw_resp);
     close(fd);
     return rc;
 }

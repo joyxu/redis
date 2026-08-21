@@ -67,6 +67,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: /dev/obmm_shmdev1
+remote_meta_cache_policy: cacheable
 remote_meta_mmap_offset: 268435456
 remote_meta_entries: 8192
 remote_meta_buckets: 16384
@@ -76,6 +77,7 @@ warm_regions:
   - region_id: 100
     provider: ub
     path: /dev/obmm_shmdev1
+    cache_policy: cacheable
     mmap_offset: 0
     bytes: ${OWNER0_REGION_BYTES}
     value_size: ${REGION_VALUE_SIZE}
@@ -84,6 +86,7 @@ warm_regions:
   - region_id: 101
     provider: ub
     path: /dev/obmm_shmdev5
+    cache_policy: noncacheable
     mmap_offset: 0
     bytes: ${OWNER1_REGION_BYTES}
     value_size: ${REGION_VALUE_SIZE}
@@ -94,6 +97,7 @@ remote_meta_views:
   - owner_id: 1
     provider: ub
     path: /dev/obmm_shmdev5
+    cache_policy: noncacheable
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -101,13 +105,17 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 1
     provider: ub
-    request_path: /dev/obmm_shmdev2
+    request_path: /dev/obmm_shmdev6
+    request_cache_policy: noncacheable
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev8
+    response_path: /dev/obmm_shmdev4
+    response_cache_policy: cacheable
     response_mmap_offset: 16777216
-    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_path: /dev/obmm_shmdev2
+    inbound_request_cache_policy: cacheable
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev4
+    outbound_response_path: /dev/obmm_shmdev8
+    outbound_response_cache_policy: noncacheable
     outbound_response_mmap_offset: 16777216
 YAML"
 
@@ -118,6 +126,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: /dev/obmm_shmdev1
+remote_meta_cache_policy: cacheable
 remote_meta_mmap_offset: 268435456
 remote_meta_entries: 8192
 remote_meta_buckets: 16384
@@ -127,6 +136,7 @@ warm_regions:
   - region_id: 101
     provider: ub
     path: /dev/obmm_shmdev1
+    cache_policy: cacheable
     mmap_offset: 0
     bytes: ${OWNER1_REGION_BYTES}
     value_size: ${REGION_VALUE_SIZE}
@@ -135,6 +145,7 @@ warm_regions:
   - region_id: 100
     provider: ub
     path: /dev/obmm_shmdev5
+    cache_policy: noncacheable
     mmap_offset: 0
     bytes: ${OWNER0_REGION_BYTES}
     value_size: ${REGION_VALUE_SIZE}
@@ -145,6 +156,7 @@ remote_meta_views:
   - owner_id: 0
     provider: ub
     path: /dev/obmm_shmdev5
+    cache_policy: noncacheable
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -152,13 +164,17 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 0
     provider: ub
-    request_path: /dev/obmm_shmdev2
+    request_path: /dev/obmm_shmdev6
+    request_cache_policy: noncacheable
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev8
+    response_path: /dev/obmm_shmdev4
+    response_cache_policy: cacheable
     response_mmap_offset: 16777216
-    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_path: /dev/obmm_shmdev2
+    inbound_request_cache_policy: cacheable
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev4
+    outbound_response_path: /dev/obmm_shmdev8
+    outbound_response_cache_policy: noncacheable
     outbound_response_mmap_offset: 16777216
 YAML"
 
@@ -191,7 +207,7 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl -
 ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE1_HOST} --port ${SERVER_PORT} --epoch 1 --min-write-epoch 1 --active 0,1 --standby 0,1 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --timeout-ms 5000"
 
 step "Prefill baseline dataset"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill ${PREFILL_KEYS} --ops 0 --threads 1 --pipeline 1 --mode vadd --client-topology --timeout-ms 10000 >${PREFILL_OUT} 2>&1 && cat ${PREFILL_OUT}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill ${PREFILL_KEYS} --ops 0 --threads 1 --pipeline 1 --mode vadd --timeout-ms 10000 >${PREFILL_OUT} 2>&1 && cat ${PREFILL_OUT}"
 
 step "Write node1 local UB expansion map"
 ssh_run "${NODE1_HOST}" "cat >${NODE1_LOCAL_MAP} <<YAML
@@ -202,6 +218,7 @@ warm_regions:
   - region_id: ${EXTRA_REGION_ID}
     provider: ub
     path: ${NODE1_EXTRA_LOCAL_PATH}
+    cache_policy: cacheable
     mmap_offset: 0
     bytes: ${EXTRA_REGION_BYTES}
     value_size: ${EXTRA_REGION_VALUE_SIZE}
@@ -218,6 +235,7 @@ warm_regions:
   - region_id: ${EXTRA_REGION_ID}
     provider: ub
     path: ${NODE0_EXTRA_PEER_PATH}
+    cache_policy: noncacheable
     mmap_offset: 0
     bytes: ${EXTRA_REGION_BYTES}
     value_size: ${EXTRA_REGION_VALUE_SIZE}
@@ -240,11 +258,11 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl -
 ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --get --transport tcp --host ${NODE1_HOST} --port ${SERVER_PORT} --timeout-ms 5000 >${NODE1_TOPO_OUT} && grep -q '^current_topology_epoch=1$' ${NODE1_TOPO_OUT} && grep -q '^active_owners=0,1$' ${NODE1_TOPO_OUT} && grep -q '^standby_owners=0,1$' ${NODE1_TOPO_OUT}"
 
 step "Run post-expand write validation"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${POST_KEYSPACE} --ops ${POST_OPS} --threads ${POST_THREADS} --pipeline 1 --mode vadd --client-topology --timeout-ms 10000 >${POST_WRITE_OUT} 2>&1 && cat ${POST_WRITE_OUT}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${POST_KEYSPACE} --ops ${POST_OPS} --threads ${POST_THREADS} --pipeline 1 --mode vadd --timeout-ms 10000 >${POST_WRITE_OUT} 2>&1 && cat ${POST_WRITE_OUT}"
 ssh_run "${NODE0_HOST}" "grep -q 'warm regions=3' ${POST_WRITE_OUT}"
 
 step "Run post-expand read validation"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${POST_KEYSPACE} --ops ${POST_OPS} --threads ${POST_THREADS} --pipeline 1 --mode vemb-inline --client-topology --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${POST_KEYSPACE} --ops ${POST_OPS} --threads ${POST_THREADS} --pipeline 1 --mode vemb-inline --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
 ssh_run "${NODE0_HOST}" "grep -q 'warm regions=3' ${POST_READ_OUT}"
 
 step "Done"

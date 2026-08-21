@@ -5,6 +5,7 @@
 #include "vemb_v16_proxy.h"
 #include "vemb_v16_proxy_internal.h"
 #include "vemb_v16_proxy_types.h"
+#include "vemb_v16_server_integration.h"
 #include "vemb_v16_storage.h"
 
 #include <errno.h>
@@ -112,6 +113,7 @@ int vemb_v16_aeron_attach_v2_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
     if (vemb_v16_storage_alloc_aeron_batch_channel(
             vemb_v16_proxy_aeron_ub_path(proxy),
             vemb_v16_proxy_aeron_response_ub_path(proxy),
+            VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
             VEMB_V16_BATCH_DESCRIPTOR_SLOT_SIZE,
             VEMB_V16_CLIENT_RING_SIZE,
             max_batch_bytes, max_batch_bytes, &allocation) != 0) {
@@ -223,6 +225,7 @@ int vemb_v16_aeron_attach_handle_fd(struct vemb_v16_proxy *proxy, int fd) {
     if (vemb_v16_storage_alloc_aeron_channel(
                                              vemb_v16_proxy_aeron_ub_path(proxy),
                                              vemb_v16_proxy_aeron_response_ub_path(proxy),
+                                             VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                              req_slot, resp_slot,
                                              VEMB_V16_CLIENT_RING_SIZE,
                                              server_request_shmdev_path,

@@ -70,9 +70,10 @@ int vemb_v16_warm_region_layout_name_from_region_path(const char *region_path,
                                                     char *out,
                                                     size_t out_len);
 int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
-                                    const char *path,
-                                    uint64_t mmap_offset,
-                                    uint32_t region_id,
+                                      uint32_t cache_policy,
+                                      const char *path,
+                                      uint64_t mmap_offset,
+                                      uint32_t region_id,
                                     uint32_t capacity_slots);
 size_t vemb_v16_warm_region_layout_bytes(uint32_t capacity_slots);
 vemb_v16_warm_slot_meta_t *vemb_v16_warm_region_slot_meta(void *base);

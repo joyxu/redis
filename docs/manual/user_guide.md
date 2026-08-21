@@ -280,13 +280,14 @@ gcc my_app.c -I$HPCREDIS_DIR/clients/c/build/include -I$HPCREDIS_DIR/src \
 
 int main(void)
 {
-    /* 1. 建立连接（单端点） */
-    vemb_v16_client_t *c = vemb_v16_client_create("127.0.0.1", 6379, DIM, 0);
+    /* 1. 配置 TCP bootstrap seed；数据 owner 由 topology 决定 */
+    const char *seeds[] = {"127.0.0.1:6379"};
+    vemb_v16_client_t *c = vemb_v16_client_create(seeds, 1, DIM, 0);
     if (!c) { fprintf(stderr, "connect failed\n"); return 1; }
 
-    /* 多端点连接（按 key 自动分流）：
+    /* 多 seed 容错：
      * const char *eps[] = {"192.168.90.111:6379", "192.168.90.112:6379"};
-     * vemb_v16_client_t *c = vemb_v16_client_create_multi(eps, 2, DIM, 0);
+     * vemb_v16_client_t *c = vemb_v16_client_create(eps, 2, DIM, 0);
      */
 
     /* 2. VADD — 写入向量 */
@@ -393,8 +394,8 @@ ssize_t used = vemb_v16_parse_response(buf, buf_len, &resp, &inline_bytes);
 
 | API | 用途 | 返回值 |
 | --- | --- | --- |
-| `vemb_v16_client_create(host, port, dim, timeout_ms)` | 创建单端点 client | client 句柄，失败返回 NULL |
-| `vemb_v16_client_create_multi(endpoints[], n, dim, timeout_ms)` | 创建多端点 client（一致性哈希路由） | client 句柄 |
+| `vemb_v16_client_create(seeds[], seed_count, dim, timeout_ms)` | 创建 client；seeds 是 TCP topology bootstrap 地址 | client 句柄，失败返回 NULL |
+| `vemb_v16_client_configure_ub_peer_view(c, manifest, client_host)` | 首次 UB channel 前配置固定 remote UB peer-view；manifest owner_id 必须是 topology owner | 0=OK, -1=配置无效或 UB 身份已固定 |
 | `vemb_v16_client_destroy(c)` | 释放 client | void |
 | `vemb_v16_client_vadd(c, set, elem, vec, dim)` | 写入向量 | 0=OK, -1=ERR |
 | `vemb_v16_client_vemb_vector(c, set, elem, out, cap, *dim)` | 读取 inline 向量 | 0=OK, 1=NOT_FOUND, -1=ERR |
@@ -456,7 +457,7 @@ static void *worker(void *arg)
     thread_ctx_t *ctx = (thread_ctx_t *)arg;
 
     /* 1. 每线程独立 client（句柄非线程安全） */
-    vemb_v16_client_t *c = vemb_v16_client_create_multi(
+    vemb_v16_client_t *c = vemb_v16_client_create(
         ENDPOINTS, N_EP, DIM, /*timeout_ms=*/0);
     if (!c) {
         fprintf(stderr, "[t%d] connect failed\n", ctx->tid);
@@ -550,7 +551,10 @@ gcc -I$HPCREDIS_DIR/clients/c/build/include -I$HPCREDIS_DIR/src \
 关键点：
 
 - 每线程一个 `vemb_v16_client_t`，禁止跨线程共享句柄。
-- 多端点用 `vemb_v16_client_create_multi`，路由由 SDK 内部按 key 一致性哈希完成。
+- `vemb_v16_client_create` 接受一个或多个 TCP bootstrap seed；SDK 从服务端 topology
+  选择 key 的 owner 和 TCP/UB 数据面，seed 列表不参与数据路由。
+- 跨节点 UB 场景在首次 UB 请求前调用 `vemb_v16_client_configure_ub_peer_view`；
+  manifest 的 `owner_id` 使用 topology 逻辑编号，而非主机名中的 111/112 编号。
 - 业务侧只需调 `vadd_pipeline` / `vemb_pipeline` / `vsim_pipeline`，`ASK` / `MOVED` / `STALE_TOPOLOGY` 由 SDK 透明重试。
 
 > 生产级压测工具 `memtier_benchmark`（自定义分支 `UnifiedBus/memtier_benchmark`）也是基于此 SDK 集成 VEMB V16 协议，详见该仓库 README 与 [最佳实践](best_practices.md)。

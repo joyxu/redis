@@ -9,6 +9,7 @@
 typedef struct vemb_v16_mapped_region {
     int fd;
     uint32_t backend_type;
+    uint32_t cache_policy;
     int unlink_on_destroy;
     int created;
     size_t requested_size;
@@ -22,6 +23,7 @@ typedef struct vemb_v16_mapped_region {
 
 int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 uint32_t backend_type,
+                                uint32_t cache_policy,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 size_t requested_size);

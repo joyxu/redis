@@ -14,8 +14,8 @@ This protocol replaces the previous TCP request layout entirely.
 ## Motivation
 
 The old TCP request path reused a wide request struct layout, which caused
-lightweight ops such as `VEMB_HANDLE`, `VEMB_INLINE`, and `VREM` to carry
-unused request fields on the wire.
+lightweight ops such as `VEMB_INLINE` and `VREM` to carry unused request
+fields on the wire.
 
 This protocol makes TCP request size proportional to the actual op.
 
@@ -24,6 +24,8 @@ This protocol makes TCP request size proportional to the actual op.
 - No change to response encoding in this document.
 - No change to SHM/Aeron request layout.
 - No conversion to RESP or argv-style internal execution.
+- `VEMB_HANDLE` is not a TCP operation. TCP clients use `VEMB_INLINE`; a
+  received handle request is rejected with `ERR`.
 
 ## Outer Frame
 
@@ -79,17 +81,6 @@ Recommended bit layout:
 
 The body layout is determined only by `op`.
 Do not infer body shape from flags.
-
-### `VEMB_HANDLE`
-
-```text
-base | key[key_len]
-```
-
-Constraints:
-
-- `key_len > 0`
-- `dim > 0`
 
 ### `VEMB_INLINE`
 
@@ -221,7 +212,7 @@ Examples of illegal combinations:
 - `VADD` without `vector_bytes`
 - `VADD` where `vector_bytes != dim * sizeof(float)`
 - `VSIM_KEY_KEY` without `key2_len`
-- `VEMB_HANDLE` carrying vector bytes
+- any `VEMB_HANDLE` request: handles are UB/AERON-only
 
 ## Expected Wire Size
 
@@ -231,9 +222,6 @@ Outer TCP frame header remains `32B`.
 
 Request payload sizes:
 
-- `VEMB_HANDLE`
-  - `24 + 10 = 34B`
-  - total frame size `66B`
 - `VREM`
   - `24 + 10 = 34B`
   - total frame size `66B`
@@ -268,7 +256,7 @@ Unit tests:
 Integration tests:
 
 - `VADD` over TCP
-- `VEMB_HANDLE` over TCP
+- reject `VEMB_HANDLE` over TCP
 - `VEMB_INLINE` over TCP
 - `VSIM_INLINE` over TCP
 - `VSIM_KEY_KEY` over TCP
