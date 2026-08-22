@@ -11,10 +11,9 @@
 #   ssh HW01 'TEST_TIME=60 bash /root/gqs/codespace/UnifiedBus/test_hpc/run_aeron_best.sh'
 #
 # 可调参数（环境变量）：
-#   TEST_TIME     bench 持续秒数         (默认 60)
-#   T C           client -t / -c         (默认 64 / 4)
-#   PIPELINE      每 channel in-flight   (默认 32)
-#   NUM_KEYS      prefill key 数         (默认 10000)
+#   TEST_TIME     bench 持续秒数         (默认 30)
+#   TS CS PS      memtier -t/-c/--pipeline (默认 17 档数组，见 TS_DEFAULT/CS_DEFAULT/PS_DEFAULT)
+#   NUM_KEYS      prefill key 数         (默认 100000)
 #   MAX_VECTORS   server vector 容量上限 (默认 131072=128K；NUM_KEYS 不能超过这个)
 #   DIM           vector 维度            (默认 300)
 #   SERVER_MASK   server taskset         (默认 "0-47")
@@ -418,15 +417,27 @@ check_ub_paths_in_use() {
     return 0
 }
 
+# 输出 "ut st"（所有线程 utime/stime jiffies 分别求和）
 get_cpu_jiffies() {
-    local pid=$1 sum=0 rest
+    local pid=$1 ut=0 st=0 rest
     for f in /proc/$pid/task/*/stat; do
         [ -r "$f" ] || continue
         rest=$(sed 's/.*)//' "$f")
         set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
+        ut=$(( ut + ${12:-0} ))
+        st=$(( st + ${13:-0} ))
     done
-    echo "$sum"
+    echo "$ut $st"
+}
+
+snapshot_si() {  # 全机 softirq jiffies (/proc/stat cpu 行第 8 列)
+    awk '/^cpu /{print $8}' /proc/stat 2>/dev/null
+}
+
+snapshot_rss() {  # pid 的 VmRSS KB
+    local pid=$1 rss
+    rss=$(awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null)
+    echo "${rss:-0}"
 }
 
 cleanup() {
@@ -478,7 +489,7 @@ if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
         --aeron-ub-cacheable "$AERON_UB_CACHEABLE_CONFIG" \
         --vemb-v16-proxy-io-threads $PIO \
         --vemb-v16-supernode-workers $SNW \
-        --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
+        --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel warning \
         >/dev/null 2>&1
 
     # Confirm the Redis TCP listener used by Aeron TCP control.
@@ -538,7 +549,7 @@ else
 fi
 
 # === TSV header ===
-printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp99_9_ms\tkb_sec\tcores\tops_per_core\n" > "$TSV"
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp99_9_ms\tkb_sec\tcores\tops_per_core\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 
 # === Sweep ===
 for ((idx=0; idx<NCONFIGS; idx++)); do
@@ -546,8 +557,12 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
 
     SRV_PID=$(cat $PIDFILE 2>/dev/null)
-    J0=0
-    [ -n "$SRV_PID" ] && J0=$(get_cpu_jiffies "$SRV_PID")
+    J0_UT=0 J0_ST=0
+    if [ -n "$SRV_PID" ]; then
+        read J0_UT J0_ST < <(get_cpu_jiffies "$SRV_PID")
+    fi
+    JB_SI=$(snapshot_si)
+    JB_SI=${JB_SI:-0}
 
     workload_cmd=(
         taskset -c "$CLIENT_MASK" "$MEMTIER"
@@ -563,34 +578,95 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
         --test-time="$TEST_TIME"
     )
     workload_log="$RAWDIR/t${t}_c${c}_p${p}.log"
+
+    # workload 后台启动 + server CPU 0.2s 采样: 稳态 cores 用 TEST_TIME 滑窗 p95 速率,
+    # 排除 memtier attach/detach channel 的空闲窗口 (通道多时可达数十秒, 全程平均口径
+    # 会把 cores 稀释腰斩; ops_sec 是 memtier 自身稳态窗口值, 两者需同口径)
+    SAMP_FILE="$RAWDIR/t${t}_c${c}_p${p}.samples"
     if [ "$PROFILE" = 1 ]; then
         perf record -F "$FREQ" -g -e "$EVENT" -o "$CLIENT_PERF_DATA" -- \
-            "${workload_cmd[@]}" >"$workload_log" 2>&1
-        workload_status=$?
+            "${workload_cmd[@]}" >"$workload_log" 2>&1 &
     else
-        "${workload_cmd[@]}" >"$workload_log" 2>&1
-        workload_status=$?
+        "${workload_cmd[@]}" >"$workload_log" 2>&1 &
     fi
+    MT_PID=$!
+    ( while kill -0 $MT_PID 2>/dev/null; do
+          if [ -n "$SRV_PID" ] && [ -d /proc/$SRV_PID ]; then
+              read SU SS < <(get_cpu_jiffies "$SRV_PID")
+              printf "%s %s %s %s\n" "$(date +%s%N)" "$SU" "$SS" "$(snapshot_si)"
+          fi
+          sleep 0.2
+      done ) > "$SAMP_FILE" 2>/dev/null &
+    SAMP_PID=$!
+    wait $MT_PID
+    workload_status=$?
+    kill $SAMP_PID 2>/dev/null
+    wait $SAMP_PID 2>/dev/null
     if [ "$workload_status" -ne 0 ]; then
         echo "FAIL: Aeron workload failed: t=$t c=$c pipeline=$p"
         tail -80 "$workload_log" 2>/dev/null
         exit 1
     fi
 
-    J1=0
-    [ -n "$SRV_PID" ] && J1=$(get_cpu_jiffies "$SRV_PID")
-    CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+    J1_UT=0 J1_ST=0
+    if [ -n "$SRV_PID" ]; then
+        read J1_UT J1_ST < <(get_cpu_jiffies "$SRV_PID")
+    fi
+    JA_SI=$(snapshot_si)
+    JA_SI=${JA_SI:-0}
+    ELAPSED_NS=$(( TEST_TIME * 1000000000 ))
+    CPU_CORES=$(awk -v d=$(( (J1_UT - J0_UT) + (J1_ST - J0_ST) )) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
+    CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
+    CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v t=$ELAPSED_NS -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/(t/1000000000) }')
+    C_SI=$(awk -v d=$((JA_SI - JB_SI)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    RSS_KB=$(snapshot_rss "$SRV_PID")
+
+    # 稳态口径: TEST_TIME 滑窗速率的 p95 (samples 不足时回退全程平均)
+    if [ -s "$SAMP_FILE" ]; then
+        awk -v tt=$TEST_TIME '
+            { ns[NR]=$1; u[NR]=$2; s[NR]=$3; si[NR]=$4; n=NR }
+            END {
+                ttns = tt * 1e9; j = 1
+                for (i = 1; i <= n; i++) {
+                    while (j <= n && ns[j] - ns[i] < ttns) j++
+                    if (j > n) break
+                    dur = (ns[j] - ns[i]) / 1e9
+                    if (dur <= 0) continue
+                    du = (u[j] - u[i]) / 100 / dur
+                    ds = (s[j] - s[i]) / 100 / dur
+                    dsi = (si[j] - si[i]) / 100 / dur
+                    if (du >= 0 && ds >= 0) printf "%.3f %.3f %.3f %.3f\n", du + ds, du, ds, dsi
+                }
+            }' "$SAMP_FILE" | sort -rn > "$SAMP_FILE.rates"
+        NRATE=$(wc -l < "$SAMP_FILE.rates")
+        if [ "$NRATE" -ge 10 ]; then
+            K=$(( NRATE / 20 )); [ $K -lt 1 ] && K=1
+            read ST_CORES ST_UT ST_ST ST_SI < <(sed -n "${K}p" "$SAMP_FILE.rates")
+            CPU_CORES=$(printf "%.2f" "$ST_CORES")
+            CORE_UT=$(printf "%.2f" "$ST_UT")
+            CORE_ST=$(printf "%.2f" "$ST_ST")
+            C_SI=$(printf "%.2f" "$ST_SI")
+        fi
+    fi
 
     totals=$(grep "^Totals" "$workload_log" | tail -1)
+    # memtier Totals 两种格式:
+    #   旧 9 列:  Totals ops hits misses avg p50 p99 p99.9 kb
+    #   新 11 列: Totals ops hits misses ?   ?   avg p50 p99 p99.9 kb
     read ops avg p50 p99 p999 kb < <(
-        echo "$totals" | awk '{if(NF>=9) printf "%s %s %s %s %s %s", $2,$5,$6,$7,$8,$9; else printf "0 NA NA NA NA NA"}'
+        echo "$totals" | awk '{
+            if (NF>=11)      printf "%s %s %s %s %s %s", $2,$7,$8,$9,$10,$11;
+            else if (NF>=9)  printf "%s %s %s %s %s %s", $2,$5,$6,$7,$8,$9;
+            else             printf "0 NA NA NA NA NA";
+        }'
     )
     OPS_PER_CORE=$(awk -v o="$ops" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0||o==0) print "NA"; else printf "%.0f", o/c }')
 
-    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$AERON_TRANSPORT" \
-        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" >> "$TSV"
-    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  p99.9=${p999}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE"
+        "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" \
+        "$CORE_UT" "$CORE_ST" "$C_SI" "$RSS_KB" >> "$TSV"
+    log "  => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  p99.9=${p999}ms  cores=$CPU_CORES  ops/core=$OPS_PER_CORE  core_ut=$CORE_UT  core_st=$CORE_ST  si=$C_SI  rss=${RSS_KB}KB"
 done
 
 if [ "$PROFILE" = 1 ]; then

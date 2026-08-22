@@ -31,6 +31,12 @@ static void *proxy_run_thread(void *arg) {
 static vemb_v16_storage_ctx_t *g_vemb_storage = NULL;
 
 static const char *vemb_v16_redis_control_host(void) {
+    /* Explicit advertisement host wins: with --bind 0.0.0.0 the fallback
+     * below would advertise 127.0.0.1, which cross-node clients cannot
+     * route, so deployments reachable from peers must set
+     * --vemb-v16-tcp-host to the routable address. */
+    if (server.vemb_v16_tcp_host && server.vemb_v16_tcp_host[0])
+        return server.vemb_v16_tcp_host;
     if (server.bindaddr_count == 1 && server.bindaddr[0][0] != '\0' &&
         strcmp(server.bindaddr[0], "0.0.0.0") != 0 &&
         strcmp(server.bindaddr[0], "::") != 0) {

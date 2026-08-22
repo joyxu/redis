@@ -5196,22 +5196,6 @@ static int open_ub_path_spec(const char *path_spec, int open_flags,
     return -1;
 }
 
-static size_t shmdev_pool_probe_map_size(int fd) {
-    /* Devices may expose slightly less than the nominal 8 GiB region
-     * (observed ~8188 MiB). Probe downwards in 2 MiB steps so the pool
-     * adapts to the actual mappable size instead of failing outright. */
-    const size_t step = (2ull << 20);
-    const size_t floor_sz = (7ull << 30);
-    for (size_t sz = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
-         sz >= floor_sz; sz -= step) {
-        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (p != MAP_FAILED) {
-            munmap(p, sz);
-            return sz;
-        }
-    }
-    return 0;
-}
 
 static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
                             const char *path_spec,
@@ -5232,7 +5216,7 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
                   path_spec, errno, strerror(errno));
         return -1;
     }
-    void *p = mmap(NULL, map_size,
+    void *p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED && (errno == EPERM || errno == EACCES)) {
         close(fd);
@@ -5247,14 +5231,14 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
         serverLog(LL_WARNING,
                   "aeron ub pool: mmap %s size=%llu failed errno=%d (%s)",
                   selected_path,
-                  (unsigned long long)map_size,
+                  (unsigned long long)VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                   errno, strerror(errno));
         close(fd);
         return -2;
     }
     pool->fd   = fd;
     pool->base = p;
-    pool->size = map_size;
+    pool->size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
     pool->bump = 0;
     pool->cache_policy = used_sync ?
         VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE :

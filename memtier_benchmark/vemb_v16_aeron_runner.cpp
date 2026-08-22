@@ -27,8 +27,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vemb_v16_protocol.h"
-
 /* Transport mode: "aeron" (TCP control + local UB ring) or
  * "aeron-cross-node" (TCP attach + UB ring).
  * Set by main() from --vemb-v16-transport via vemb_v16_aeron_set_transport().
@@ -46,6 +44,7 @@ void vemb_v16_aeron_set_transport(const std::string &mode,
 }
 
 extern "C" {
+#include "vemb_v16_protocol.h"
 #include "vemb_v16_client_sdk.h"
 #include "monotonic.h"
 }

@@ -1351,13 +1351,8 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
             fprintf(stderr, "error: Aeron requires --vemb-v16-ub-peer-view-manifest and --vemb-v16-ub-peer-view-client-host\n");
             exit(1);
         }
-        if (strcmp(mode, "aeron") == 0 && endpoint[0] != '\0') {
-            fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (use aeron-cross-node)\n");
-            exit(1);
-        }
-        vemb_v16_aeron_set_transport(mode, endpoint, cfg->vemb_v16_aeron_control_uds != 0);
-        fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged (mode=%s)\n",
-                run_id, mode);
+        fprintf(stderr, "[RUN #%u] VEMB common-core runner engaged (mode=aeron)\n",
+                run_id);
         return vemb_v16_aeron_run(cfg, obj_gen);
     }
 

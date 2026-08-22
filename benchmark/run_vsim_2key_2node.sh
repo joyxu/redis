@@ -339,6 +339,7 @@ start_hpc_0() {
     taskset -c 0-95 \
         $HPC_DIR/src/redis-server \
             --port $HPC_PORT --bind 0.0.0.0 --protected-mode no \
+            --vemb-v16-tcp-host $NODE0_HOST \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \
@@ -359,6 +360,7 @@ start_hpc_1() {
         taskset -c 0-95 \
         $HPC_DIR/src/redis-server \
             --port $HPC_PORT --bind 0.0.0.0 --protected-mode no \
+            --vemb-v16-tcp-host $NODE1_HOST \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \

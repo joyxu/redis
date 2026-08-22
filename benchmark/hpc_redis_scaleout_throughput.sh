@@ -112,26 +112,10 @@ PREFILL_LOG="$REMOTE_DIR/$REMOTE_SUBDIR/prefill.log"
 RAW_DIR="$REMOTE_DIR/$REMOTE_SUBDIR/raw"
 
 # 工具函数
-ssh_run() {
-    local node_host=$1
-    shift
-    local ssh_host ssh_port
-    case "$node_host" in
-        "$NODE0_HOST")
-            ssh_host=$NODE0_SSH_HOST
-            ssh_port=$NODE0_SSH_PORT
-            ;;
-        "$NODE1_HOST")
-            ssh_host=$NODE1_SSH_HOST
-            ssh_port=$NODE1_SSH_PORT
-            ;;
-        *)
-            echo "unknown scaleout node: $node_host" >&2
-            return 2
-            ;;
-    esac
-    ssh -p "$ssh_port" "${SSH_USER}@$ssh_host" "$@"
-}
+# 直连内网 ssh (port 22): 脚本在内网执行, 任意节点 (含负载机) 可达。
+# 原理: merge b7000d1 曾改为 NODE0/NODE1 硬编码外网映射, 导致 MEMTIER_HOST=HW04
+# (192.168.1.21, 独立 client 负载机) 无法识别, 此处恢复直连实现。
+ssh_run() { ssh -p 22 "${SSH_USER}@$1" "${@:2}"; }
 log() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 summary_row() {
     printf '%-32s %-15s %-10s %-10s %-8s %s\n' "$@"
@@ -560,7 +544,7 @@ record_phase "scaleout_baseline" "$ops" "$hits" "$p50" "$p99" "$(ns2sec $T1 $T0)
 log "段2: during scaleout (background VEMB ${BG_TIME_SCALEOUT}s + topology change)"
 read -r d2_b_ut d2_b_st d2_b_si d2_b_rss < <(snap_both)
 run_memtier_bg "$MEMTIER_HOST" "$RAW_DIR/scaleout_during.txt" "$BG_TIME_SCALEOUT" \
-    "--vemb-v16-client-topology --vemb-v16-topology-retry-limit=8" \
+    "" \
     "$FINAL_ENDPOINTS"
 T0=$(date +%s%N)
 
@@ -644,7 +628,7 @@ log "段3c: after scaleout client-topology old-key VEMB read (${TEST_TIME}s)"
 read -r d3c_b_ut d3c_b_st d3c_b_si d3c_b_rss < <(snap_both)
 T0=$(date +%s%N)
 result=$(run_memtier "$MEMTIER_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_old_keys.txt" \
-    "--vemb-v16-client-topology" "$FINAL_ENDPOINTS" 1 "$PREFILL_KEYS")
+    "" "$FINAL_ENDPOINTS" 1 "$PREFILL_KEYS")
 T1=$(date +%s%N)
 read ops hits p50 p99 <<< "$result"
 read -r d3c_a_ut d3c_a_st d3c_a_si d3c_a_rss < <(snap_both)
@@ -657,7 +641,7 @@ read -r d3d_b_ut d3d_b_st d3d_b_si d3d_b_rss < <(snap_both)
 T0=$(date +%s%N)
 prefill_steady_data "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX" "$RAW_DIR/scaleout_after_prefill.txt"
 result=$(run_memtier "$MEMTIER_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after.txt" \
-    "--vemb-v16-client-topology" "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
+    "" "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
 T1=$(date +%s%N)
 read ops hits p50 p99 <<< "$result"
 read -r d3d_a_ut d3d_a_st d3d_a_si d3d_a_rss < <(snap_both)

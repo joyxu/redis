@@ -613,10 +613,11 @@ int client_group::create_clients(int num)
     for (int i = 0; i < num; i++) {
         client* c;
 
-        if (m_config->protocol == PROTOCOL_VEMB_V16)
-            c = new vemb_v16_multi_client(this);
-        else if (m_config->cluster_mode)
+        if (m_config->cluster_mode)
             c = new cluster_client(this);
+        else if (m_config->protocol == PROTOCOL_VEMB_V16 &&
+                 m_config->vemb_v16_endpoints != NULL)
+            c = new vemb_v16_multi_client(this);
         else
             c = new client(this);
 

@@ -72,10 +72,21 @@ echo ">>> starting server..."
 # Redis listener accepts ATTACH frames (plain sniff mode ignores them).
 AERON_ARGS=""
 if [ "$TRANSPORT" = "aeron" ]; then
-    AERON_ARGS="--vemb-v16-transport aeron --vemb-v16-aeron-control tcp \
+    AERON_ARGS="--vemb-v16-transport aeron \
         --vemb-v16-aeron-ub-path /dev/obmm_shmdev1 \
-        --vemb-v16-aeron-response-ub-path /dev/obmm_shmdev2"
+        --vemb-v16-aeron-response-ub-path /dev/obmm_shmdev3"
 fi
+# 统一传输后 memtier 的传输相关参数:
+#   aeron: peer-view 三件套 (本地视图, 路径与 server AERON_ARGS 对应)
+#   tcp:   按 owner 路由需 endpoints
+TRANSPORT_MEMTIER_ARGS=""
+if [ "$TRANSPORT" = "aeron" ]; then
+    TRANSPORT_MEMTIER_ARGS="--vemb-v16-ub-peer-view-manifest=$HPC/examples/vemb_v16_ub_peer_view_local_111.yaml \
+        --vemb-v16-ub-peer-view-client-host=local --vemb-v16-ub-peer-view-owner-id=0"
+else
+    TRANSPORT_MEMTIER_ARGS=""
+fi
+
 taskset -c "$SERVER_MASK" $REDIS \
     --port $PORT --bind 0.0.0.0 --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim $DIM \
@@ -101,7 +112,7 @@ sleep 1
 #    plain vemb_v16 TCP prefill would stall when TRANSPORT=aeron) ──
 echo ">>> prefilling $NUM_KEYS keys via ${TRANSPORT}..."
 PREFILL_OUT=$(taskset -c "$CLIENT_MASK" $MEMTIER \
-    --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} \
+    --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} $TRANSPORT_MEMTIER_ARGS \
     --vemb-v16-dim $DIM -s 127.0.0.1 -p $PORT \
     -t 1 -c 1 -n $NUM_KEYS --pipeline=32 \
     --ratio=1:0 --key-pattern=S:S \
@@ -221,7 +232,7 @@ J0_NS=$(date +%s%N)
 J0_SI=$(snapshot_si)
 
 taskset -c "$CLIENT_MASK" $MEMTIER \
-    --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} \
+    --protocol vemb_v16 --vemb-v16-transport=${TRANSPORT} $TRANSPORT_MEMTIER_ARGS \
     --vemb-v16-dim $DIM -s 127.0.0.1 -p $PORT \
     -t $T -c $C --pipeline=$PIPELINE \
     --ratio=0:1 --key-pattern=R:R \

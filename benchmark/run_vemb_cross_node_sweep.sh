@@ -180,6 +180,7 @@ start_hpc() {
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
+            --vemb-v16-tcp-host $SERVER_HOST \
             --vemb-v16-dim $DIM \
             --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \

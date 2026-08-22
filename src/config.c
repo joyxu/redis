@@ -2374,6 +2374,14 @@ static int isValidVembV16Transport(char *val, const char **err) {
     return 1;
 }
 
+static int isValidVembV16AeronControl(char *val, const char **err) {
+    if (strcmp(val, "tcp") && strcmp(val, "uds")) {
+        *err = "vemb-v16-aeron-control must be 'tcp' or 'uds'";
+        return 0;
+    }
+    return 1;
+}
+
 static int isValidAOFfilename(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appendfilename can't be empty";
