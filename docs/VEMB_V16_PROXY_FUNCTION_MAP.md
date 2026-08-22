@@ -7,7 +7,7 @@
 建议按下面顺序阅读：
 
 1. 入口和生命周期：`vemb_v16_proxy_create()`、`vemb_v16_proxy_run()`、`vemb_v16_proxy_stop()`、`vemb_v16_proxy_destroy()`
-2. 控制面：`vemb_v16_aeron_handle_control_fd()`、`vemb_v16_tcp_handle_fd()`、`alloc_channel_common()`、`close_channel()`
+2. 控制面：`vemb_v16_tcp_handle_fd()`、`alloc_channel_common()`、`close_channel()`
 3. 调度主路径：`vemb_v16_proxy_handle_request()`、`publish_shard_job()`、`drain_completions()`
 4. 执行主路径：`supernode_pool_thread_main()`、`drain_job_shard_queues()`、`apply_unified_shard_job()`、`apply_vemb_job()`、`apply_vadd_job()`
 5. 传输细节：TCP 请求/响应、UB/SHM ring 读写
@@ -15,8 +15,8 @@
 
 Transport 语义是严格二选一：
 
-- `--transport tcp`：控制面和数据面都走 TCP，不启动 UDS listener。
-- `--transport aeron`：控制面走 UDS，数据面走 SHM/Aeron ring，不启动 TCP listener。
+- `--transport tcp`：控制面和数据面都走 TCP。
+- `--transport aeron`：控制面同样走 TCP，数据面走 UB/Aeron ring。
 - 当前没有 `both` 语义；如果以后要支持双开，需要显式重新设计 channel lifecycle 和 stats/close 路径。
 
 主数据流可以先记成两条线：
@@ -38,11 +38,11 @@ Transport 语义是严格二选一：
 这一层回答的是：proxy 怎么被创建、启动、停止、销毁。
 
 - `vemb_v16_proxy_create()`：初始化 proxy 基本配置和全局状态，但不启动线程和监听 socket。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1655)
-- `vemb_v16_proxy_enable_uds()`：打开 SHM 模式的 UDS 控制面；后续 channel 数据面走 SHM/Aeron ring。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1711)
-- `vemb_v16_proxy_enable_tcp()`：打开 TCP-only 接入配置；控制帧和数据帧都走 TCP。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1697)
+- `vemb_v16_proxy_enable_tcp()`：打开 TCP 数据面配置。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:3607)
+- `vemb_v16_proxy_enable_aeron_tcp_control()`：打开 TCP 控制面和 UB/Aeron 数据面配置。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:3624)
 - `vemb_v16_proxy_set_supernode_workers()`：设置执行侧 worker 数量。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1732)
 - `vemb_v16_proxy_set_proxy_io_threads()`：设置调度侧 worker 数量。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1740)
-- `vemb_v16_proxy_run()`：按已启用的 transport 启动监听、初始化 job shard queue、拉起 worker 池，并进入 accept 主循环；`tcp` 只 accept TCP，`shm` 只 accept UDS。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1774)
+- `vemb_v16_proxy_run()`：启动 TCP listener、初始化 job shard queue、拉起 worker 池，并进入 accept 主循环；Aeron 的 ATTACH/CLOSE/status 也通过此 listener。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:3792)
 - `vemb_v16_proxy_stop()`：把 `running` 置 0，并打断监听 fd。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1883)
 - `vemb_v16_proxy_destroy()`：停机、join worker、释放 channel 和队列资源。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1748)
 - `vemb_v16_proxy_get_stats()`：汇总活跃 channel、关闭 channel、queue depth 与底层存储统计。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1892)
@@ -51,8 +51,7 @@ Transport 语义是严格二选一：
 
 这一层负责“建链”和“拆链”，不做 VADD/VEMB 业务执行。
 
-- `vemb_v16_aeron_handle_control_fd()`：SHM 模式专用，处理 UDS 控制请求，主要面向 SHM/Aeron channel 分配、stats、close 操作。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:155)
-- `vemb_v16_tcp_handle_fd()`：TCP 模式专用，处理一个新接入的 TCP fd。它既能处理 stats/close 这类控制帧，也能处理 `HELLO/WELCOME` 建 channel。[src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:441)
+- `vemb_v16_tcp_handle_fd()`：处理一个新接入的 TCP fd。它处理 TCP 数据帧、Aeron ATTACH、stats、close 与 topology 控制帧。[src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:441)
 - `alloc_channel_common()`：统一分配 channel 状态，是 TCP 和 UB/SHM 两条控制路径的汇合点。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:780)
 - `vemb_v16_proxy_alloc_shm_channel()`：UB/SHM channel 的薄封装。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:895)
 - `vemb_v16_proxy_alloc_tcp_channel()`：TCP channel 的薄封装。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:900)
@@ -100,13 +99,13 @@ Transport 拆文件的目标边界是：
 
 - `vemb_v16_proxy.c` 保留 lifecycle、channel 表、worker 池、`vemb_v16_proxy_handle_request()`、shard queue 调度和 SuperNode 执行路径。
 - `vemb_v16_tcp_transport.c` 承担 TCP listener 创建、accept 后的控制帧处理、`HELLO/WELCOME` 建链、TCP request 读入、TCP response 编码/回写、backpressure backlog。
-- `vemb_v16_aeron_transport.c` 承担 UDS listener 创建、UDS 控制帧处理、SHM/Aeron ring 创建/销毁、request ring poll、response ring publish。
+- `vemb_v16_aeron_transport.c` 承担 UB/Aeron ring 创建/销毁、request ring poll、response ring publish；不拥有 listener 或 UDS 控制面。
 - 两个 transport 文件不直接执行 VADD/VEMB，只把 request 交给 proxy 层的 `vemb_v16_proxy_handle_request()`；completion 回写则由 proxy 层按 channel transport 分派到对应 transport helper。
-- `vemb_v16_proxy_run()` 只选择一个 `vemb_v16_transport_listener_t` 并统一 accept，不再直接创建 UDS/TCP listener。
+- `vemb_v16_proxy_run()` 统一创建并 accept TCP listener；channel 的数据面由 channel transport 决定。
 
-当前已完成独立编译拆分：TCP transport helper 位于 [src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:1)，UDS + SHM/Aeron transport helper 位于 [src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:1)。二者通过 [src/vemb_v16_proxy_internal.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_internal.h:1) 声明的 accessor 和 lifecycle 回调访问 proxy/channel 状态，transport 文件内不直接解引用 `ch->` / `proxy->` 字段。transport 对 proxy 暴露的接口分别声明在 [src/vemb_v16_tcp_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.h:1) 和 [src/vemb_v16_aeron_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.h:1)。
+当前已完成独立编译拆分：TCP control/data helper 位于 [src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:1)，UB/Aeron data helper 位于 [src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:1)。二者通过 [src/vemb_v16_proxy_internal.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_internal.h:1) 声明的 accessor 和 lifecycle 回调访问 proxy/channel 状态，transport 文件内不直接解引用 `ch->` / `proxy->` 字段。transport 对 proxy 暴露的接口分别声明在 [src/vemb_v16_tcp_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.h:1) 和 [src/vemb_v16_aeron_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.h:1)。
 
-Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/szza/codespace/work/hpc-redis/scripts/vemb_v16_transport_smoke.sh:1) 做轻量回归：脚本会构建 server/bench，确认 `--transport both` 被拒绝，再分别用 `tcp` 和 `aeron` 跑一组 `ping`。TCP case 会传入一个临时 `--socket` 并确认不会创建 UDS socket，用来防止 TCP-only 路径重新依赖 UDS。
+Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/szza/codespace/work/hpc-redis/scripts/vemb_v16_transport_smoke.sh:1) 做轻量回归：脚本会构建 server/bench，确认 `--transport both` 被拒绝，再分别用 `tcp` 和 `aeron` 跑一组 `ping`。
 
 ### 5.1 TCP 路径
 
@@ -128,7 +127,6 @@ TCP inline vector response 的 payload 由 SuperNode 写入 completion snapshot�
 
 ### 5.2 UB/SHM 路径
 
-- `vemb_v16_aeron_listen()`：创建 UDS listener，并返回 transport listener ops。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:21)
 - `vemb_v16_aeron_create_shared_ring()`、`vemb_v16_aeron_destroy_shared_ring()`：创建和销毁 client 可见的共享内存 ring。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:52)
 - `vemb_v16_aeron_poll_shm_requests()`：从 request ring 批量拉取请求并交给 `vemb_v16_proxy_handle_request()`。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:107)
 - `vemb_v16_aeron_publish_response()`：把 response 发布到 response ring。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:141)

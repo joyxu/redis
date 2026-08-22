@@ -3335,7 +3335,7 @@ standardConfig static_configs[] = {
     createStringConfig("vemb-v16-aeron-control", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_control, "tcp", isValidVembV16AeronControl, NULL),
     createStringConfig("vemb-v16-aeron-ub-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_ub_path, VEMB_V16_DEFAULT_AERON_UB_PATH, NULL, NULL),
     createStringConfig("vemb-v16-aeron-response-ub-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_aeron_response_ub_path, VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH, NULL, NULL),
-    createBoolConfig("vemb-v16-cross-node-aeron", NULL, IMMUTABLE_CONFIG, server.vemb_v16_cross_node_aeron_enabled, 0, NULL, NULL),
+    createBoolConfig("aeron-ub-cacheable", NULL, IMMUTABLE_CONFIG, server.vemb_v16_aeron_ub_cacheable, 0, NULL, NULL),
 
     /* Special configs */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),

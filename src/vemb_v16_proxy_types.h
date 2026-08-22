@@ -55,6 +55,9 @@ typedef struct vemb_v16_shard_queue {
 struct vemb_v16_channel {
     uint64_t channel_id;
     atomic_uint_fast64_t slot_channel_id;
+    /* Unique identity of the currently attached backing resources.  It is
+     * read by the control plane without dereferencing channel mappings. */
+    atomic_uint_fast64_t resource_generation;
     uint32_t index;
     /* Stable data-plane owners.  index is a channel-table slot, not a lane
      * identity; v2 channels receive independent round-robin owners. */
@@ -95,7 +98,6 @@ struct vemb_v16_channel {
 };
 
 struct vemb_v16_proxy {
-    char uds_path[108];
     char tcp_host[64];
     char aeron_ub_path[256];
     char aeron_response_ub_path[256];
@@ -113,7 +115,6 @@ struct vemb_v16_proxy {
     atomic_int running;
     int listen_fd;
     uint16_t tcp_port;
-    int uds_enabled;
     int tcp_enabled;
     int inject_only;
     uint32_t data_transport_type;

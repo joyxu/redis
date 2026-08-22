@@ -233,6 +233,8 @@ run_one_config() {
 
     # jiffies before
     local jb_ut=0 jb_st=0
+    JB_NS=$(date +%s%N)
+
     for ((i=0; i<NNODES; i++)); do
         read u s < <(snapshot_jiffies_node $i)
         jb_ut=$((jb_ut + ${u:-0})); jb_st=$((jb_st + ${s:-0}))
@@ -257,6 +259,9 @@ run_one_config() {
     fi
 
     # jiffies after
+    JA_NS=$(date +%s%N)
+    ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐: 分子分母同区间)
     local ja_ut=0 ja_st=0
     for ((i=0; i<NNODES; i++)); do
         read u s < <(snapshot_jiffies_node $i)
@@ -267,10 +272,10 @@ run_one_config() {
         si_a=$((si_a + $(snapshot_si_node $i)))
         rss_a=$((rss_a + $(snapshot_rss_node $i)))
     done
-    local cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local si=$(awk -v d=$((si_a - si_b)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+    local cores=$(awk -v d=$((ja_ut + ja_st - jb_ut - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local si=$(awk -v d=$((si_a - si_b)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local rss=$(((rss_a + rss_b) / 2))
 
     # parse Totals (cluster mode has MOVED/ASK columns)

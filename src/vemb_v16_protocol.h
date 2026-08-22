@@ -40,7 +40,7 @@
 #define VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN 17u
 #define VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN 184u
 #define VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN 56u
-#define VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN 33u
+#define VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN 29u
 #define VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN 73u
 #define VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN 32u
 #define VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN 105u
@@ -86,6 +86,10 @@
 #define VEMB_V16_REGION_LOCAL_SHM 1u
 #define VEMB_V16_REGION_UB 2u
 
+/* UB mappings first use O_RDWR; EPERM/EACCES triggers an O_SYNC retry. */
+#define VEMB_V16_UB_CACHE_POLICY_CACHEABLE 1u
+#define VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE 2u
+
 #define VEMB_V16_TRANSPORT_AERON 1u
 #define VEMB_V16_TRANSPORT_TCP 2u
 
@@ -99,29 +103,6 @@
 #define VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED 0x02u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_AUTO_SCALEOUT 0x04u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_COORDINATED_SCALEOUT 0x08u
-
-enum vemb_v16_ctrl_op {
-    VEMB_V16_CTRL_PING = 0x01,
-    VEMB_V16_CTRL_ALLOC_CHANNEL = 0x20,
-    VEMB_V16_CTRL_CLOSE_CHANNEL = 0x21,
-    VEMB_V16_CTRL_STATS = 0x22,
-    VEMB_V16_CTRL_CLOSE_ALL_CHANNELS = 0x23,
-    VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING = 0x30,
-    VEMB_V16_CTRL_MIGRATION_MARK_CUTOVER = 0x31,
-    VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING_BATCH = 0x32,
-    VEMB_V16_CTRL_MIGRATION_BARRIER = 0x33,
-    VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER = 0x34,
-    VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER = 0x35,
-    VEMB_V16_CTRL_MIGRATION_MARK_SOURCE_GC = 0x36,
-    VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC = 0x37,
-    VEMB_V16_CTRL_EPOCH_SET = 0x40,
-    VEMB_V16_CTRL_EPOCH_GET = 0x41,
-    VEMB_V16_CTRL_TOPOLOGY_SET = 0x42,
-    VEMB_V16_CTRL_TOPOLOGY_GET = 0x43,
-    VEMB_V16_CTRL_SCALEOUT_LOCAL_DONE = 0x44,
-    VEMB_V16_CTRL_PEER_VIEW_MAP_APPLY = 0x45,
-    VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET = 0x46,
-};
 
 enum vemb_v16_net_frame_type {
     VEMB_V16_NET_HELLO = 0x01,
@@ -157,6 +138,9 @@ enum vemb_v16_net_frame_type {
     VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET = 0x1f,
     VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE = 0x20,
     VEMB_V16_NET_ALLOC_AERON_CHANNEL = 0x21,
+    /* Read-only status for an existing v1/v2 UB channel. The response is
+     * CONTROL_STATUS.value = server resource generation. */
+    VEMB_V16_NET_AERON_CHANNEL_STATUS = 0x22,
 };
 
 enum vemb_v16_data_op {
@@ -309,6 +293,8 @@ typedef struct vemb_v16_topology_endpoint {
     uint16_t tcp_port;
     uint16_t reserved0;
     char host[VEMB_V16_TOPOLOGY_ENDPOINT_HOST_LEN];
+    /* Reserved wire field. Aeron and TCP endpoints both use host:port for
+     * control; new senders must leave this zeroed. */
     char uds_path[VEMB_V16_TOPOLOGY_ENDPOINT_PATH_LEN];
 } vemb_v16_topology_endpoint_t;
 
@@ -1819,7 +1805,10 @@ static inline int vemb_v16_req_decode(vemb_v16_req_t *req,
                                       size_t len) {
     RETURN_IF(len < 24u, -1);
     const uint8_t *p = src;
-    memset(req, 0, sizeof(*req));
+    /* Compact Aeron frames omit the vector for read operations. Clear the
+     * scalar and key fields, while leaving the large vector scratch area for
+     * the decoder to populate only when the operation carries one. */
+    memset(req, 0, offsetof(vemb_v16_req_t, vector));
     uint8_t op_flags = vemb_v16_proto_get_u8(&p);
     req->op = op_flags & VEMB_V16_TCP_REQ_OP_MASK;
     req->flags = vemb_v16_req_flags_from_wire(op_flags & VEMB_V16_TCP_REQ_FLAG_MASK);

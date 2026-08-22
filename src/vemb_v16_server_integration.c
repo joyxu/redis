@@ -17,17 +17,6 @@
  * references when compiling vemb_v16_proxy.o / vemb_v16_supernode.o. */
 int vemb_v16_log_verbosity_value = LL_NOTICE;
 
-/* Accessor for proxy.c / supernode.c which can't include server.h
- * (zmalloc.h deprecated free conflicts with their use of libc free). */
-int vemb_v16_cross_node_aeron_enabled(void) {
-    return server.vemb_v16_cross_node_aeron_enabled;
-}
-
-static int vemb_v16_aeron_tcp_control_enabled(void) {
-    return server.vemb_v16_aeron_control &&
-           !strcmp(server.vemb_v16_aeron_control, "tcp");
-}
-
 #include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -40,6 +29,21 @@ static void *proxy_run_thread(void *arg) {
 }
 
 static vemb_v16_storage_ctx_t *g_vemb_storage = NULL;
+
+static const char *vemb_v16_redis_control_host(void) {
+    /* Explicit advertisement host wins: with --bind 0.0.0.0 the fallback
+     * below would advertise 127.0.0.1, which cross-node clients cannot
+     * route, so deployments reachable from peers must set
+     * --vemb-v16-tcp-host to the routable address. */
+    if (server.vemb_v16_tcp_host && server.vemb_v16_tcp_host[0])
+        return server.vemb_v16_tcp_host;
+    if (server.bindaddr_count == 1 && server.bindaddr[0][0] != '\0' &&
+        strcmp(server.bindaddr[0], "0.0.0.0") != 0 &&
+        strcmp(server.bindaddr[0], "::") != 0) {
+        return server.bindaddr[0];
+    }
+    return "127.0.0.1";
+}
 
 int vemb_v16_server_integration_init(void) {
     if (!server.vemb_v16_enabled) return 0;
@@ -70,11 +74,21 @@ int vemb_v16_server_integration_init(void) {
     vemb_v16_warm_regions_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
     if (vemb_v16_parse_warm_regions_manifest(server.vemb_v16_warm_regions_manifest,
-                                              dim * sizeof(float),
-                                              &manifest) != 0) {
+                                             dim * sizeof(float),
+                                             &manifest) != 0) {
         serverLog(LL_WARNING, "vemb_v16_parse_warm_regions_manifest failed: %s",
                   server.vemb_v16_warm_regions_manifest);
         return -1;
+    }
+
+    if (server.vemb_v16_aeron_ub_cacheable) {
+        for (uint32_t i = 0; i < manifest.region_count; i++) {
+            if (manifest.regions[i].backend_type == VEMB_V16_REGION_UB)
+                manifest.regions[i].cache_policy =
+                    VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+        }
+        serverLog(LL_NOTICE,
+                  "VEMB V16 Aeron UB cache policy: local cacheable (O_SYNC disabled)");
     }
     if (server.vemb_v16_reset_warm_regions) {
         if (vemb_v16_storage_reset_manifest_regions(&manifest) != 0) {
@@ -94,7 +108,6 @@ int vemb_v16_server_integration_init(void) {
     }
 
     if (vemb_v16_proxy_create(&server.vemb_v16_proxy,
-                              VEMB_V16_UDS_PATH,
                               dim,
                               max_vectors,
                               storage,
@@ -169,26 +182,25 @@ int vemb_v16_server_integration_init(void) {
             ? server.vemb_v16_transport : "sniff";
 
     if (!strcmp(vemb_transport, "aeron")) {
-        int control_rc = vemb_v16_aeron_tcp_control_enabled() ?
-            vemb_v16_proxy_enable_aeron_tcp_inject_only(server.vemb_v16_proxy) :
-            vemb_v16_proxy_enable_uds(server.vemb_v16_proxy);
-        if (control_rc != 0) {
+        if (vemb_v16_proxy_enable_aeron_tcp_inject_only(
+                server.vemb_v16_proxy,
+                vemb_v16_redis_control_host(),
+                (uint16_t)server.port) != 0) {
             serverLog(LL_WARNING,
-                      "vemb_v16 aeron control setup failed: control=%s",
-                      server.vemb_v16_aeron_control ?
-                          server.vemb_v16_aeron_control : "(null)");
+                      "vemb_v16 aeron TCP control setup failed");
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
             server.vemb_v16_proxy = NULL;
             return -1;
         }
-        serverLog(LL_NOTICE, "VEMB V16 Aeron control enabled: %s ub_path=%s",
-                  vemb_v16_aeron_tcp_control_enabled() ? "tcp/redis-listener" :
-                      VEMB_V16_UDS_PATH,
+        serverLog(LL_NOTICE, "VEMB V16 Aeron TCP control enabled: redis-listener ub_path=%s",
                   server.vemb_v16_aeron_ub_path ?
                       server.vemb_v16_aeron_ub_path :
                       VEMB_V16_DEFAULT_AERON_UB_PATH);
     } else {
-        if (vemb_v16_proxy_enable_tcp_inject_only(server.vemb_v16_proxy) != 0) {
+        if (vemb_v16_proxy_enable_tcp_inject_only(
+                server.vemb_v16_proxy,
+                vemb_v16_redis_control_host(),
+                (uint16_t)server.port) != 0) {
             serverLog(LL_WARNING,
                       "vemb_v16_proxy_enable_tcp_inject_only failed");
             vemb_v16_proxy_destroy(server.vemb_v16_proxy);
@@ -250,11 +262,7 @@ int vemb_v16_server_integration_init(void) {
 static int vemb_try_aeron_attach_steal(connection *conn) {
     int fd = conn->fd;
     if (fd < 0) return 0;
-    /* Cross-node aeron is opt-in via --vemb-v16-cross-node-aeron yes.
-     * When disabled, never peek for the ATTACH magic — falls through
-     * to the normal VEMB/RESP sniff path (pre-cross-node behavior). */
-    if (!vemb_v16_aeron_tcp_control_enabled() ||
-        !server.vemb_v16_transport ||
+    if (!server.vemb_v16_transport ||
         strcmp(server.vemb_v16_transport, "aeron") != 0)
         return 0;
 
@@ -453,8 +461,7 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
              * RESP here would silently swallow the ATTACH.
              * Skipped when cross-node aeron is disabled (pre-cross-node
              * behavior: anything non-VEMB_V16_MAGIC falls through to RESP). */
-            if (vemb_v16_aeron_tcp_control_enabled() &&
-                server.vemb_v16_transport &&
+            if (server.vemb_v16_transport &&
                 !strcmp(server.vemb_v16_transport, "aeron") &&
                 memcmp(buf, VEMB_V16_AERON_ATTACH_MAGIC, 4) == 0) {
                 if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)

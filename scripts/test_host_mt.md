@@ -1,4 +1,4 @@
-$ ssh -p 22 root@192.168.90.112
+$ ssh -p 8112 root@43.154.145.18
 $ directory:
 $ - /root/szz/codespace/hpc-redis
 $ - /root/FlameGraph/flamegraph.pl: only for redis-server
@@ -36,12 +36,14 @@ $ run
 - 本地使用 `scripts/run_host_mt_server_flamegraph.sh` 执行一组测试并拉回完整产物；脚本不会批量循环。例如：
   `BATCH=32 PIPELINE=32 WORKERS=21:21 NUM_KEYS=100000 bash scripts/run_host_mt_server_flamegraph.sh`
   `SCENARIO=cache BATCH=32 PIPELINE=32 WORKERS=21:21 NUM_KEYS=10000 bash scripts/run_host_mt_server_flamegraph.sh`
+  仅做 host-mt 回归、不采集 perf 或生成 SVG 时，使用
+  `NODE=43.154.145.18 SSH_PORT=8112 PROFILE=0 bash scripts/run_host_mt_server_flamegraph.sh`。
 
 ## memtier_benchmar
 - 如果需要编译 memtier_benchmark, 流程:
 ```
 - 在本地同步当前代码到远端测试目录（只同步代码、头文件和 Makefile，不传文档或二进制）：
-  NODE=192.168.90.112 REMOTE_ROOT=/root/szz/codespace/hpc-redis bash scripts/sync_changed_code_to_peer.sh --all-code
+  NODE=43.154.145.18 SSH_PORT=8112 REMOTE_ROOT=/root/szz/codespace/hpc-redis bash scripts/sync_changed_code_to_peer.sh --all-code
 - 先编译 client sdk : cd clients/c/ && make -j
 - 再编译 memtier_benchmark:  autoreconf -ivf && ./configure && make -j
 make -C clients/c -j && make -C memtier_benchmark -j

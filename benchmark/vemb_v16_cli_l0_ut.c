@@ -173,12 +173,54 @@ static void test_prepared_draft_keeps_group_indexed(void) {
     vemb_v16_cli_l0_destroy(l0);
 }
 
+static void test_identity_fences_groups_and_batches(void) {
+    vemb_v16_cli_l0_t *l0 = vemb_v16_cli_l0_create(1);
+    assert(l0);
+    const vemb_v16_owner_session_identity_t epoch_7 = {
+        .owner_id = 2, .topology_epoch = 7, .owner_generation = 4,
+    };
+    const vemb_v16_owner_session_identity_t epoch_8 = {
+        .owner_id = 2, .topology_epoch = 8, .owner_generation = 4,
+    };
+    const vemb_v16_owner_session_identity_t other_owner = {
+        .owner_id = 3, .topology_epoch = 8, .owner_generation = 4,
+    };
+    uint32_t entry_a, entry_b, entry_c, channel;
+    assert(vemb_v16_cli_l0_submit_with_identity(
+               l0, "same", 4, 19, 71, &epoch_7, &entry_a, &channel) ==
+           VEMB_V16_CLI_L0_NEW_LEADER);
+    assert(vemb_v16_cli_l0_submit_with_identity(
+               l0, "same", 4, 19, 72, &epoch_7, &entry_a, &channel) ==
+           VEMB_V16_CLI_L0_COALESCED_FOLLOWER);
+    assert(vemb_v16_cli_l0_submit_with_identity(
+               l0, "same", 4, 19, 73, &epoch_8, &entry_b, &channel) ==
+           VEMB_V16_CLI_L0_NEW_LEADER);
+    assert(vemb_v16_cli_l0_submit_with_identity(
+               l0, "same", 4, 19, 74, &other_owner, &entry_c, &channel) ==
+           VEMB_V16_CLI_L0_NEW_LEADER);
+    assert(entry_a != entry_b && entry_b != entry_c);
+
+    vemb_v16_cli_l0_batch_draft_t draft;
+    assert(vemb_v16_cli_l0_prepare_batch(l0, channel, 8, 256, &draft) == 1);
+    assert(vemb_v16_owner_session_identity_equal(&draft.identity, &epoch_7));
+    assert(vemb_v16_cli_l0_publish_batch(l0, &draft, 401) == 0);
+    vemb_v16_owner_session_identity_t published;
+    assert(vemb_v16_cli_l0_get_batch_identity(l0, channel, 401, &published) == 0);
+    assert(vemb_v16_owner_session_identity_equal(&published, &epoch_7));
+
+    assert(vemb_v16_cli_l0_prepare_batch(l0, channel, 8, 256, &draft) == 1);
+    assert(vemb_v16_owner_session_identity_equal(&draft.identity, &epoch_8));
+    vemb_v16_cli_l0_abort_all(l0, NULL, NULL);
+    vemb_v16_cli_l0_destroy(l0);
+}
+
 int main(void) {
     test_coalesce_and_out_of_order_response();
     test_fallback_and_generation_rejection();
     test_capacity_fallbacks();
     test_key_slab_and_entry_pool_exhaustion();
     test_prepared_draft_keeps_group_indexed();
+    test_identity_fences_groups_and_batches();
     printf("vemb_v16_cli_l0_ut: all tests passed\n");
     return 0;
 }

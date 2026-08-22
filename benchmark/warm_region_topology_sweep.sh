@@ -119,6 +119,7 @@ for topo_entry in "${TOPOS[@]}"; do
         SRV_PID=$(pgrep -f "redis-server.*:${PORT}" 2>/dev/null | head -1)
         if [ -n "$SRV_PID" ]; then
             read J0_UT J0_ST < <(get_cpu_jiffies "$SRV_PID")
+J0_NS=$(date +%s%N)
         else
             log "WARN: no redis-server on :${PORT}, jiffies/rss will be 0"
             J0_UT=0; J0_ST=0
@@ -128,6 +129,9 @@ for topo_entry in "${TOPOS[@]}"; do
         # ── bench 后快照 ──
         if [ -n "$SRV_PID" ]; then
             read J1_UT J1_ST < <(get_cpu_jiffies "$SRV_PID")
+J1_NS=$(date +%s%N)
+ELAPSED_NS=$((J1_NS - J0_NS > 0 ? J1_NS - J0_NS : TEST_TIME * 1000000000))
+# core 分母 = 纳秒实测窗口 (与脚本13对齐)
         else
             J1_UT=0; J1_ST=0
         fi
@@ -135,9 +139,9 @@ for topo_entry in "${TOPOS[@]}"; do
         RSS=$(snapshot_rss "$SRV_PID")
         kill_server
         # ── 计算并落地每个 tag 的 4 指标 ──
-        CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v s=${TEST_TIME} 'BEGIN{printf "%.2f", d/100.0/s}')
-        CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v s=${TEST_TIME} 'BEGIN{printf "%.2f", d/100.0/s}')
-        C_SI=$(awk -v d=$((J1_SI - J0_SI)) -v s=${TEST_TIME} 'BEGIN{printf "%.2f", d/100.0/s}')
+        CORE_UT=$(awk -v d=$((J1_UT - J0_UT)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        CORE_ST=$(awk -v d=$((J1_ST - J0_ST)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        C_SI=$(awk -v d=$((J1_SI - J0_SI)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
         [ -z "$RSS" ] && RSS="NA"
         printf '%s %s %s %s\n' "$CORE_UT" "$CORE_ST" "$C_SI" "$RSS" > ${RAWDIR}/metrics_${tag}.txt
     done

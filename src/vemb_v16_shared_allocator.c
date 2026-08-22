@@ -174,6 +174,8 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
     vemb_v16_mapped_region_t region;
     if (vemb_v16_mapped_region_open(&region,
                                     backend_type,
+                                    is_local ? VEMB_V16_UB_CACHE_POLICY_CACHEABLE :
+                                               VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE,
                                     path,
                                     mmap_offset,
                                     sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
@@ -220,6 +222,8 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
     vemb_v16_mapped_region_t region;
     if (vemb_v16_mapped_region_open(&region,
                                     backend_type,
+                                    is_local ? VEMB_V16_UB_CACHE_POLICY_CACHEABLE :
+                                               VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE,
                                     path,
                                     mmap_offset,
                                     sizeof(vemb_v16_shared_region_allocator_t)) != 0) {

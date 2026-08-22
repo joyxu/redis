@@ -287,7 +287,7 @@ run_one_config() {
     local jb_ut jb_st
     read jb_ut jb_st < <(snapshot_jiffies $PORT)
     local jb_iowait=$(snapshot_iowait) jb_si=$(snapshot_si) jb_hi=$(snapshot_hi)
-    local jb_sec=$(date +%s)
+    local jb_ns=$(date +%s%N)
     if [ "$server_type" = "hpc" ]; then
         # hpc server: VEMB V16 二进制协议
         #   所有 OP 统一 item: key 范围
@@ -338,15 +338,16 @@ run_one_config() {
     fi
     local ja_ut ja_st
     read ja_ut ja_st < <(snapshot_jiffies $PORT)
-    local ja_sec=$(date +%s)
-    local elapsed=$((ja_sec - jb_sec > 0 ? ja_sec - jb_sec : TEST_TIME))
-    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", (du+ds)/100.0/s}')
-    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local ja_ns=$(date +%s%N)
+    local elapsed_ns=$((ja_ns - jb_ns > 0 ? ja_ns - jb_ns : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (分子分母同区间)
+    local cores=$(awk -v du=$((ja_ut - jb_ut)) -v ds=$((ja_st - jb_st)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", (du+ds)/100.0/(s/1000000000)}')
+    local core_ut=$(awk -v d=$((ja_ut - jb_ut)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local core_st=$(awk -v d=$((ja_st - jb_st)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local ja_iowait=$(snapshot_iowait) ja_si=$(snapshot_si) ja_hi=$(snapshot_hi)
-    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
-    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed 'BEGIN{printf "%.2f", d/100.0/s}')
+    local c_iowait=$(awk -v d=$((ja_iowait - jb_iowait)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local c_si=$(awk -v d=$((ja_si - jb_si)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local rss=$(snapshot_rss $PORT)
 
     # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)

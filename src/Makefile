@@ -453,7 +453,7 @@ REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet
                     vemb_v16_control_listener.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_client_sdk.o vemb_v16_net.o vemb_v16_client_topology.o vemb_v16_topology.o
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_client_sdk.o vemb_v16_cluster_core.o vemb_v16_ub_peer_view.o vemb_v16_net.o vemb_v16_client_topology.o vemb_v16_topology.o
 REDIS_BENCHMARK_NAME=$(OUT_DIR)/redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 # HPC-Redis: link the VEMB V16 client SDK as a static archive (per CLAUDE.md
@@ -573,6 +573,12 @@ DEP = $(addprefix $(OUT_DIR)/,$(REDIS_SERVER_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR
 $(OUT_DIR)/vemb_v16_client_sdk.o: ../clients/c/vemb_v16_client_sdk.c .make-prerequisites
 	@mkdir -p $(OUT_DIR)
 	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_cluster_core.o: ../clients/c/vemb_v16_cluster_core.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_ub_peer_view.o: ../clients/c/vemb_v16_ub_peer_view.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
 $(OUT_DIR)/vemb_v16_client_topology.o: vemb_v16_client_topology.c .make-prerequisites
 	@mkdir -p $(OUT_DIR)
 	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
@@ -676,6 +682,7 @@ VEMB_V16_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE
 VEMB_V16_CFLAGS += $(VEMB_V16_EXTRA_CFLAGS)
 
 vemb_v16_server: vemb_v16_server.c futex.c futex.h vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_aeron_attach.h vemb_v16_storage.h vemb_v16_warm_region_layout.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h
+	@echo 'WARNING: vemb_v16_server is deprecated; do not use it for performance benchmarks. Use redis-server + memtier_benchmark.' 1>&2
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
 	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c futex.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c -pthread -lm
 

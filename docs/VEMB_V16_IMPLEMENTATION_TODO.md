@@ -2,6 +2,8 @@
 
 日期：2026-05-20
 
+> 弃用说明：`src/vemb_v16_server` 与 `benchmark/vemb_v16_bench` 仅保留给协议兼容和功能 smoke 测试。不得用于性能压测或性能结论；正式压测统一使用 `src/redis-server` 和 `memtier_benchmark`。
+
 ## 当前落地范围
 
 实现一条独立 VEMB V16 数据面路径，不改造 `tlc_v16`，也不依赖 Redis command / RedisModule / blocked-client 路径：

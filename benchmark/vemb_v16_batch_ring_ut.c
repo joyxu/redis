@@ -10,10 +10,12 @@ int main(void) {
     uint8_t frame[256];
     uint32_t key_bytes = lens[0] + lens[1];
     size_t frame_len = batch_request_encoded_len(key_bytes, 2);
-    batch_request_encode(frame, 7, 9, keys, lens, 2, key_bytes);
+    /* A batch carries its core-selected submit epoch, independently from the
+     * v2 channel ATTACH epoch. */
+    batch_request_encode(frame, 7, 43, keys, lens, 2, key_bytes);
     batch_request_view_t view;
     assert(batch_request_decode(&view, frame, frame_len) == 0);
-    assert(view.batch_id == 7 && view.topology_epoch == 9 && view.item_count == 2);
+    assert(view.batch_id == 7 && view.topology_epoch == 43 && view.item_count == 2);
     assert(batch_request_key_len_at(&view, 0) == 1 &&
            batch_request_key_len_at(&view, 1) == 5);
     assert(memcmp(view.keys, "akey-b", 6) == 0);
@@ -38,7 +40,7 @@ int main(void) {
 
     batch_response_t response = {
         .batch_id = 7,
-        .topology_epoch = 9,
+        .topology_epoch = 43,
         .item_count = 2,
     };
     response.entries[0] = (vemb_v16_resp_t){
@@ -60,7 +62,7 @@ int main(void) {
     batch_response_view_t response_view;
     vemb_v16_resp_t decoded[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
     assert(batch_response_decode(&response_view, decoded, frame, frame_len) == 0);
-    assert(response_view.batch_id == 7 && response_view.topology_epoch == 9 &&
+    assert(response_view.batch_id == 7 && response_view.topology_epoch == 43 &&
            response_view.item_count == 2 && decoded[0].req_id == 0 &&
            decoded[1].req_id == 1 && decoded[1].vector_offset == 4096);
     frame[frame_len - 1] ^= 1;

@@ -34,6 +34,7 @@ static int manifest_ut_open_layout_view(manifest_ut_layout_view_t *view,
     memset(view, 0, sizeof(*view));
     if (vemb_v16_mapped_region_open(&view->mapping,
                                     VEMB_V16_REGION_LOCAL_SHM,
+                                    VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                     path,
                                     0,
                                     vemb_v16_warm_region_layout_bytes(
@@ -122,6 +123,7 @@ static void test_shm_provider_attaches_existing_payload(void) {
     assert(vemb_v16_warm_provider_open(&first,
                                        301,
                                        VEMB_V16_REGION_LOCAL_SHM,
+                                       VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                        shm_name,
                                        0,
                                        dim * sizeof(float),
@@ -135,6 +137,7 @@ static void test_shm_provider_attaches_existing_payload(void) {
     assert(vemb_v16_warm_provider_open(&second,
                                        301,
                                        VEMB_V16_REGION_LOCAL_SHM,
+                                       VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                        shm_name,
                                        0,
                                        dim * sizeof(float),
@@ -152,6 +155,7 @@ static void test_shm_provider_attaches_existing_payload(void) {
 
 static void test_manifest_shm_mock_ub_create_and_put(void) {
     enum { dim = 2, max_vectors = 4 };
+    const uint32_t warm_region_bytes = sizeof(float) * dim * 2 + 1;
     char manifest_path[128];
     char shm1[64];
     char ub2[128];
@@ -173,7 +177,7 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
         vemb_v16_warm_region_layout_bytes(2);
     assert(ftruncate(ub_fd,
                      ub2_allocator_layout +
-                     sizeof(float) * dim * 2) == 0);
+                     warm_region_bytes) == 0);
     close(ub_fd);
 
     FILE *fp = fopen(manifest_path, "w");
@@ -200,10 +204,10 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
             "    home_ub_node_id: 1\n"
             "    weight: 1\n",
             shm1,
-            (unsigned)(sizeof(float) * dim * 2),
+            warm_region_bytes,
             (unsigned)(sizeof(float) * dim),
             ub2,
-            (unsigned)(sizeof(float) * dim * 2),
+            warm_region_bytes,
             (unsigned)(sizeof(float) * dim));
     fclose(fp);
 
@@ -770,6 +774,7 @@ static void test_storage_reset_clears_payload_and_layout(void) {
     assert(vemb_v16_warm_provider_open(&provider,
                                        401,
                                        VEMB_V16_REGION_LOCAL_SHM,
+                                       VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                        shm_name,
                                        0,
                                        dim * sizeof(float),
@@ -800,6 +805,7 @@ static void test_storage_reset_clears_payload_and_layout(void) {
     assert(vemb_v16_warm_provider_open(&provider,
                                        401,
                                        VEMB_V16_REGION_LOCAL_SHM,
+                                       VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                        shm_name,
                                        0,
                                        dim * sizeof(float),

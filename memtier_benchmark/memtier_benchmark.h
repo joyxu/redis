@@ -107,13 +107,13 @@ struct benchmark_config {
     struct arbitrary_command_list* arbitrary_commands;
     const char *hdr_prefix;
     uint32_t vemb_v16_dim;
+    int vemb_v16_aeron_control_uds;  /* aeron control plane: 0=tcp (default), 1=uds */
     bool     vemb_v16_handle;
     bool     vemb_v16_vsim;
     bool     vemb_v16_vsim_key_key;
     bool     vemb_v16_vrem;
     bool     vemb_v16_batch_disable;
     const char *vemb_v16_endpoints;
-    bool     vemb_v16_client_topology;
     unsigned int vemb_v16_topology_refresh_ms;
     unsigned int vemb_v16_topology_retry_limit;
     uint32_t vemb_v16_batch_request_size;
@@ -121,8 +121,11 @@ struct benchmark_config {
     /* Per-Aeron-worker completed-vector L1 entries; zero disables L1. */
     uint32_t vemb_v16_l1_entries;
     /* transport: "tcp" (default, libevent RESP/sniff) or "aeron"
-     * (UDS + POSIX SHM SPSC ring, side-channel runner bypassing libevent). */
+     * (TCP control plus client-resolved UB mappings). */
     const char *vemb_v16_transport;
+    const char *vemb_v16_ub_peer_view_manifest;
+    const char *vemb_v16_ub_peer_view_client_host;
+    uint32_t vemb_v16_ub_peer_view_owner_id;
     unsigned int request_rate;
     unsigned int request_per_interval;
     unsigned int request_interval_microsecond;

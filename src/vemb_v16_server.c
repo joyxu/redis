@@ -1,5 +1,10 @@
 #define _GNU_SOURCE
 
+/*
+ * Deprecated compatibility harness. Keep it for focused protocol smoke tests;
+ * all VEMB performance scripts must start redis-server and use memtier.
+ */
+
 #include "vemb_v16_proxy.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
@@ -10,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 static vemb_v16_proxy_t *g_proxy;
@@ -60,8 +64,6 @@ int main(int argc, char **argv) {
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
     const char *transport = "tcp";
-    const char *aeron_control = "tcp";
-    const char *uds_path = "/tmp/vemb_v16.sock";
     const char *aeron_ub_path = VEMB_V16_DEFAULT_AERON_UB_PATH;
     const char *aeron_response_ub_path =
         VEMB_V16_DEFAULT_AERON_RESPONSE_UB_PATH;
@@ -71,20 +73,11 @@ int main(int argc, char **argv) {
     int reset_warm_regions = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
-            uds_path = argv[++i];
-        } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             transport = argv[++i];
             if (strcmp(transport, "aeron") &&
                 strcmp(transport, "tcp")) {
                 fprintf(stderr, "invalid transport\n");
-                goto cleanup;
-            }
-        } else if (!strcmp(argv[i], "--aeron-control") && i + 1 < argc) {
-            aeron_control = argv[++i];
-            if (strcmp(aeron_control, "uds") &&
-                strcmp(aeron_control, "tcp")) {
-                fprintf(stderr, "invalid aeron control plane\n");
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--tcp-host") && i + 1 < argc) {
@@ -132,7 +125,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-        printf("usage: %s [--transport tcp|aeron] [--aeron-control uds|tcp] [--aeron-ub-path PATH] [--aeron-response-ub-path PATH] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+        printf("usage: %s [--transport tcp|aeron] [--aeron-ub-path PATH] [--aeron-response-ub-path PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -151,12 +144,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid batch request size\n");
         goto cleanup;
     }
-    if (!uds_path || uds_path[0] == '\0' ||
-        strlen(uds_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "--socket path must be non-empty and shorter than %zu bytes\n",
-                sizeof(((struct sockaddr_un *)0)->sun_path));
-        goto cleanup;
-    }
     if (dim == 0 || dim > VEMB_V16_MAX_DIM) {
         fprintf(stderr, "--dim is required and must be in [1, %u]\n",
                 VEMB_V16_MAX_DIM);
@@ -173,8 +160,8 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s aeron_control=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
-              transport, aeron_control, uds_path, tcp_host, tcp_port,
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s tcp_control=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
+              transport, tcp_host, tcp_port,
               proxy_io_threads,
               supernode_workers, dim, max_vectors, vector_region_name,
               warm_regions_manifest ? warm_regions_manifest : "(none)");
@@ -204,6 +191,8 @@ int main(int argc, char **argv) {
         region->region_id = warm_region_id;
         region->backend_type = warm_backend_type ?
             warm_backend_type : VEMB_V16_REGION_LOCAL_SHM;
+        region->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+        region->has_cache_policy = 1;
         region->is_local = 1;
         region->has_is_local = 1;
         region->weight = 1;
@@ -229,7 +218,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (vemb_v16_proxy_create(&g_proxy,
-                              uds_path,
                               dim,
                               max_vectors,
                               storage,
@@ -263,14 +251,10 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (!strcmp(transport, "aeron")) {
-        int control_rc = !strcmp(aeron_control, "tcp") ?
-            vemb_v16_proxy_enable_aeron_tcp_control(g_proxy,
-                                                    tcp_host,
-                                                    tcp_port) :
-            vemb_v16_proxy_enable_uds(g_proxy);
-        if (control_rc != 0) {
-            serverLog(LL_WARNING, "failed to enable vemb_v16 aeron control plane: %s",
-                      aeron_control);
+        if (vemb_v16_proxy_enable_aeron_tcp_control(g_proxy,
+                                                     tcp_host,
+                                                     tcp_port) != 0) {
+            serverLog(LL_WARNING, "failed to enable vemb_v16 Aeron TCP control plane");
             goto cleanup;
         }
     } else {

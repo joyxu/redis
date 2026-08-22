@@ -6,10 +6,7 @@
 
 #include <string.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 static int g_stc_fd = -1;
 static uint64_t g_stc_channel_id = 0;
@@ -20,70 +17,6 @@ static uint32_t g_stc_req_id = 1;
 static char g_stc_host[64];
 static uint16_t g_stc_port = 0;
 static int g_stc_reconnecting = 0;
-
-/* warm region (mmap'd once, aligned with vemb_v16_bench.c) */
-static uint8_t *g_stc_warm_mapping_addr = NULL;
-static size_t   g_stc_warm_mapping_bytes = 0;
-static uint8_t *g_stc_warm_mapped_addr = NULL;
-static uint64_t g_stc_warm_region_bytes = 0;
-
-static void stc_close_warm_region(void) {
-    if (g_stc_warm_mapping_addr) {
-        munmap(g_stc_warm_mapping_addr, g_stc_warm_mapping_bytes);
-        g_stc_warm_mapping_addr = NULL;
-        g_stc_warm_mapping_bytes = 0;
-        g_stc_warm_mapped_addr = NULL;
-        g_stc_warm_region_bytes = 0;
-    }
-}
-
-static int stc_open_warm_region(const vemb_v16_channel_desc_t *desc) {
-    if (!desc || !desc->vector_region_name[0])
-        return -1;
-
-    stc_close_warm_region();
-
-    int fd = -1;
-    if (desc->warm_backend_type == VEMB_V16_REGION_LOCAL_SHM) {
-        fd = shm_open(desc->vector_region_name, O_RDWR, 0666);
-    } else if (desc->warm_backend_type == VEMB_V16_REGION_UB) {
-        fd = open(desc->vector_region_name, O_RDWR);
-    } else {
-        return -1;
-    }
-    if (fd < 0)
-        return -1;
-
-    size_t size = desc->warm_region_bytes
-        ? (size_t)desc->warm_region_bytes
-        : (size_t)desc->vector_stride * desc->max_vectors;
-
-    long page_size = sysconf(_SC_PAGESIZE);
-    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
-    uint64_t aligned_offset = desc->warm_mmap_offset & ~page_mask;
-    size_t offset_delta = (size_t)(desc->warm_mmap_offset - aligned_offset);
-    size_t map_size = size + offset_delta;
-
-    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                     (off_t)aligned_offset);
-    close(fd);
-    if (ptr == MAP_FAILED)
-        return -1;
-
-    g_stc_warm_region_bytes = size;
-    g_stc_warm_mapping_bytes = map_size;
-    g_stc_warm_mapping_addr = (uint8_t *)ptr;
-    g_stc_warm_mapped_addr = (uint8_t *)ptr + offset_delta;
-    return 0;
-}
-
-const uint8_t *vemb_v16_stc_get_warm_mapped_addr(void) {
-    return g_stc_warm_mapped_addr;
-}
-
-uint64_t vemb_v16_stc_get_warm_region_bytes(void) {
-    return g_stc_warm_region_bytes;
-}
 
 static int stc_do_connect(const char *host, uint16_t port, uint32_t dim) {
     int fd = -1;
@@ -119,11 +52,6 @@ static int stc_do_connect(const char *host, uint16_t port, uint32_t dim) {
     if (vemb_v16_net_read_full(fd, &desc, sizeof(desc)) != 0 ||
         desc.magic != VEMB_V16_MAGIC ||
         desc.version != VEMB_V16_VERSION) {
-        close(fd);
-        return -1;
-    }
-
-    if (stc_open_warm_region(&desc) != 0) {
         close(fd);
         return -1;
     }
@@ -262,100 +190,6 @@ int vemb_v16_stc_vadd(const char *key, uint32_t key_len,
     return 0;
 }
 
-int vemb_v16_stc_vemb(const char *key, uint32_t key_len,
-                      int inline_vector,
-                      vemb_v16_resp_t *resp,
-                      uint8_t *out_vector, uint32_t out_vector_cap,
-                      uint32_t *out_vector_bytes) {
-    if (!resp) return -1;
-    if (stc_check_and_reconnect() != 0) return -1;
-
-    vemb_v16_req_t req = {0};
-    req.op = VEMB_V16_OP_VEMB_HANDLE;
-    req.flags = 0;
-    (void)inline_vector; /* always 0 from callers — zero-copy handle mode */
-    req.req_id = g_stc_req_id++;
-    req.channel_id = g_stc_channel_id;
-    req.dim = g_stc_dim;
-    req.vector_bytes = g_stc_dim * sizeof(float);
-
-    if (key_len >= VEMB_V16_MAX_KEY_LEN) key_len = VEMB_V16_MAX_KEY_LEN - 1;
-    req.key_len = key_len;
-    memcpy(req.key, key, key_len);
-    req.key[key_len] = '\0';
-    req.key_hash = vemb_v16_murmur3(req.key, key_len);
-
-    uint8_t enc_buf[24u + 4u + VEMB_V16_MAX_KEY_LEN +
-                    VEMB_V16_MAX_DIM * sizeof(float) + 64u];
-    size_t enc_len = 0;
-    if (vemb_v16_req_encode(enc_buf, sizeof(enc_buf), &req, &enc_len) != 0) {
-        return -1;
-    }
-    if (vemb_v16_net_write_frame(g_stc_fd,
-                                 VEMB_V16_NET_REQUEST,
-                                 0,
-                                 g_stc_channel_id,
-                                 req.req_id,
-                                 enc_buf,
-                                 (uint32_t)enc_len) != 0) {
-        if (stc_reconnect() != 0) return -1;
-        /* retry once after reconnect */
-        req.req_id = g_stc_req_id++;
-        if (vemb_v16_req_encode(enc_buf, sizeof(enc_buf), &req, &enc_len) != 0) {
-            return -1;
-        }
-        if (vemb_v16_net_write_frame(g_stc_fd,
-                                     VEMB_V16_NET_REQUEST,
-                                     0,
-                                     g_stc_channel_id,
-                                     req.req_id,
-                                     enc_buf,
-                                     (uint32_t)enc_len) != 0) {
-            return -1;
-        }
-    }
-
-    vemb_v16_net_hdr_t hdr;
-    if (vemb_v16_net_read_header(g_stc_fd, &hdr) != 0 ||
-        hdr.type != VEMB_V16_NET_RESPONSE ||
-        hdr.channel_id != g_stc_channel_id ||
-        hdr.payload_len < vemb_v16_resp_encoded_base_len()) {
-        if (stc_reconnect() != 0) return -1;
-        /* retry once after reconnect */
-        req.req_id = g_stc_req_id++;
-        if (vemb_v16_req_encode(enc_buf, sizeof(enc_buf), &req, &enc_len) != 0 ||
-            vemb_v16_net_write_frame(g_stc_fd,
-                                     VEMB_V16_NET_REQUEST,
-                                     0,
-                                     g_stc_channel_id,
-                                     req.req_id,
-                                     enc_buf,
-                                     (uint32_t)enc_len) != 0 ||
-            vemb_v16_net_read_header(g_stc_fd, &hdr) != 0 ||
-            hdr.type != VEMB_V16_NET_RESPONSE ||
-            hdr.channel_id != g_stc_channel_id ||
-            hdr.payload_len < vemb_v16_resp_encoded_base_len()) {
-            return -1;
-        }
-    }
-
-    /* Compact response: body is self-contained (no trailing inline vector). */
-    uint8_t resp_buf[128];
-    if (hdr.payload_len > sizeof(resp_buf)) return -1;
-    if (vemb_v16_net_read_full(g_stc_fd, resp_buf, hdr.payload_len) != 0) {
-        return -1;
-    }
-    if (vemb_v16_resp_decode(resp, resp_buf, hdr.payload_len) != 0) {
-        return -1;
-    }
-    /* Caller reads vector from mmap via resp.vector_offset / resp.region_id. */
-    if (out_vector_bytes) *out_vector_bytes = 0;
-    (void)inline_vector;
-    (void)out_vector;
-    (void)out_vector_cap;
-    return 0;
-}
-
 void vemb_v16_stc_cleanup(void) {
     if (g_stc_fd < 0) return;
 
@@ -369,6 +203,4 @@ void vemb_v16_stc_cleanup(void) {
     close(g_stc_fd);
     g_stc_fd = -1;
     g_stc_channel_id = 0;
-
-    stc_close_warm_region();
 }

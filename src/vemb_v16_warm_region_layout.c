@@ -82,10 +82,11 @@ static void init_header(vemb_v16_warm_region_header_t *header,
 }
 
 int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
+                                      uint32_t cache_policy,
                                       const char *path,
-                                    uint64_t mmap_offset,
-                                    uint32_t region_id,
-                                    uint32_t capacity_slots) {
+                                      uint64_t mmap_offset,
+                                      uint32_t region_id,
+                                      uint32_t capacity_slots) {
     RETURN_IF(!path[0] || capacity_slots == 0, -1);
     backend_type = backend_type ? backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM)
@@ -94,6 +95,7 @@ int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
     vemb_v16_mapped_region_t region;
     if (vemb_v16_mapped_region_open(&region,
                                     backend_type,
+                                    cache_policy,
                                     path,
                                     mmap_offset,
                                     vemb_v16_warm_region_layout_bytes(

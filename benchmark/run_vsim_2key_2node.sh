@@ -278,6 +278,7 @@ run_baseline() {
         local jb_ut0 jb_st0 jb_ut1 jb_st1 ja_ut0 ja_st0 ja_ut1 ja_st1
         read jb_ut0 jb_st0 < <(snapshot_jiffies_0)
         read jb_ut1 jb_st1 < <(snapshot_jiffies_1)
+        JB_NS=$(date +%s%N)
         local si0=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
         local rss0=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
 
@@ -293,12 +294,15 @@ run_baseline() {
 
         read ja_ut0 ja_st0 < <(snapshot_jiffies_0)
         read ja_ut1 ja_st1 < <(snapshot_jiffies_1)
+        JA_NS=$(date +%s%N)
+        ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+        # core 分母 = 纳秒实测窗口 (与脚本13对齐)
         local si1=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
         local rss1=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
-        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local si=$(awk -v d=$((si1 - si0)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local si=$(awk -v d=$((si1 - si0)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
         local rss=$(((rss1 + rss0) / 2))
 
         # Parse Totals (cluster mode: NF>=9 with MOVED/ASK)
@@ -335,6 +339,7 @@ start_hpc_0() {
     taskset -c 0-95 \
         $HPC_DIR/src/redis-server \
             --port $HPC_PORT --bind 0.0.0.0 --protected-mode no \
+            --vemb-v16-tcp-host $NODE0_HOST \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \
@@ -355,6 +360,7 @@ start_hpc_1() {
         taskset -c 0-95 \
         $HPC_DIR/src/redis-server \
             --port $HPC_PORT --bind 0.0.0.0 --protected-mode no \
+            --vemb-v16-tcp-host $NODE1_HOST \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \
@@ -429,6 +435,7 @@ run_hpc() {
         local jb_ut0 jb_st0 jb_ut1 jb_st1 ja_ut0 ja_st0 ja_ut1 ja_st1
         read jb_ut0 jb_st0 < <(snapshot_jiffies_0)
         read jb_ut1 jb_st1 < <(snapshot_jiffies_1)
+        JB_NS=$(date +%s%N)
         local si0=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
         local rss0=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
 
@@ -444,12 +451,15 @@ run_hpc() {
 
         read ja_ut0 ja_st0 < <(snapshot_jiffies_0)
         read ja_ut1 ja_st1 < <(snapshot_jiffies_1)
+        JA_NS=$(date +%s%N)
+        ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+        # core 分母 = 纳秒实测窗口 (与脚本13对齐)
         local si1=$(( $(snapshot_si_0) + $(snapshot_si_1) ))
         local rss1=$(( $(snapshot_rss_0) + $(snapshot_rss_1) ))
-        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-        local si=$(awk -v d=$((si1 - si0)) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+        local cores=$(awk -v d=$(((ja_ut0 + ja_st0 + ja_ut1 + ja_st1) - (jb_ut0 + jb_st0 + jb_ut1 + jb_st1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local core_ut=$(awk -v d=$(((ja_ut0 - jb_ut0) + (ja_ut1 - jb_ut1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local core_st=$(awk -v d=$(((ja_st0 - jb_st0) + (ja_st1 - jb_st1))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+        local si=$(awk -v d=$((si1 - si0)) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
         local rss=$(((rss1 + rss0) / 2))
 
         # Parse Totals

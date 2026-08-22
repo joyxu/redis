@@ -42,6 +42,9 @@ INCLUDES := -I$(SDK_DIR) -I$(INTERNAL_DIR) -I$(SRC_DIR)
 # ---- sources comprising the SDK ----
 SDK_SOURCES := \
 	$(SDK_DIR)/vemb_v16_client_sdk.c \
+	$(SDK_DIR)/vemb_v16_cluster_core.c \
+	$(SDK_DIR)/vemb_v16_owner_session.c \
+	$(SDK_DIR)/vemb_v16_ub_peer_view.c \
 	$(SDK_DIR)/vemb_v16_cli_l0.c \
 	$(SDK_DIR)/vemb_v16_cli_l1.c \
 	$(SDK_DIR)/vemb_v16_aeron_batch_client.c \
@@ -70,18 +73,31 @@ PUBLIC_HEADERS := \
 	$(INC_DIR)/vemb_v16_client_topology.h \
 	$(INC_DIR)/vemb_v16_topology.h \
 	$(INC_DIR)/vemb_v16_hash.h \
-	$(INC_DIR)/vemb_v16_peer_view_map.h
+	$(INC_DIR)/vemb_v16_peer_view_map.h \
+	$(INC_DIR)/vemb_v16_ub_peer_view.h
 
 # ---- compile flags shared across all .c ----
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
 
 # ---- targets ----
-.PHONY: all static shared install-headers example example_so correctness clean
+.PHONY: all static shared install-headers example example_so correctness cluster-smoke clean
 
 all: static shared install-headers
 
 # Compile rule: SDK-local .c (vemb_v16_client_sdk.c)
 $(OBJ_DIR)/vemb_v16_client_sdk.o: $(SDK_DIR)/vemb_v16_client_sdk.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
+$(OBJ_DIR)/vemb_v16_cluster_core.o: $(SDK_DIR)/vemb_v16_cluster_core.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
+$(OBJ_DIR)/vemb_v16_owner_session.o: $(SDK_DIR)/vemb_v16_owner_session.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
+
+$(OBJ_DIR)/vemb_v16_ub_peer_view.o: $(SDK_DIR)/vemb_v16_ub_peer_view.c
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 
@@ -169,6 +185,10 @@ $(INC_DIR)/vemb_v16_peer_view_map.h: $(SRC_DIR)/vemb_v16_peer_view_map.h
 	@mkdir -p $(INC_DIR)
 	cp $< $@
 
+$(INC_DIR)/vemb_v16_ub_peer_view.h: $(SDK_DIR)/vemb_v16_ub_peer_view.h
+	@mkdir -p $(INC_DIR)
+	cp $< $@
+
 # ---- validation: link example.c against the library ----
 # NOTE: for the static variant we pass the .a path directly (not -l), because
 # the linker otherwise prefers libvemb_v16_client.so when both are present.
@@ -186,6 +206,11 @@ example_so: $(LIB_DIR)/libvemb_v16_client.so install-headers
 correctness: $(LIB_DIR)/libvemb_v16_client.a
 	$(CC) $(CFLAGS) $(ARCH_FLAGS) $(INCLUDES) \
 		-o $(BUILD_DIR)/sdk_multi_region_correctness sdk_multi_region_correctness.c \
+		$(LIB_DIR)/libvemb_v16_client.a -lpthread -lm
+
+cluster-smoke: $(LIB_DIR)/libvemb_v16_client.a
+	$(CC) $(CFLAGS) $(ARCH_FLAGS) $(INCLUDES) \
+		-o $(BUILD_DIR)/sdk_cluster_topology_smoke sdk_cluster_topology_smoke.c \
 		$(LIB_DIR)/libvemb_v16_client.a -lpthread -lm
 
 clean:

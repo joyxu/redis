@@ -71,31 +71,25 @@ static void assert_has_dual_write_plan(
     assert(plan.standby_owner == 2);
 }
 
-static void *fake_uds_topology_server(void *arg) {
-    fake_topology_server_t *server = arg;
-    uint8_t op = 0;
-    assert(vemb_v16_net_read_full(server->fd, &op, sizeof(op)) == 0);
-    assert(op == VEMB_V16_CTRL_TOPOLOGY_GET);
-    assert(vemb_v16_net_write_full(server->fd,
-                                   &server->resp,
-                                   sizeof(server->resp)) == 0);
-    close(server->fd);
-    return NULL;
-}
-
 static void *fake_tcp_topology_server(void *arg) {
     fake_topology_server_t *server = arg;
     vemb_v16_net_hdr_t hdr;
+    uint8_t payload[2048];
+    size_t payload_len = 0;
     assert(vemb_v16_net_read_header(server->fd, &hdr) == 0);
     assert(hdr.type == VEMB_V16_NET_TOPOLOGY_GET);
     assert(hdr.payload_len == 0);
+    assert(vemb_v16_topology_control_resp_encode(payload,
+                                                  sizeof(payload),
+                                                  &server->resp,
+                                                  &payload_len) == 0);
     assert(vemb_v16_net_write_frame(server->fd,
                                     VEMB_V16_NET_TOPOLOGY_RESPONSE,
                                     0,
                                     0,
                                     0,
-                                    &server->resp,
-                                    sizeof(server->resp)) == 0);
+                                    payload,
+                                    (uint32_t)payload_len) == 0);
     close(server->fd);
     return NULL;
 }
@@ -141,26 +135,6 @@ static void test_topology_from_response_and_plan(void) {
     assert(vemb_v16_client_topology_from_response(&resp, &topology) != 0);
 }
 
-static void test_fetch_uds_fd(void) {
-    int sv[2];
-    pthread_t thread;
-    vemb_v16_client_topology_t topology;
-    vemb_v16_topology_control_resp_t raw_resp;
-    fake_topology_server_t server;
-
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    server.fd = sv[1];
-    fill_resp(&server.resp, VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED);
-    assert(pthread_create(&thread, NULL, fake_uds_topology_server, &server) == 0);
-    assert(vemb_v16_client_topology_fetch_uds_fd(sv[0],
-                                                 &topology,
-                                                 &raw_resp) == 0);
-    assert(pthread_join(thread, NULL) == 0);
-    close(sv[0]);
-    assert(raw_resp.current_topology_epoch == 9);
-    assert_has_dual_write_plan(&topology);
-}
-
 static void test_fetch_tcp_fd(void) {
     int sv[2];
     pthread_t thread;
@@ -183,7 +157,6 @@ static void test_fetch_tcp_fd(void) {
 
 int main(void) {
     test_topology_from_response_and_plan();
-    test_fetch_uds_fd();
     test_fetch_tcp_fd();
     printf("vemb_v16_client_topology_ut: all tests passed\n");
     return 0;

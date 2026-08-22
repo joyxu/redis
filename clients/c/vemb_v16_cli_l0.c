@@ -27,6 +27,7 @@ typedef struct vemb_v16_cli_l0_entry {
     uint64_t hash;
     uint64_t batch_id;
     uint64_t leader_cookie;
+    vemb_v16_owner_session_identity_t identity;
     uint32_t generation;
     uint32_t pending_next;
     uint32_t follower_head;
@@ -57,6 +58,7 @@ typedef struct vemb_v16_cli_l0_key_slab {
 
 typedef struct vemb_v16_cli_l0_batch_record {
     uint64_t batch_id;
+    vemb_v16_owner_session_identity_t identity;
     uint64_t completed[(VEMB_V16_BATCH_REQUEST_SIZE_MAX + 63u) / 64u];
     uint32_t channel_index;
     uint32_t item_count;
@@ -289,10 +291,11 @@ void vemb_v16_cli_l0_destroy(vemb_v16_cli_l0_t *l0) {
     free(l0);
 }
 
-int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
-                            uint16_t key_len, uint64_t hash,
-                            uint64_t caller_cookie, uint32_t *out_entry_id,
-                            uint32_t *out_channel_index) {
+int vemb_v16_cli_l0_submit_with_identity(
+    vemb_v16_cli_l0_t *l0, const char *final_key, uint16_t key_len,
+    uint64_t hash, uint64_t caller_cookie,
+    const vemb_v16_owner_session_identity_t *identity,
+    uint32_t *out_entry_id, uint32_t *out_channel_index) {
     uint32_t channel_index = (uint32_t)(hash % l0->channel_count);
     uint32_t bucket_index = (uint32_t)(hash &
         (VEMB_V16_CLI_L0_BUCKET_COUNT - 1u));
@@ -311,7 +314,8 @@ int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
         vemb_v16_cli_l0_entry_t *entry = &l0->entries[bucket->entry_id[slot]];
         if (entry->state == VEMB_V16_CLI_L0_FREE || entry->hash != hash)
             continue;
-        if (entry->key_len != key_len ||
+        if (!vemb_v16_owner_session_identity_equal(&entry->identity, identity) ||
+            entry->key_len != key_len ||
             memcmp(vemb_v16_cli_l0_key_ptr(l0, entry), final_key, key_len) != 0) {
             l0->stats.exact_key_mismatch++;
             continue;
@@ -355,6 +359,7 @@ int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
     vemb_v16_cli_l0_entry_t *entry = &l0->entries[entry_id];
     entry->hash = hash;
     entry->leader_cookie = caller_cookie;
+    entry->identity = *identity;
     entry->channel_index = channel_index;
     entry->key_len = key_len;
     entry->key_class = (uint8_t)key_class;
@@ -374,6 +379,16 @@ int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
     return VEMB_V16_CLI_L0_NEW_LEADER;
 }
 
+int vemb_v16_cli_l0_submit(vemb_v16_cli_l0_t *l0, const char *final_key,
+                            uint16_t key_len, uint64_t hash,
+                            uint64_t caller_cookie, uint32_t *out_entry_id,
+                            uint32_t *out_channel_index) {
+    const vemb_v16_owner_session_identity_t identity = {0};
+    return vemb_v16_cli_l0_submit_with_identity(
+        l0, final_key, key_len, hash, caller_cookie, &identity,
+        out_entry_id, out_channel_index);
+}
+
 int vemb_v16_cli_l0_prepare_batch(vemb_v16_cli_l0_t *l0,
                                    uint32_t channel_index,
                                    uint32_t max_items, uint32_t max_bytes,
@@ -390,13 +405,21 @@ int vemb_v16_cli_l0_prepare_batch(vemb_v16_cli_l0_t *l0,
         vemb_v16_cli_l0_entry_t *entry = &l0->entries[entry_id];
         if (entry->state != VEMB_V16_CLI_L0_PENDING_SEND)
             return -1;
+        if (out->item_count != 0 &&
+            !vemb_v16_owner_session_identity_equal(&out->identity,
+                                                    &entry->identity))
+            break;
         uint32_t item_bytes = (uint32_t)sizeof(uint16_t) + entry->key_len;
         if (bytes + item_bytes > max_bytes) {
-            if (out->item_count == 0)
+            if (out->item_count == 0) {
                 out->oversized_entry_id = entry_id;
+                out->identity = entry->identity;
+            }
             break;
         }
         uint32_t item = out->item_count++;
+        if (item == 0)
+            out->identity = entry->identity;
         out->entry_ids[item] = entry_id;
         out->keys[item] = vemb_v16_cli_l0_key_ptr(l0, entry);
         out->key_lens[item] = entry->key_len;
@@ -434,6 +457,9 @@ int vemb_v16_cli_l0_publish_batch(vemb_v16_cli_l0_t *l0,
         vemb_v16_cli_l0_entry_t *entry = &l0->entries[draft->entry_ids[i]];
         if (entry->state != VEMB_V16_CLI_L0_PENDING_SEND)
             return -1;
+        if (!vemb_v16_owner_session_identity_equal(&entry->identity,
+                                                    &draft->identity))
+            return -1;
         l0->pending_head[draft->channel_index] = entry->pending_next;
         if (l0->pending_tail[draft->channel_index] == draft->entry_ids[i])
             l0->pending_tail[draft->channel_index] = VEMB_V16_CLI_L0_NONE;
@@ -447,6 +473,7 @@ int vemb_v16_cli_l0_publish_batch(vemb_v16_cli_l0_t *l0,
     }
     *record = (vemb_v16_cli_l0_batch_record_t){
         .batch_id = batch_id,
+        .identity = draft->identity,
         .channel_index = draft->channel_index,
         .item_count = draft->item_count,
         .active = 1,
@@ -558,6 +585,38 @@ int vemb_v16_cli_l0_get_group(vemb_v16_cli_l0_t *l0, uint32_t entry_id,
     return 0;
 }
 
+void vemb_v16_cli_l0_get_group_identity(
+    const vemb_v16_cli_l0_t *l0, uint32_t entry_id,
+    vemb_v16_owner_session_identity_t *out) {
+    *out = l0->entries[entry_id].identity;
+}
+
+int vemb_v16_cli_l0_get_batch_identity(
+    const vemb_v16_cli_l0_t *l0, uint32_t channel_index, uint64_t batch_id,
+    vemb_v16_owner_session_identity_t *out) {
+    for (uint32_t i = 0; i < VEMB_V16_CLI_L0_MAX_BATCH_RECORDS; i++) {
+        const vemb_v16_cli_l0_batch_record_t *record = &l0->batch_records[i];
+        if (record->active && record->channel_index == channel_index &&
+            record->batch_id == batch_id) {
+            *out = record->identity;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+uint32_t vemb_v16_cli_l0_batch_item_count(
+    const vemb_v16_cli_l0_t *l0, uint32_t channel_index,
+    uint64_t batch_id) {
+    for (uint32_t i = 0; i < VEMB_V16_CLI_L0_MAX_BATCH_RECORDS; i++) {
+        const vemb_v16_cli_l0_batch_record_t *record = &l0->batch_records[i];
+        if (record->active && record->channel_index == channel_index &&
+            record->batch_id == batch_id)
+            return record->item_count;
+    }
+    return 0;
+}
+
 uint32_t vemb_v16_cli_l0_group_fanout_count(
     const vemb_v16_cli_l0_t *l0,
     const vemb_v16_cli_l0_completion_t *completion) {
@@ -571,6 +630,26 @@ uint32_t vemb_v16_cli_l0_group_fanout_count(
          follower = l0->followers[follower].next)
         count++;
     return count;
+}
+
+void vemb_v16_cli_l0_drain_pending(vemb_v16_cli_l0_t *l0,
+                                   vemb_v16_cli_l0_fanout_cb cb, void *priv) {
+    vemb_v16_cli_l0_completion_t
+        pending[VEMB_V16_CLI_L0_MAX_ENTRIES];
+    uint32_t count = 0;
+
+    /* Snapshot first: the callback may schedule work for a later route. */
+    for (uint32_t i = 0; i < VEMB_V16_CLI_L0_MAX_ENTRIES; i++) {
+        const vemb_v16_cli_l0_entry_t *entry = &l0->entries[i];
+        if (entry->state != VEMB_V16_CLI_L0_PENDING_SEND)
+            continue;
+        pending[count++] = (vemb_v16_cli_l0_completion_t){
+            .entry_id = i,
+            .generation = entry->generation,
+        };
+    }
+    for (uint32_t i = 0; i < count; i++)
+        (void)vemb_v16_cli_l0_finish(l0, &pending[i], cb, priv);
 }
 
 void vemb_v16_cli_l0_abort_all(vemb_v16_cli_l0_t *l0,

@@ -110,6 +110,7 @@ run_mixed() {
     local si0 si1 c_si
 
     read j0_ut j0_st < <(get_cpu_jiffies "$SERVER_PID")
+    J0_NS=$(date +%s%N)
     si0=$(snapshot_si)
     mem_base_mb=$(awk '/^VmRSS:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
 
@@ -120,14 +121,17 @@ run_mixed() {
         --test-time=$TEST_TIME >"$raw" 2>&1
 
     read j1_ut j1_st < <(get_cpu_jiffies "$SERVER_PID")
+    J1_NS=$(date +%s%N)
+    ELAPSED_NS=$((J1_NS - J0_NS > 0 ? J1_NS - J0_NS : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐)
     si1=$(snapshot_si)
     mem_peak_mb=$(awk '/^VmHWM:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
     rss_kb=$(awk '/^VmRSS:/{print $2}' /proc/$SERVER_PID/status 2>/dev/null)
     rss_kb=${rss_kb:-0}
-    cores=$(awk -v d=$(( (j1_ut - j0_ut) + (j1_st - j0_st) )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
-    core_ut=$(awk -v d=$(( j1_ut - j0_ut )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
-    core_st=$(awk -v d=$(( j1_st - j0_st )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
-    c_si=$(awk -v d=$(( ${si1:-0} - ${si0:-0} )) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    cores=$(awk -v d=$(( (j1_ut - j0_ut) + (j1_st - j0_st) )) -v tt=$ELAPSED_NS 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/(tt/1000000000) }')
+    core_ut=$(awk -v d=$(( j1_ut - j0_ut )) -v tt=$ELAPSED_NS 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/(tt/1000000000) }')
+    core_st=$(awk -v d=$(( j1_st - j0_st )) -v tt=$ELAPSED_NS 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/(tt/1000000000) }')
+    c_si=$(awk -v d=$(( ${si1:-0} - ${si0:-0} )) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
 
     local tot; tot=$(grep '^Totals' "$raw" | tail -1)
     local ops hits p50 p99

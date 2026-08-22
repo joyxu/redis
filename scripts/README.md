@@ -151,7 +151,7 @@ batch 大小、测试时长、build policy 和源码 commit，只改变正在测
 | `MAX_FOREIGN_RSS_MB` | `256` | 外部进程 RSS 超过该 MiB 即失败。 |
 | `KILL_OPENCODE` | `1` | 设为 `0` 保留 `opencode` tmux session 和同名进程。 |
 | `KILL_MUTAGEN` | `1` | 设为 `0` 保留 `mutagen-agent` 及其直接 parent。 |
-| `RUN_ID`, `LOCAL_ROOT` | 时间戳 | 工件名称和本地输出目录。 |
+| `RUN_ID`, `LOCAL_ROOT` | `p<PIO>_s<SNW>_svr<SERVER_CPU_MASK>_<distribution>_<timestamp>` | 工件名称和本地输出目录；显式设置 `RUN_ID` 可覆盖。 |
 | `REMOTE_TMP_ROOT`, `REMOTE_RUN_DIR` | `/tmp`, `$REMOTE_TMP_ROOT/$RUN_ID` | 远端临时运行目录。 |
 | `DRY_RUN` | `0` | 设为 `1` 只校验参数，不执行 SSH、构建和测试。 |
 

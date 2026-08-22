@@ -127,6 +127,18 @@ static int parse_backend_value(const char *s, uint32_t *out) {
     return -1;
 }
 
+static int parse_ub_cache_policy_value(const char *value, uint32_t *out) {
+    if (!strcmp(value, "cacheable") || !strcmp(value, "cc")) {
+        *out = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+        return 0;
+    }
+    if (!strcmp(value, "noncacheable") || !strcmp(value, "nc")) {
+        *out = VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE;
+        return 0;
+    }
+    return -1;
+}
+
 static vemb_v16_warm_slot_meta_t *warm_slot_meta_from_mapping(
         const vemb_v16_mapped_region_t *mapping,
         uint32_t capacity_slots) {
@@ -270,6 +282,7 @@ static void manifest_region_defaults(vemb_v16_manifest_region_t *region,
                                      uint32_t value_size) {
     memset(region, 0, sizeof(*region));
     region->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    region->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     region->weight = 1;
     region->value_size = value_size;
 }
@@ -278,12 +291,14 @@ static void manifest_remote_meta_view_defaults(
         vemb_v16_manifest_remote_meta_view_t *view) {
     memset(view, 0, sizeof(*view));
     view->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    view->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
 }
 
 static void manifest_ub_rpc_ring_defaults(
         vemb_v16_ub_rpc_ring_config_t *ring) {
     memset(ring, 0, sizeof(*ring));
     ring->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    ring->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
 }
 
 static void manifest_ub_rpc_peer_defaults(
@@ -327,7 +342,23 @@ static int manifest_ring_config_valid(
         const vemb_v16_ub_rpc_ring_config_t *ring) {
     return ring->path[0] &&
            (ring->backend_type == VEMB_V16_REGION_LOCAL_SHM ||
-            ring->backend_type == VEMB_V16_REGION_UB);
+            ring->backend_type == VEMB_V16_REGION_UB) &&
+           (ring->cache_policy == VEMB_V16_UB_CACHE_POLICY_CACHEABLE ||
+            ring->cache_policy == VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE);
+}
+
+static int manifest_ub_rpc_peer_config_valid(
+        const vemb_v16_manifest_ub_rpc_peer_t *peer) {
+    if (!peer || !manifest_ring_config_valid(&peer->request) ||
+        !manifest_ring_config_valid(&peer->response) ||
+        !manifest_ring_config_valid(&peer->inbound_request) ||
+        !manifest_ring_config_valid(&peer->outbound_response)) {
+        return 0;
+    }
+    /* Cache policy is an explicit deployment property. Imported UB views may
+     * be NC for both request and response directions; preserve only the
+     * shape/backend/path checks above. */
+    return 1;
 }
 
 static int manifest_push_ub_rpc_peer(
@@ -336,11 +367,7 @@ static int manifest_push_ub_rpc_peer(
     RETURN_IF(manifest->ub_rpc_peer_count >=
               VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS, -1);
     RETURN_IF(!peer->has_owner_id, -1);
-    RETURN_IF(!manifest_ring_config_valid(&peer->request) ||
-              !manifest_ring_config_valid(&peer->response) ||
-              !manifest_ring_config_valid(&peer->inbound_request) ||
-              !manifest_ring_config_valid(&peer->outbound_response),
-              -1);
+    RETURN_IF(!manifest_ub_rpc_peer_config_valid(peer), -1);
     for (uint32_t i = 0; i < manifest->ub_rpc_peer_count; i++) {
         RETURN_IF(manifest->ub_rpc_peers[i].owner_id == peer->owner_id,
                   -1);
@@ -356,6 +383,7 @@ static int storage_cache_ub_rpc_peer_config(
 static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
                                          uint32_t owner_supernode_id,
                                          uint32_t backend_type,
+                                         uint32_t cache_policy,
                                          const char *path,
                                          uint64_t mmap_offset,
                                          uint32_t requested_entry_count,
@@ -405,6 +433,7 @@ static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
         *is_mapped = 1;
         if (vemb_v16_mapped_region_open(mapping,
                                         backend_type,
+                                        cache_policy,
                                         path,
                                         mmap_offset,
                                         *bytes) != 0) {
@@ -514,6 +543,9 @@ static int storage_remote_meta_init(vemb_v16_storage_ctx_t *storage,
     return storage_remote_meta_open_view(storage,
                                          owner_supernode_id,
                                          storage->remote_meta_backend_type,
+                                         manifest->has_remote_meta_cache_policy ?
+                                             manifest->remote_meta_cache_policy :
+                                             VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                          storage->remote_meta_path,
                                          storage->remote_meta_mmap_offset,
                                          manifest->remote_meta_entry_count,
@@ -553,6 +585,7 @@ static int storage_remote_meta_owner_views_init(
         if (storage_remote_meta_open_view(storage,
                                           dst->owner_id,
                                           dst->backend_type,
+                                          src->cache_policy,
                                           dst->path,
                                           dst->mmap_offset,
                                           src->entry_count,
@@ -829,6 +862,7 @@ static int storage_attach_remote_meta_owner_view_config(
     RETURN_IF(storage_remote_meta_open_view(storage,
                                             dst->owner_id,
                                             dst->backend_type,
+                                            src->cache_policy,
                                             dst->path,
                                             dst->mmap_offset,
                                             dst->entry_count,
@@ -876,20 +910,15 @@ static int storage_attach_ub_rpc_peer_config(
         .inbound_request = src->inbound_request,
         .outbound_response = src->outbound_response,
     };
-    /*
-     * Runtime peer attach happens via peer-view-map AFTER server startup,
-     * so the startup manifest reset path (vemb_v16_storage_reset_manifest_regions)
-     * never saw these ub_rpc_peers and never cleaned the rings. Stale magic +
-     * head/tail from previous test runs survive in the shmdev backing, causing
-     * peer_open's init_on_open check (rpc_ring_ready sees old magic -> skip init)
-     * to reuse a dirty ring. The producer then writes into a ring whose consumer
-     * head pointer is stale, so requests/responses cross past each other and
-     * nothing lands. Force-reset all 4 rings here so both sides start clean.
-     */
+    /* Runtime peer attach is the producer for request and outbound_response.
+     * UB receivers are peer-owned CC mappings. Local SHM retains its shared
+     * test/runtime reset behavior because it has no NC/CC device direction. */
     if (reset_ub_rpc_ring_backing(&peer.request, 0) != 0 ||
-        reset_ub_rpc_ring_backing(&peer.response, 1) != 0 ||
-        reset_ub_rpc_ring_backing(&peer.inbound_request, 0) != 0 ||
-        reset_ub_rpc_ring_backing(&peer.outbound_response, 1) != 0) {
+        reset_ub_rpc_ring_backing(&peer.outbound_response, 1) != 0 ||
+        (peer.response.backend_type == VEMB_V16_REGION_LOCAL_SHM &&
+         reset_ub_rpc_ring_backing(&peer.response, 1) != 0) ||
+        (peer.inbound_request.backend_type == VEMB_V16_REGION_LOCAL_SHM &&
+         reset_ub_rpc_ring_backing(&peer.inbound_request, 0) != 0)) {
         serverLog(LL_WARNING,
                   "vemb_v16 runtime ub rpc peer reset rings failed: local_owner=%u peer_owner=%u",
                   storage->local_owner_id,
@@ -932,14 +961,16 @@ static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
 
     if (src->backend_type == VEMB_V16_REGION_UB && src->is_local) {
         RETURN_IF(vemb_v16_warm_region_layout_reset(src->backend_type,
-                                                  src->path,
-                                                  src->mmap_offset,
-                                                  src->region_id,
-                                                  capacity_slots) != 0,
+                                                     src->cache_policy,
+                                                     src->path,
+                                                     src->mmap_offset,
+                                                     src->region_id,
+                                                     capacity_slots) != 0,
                   -1);
     }
     RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
                                           src->backend_type,
+                                          src->cache_policy,
                                           src->path,
                                           src->mmap_offset,
                                           allocator_layout_bytes +
@@ -1022,6 +1053,9 @@ static int parse_ub_rpc_ring_field(vemb_v16_ub_rpc_ring_config_t *ring,
     snprintf(expected, sizeof(expected), "%s_mmap_offset", prefix);
     if (!strcmp(key, expected))
         return parse_u64_value(value, &ring->mmap_offset);
+    snprintf(expected, sizeof(expected), "%s_cache_policy", prefix);
+    if (!strcmp(key, expected))
+        return parse_ub_cache_policy_value(value, &ring->cache_policy);
     return 1;
 }
 
@@ -1058,6 +1092,13 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "remote_meta_mmap_offset"))
             return parse_u64_value(value, &manifest->remote_meta_mmap_offset);
+        if (!strcmp(key, "remote_meta_cache_policy")) {
+            if (parse_ub_cache_policy_value(value,
+                                            &manifest->remote_meta_cache_policy) != 0)
+                return -1;
+            manifest->has_remote_meta_cache_policy = 1;
+            return 0;
+        }
         if (!strcmp(key, "job_plane_provider") ||
             !strcmp(key, "job_plane_backend")) {
             if (parse_backend_value(value, &manifest->job_plane_backend_type) != 0)
@@ -1119,6 +1160,12 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
             current->has_is_local = 1;
             return 0;
         }
+        if (!strcmp(key, "cache_policy")) {
+            if (parse_ub_cache_policy_value(value, &current->cache_policy) != 0)
+                return -1;
+            current->has_cache_policy = 1;
+            return 0;
+        }
         return 0;
     }
 
@@ -1150,6 +1197,13 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
             return parse_u32_value(value, &current_meta->set_count);
         if (!strcmp(key, "ways"))
             return parse_u32_value(value, &current_meta->ways);
+        if (!strcmp(key, "cache_policy")) {
+            if (parse_ub_cache_policy_value(value,
+                                            &current_meta->cache_policy) != 0)
+                return -1;
+            current_meta->has_cache_policy = 1;
+            return 0;
+        }
         return 0;
     }
 
@@ -1363,6 +1417,7 @@ static int unlink_shm_if_exists(const char *name) {
 
 static int reset_remote_meta_backing(uint32_t owner_id,
                                      uint32_t backend_type,
+                                     uint32_t cache_policy,
                                      const char *path,
                                      uint64_t mmap_offset,
                                      uint32_t value_size,
@@ -1405,6 +1460,7 @@ static int reset_remote_meta_backing(uint32_t owner_id,
         mapping.fd = -1;
         if (vemb_v16_mapped_region_open(&mapping,
                                         backend_type,
+                                        cache_policy,
                                         path,
                                         mmap_offset,
                                         bytes) != 0) {
@@ -1497,6 +1553,10 @@ static int reset_ub_rpc_ring_backing(
 int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest) {
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
+        if (manifest->has_local_ub_node_id && !region->is_local &&
+            region->backend_type == VEMB_V16_REGION_UB) {
+            continue;
+        }
         uint32_t capacity_slots = (uint32_t)(region->region_bytes / region->value_size);
         if (region->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
             char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
@@ -1534,10 +1594,11 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
             RETURN_IF(rc != 0, -1);
         } else if (region->backend_type == VEMB_V16_REGION_UB) {
             int rc = vemb_v16_warm_region_layout_reset(region->backend_type,
-                                                     region->path,
-                                                     region->mmap_offset,
-                                                     region->region_id,
-                                                     capacity_slots);
+                                                        region->cache_policy,
+                                                        region->path,
+                                                        region->mmap_offset,
+                                                        region->region_id,
+                                                        capacity_slots);
             int reset_allocator_errno = errno;
             serverLog(LL_NOTICE,
                       "reset warm allocator ub: region_id=%u path=%s offset=%llu rc=%d status=%s",
@@ -1560,6 +1621,9 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
         manifest->remote_meta_backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (reset_remote_meta_backing(owner_id,
                                   backend_type,
+                                  manifest->has_remote_meta_cache_policy ?
+                                      manifest->remote_meta_cache_policy :
+                                      VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                   manifest->remote_meta_path,
                                   manifest->remote_meta_mmap_offset,
                                   manifest->regions[0].value_size,
@@ -1574,8 +1638,14 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
             &manifest->remote_meta_views[i];
         backend_type = view->has_backend_type ?
             view->backend_type : VEMB_V16_REGION_LOCAL_SHM;
+        if (manifest->has_local_ub_node_id &&
+            view->owner_id != manifest->local_ub_node_id &&
+            backend_type == VEMB_V16_REGION_UB) {
+            continue;
+        }
         if (reset_remote_meta_backing(view->owner_id,
                                       backend_type,
+                                      view->cache_policy,
                                       view->path,
                                       view->mmap_offset,
                                       manifest->regions[0].value_size,
@@ -1590,9 +1660,11 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
         const vemb_v16_manifest_ub_rpc_peer_t *peer =
             &manifest->ub_rpc_peers[i];
         if (reset_ub_rpc_ring_backing(&peer->request, 0) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->response, 1) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->inbound_request, 0) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->outbound_response, 1) != 0) {
+            reset_ub_rpc_ring_backing(&peer->outbound_response, 1) != 0 ||
+            (peer->response.backend_type == VEMB_V16_REGION_LOCAL_SHM &&
+             reset_ub_rpc_ring_backing(&peer->response, 1) != 0) ||
+            (peer->inbound_request.backend_type == VEMB_V16_REGION_LOCAL_SHM &&
+             reset_ub_rpc_ring_backing(&peer->inbound_request, 0) != 0)) {
             RETURN_IF(1, -1);
         }
     }
@@ -1615,18 +1687,6 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
         RETURN_IF(region->value_size != vector_stride ||
                   region->region_bytes < region->value_size, -1);
-        /* Capacity is floor(region_bytes / value_size); a non-multiple tail
-         * (e.g. 1 GiB region with value_size=1200) is not a config error. */
-        if (region->region_bytes % region->value_size != 0) {
-            serverLog(LL_NOTICE,
-                      "vemb_v16 warm region tail bytes ignored: region_id=%u "
-                      "region_bytes=%llu value_size=%u usable_slots=%llu",
-                      region->region_id,
-                      (unsigned long long)region->region_bytes,
-                      region->value_size,
-                      (unsigned long long)(region->region_bytes /
-                                           region->value_size));
-        }
     }
 
     vemb_v16_storage_ctx_t *storage = zcalloc(sizeof(*storage));
@@ -1712,6 +1772,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
              */
             if (vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
                                             src->backend_type,
+                                            src->cache_policy,
                                             src->path,
                                             src->mmap_offset,
                                             allocator_layout_bytes +
@@ -1742,6 +1803,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         } else if (src->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
             if (vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
                                             src->backend_type,
+                                            VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                             src->path,
                                             src->mmap_offset,
                                             (size_t)src->region_bytes) != 0) {
@@ -1781,6 +1843,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
             }
             if (vemb_v16_mapped_region_open(&storage->warm_allocator_mappings[i],
                                             src->backend_type,
+                                            VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                             layout_name,
                                             0,
                                             allocator_layout_bytes) != 0) {
@@ -2255,40 +2318,26 @@ static int topology_endpoint_valid(
                                          endpoint->owner_id))) {
         return 0;
     }
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        return endpoint->tcp_port != 0 &&
-               topology_endpoint_string_valid(
-                   endpoint->host,
-                   sizeof(endpoint->host)) &&
-               endpoint->host[0] != '\0';
-    }
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-        return topology_endpoint_string_valid(
-                   endpoint->uds_path,
-                   sizeof(endpoint->uds_path)) &&
-               endpoint->uds_path[0] != '\0';
-    }
-    return 0;
+    if (endpoint->transport_type != VEMB_V16_TRANSPORT_TCP &&
+        endpoint->transport_type != VEMB_V16_TRANSPORT_AERON)
+        return 0;
+    return endpoint->tcp_port != 0 &&
+           topology_endpoint_string_valid(endpoint->host,
+                                          sizeof(endpoint->host)) &&
+           endpoint->host[0] != '\0';
 }
 
 static int topology_coordinator_endpoint_valid(
         const vemb_v16_topology_endpoint_t *endpoint) {
     if (!endpoint)
         return 0;
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        return endpoint->tcp_port != 0 &&
-               topology_endpoint_string_valid(
-                   endpoint->host,
-                   sizeof(endpoint->host)) &&
-               endpoint->host[0] != '\0';
-    }
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON) {
-        return topology_endpoint_string_valid(
-                   endpoint->uds_path,
-                   sizeof(endpoint->uds_path)) &&
-               endpoint->uds_path[0] != '\0';
-    }
-    return 0;
+    if (endpoint->transport_type != VEMB_V16_TRANSPORT_TCP &&
+        endpoint->transport_type != VEMB_V16_TRANSPORT_AERON)
+        return 0;
+    return endpoint->tcp_port != 0 &&
+           topology_endpoint_string_valid(endpoint->host,
+                                          sizeof(endpoint->host)) &&
+           endpoint->host[0] != '\0';
 }
 
 static void topology_resp_copy_ring_owners(
@@ -2917,6 +2966,9 @@ static int peer_view_region_desc_to_manifest(
     dst->is_local = src->home_ub_node_id == local_owner_id;
     dst->has_is_local = 1;
     dst->weight = src->weight ? src->weight : 1;
+    dst->cache_policy = src->cache_policy ? src->cache_policy :
+        VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+    dst->has_cache_policy = 1;
     dst->mmap_offset = src->mmap_offset;
     dst->region_bytes = src->region_bytes;
     strncpy(dst->path, src->path, sizeof(dst->path) - 1);
@@ -2936,6 +2988,9 @@ static int peer_view_remote_meta_desc_to_manifest(
     dst->bucket_count = src->bucket_count;
     dst->set_count = src->set_count;
     dst->ways = src->ways;
+    dst->cache_policy = src->cache_policy ? src->cache_policy :
+        VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+    dst->has_cache_policy = 1;
     dst->mmap_offset = src->mmap_offset;
     strncpy(dst->path, src->path, sizeof(dst->path) - 1);
     RETURN_IF(dst->entry_count == 0 &&
@@ -2949,6 +3004,8 @@ static void peer_view_ring_desc_to_config(
         const vemb_v16_peer_view_ring_desc_t *src) {
     memset(dst, 0, sizeof(*dst));
     dst->backend_type = src->backend_type;
+    dst->cache_policy = src->cache_policy ? src->cache_policy :
+        VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     dst->mmap_offset = src->mmap_offset;
     strncpy(dst->path, src->path, sizeof(dst->path) - 1);
 }
@@ -2965,11 +3022,7 @@ static int peer_view_ub_rpc_desc_to_manifest(
                                   &src->inbound_request);
     peer_view_ring_desc_to_config(&dst->outbound_response,
                                   &src->outbound_response);
-    RETURN_IF(!manifest_ring_config_valid(&dst->request) ||
-              !manifest_ring_config_valid(&dst->response) ||
-              !manifest_ring_config_valid(&dst->inbound_request) ||
-              !manifest_ring_config_valid(&dst->outbound_response),
-              -1);
+    RETURN_IF(!manifest_ub_rpc_peer_config_valid(dst), -1);
     return 0;
 }
 
@@ -3057,6 +3110,27 @@ int vemb_v16_storage_topology_set_with_rings(
                                                         standby_ring);
 
     pthread_mutex_lock(&storage->topology_lock);
+    uint64_t current_topology_epoch =
+        atomic_load_explicit(&storage->current_topology_epoch,
+                             memory_order_acquire);
+    uint64_t current_min_write_epoch =
+        atomic_load_explicit(&storage->min_write_epoch, memory_order_acquire);
+    if (req->current_topology_epoch < current_topology_epoch ||
+        req->min_write_epoch < current_min_write_epoch) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 topology rejected non-monotonic epoch: "
+                  "local_owner=%u current_epoch=%llu request_epoch=%llu "
+                  "current_min_write_epoch=%llu request_min_write_epoch=%llu "
+                  "flags=0x%x",
+                  storage->local_owner_id,
+                  (unsigned long long)current_topology_epoch,
+                  (unsigned long long)req->current_topology_epoch,
+                  (unsigned long long)current_min_write_epoch,
+                  (unsigned long long)req->min_write_epoch,
+                  req->flags);
+        pthread_mutex_unlock(&storage->topology_lock);
+        return -1;
+    }
     if (owner_sets_changed) {
         /* Stage the post-expand resolver snapshot now, but keep the current
          * snapshot live until full-active publish/cutover. */
@@ -4372,11 +4446,6 @@ int vemb_v16_storage_migration_mark_cutover_in_shard(
         current.shard_id != shard_id) {
         return -1;
     }
-    if (migration_info_requires_storage_slow_path(&current) &&
-        !vemb_v16_storage_migration_active(storage)) {
-        storage_migration_active_inc(storage);
-    }
-
     vemb_v16_migration_outbox_stats_t stats;
     memset(&stats, 0, sizeof(stats));
     if (migration_prepare_final_fence(storage,
@@ -4475,11 +4544,6 @@ int vemb_v16_storage_migration_mark_source_gc_in_shard(
         current.shard_id != shard_id) {
         return -1;
     }
-    if (migration_info_requires_storage_slow_path(&current) &&
-        !vemb_v16_storage_migration_active(storage)) {
-        storage_migration_active_inc(storage);
-    }
-
     tlc_core_key_migration_info_t updated = {0};
     int rc = tlc_core_mark_source_gc(storage->tlc->core,
                                          key,
@@ -4494,6 +4558,8 @@ int vemb_v16_storage_migration_mark_source_gc_in_shard(
                                       TLC_CORE_KEY_SOURCE_GC ? 0 : 1,
                                   memory_order_relaxed);
         storage_update_gc_safe_watermark(storage, updated.topology_epoch);
+        if (current.migration_state == TLC_CORE_KEY_CUTOVER)
+            storage_migration_active_dec(storage);
         if (info)
             *info = updated;
     }
@@ -5077,6 +5143,7 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
 typedef struct {
     int      inited;
     int      fd;
+    uint32_t cache_policy;
     void    *base;
     size_t   size;
     size_t   bump;  /* next free byte offset */
@@ -5129,80 +5196,67 @@ static int open_ub_path_spec(const char *path_spec, int open_flags,
     return -1;
 }
 
-static size_t shmdev_pool_probe_map_size(int fd) {
-    /* Devices may expose slightly less than the nominal 8 GiB region
-     * (observed ~8188 MiB). Probe downwards in 2 MiB steps so the pool
-     * adapts to the actual mappable size instead of failing outright. */
-    const size_t step = (2ull << 20);
-    const size_t floor_sz = (7ull << 30);
-    for (size_t sz = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
-         sz >= floor_sz; sz -= step) {
-        void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (p != MAP_FAILED) {
-            munmap(p, sz);
-            return sz;
-        }
-    }
-    return 0;
-}
 
 static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
-                            const char *path_spec, int noncacheable) {
-    if (pool->inited) return 0;
+                            const char *path_spec,
+                            uint32_t cache_policy) {
+    if (pool->inited)
+        return 0;
+    (void)cache_policy;
     char selected_path[256];
-    /* The preferred mapping mode is the caller's hint; if the device
-     * rejects that mode (NC device with CC open or vice versa), retry
-     * with the other mode so the pool adapts to the device. */
-    const int modes[2] = { noncacheable ? O_SYNC : 0,
-                           noncacheable ? 0 : O_SYNC };
-    int fd = -1;
-    size_t map_size = 0;
     int used_sync = 0;
-    for (int attempt = 0; attempt < 2 && map_size == 0; attempt++) {
-        fd = open_ub_path_spec(path_spec, O_RDWR | modes[attempt],
-                               selected_path);
-        if (fd < 0) continue;
-        map_size = shmdev_pool_probe_map_size(fd);
-        if (map_size == 0) {
-            close(fd);
-            fd = -1;
-        } else {
-            used_sync = (modes[attempt] == O_SYNC);
-        }
+    int fd = open_ub_path_spec(path_spec, O_RDWR, selected_path);
+    if (fd < 0 && (errno == EPERM || errno == EACCES)) {
+        fd = open_ub_path_spec(path_spec, O_RDWR | O_SYNC, selected_path);
+        if (fd >= 0)
+            used_sync = 1;
     }
     if (fd < 0) {
         serverLog(LL_WARNING, "aeron ub pool: no usable path in %s errno=%d (%s)",
                   path_spec, errno, strerror(errno));
         return -1;
     }
-    void *p = mmap(NULL, map_size,
+    void *p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED && (errno == EPERM || errno == EACCES)) {
+        close(fd);
+        fd = open_ub_path_spec(path_spec, O_RDWR | O_SYNC, selected_path);
+        if (fd >= 0) {
+            used_sync = 1;
+            p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
+                     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        }
+    }
     if (p == MAP_FAILED) {
         serverLog(LL_WARNING,
                   "aeron ub pool: mmap %s size=%llu failed errno=%d (%s)",
                   selected_path,
-                  (unsigned long long)map_size,
+                  (unsigned long long)VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
                   errno, strerror(errno));
         close(fd);
         return -2;
     }
     pool->fd   = fd;
     pool->base = p;
-    pool->size = map_size;
+    pool->size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
     pool->bump = 0;
+    pool->cache_policy = used_sync ?
+        VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE :
+        VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     strncpy(pool->path, selected_path, sizeof(pool->path) - 1);
     pool->path[sizeof(pool->path) - 1] = '\0';
     pool->inited = 1;
     serverLog(LL_NOTICE,
               "aeron ub pool ready: configured=%s selected=%s size=%zu mode=%s",
               path_spec, pool->path, pool->size,
-              used_sync ? "NC" : "CC");
+              pool->cache_policy == VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE ?
+                  "NC" : "CC");
     return 0;
 }
 
 static int shmdev_pool_reserve(vemb_v16_shmdev_pool_t *pool,
                                const char *path_spec,
-                               int noncacheable,
+                               uint32_t cache_policy,
                                size_t bytes,
                                uint64_t *out_off,
                                void **out_mapping,
@@ -5210,7 +5264,7 @@ static int shmdev_pool_reserve(vemb_v16_shmdev_pool_t *pool,
                                char out_path[256]) {
     if (bytes == 0 || bytes % CACHELINE_SIZE != 0)
         return -1;
-    if (shmdev_pool_init(pool, path_spec, noncacheable) != 0)
+    if (shmdev_pool_init(pool, path_spec, cache_policy) != 0)
         return -2;
     size_t aligned = align_up_size(bytes, 4096u);
     if (pool->bump + aligned > pool->size)
@@ -5227,6 +5281,7 @@ static int shmdev_pool_reserve(vemb_v16_shmdev_pool_t *pool,
 
 int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
                                          const char *response_ub_path,
+                                         uint32_t response_cache_policy,
                                          uint32_t req_slot_size,
                                          uint32_t resp_slot_size,
                                          uint32_t ring_slots,
@@ -5259,11 +5314,15 @@ int vemb_v16_storage_alloc_aeron_channel(const char *request_ub_path,
     vemb_v16_shmdev_pool_t *resp_pool = &g_shmdev_pools[1];
     size_t req_bump = req_pool->bump;
     size_t resp_bump = resp_pool->bump;
-    int rc = shmdev_pool_reserve(req_pool, request_ub_path, 0, req_bytes,
+    int rc = shmdev_pool_reserve(req_pool, request_ub_path,
+                                 VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+                                 req_bytes,
                                  out_req_off, out_req_mapping, out_req_bytes,
                                  out_request_shmdev_path);
     if (rc == 0)
-        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1, resp_bytes,
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path,
+                                 response_cache_policy,
+                                 resp_bytes,
                                  out_resp_off, out_resp_mapping, out_resp_bytes,
                                  out_response_shmdev_path);
     if (rc != 0) {
@@ -5298,6 +5357,7 @@ void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
 
 int vemb_v16_storage_alloc_aeron_batch_channel(
     const char *request_ub_path, const char *response_ub_path,
+    uint32_t response_cache_policy,
     uint32_t descriptor_slot_size, uint32_t descriptor_slots,
     uint32_t request_arena_bytes, uint32_t response_arena_bytes,
     vemb_v16_aeron_batch_channel_allocation_t *out) {
@@ -5319,20 +5379,26 @@ int vemb_v16_storage_alloc_aeron_batch_channel(
     vemb_v16_shmdev_pool_t *resp_pool = &g_shmdev_pools[1];
     size_t req_bump = req_pool->bump;
     size_t resp_bump = resp_pool->bump;
-    int rc = shmdev_pool_reserve(req_pool, request_ub_path, 0, desc_bytes,
+    int rc = shmdev_pool_reserve(req_pool, request_ub_path,
+                                 VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+                                 desc_bytes,
                                  &out->request_desc_off, &out->request_desc_mapping,
                                  &out->request_desc_bytes, out->request_path);
     if (rc == 0)
-        rc = shmdev_pool_reserve(req_pool, request_ub_path, 0,
+        rc = shmdev_pool_reserve(req_pool, request_ub_path,
+                                 VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
                                  request_arena_bytes,
                                  &out->request_arena_off, &out->request_arena_mapping,
                                  &out->request_arena_bytes, out->request_path);
     if (rc == 0)
-        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1, desc_bytes,
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path,
+                                 response_cache_policy,
+                                 desc_bytes,
                                  &out->response_desc_off, &out->response_desc_mapping,
                                  &out->response_desc_bytes, out->response_path);
     if (rc == 0)
-        rc = shmdev_pool_reserve(resp_pool, response_ub_path, 1,
+        rc = shmdev_pool_reserve(resp_pool, response_ub_path,
+                                 response_cache_policy,
                                  response_arena_bytes,
                                  &out->response_arena_off, &out->response_arena_mapping,
                                  &out->response_arena_bytes, out->response_path);

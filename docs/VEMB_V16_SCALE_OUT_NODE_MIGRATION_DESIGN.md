@@ -853,7 +853,6 @@ endpoint[0]=owner:0 transport:tcp host:192.168.90.111 port:6391
   --threads 1 \
   --pipeline 1 \
   --mode vadd \
-  --client-topology \
   --timeout-ms 10000 \
   >/tmp/v16_prefill.out 2>&1
 
@@ -882,7 +881,6 @@ nohup ./benchmark/vemb_v16_bench \
   --threads 2 \
   --pipeline 1 \
   --mode vadd \
-  --client-topology \
   --timeout-ms 180000 \
   >/tmp/v16_live_write.out 2>&1 &
 ```
@@ -1022,7 +1020,6 @@ endpoint[1]=owner:1 transport:tcp host:192.168.90.112 port:6391
   --threads 2 \
   --pipeline 1 \
   --mode vadd \
-  --client-topology \
   --timeout-ms 10000 \
   >/tmp/v16_post_cutover.out 2>&1
 
@@ -1050,7 +1047,6 @@ cat /tmp/v16_post_cutover.out
   --threads 2 \
   --pipeline 1 \
   --mode vemb-supernode-read \
-  --client-topology \
   --timeout-ms 10000 \
   >/tmp/v16_post_read.out 2>&1
 

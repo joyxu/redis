@@ -642,8 +642,7 @@ static int decode_tcp_key_only_request(vemb_v16_req_t *req,
     const uint8_t *p = src;
     uint8_t op_flags = vemb_v16_proto_get_u8(&p);
     uint8_t op = op_flags & VEMB_V16_TCP_REQ_OP_MASK;
-    if (op != VEMB_V16_OP_VEMB_HANDLE &&
-        op != VEMB_V16_OP_VEMB_INLINE &&
+    if (op != VEMB_V16_OP_VEMB_INLINE &&
         op != VEMB_V16_OP_VREM &&
         op != VEMB_V16_OP_PING) {
         return 0;
@@ -1201,6 +1200,20 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
         }
         uint64_t closed = vemb_v16_proxy_close_all_channels(proxy);
         tcp_write_status(fd, VEMB_V16_STATUS_OK, closed);
+        close(fd);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_AERON_CHANNEL_STATUS) {
+        if (hdr.payload_len != 0) {
+            close(fd);
+            return;
+        }
+        uint64_t resource_generation = 0;
+        uint8_t status = vemb_v16_proxy_aeron_channel_resource_generation(
+            proxy, hdr.channel_id, &resource_generation) == 0 ?
+            VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
+        tcp_write_status(fd, status, resource_generation);
         close(fd);
         return;
     }

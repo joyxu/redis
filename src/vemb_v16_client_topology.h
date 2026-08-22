@@ -44,13 +44,4 @@ int vemb_v16_client_topology_fetch_tcp(
     uint32_t timeout_ms,
     vemb_v16_client_topology_t *topology,
     vemb_v16_topology_control_resp_t *raw_resp);
-int vemb_v16_client_topology_fetch_uds_fd(
-    int fd,
-    vemb_v16_client_topology_t *topology,
-    vemb_v16_topology_control_resp_t *raw_resp);
-int vemb_v16_client_topology_fetch_uds(
-    const char *socket_path,
-    vemb_v16_client_topology_t *topology,
-    vemb_v16_topology_control_resp_t *raw_resp);
-
 #endif

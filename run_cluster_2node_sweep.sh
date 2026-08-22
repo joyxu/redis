@@ -225,6 +225,7 @@ run_one_config() {
     # === jiffies before ===
     read j0_ut_hw01 j0_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
     read j0_ut_hw02 j0_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    JB_NS=$(date +%s%N)
     local si0_hw01=$(snapshot_si)
     local si0_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
     local rss0_hw01=$(snapshot_rss $SERVER_PORT)
@@ -260,16 +261,19 @@ run_one_config() {
     # === jiffies after ===
     read j1_ut_hw01 j1_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
     read j1_ut_hw02 j1_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
-    local cores01=$(awk -v d=$(((j1_ut_hw01 + j1_st_hw01) - (j0_ut_hw01 + j0_st_hw01))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local cores02=$(awk -v d=$(((j1_ut_hw02 + j1_st_hw02) - (j0_ut_hw02 + j0_st_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
+    JA_NS=$(date +%s%N)
+    ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
+    # core 分母 = 纳秒实测窗口 (与脚本13对齐)
+    local cores01=$(awk -v d=$(((j1_ut_hw01 + j1_st_hw01) - (j0_ut_hw01 + j0_st_hw01))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local cores02=$(awk -v d=$(((j1_ut_hw02 + j1_st_hw02) - (j0_ut_hw02 + j0_st_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local si1_hw01=$(snapshot_si)
     local si1_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
     local rss1_hw01=$(snapshot_rss $SERVER_PORT)
     local rss1_hw02=$(ssh HW02 "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
     # sum across both server nodes
-    local core_ut=$(awk -v d=$(((j1_ut_hw01 - j0_ut_hw01) + (j1_ut_hw02 - j0_ut_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local core_st=$(awk -v d=$(((j1_st_hw01 - j0_st_hw01) + (j1_st_hw02 - j0_st_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%.2f", d/100.0/s}')
-    local si=$(awk -v d=$(((si1_hw01 - si0_hw01) + (si1_hw02 - si0_hw02))) -v s=$TEST_TIME 'BEGIN{printf "%d", d/s}')
+    local core_ut=$(awk -v d=$(((j1_ut_hw01 - j0_ut_hw01) + (j1_ut_hw02 - j0_ut_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local core_st=$(awk -v d=$(((j1_st_hw01 - j0_st_hw01) + (j1_st_hw02 - j0_st_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
+    local si=$(awk -v d=$(((si1_hw01 - si0_hw01) + (si1_hw02 - si0_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local rss=$((((rss1_hw01 + rss1_hw02) + (rss0_hw01 + rss0_hw02)) / 2))
 
     # === 解析吞吐 ===

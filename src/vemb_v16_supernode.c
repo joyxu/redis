@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 
 #include "cpu_relax.h"
-#include "vemb_v16_server_integration.h"   /* vemb_v16_cross_node_aeron_enabled() */
 #include "vemb_v16_supernode.h"
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
@@ -178,7 +177,7 @@ static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
     if (!ctx->completion_batch || !ctx->completion_batch_count ||
         ctx->completion_batch_capacity == 0) {
         uint32_t spins = 0;
-        int use_backoff = vemb_v16_cross_node_aeron_enabled();
+        int use_backoff = 1;
         while (vemb_v16_aeron_publish(ctx->completion_ring, completion) != 0 &&
                atomic_load_explicit(ctx->running, memory_order_relaxed) &&
                atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
