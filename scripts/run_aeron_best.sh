@@ -7,38 +7,38 @@
 #
 # 使用方法（所有参数都有默认值，按需覆盖）：
 #   bash run_aeron_best.sh
-#   TEST_TIME=60 T=64 C=4 PIPELINE=32 PIO=21 SNW=21 bash run_aeron_best.sh
+#   NODE=43.154.145.18 SSH_PORT=8112 REMOTE_DIR=/root/szz/codespace/hpc-redis \
+#   BUILD=0 WORKERS=21:21 TS=64 CS=4 PIPELINE=32 bash run_aeron_best.sh
 #   ssh HW01 'TEST_TIME=60 bash /root/gqs/codespace/UnifiedBus/test_hpc/run_aeron_best.sh'
 #
 # 可调参数（环境变量）：
 #   TEST_TIME     bench 持续秒数         (默认 60)
-#   T C           client -t / -c         (默认 64 / 4)
-#   PIPELINE      每 channel in-flight   (默认 32)
-#   NUM_KEYS      prefill key 数         (默认 10000)
+#   TS CS         client -t / -c         (默认 64 / 4；可传空格分隔矩阵)
+#   PIPELINE      每 channel in-flight   (默认 32；可传空格分隔矩阵)
+#   NUM_KEYS      prefill key 数         (默认 100000)
 #   MAX_VECTORS   server vector 容量上限 (默认 131072=128K；NUM_KEYS 不能超过这个)
 #   DIM           vector 维度            (默认 300)
 #   SERVER_MASK   server taskset         (默认 "0-47")
-#   PIO           vemb-v16 proxy IO 线程数 (默认 21)
-#   SNW           vemb-v16 supernode worker 数 (默认 21)
+#   WORKERS       proxy-io:supernode     (默认 "8:8")
 #   CLIENT_MASK   client taskset         (默认 "96-191")
 #   SERVER_HOST   client 连接的 server IP (默认 127.0.0.1)
 #   PORT          server 端口            (默认 6395)
 #   ROLE          both|server|client     (默认 both)
 #   AERON_BATCH_DISABLE=yes  强制使用 v1 channel
 #   PROFILE=0|1   启用/禁用 server、client perf 和 SVG 火焰图 (默认 0)
-#   SERVER_FLAME_DURATION perf 采样时间 (默认 25)
+#   FLAME_DURATION perf 采样时间        (默认 25)
 #   FREQ/EVENT      perf 频率/事件 (默认 99/cycles)
-#   OUTDIR          结果目录 (默认 perf/aeron_sweep)
-#   REMOTE_OUTDIR   远端临时结果目录 (默认 /tmp/aeron_sweep)
+#   LOCAL_ROOT      本地结果目录       (默认 perf/aeron_sweep/<run-id>)
+#   RUN_ID          运行标识           (默认 YYYYMMDD_HHMMSS)
 
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 HPC=${HPC:-$(cd "$SCRIPT_DIR/.." && pwd -P)}
-REMOTE_NODE=${REMOTE_NODE:-43.154.145.18}
-REMOTE_SSH_PORT=${REMOTE_SSH_PORT:-8112}
-REMOTE_ROOT=${REMOTE_ROOT:-/root/szz/codespace/hpc-redis}
-REMOTE_OUTDIR=${REMOTE_OUTDIR:-/tmp/aeron_sweep}
+NODE=${NODE:-43.154.145.18}
+SSH_PORT=${SSH_PORT:-8112}
+REMOTE_DIR=${REMOTE_DIR:-/root/szz/codespace/hpc-redis}
+REMOTE_RESULT_ROOT=/tmp/aeron_sweep
 RUN_LOCAL=${RUN_LOCAL:-0}
 REMOTE_CHILD=${AERON_BEST_REMOTE_CHILD:-0}
 REDIS=$HPC/src/redis-server
@@ -48,19 +48,29 @@ MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 PORT=${PORT:-6395}
 SERVER_HOST=${SERVER_HOST:-127.0.0.1}
 ROLE=${ROLE:-both}
-VERIFY_VEMB_BUILD=${VERIFY_VEMB_BUILD:-yes}
+BUILD=${BUILD:-0}
+case "$BUILD" in
+    0) ;;
+    1) echo "ERROR: run_aeron_best.sh reuses the prebuilt remote binaries; use BUILD=0" >&2; exit 2 ;;
+    *) echo "ERROR: BUILD must be 0" >&2; exit 2 ;;
+esac
 DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-100000}
 MAX_VECTORS=${MAX_VECTORS:-131072}
 TEST_TIME=${TEST_TIME:-30}
 PROFILE=${PROFILE:-0}
-SERVER_FLAME_DURATION=${SERVER_FLAME_DURATION:-25}
+FLAME_DURATION=${FLAME_DURATION:-25}
 FREQ=${FREQ:-99}
 EVENT=${EVENT:-cycles}
 FLAMEGRAPH_DIR=${FLAMEGRAPH_DIR:-$HPC/perf/FlameGraph}
 KEY_PREFIX=${KEY_PREFIX:-"item:"}
-PIO=${PIO:-8}
-SNW=${SNW:-8}
+WORKERS=${WORKERS:-8:8}
+case "$WORKERS" in
+    *:*) ;;
+    *) echo "ERROR: WORKERS must use pio:snw format, for example 8:8" >&2; exit 2 ;;
+esac
+PIO="${WORKERS%%:*}"
+SNW="${WORKERS##*:}"
 AERON_UB_PATH=${AERON_UB_PATH:-/dev/obmm_shmdev1}
 AERON_RESPONSE_UB_PATH=${AERON_RESPONSE_UB_PATH:-/dev/obmm_shmdev3}
 AERON_TRANSPORT=${AERON_TRANSPORT:-aeron}
@@ -107,21 +117,31 @@ fi
 SERVER_MASK=${SERVER_MASK:-"0-47"}
 CLIENT_MASK=${CLIENT_MASK:-"96-191"}
 
-# === 17 档配置矩阵 ===
+# === 配置矩阵 ===
 TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
 CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
 PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
-PS=( ${PS:-${PS_DEFAULT[*]}} )
+PS=( ${PIPELINE:-${PS_DEFAULT[*]}} )
 NCONFIGS=${#TS[@]}
+[ "${#CS[@]}" -eq "$NCONFIGS" ] && [ "${#PS[@]}" -eq "$NCONFIGS" ] || {
+    echo "ERROR: TS, CS, and PIPELINE must contain the same number of configurations" >&2
+    exit 2
+}
 
 # === 输出 ===
-OUTDIR=${OUTDIR:-perf/aeron_sweep}
-RUN_TIMESTAMP=${RUN_TIMESTAMP:-}
-TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
-RAWDIR="$OUTDIR/$TIMESTAMP/raw"
-TSV="$OUTDIR/$TIMESTAMP/summary.tsv"
+RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
+if [ -n "${LOCAL_ROOT:-}" ]; then
+    case "$LOCAL_ROOT" in
+        /*) ;;
+        *) LOCAL_ROOT="$HPC/$LOCAL_ROOT" ;;
+    esac
+else
+    LOCAL_ROOT="$HPC/perf/aeron_sweep/$RUN_ID"
+fi
+RAWDIR="$LOCAL_ROOT/raw"
+TSV="$LOCAL_ROOT/summary.tsv"
 
 PIDFILE=/tmp/vemb_aeron_sweep.pid
 SERVER_LOG=/tmp/vemb_aeron_sweep.log
@@ -129,56 +149,52 @@ SERVER_PERF_PID=
 CLIENT_PERF_DATA="$RAWDIR/client.perf.data"
 
 run_remote_same_host() {
-    local peer="root@$REMOTE_NODE"
-    local local_outdir remote_outdir local_run_dir remote_run_dir
-    case "$OUTDIR" in
-        /*) local_outdir="$OUTDIR" ;;
-        *) local_outdir="$HPC/$OUTDIR" ;;
-    esac
-    case "$REMOTE_OUTDIR" in
-        /*) remote_outdir="$REMOTE_OUTDIR" ;;
-        *) remote_outdir="$REMOTE_ROOT/$REMOTE_OUTDIR" ;;
-    esac
-    local_run_dir="$local_outdir/$TIMESTAMP"
-    remote_run_dir="$remote_outdir/$TIMESTAMP"
+    local peer="root@$NODE"
+    local remote_outdir local_run_dir remote_run_dir remote_archive local_archive
+    local remote_tar_command remote_cleanup_command
+    remote_outdir="$REMOTE_RESULT_ROOT"
+    local_run_dir="${LOCAL_ROOT%/}"
+    remote_run_dir="$remote_outdir/$RUN_ID"
+    remote_archive="$remote_run_dir.tar.gz"
+    local_archive="$local_run_dir.tar.gz"
     local remote_env_names=(
         NUM_KEYS KEY_PREFIX MAX_VECTORS DIM TEST_TIME PROFILE
-        SERVER_FLAME_DURATION FREQ EVENT FLAMEGRAPH_DIR PIO SNW
-        SERVER_MASK CLIENT_MASK PORT SERVER_HOST ROLE VERIFY_VEMB_BUILD
+        FLAME_DURATION FREQ EVENT FLAMEGRAPH_DIR WORKERS
+        SERVER_MASK CLIENT_MASK PORT SERVER_HOST ROLE BUILD
         AERON_UB_PATH AERON_RESPONSE_UB_PATH AERON_TRANSPORT
         AERON_BATCH_DISABLE AERON_UB_CACHEABLE AERON_PEER_VIEW_MANIFEST
         AERON_PEER_VIEW_CLIENT_HOST AERON_PEER_VIEW_OWNER_ID SERVER_TRANSPORT
-        TS CS PS
+        TS CS PIPELINE
     )
-    local remote_args=("$REMOTE_ROOT" "$TIMESTAMP")
+    local remote_args=("$REMOTE_DIR" "$RUN_ID")
     local name value
     for name in "${remote_env_names[@]}"; do
         if [ "${!name+x}" = x ]; then
             case "$name" in
                 TS) value="${TS[*]}" ;;
                 CS) value="${CS[*]}" ;;
-                PS) value="${PS[*]}" ;;
+                PIPELINE) value="${PIPELINE:-}" ;;
                 *) value=${!name} ;;
             esac
             case "$name" in
                 AERON_PEER_VIEW_MANIFEST|FLAMEGRAPH_DIR)
                     case "$value" in
-                        "$HPC"/*) value="$REMOTE_ROOT/${value#"$HPC/"}" ;;
+                        "$HPC"/*) value="$REMOTE_DIR/${value#"$HPC/"}" ;;
                     esac
                     ;;
             esac
             remote_args+=("$name" "$value")
         fi
     done
-    remote_args+=("OUTDIR" "$remote_outdir")
+    remote_args+=("LOCAL_ROOT" "$remote_run_dir")
 
     printf '[%s] same-host remote run: %s:%s:%s\n' \
-        "$(date '+%F %T')" "$peer" "$REMOTE_SSH_PORT" "$REMOTE_ROOT"
+        "$(date '+%F %T')" "$peer" "$SSH_PORT" "$REMOTE_DIR"
     # SSH concatenates remote command arguments and reparses them remotely;
-    # quote each value so array settings such as TS/CS/PS stay one argument.
+    # quote each value so array settings such as TS/CS/PIPELINE stay one argument.
     local remote_command
     printf -v remote_command '%q ' "${remote_args[@]}"
-    if ! ssh -p "$REMOTE_SSH_PORT" "$peer" "bash -s -- $remote_command" <<'REMOTE_SAME_HOST' \
+    if ! ssh -p "$SSH_PORT" "$peer" "bash -s -- $remote_command" <<'REMOTE_SAME_HOST' \
         2>&1 | sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'
 set -euo pipefail
 root=$1
@@ -191,7 +207,7 @@ while [ "$#" -gt 0 ]; do
     export "$name=$value"
 done
 export AERON_BEST_REMOTE_CHILD=1
-export RUN_TIMESTAMP="$timestamp"
+export RUN_ID="$timestamp"
 cd "$root"
 exec bash scripts/run_aeron_best.sh
 REMOTE_SAME_HOST
@@ -200,13 +216,33 @@ REMOTE_SAME_HOST
         return 1
     fi
 
-    mkdir -p "$local_outdir"
-    if ! scp -P "$REMOTE_SSH_PORT" -r \
-        "$peer:$remote_run_dir" "$local_outdir/" 2>&1 | \
+    printf '[%s] compressing remote results: %s\n' \
+        "$(date '+%F %T')" "$remote_run_dir"
+    printf -v remote_tar_command 'tar -C %q -czf %q .' \
+        "$remote_run_dir" "$remote_archive"
+    if ! ssh -p "$SSH_PORT" "$peer" "$remote_tar_command" 2>&1 | \
         sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'; then
-        echo "ERROR: failed to pull remote results: $remote_run_dir" >&2
+        echo "ERROR: failed to compress remote results: $remote_run_dir" >&2
         return 1
     fi
+
+    mkdir -p "$local_run_dir"
+    printf '[%s] pulling: %s:%s -> %s\n' \
+        "$(date '+%F %T')" "$peer" "$remote_archive" "$local_archive"
+    if ! scp -P "$SSH_PORT" \
+        "$peer:$remote_archive" "$local_archive" 2>&1 | \
+        sed '/^Authorized users only\. All activities may be monitored and reported\.$/d'; then
+        echo "ERROR: failed to pull remote archive: $remote_archive" >&2
+        return 1
+    fi
+    if ! tar -xzf "$local_archive" -C "$local_run_dir"; then
+        echo "ERROR: failed to extract local archive: $local_archive" >&2
+        return 1
+    fi
+    rm -f "$local_archive"
+    printf -v remote_cleanup_command 'rm -f %q' "$remote_archive"
+    ssh -p "$SSH_PORT" "$peer" "$remote_cleanup_command" >/dev/null 2>&1 ||
+        echo "WARNING: failed to remove remote temporary archive: $remote_archive" >&2
     printf '[%s] pulled: %s\n' "$(date '+%F %T')" "$local_run_dir"
     if [ "$PROFILE" = 1 ]; then
         printf 'server SVG: %s/raw/server.svg\n' "$local_run_dir"
@@ -225,7 +261,6 @@ mkdir -p "$RAWDIR"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 verify_vemb_build() {
-    [ "$VERIFY_VEMB_BUILD" = "yes" ] || return 0
     case "$ROLE" in
         server) "$HPC/scripts/vemb_v16_build_stamp.sh" verify server ;;
         client) "$HPC/scripts/vemb_v16_build_stamp.sh" verify client ;;
@@ -246,15 +281,15 @@ validate_profile() {
         0|1) ;;
         *) echo "ERROR: PROFILE must be 0 or 1" >&2; exit 2 ;;
     esac
-    case "$SERVER_FLAME_DURATION" in
-        ''|*[!0-9]*) echo "ERROR: SERVER_FLAME_DURATION must be a positive integer" >&2; exit 2 ;;
+    case "$FLAME_DURATION" in
+        ''|*[!0-9]*) echo "ERROR: FLAME_DURATION must be a positive integer" >&2; exit 2 ;;
     esac
-    [ "$SERVER_FLAME_DURATION" -gt 0 ] || {
-        echo "ERROR: SERVER_FLAME_DURATION must be positive" >&2
+    [ "$FLAME_DURATION" -gt 0 ] || {
+        echo "ERROR: FLAME_DURATION must be positive" >&2
         exit 2
     }
-    [ "$SERVER_FLAME_DURATION" -lt "$TEST_TIME" ] || {
-        echo "ERROR: SERVER_FLAME_DURATION must be less than TEST_TIME" >&2
+    [ "$FLAME_DURATION" -lt "$TEST_TIME" ] || {
+        echo "ERROR: FLAME_DURATION must be less than TEST_TIME" >&2
         exit 2
     }
     if [ "$PROFILE" = 1 ]; then
@@ -300,11 +335,11 @@ start_server_perf() {
         exit 1
     }
     nohup perf record -F "$FREQ" -g -e "$EVENT" --tid "$tids" \
-        -o "$RAWDIR/server.perf.data" -- sleep "$SERVER_FLAME_DURATION" \
+        -o "$RAWDIR/server.perf.data" -- sleep "$FLAME_DURATION" \
         >"$RAWDIR/server.perf.log" 2>&1 &
     SERVER_PERF_PID=$!
     printf '%s\n' "$SERVER_PERF_PID" >"$RAWDIR/server.perf.pid"
-    log "server perf: tids=$(echo "$tids" | tr ',' ' ' | wc -w | tr -d ' ') duration=${SERVER_FLAME_DURATION}s pid=$SERVER_PERF_PID"
+    log "server perf: tids=$(echo "$tids" | tr ',' ' ' | wc -w | tr -d ' ') duration=${FLAME_DURATION}s pid=$SERVER_PERF_PID"
 }
 
 wait_server_perf() {
@@ -334,7 +369,7 @@ render_flamegraphs() {
     awk '{ sub(/^[^;]+;/, "all;redis-server;"); print }' \
         "$RAWDIR/server.collapsed.txt" >"$RAWDIR/server.process.collapsed.txt"
     "$FLAMEGRAPH_DIR/flamegraph.pl" \
-        --title "vemb-v16 local server $TIMESTAMP" \
+        --title "vemb-v16 local server $RUN_ID" \
         --subtitle "all redis-server TIDs user+kernel; event=${EVENT}@${FREQ}Hz" \
         "$RAWDIR/server.process.collapsed.txt" >"$RAWDIR/server.svg"
     grep -q 'vemb-v16 local server' "$RAWDIR/server.svg" || {
@@ -354,7 +389,7 @@ render_flamegraphs() {
     "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$RAWDIR/client.perf.script" \
         >"$RAWDIR/client.collapsed.txt"
     "$FLAMEGRAPH_DIR/flamegraph.pl" \
-        --title "vemb-v16 local client $TIMESTAMP" \
+        --title "vemb-v16 local client $RUN_ID" \
         --subtitle "memtier user+kernel; event=${EVENT}@${FREQ}Hz" \
         "$RAWDIR/client.collapsed.txt" >"$RAWDIR/client.svg"
     grep -q 'vemb-v16 local client' "$RAWDIR/client.svg" || {
@@ -370,7 +405,7 @@ fi
 
 validate_profile
 if [ "$PROFILE" = 1 ] && [ "$NCONFIGS" -ne 1 ]; then
-    echo "ERROR: PROFILE=1 requires exactly one TS/CS/PS configuration" >&2
+    echo "ERROR: PROFILE=1 requires exactly one TS/CS/PIPELINE configuration" >&2
     exit 2
 fi
 
@@ -583,7 +618,16 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
 
     totals=$(grep "^Totals" "$workload_log" | tail -1)
     read ops avg p50 p99 p999 kb < <(
-        echo "$totals" | awk '{if(NF>=9) printf "%s %s %s %s %s %s", $2,$5,$6,$7,$8,$9; else printf "0 NA NA NA NA NA"}'
+        echo "$totals" | awk '
+            /^Totals[[:space:]]/ {
+                if (NF >= 11)
+                    printf "%s %s %s %s %s %s", $2, $7, $8, $9, $10, $11
+                else if (NF >= 9)
+                    printf "%s %s %s %s %s %s", $2, $5, $6, $7, $8, $9
+                else
+                    printf "0 NA NA NA NA NA"
+            }
+        '
     )
     OPS_PER_CORE=$(awk -v o="$ops" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0||o==0) print "NA"; else printf "%.0f", o/c }')
 

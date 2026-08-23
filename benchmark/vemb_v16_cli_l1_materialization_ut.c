@@ -1,4 +1,4 @@
-#include <assert.h>
+#include "../src/redisassert.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

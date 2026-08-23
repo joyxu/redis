@@ -10,13 +10,13 @@
 #include "../../src/vemb_v16_net.h"
 #include "../../src/vemb_v16_aeron_attach.h"  /* TCP ATTACH protocol */
 #include "../../src/vemb_v16_batch_ring.h"
+#include "../../src/redisassert.h"
 #include "../../src/vemb_v16_util.h"
 /* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
  * public SDK header — so C++ consumers stay clean. */
 #include "../../src/vemb_v16_client_ring.h"
 
 #include <stdio.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -201,9 +201,13 @@ static int sdk_backend_open(sdk_backend_t *backend, uint32_t dim,
 
 static void sdk_backend_close(sdk_backend_t *backend)
 {
-    backend->ops->close_channel(backend);
+    assert(backend->ops != NULL);
     backend->resource_generation = 0;
     backend->resource_checked_topology_epoch = 0;
+    /* A failed poll closes broken transport state immediately. The owner
+     * lifecycle still reaches here to clear its logical channel state. */
+    RETURN_IF(backend->state == NULL);
+    backend->ops->close_channel(backend);
 }
 
 static int sdk_backend_ready(const sdk_backend_t *backend)
@@ -220,16 +224,6 @@ static int sdk_backend_matches_endpoint(
         sdk_backend_ready(backend) &&
         backend->port == endpoint->tcp_port &&
         strcmp(backend->host, endpoint->host) == 0;
-}
-
-static const vemb_v16_data_transport_ops_t *sdk_transport_for_endpoint(
-    const vemb_v16_topology_endpoint_t *endpoint)
-{
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP)
-        return &sdk_tcp_data_transport_ops;
-    if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON)
-        return &sdk_ub_data_transport_ops;
-    return NULL;
 }
 
 static int sdk_backend_submit(sdk_backend_t *backend,
@@ -278,6 +272,8 @@ struct vemb_v16_client {
     uint32_t req_id;
     uint32_t connect_timeout_ms; /* 0 = default 10000 */
     uint32_t ub_batch_request_size;
+    uint32_t transport_type;
+    uint8_t vector_read_op;
 
     /* Bootstrap addresses carry TCP control only. They are never data
      * channels and are retried round-robin for topology/control requests. */
@@ -322,8 +318,6 @@ static void sdk_format_owner_ring(char *out, size_t out_cap,
                                   const vemb_v16_topology_ring_t *ring)
 {
     size_t used = 0;
-    if (!out || out_cap == 0 || !ring)
-        return;
     out[0] = '\0';
     used += (size_t)snprintf(out + used, out_cap - used, "{");
     for (uint32_t i = 0; i < ring->owner_count && used < out_cap; i++) {
@@ -339,7 +333,7 @@ static void sdk_format_owner_ring(char *out, size_t out_cap,
 static int sdk_topology_rings_equal(const vemb_v16_topology_ring_t *a,
                                     const vemb_v16_topology_ring_t *b)
 {
-    if (!a || !b || a->owner_count != b->owner_count ||
+    if (a->owner_count != b->owner_count ||
         a->node_count != b->node_count)
         return 0;
     for (uint32_t i = 0; i < a->owner_count; i++) {
@@ -349,15 +343,26 @@ static int sdk_topology_rings_equal(const vemb_v16_topology_ring_t *a,
     return 1;
 }
 
-/* The topology is authoritative for a handle's data-plane capability. This
- * helper is called only after cluster_core supplied a ready owner route. */
-static int sdk_owner_supports_handle(const vemb_v16_client_t *client,
-                                     uint32_t owner_id)
+static void sdk_warn_topology_transport_mismatch(
+    const vemb_v16_client_t *client,
+    const vemb_v16_client_topology_t *topology,
+    const char *seed_host,
+    uint16_t seed_port)
 {
-    const vemb_v16_topology_endpoint_t *endpoint =
-        vemb_v16_client_topology_find_endpoint(
-            vemb_v16_cluster_core_topology(&client->cluster), owner_id);
-    return endpoint && endpoint->transport_type == VEMB_V16_TRANSPORT_AERON;
+    for (uint32_t i = 0; i < topology->endpoint_count; i++) {
+        const vemb_v16_topology_endpoint_t *endpoint =
+            &topology->endpoints[i];
+        if (endpoint->transport_type == client->transport_type)
+            continue;
+        fprintf(stderr,
+                "[sdk][WARNING] topology endpoint transport mismatch: "
+                "client=%s endpoint=%s owner=%u seed=%s:%u; "
+                "client startup transport remains fixed\n",
+                vemb_v16_transport_name(client->transport_type),
+                vemb_v16_transport_name(endpoint->transport_type),
+                endpoint->owner_id, seed_host, seed_port);
+        return;
+    }
 }
 
 static void sdk_owner_v2_stop(vemb_v16_client_t *client, uint32_t owner_id);
@@ -376,6 +381,7 @@ int vemb_v16_build_combined_key(char *out, size_t out_cap,
                                 const char *set_name, const char *elem_name,
                                 uint32_t *out_len)
 {
+    assert(out != NULL && out_cap > 0 && elem_name != NULL && out_len != NULL);
     size_t elem_len = strlen(elem_name);
     if (set_name == NULL || *set_name == '\0') {
         /* 无 set_name：key = elem_name (无分隔符) */
@@ -780,8 +786,7 @@ static int sdk_tcp_pending_reserve(sdk_tcp_channel_t *state)
     }
     sdk_tcp_pending_t *pending = realloc(
         state->pending, pending_bytes);
-    if (!pending)
-        return -1;
+    assert(pending != NULL);
     state->pending = pending;
     state->pending_cap = next_cap;
     return 0;
@@ -813,8 +818,7 @@ static int sdk_tcp_open_owner_channel(
     vemb_v16_data_channel_t *channel,
     const vemb_v16_transport_open_spec_t *spec)
 {
-    if (channel->state)
-        return 0;
+    assert(channel->state == NULL);
 
     uint32_t effective_timeout = spec->timeout_ms ? spec->timeout_ms : 10000;
     int fd = -1;
@@ -871,10 +875,7 @@ static int sdk_tcp_open_owner_channel(
     }
 
     sdk_tcp_channel_t *state = calloc(1, sizeof(*state));
-    if (!state) {
-        close(fd);
-        return -1;
-    }
+    assert(state != NULL);
     state->fd = fd;
     state->desc = desc;
     channel->state = state;
@@ -887,8 +888,8 @@ static int sdk_tcp_open_owner_channel(
 
 /* Fetch topology over a fresh TCP control connection. A bootstrap address
  * can be down or stale, so every snapshot attempt walks the complete seed
- * set from a rotating start point. The returned snapshot, not the seed,
- * determines the data-plane owner and transport. */
+ * set from a rotating start point. The snapshot determines owner endpoints;
+ * the client startup contract determines the data transport. */
 static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
 {
     if (client->bootstrap_seed_count == 0)
@@ -908,6 +909,8 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
                 seed->host, seed->port, timeout_ms, &topology, NULL) != 0) {
             continue;
         }
+        sdk_warn_topology_transport_mismatch(client, &topology,
+                                             seed->host, seed->port);
         const vemb_v16_client_topology_t *old =
             vemb_v16_cluster_core_topology(&client->cluster);
         int topology_changed = old->current_topology_epoch !=
@@ -952,8 +955,10 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
             /* L0/cache identity includes topology epoch even for TCP, where
              * the owner session deliberately remains V1_ONLY. */
             if (topology_changed || v2_quiesce) {
-                sdk_handle_session_owner_quiesce(client, owner);
-                sdk_vector_session_owner_quiesce(client, owner);
+                if (client->handle_session)
+                    sdk_handle_session_owner_quiesce(client, owner);
+                if (client->vector_session)
+                    sdk_vector_session_owner_quiesce(client, owner);
             }
             if (topology_changed)
                 client->owner_v2[owner].unavailable = 0;
@@ -971,8 +976,6 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
 static void sdk_tcp_close_channel(vemb_v16_data_channel_t *channel)
 {
     sdk_tcp_channel_t *state = sdk_tcp_state(channel);
-    if (!state)
-        return;
     if (state->fd >= 0) {
         char close_buf[32];
         memset(close_buf, 0, sizeof(close_buf));
@@ -1168,18 +1171,24 @@ failed:
 vemb_v16_client_t *vemb_v16_client_create(const char *seeds[],
                                            int seed_count,
                                            uint32_t dim,
-                                           uint32_t timeout_ms)
+                                           uint32_t timeout_ms,
+                                           uint32_t transport_type)
 {
     if (!seeds || seed_count <= 0 ||
         seed_count > VEMB_V16_SDK_MAX_ENDPOINTS ||
-        dim == 0 || dim > VEMB_V16_MAX_DIM)
+        dim == 0 || dim > VEMB_V16_MAX_DIM ||
+        (transport_type != VEMB_V16_TRANSPORT_TCP &&
+         transport_type != VEMB_V16_TRANSPORT_AERON))
         return NULL;
 
     vemb_v16_client_t *c = calloc(1, sizeof(*c));
-    if (!c) return NULL;
+    assert(c != NULL);
     c->dim               = dim;
     c->req_id            = 1;
     c->ub_batch_request_size = VEMB_V16_BATCH_REQUEST_SIZE_DEFAULT;
+    c->transport_type = transport_type;
+    c->vector_read_op = transport_type == VEMB_V16_TRANSPORT_AERON ?
+        VEMB_V16_OP_VEMB_HANDLE : VEMB_V16_OP_VEMB_INLINE;
     c->bootstrap_seed_count = (uint32_t)seed_count;
     c->connect_timeout_ms = timeout_ms;
     vemb_v16_cluster_core_init(&c->cluster, 1, 256);
@@ -1204,7 +1213,8 @@ int vemb_v16_client_configure_ub_peer_view(
     vemb_v16_client_t *client, const char *manifest_path,
     const char *client_host)
 {
-    if (!client || !manifest_path || !manifest_path[0] || !client_host ||
+    if (!manifest_path || !manifest_path[0] || !client_host ||
+        client->transport_type != VEMB_V16_TRANSPORT_AERON ||
         !client_host[0] || strlen(client_host) >=
             sizeof(client->ub_peer_view_client_host)) {
         return -1;
@@ -1235,7 +1245,8 @@ int vemb_v16_client_configure_ub_peer_view(
 int vemb_v16_client_set_ub_batch_request_size(
     vemb_v16_client_t *client, uint32_t requested_batch_size)
 {
-    if (!client || requested_batch_size == 0 ||
+    if (requested_batch_size == 0 ||
+        client->transport_type != VEMB_V16_TRANSPORT_AERON ||
         requested_batch_size > VEMB_V16_BATCH_REQUEST_SIZE_MAX) {
         return -1;
     }
@@ -1249,7 +1260,6 @@ int vemb_v16_client_set_ub_batch_request_size(
 
 void vemb_v16_client_destroy(vemb_v16_client_t *c)
 {
-    if (!c) return;
     if (c->handle_session)
         vemb_v16_client_handle_session_close(c->handle_session, NULL, NULL);
     if (c->vector_session)
@@ -1268,14 +1278,7 @@ void vemb_v16_client_destroy(vemb_v16_client_t *c)
 static void sdk_owner_v2_stop(vemb_v16_client_t *client, uint32_t owner_id)
 {
     sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    if (!client->owner_session_inited[owner_id]) {
-        if (v2->channel) {
-            vemb_v16_aeron_batch_close(v2->channel);
-            vemb_v16_cli_l0_destroy(v2->l0);
-            *v2 = (sdk_owner_v2_t){0};
-        }
-        return;
-    }
+    assert(client->owner_session_inited[owner_id]);
 
     vemb_v16_owner_session_t *session =
         &client->owner_sessions[owner_id];
@@ -1295,7 +1298,9 @@ static void sdk_owner_v2_stop(vemb_v16_client_t *client, uint32_t owner_id)
 static void sdk_owner_channel_close(vemb_v16_client_t *client,
                                     uint32_t owner_id)
 {
-    sdk_vector_session_owner_quiesce(client, owner_id);
+    assert(client->owner_channel_inited[owner_id]);
+    if (client->vector_session)
+        sdk_vector_session_owner_quiesce(client, owner_id);
     sdk_owner_v2_stop(client, owner_id);
     sdk_backend_close(&client->owner_channels[owner_id]);
     client->owner_channel_inited[owner_id] = 0;
@@ -1304,15 +1309,13 @@ static void sdk_owner_channel_close(vemb_v16_client_t *client,
 
 /* v2 is optional and is never the source of owner routing. It can only be
  * reopened after the permanent v1 channel established the owner generation.
- * Peer-view is mandatory for every UB owner: a rejected ATTACH or migration
- * state leaves the owner on v1 without changing the logical operation. */
+ * Peer-view is mandatory for every owner of an AERON client: a rejected ATTACH
+ * or migration state leaves the owner on v1 without changing the logical
+ * operation. */
 static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
 {
     sdk_backend_t *backend = &client->owner_channels[owner_id];
-    if (backend->ops != &sdk_ub_data_transport_ops ||
-        !client->owner_session_inited[owner_id]) {
-        return 0;
-    }
+    assert(client->owner_session_inited[owner_id]);
 
     vemb_v16_owner_session_t *session =
         &client->owner_sessions[owner_id];
@@ -1324,8 +1327,10 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
     if (session->migration_active ||
         session->v2_state == VEMB_V16_OWNER_SESSION_V2_DRAINING)
         return 0;
-    if (session->v2_state == VEMB_V16_OWNER_SESSION_V2_READY)
-        return v2->channel != NULL;
+    if (session->v2_state == VEMB_V16_OWNER_SESSION_V2_READY) {
+        assert(v2->channel != NULL && v2->l0 != NULL);
+        return 1;
+    }
     if (session->v2_state != VEMB_V16_OWNER_SESSION_V1_ONLY)
         return 0;
 
@@ -1342,24 +1347,11 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
             return 0;
         }
         vemb_v16_aeron_batch_resources_t resources;
-        if (vemb_v16_aeron_batch_get_resources(v2->channel, &resources) != 0) {
-            vemb_v16_aeron_batch_close(v2->channel);
-            *v2 = (sdk_owner_v2_t){0};
-            v2->unavailable = 1;
-            vemb_v16_owner_session_v2_channel_failed(session);
-            return 0;
-        }
+        vemb_v16_aeron_batch_get_resources(v2->channel, &resources);
         v2->effective_batch_size = resources.effective_batch_size;
         v2->max_batch_bytes = resources.max_batch_bytes;
         v2->next_batch_id = 1;
         v2->l0 = vemb_v16_cli_l0_create(1);
-        if (!v2->l0) {
-            vemb_v16_aeron_batch_close(v2->channel);
-            *v2 = (sdk_owner_v2_t){0};
-            v2->unavailable = 1;
-            vemb_v16_owner_session_v2_channel_failed(session);
-            return 0;
-        }
     }
     vemb_v16_owner_session_v2_channel_ready(session);
     return 1;
@@ -1370,13 +1362,12 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
  * owner_channels[owner_id]), -1 on failure. Idempotent: if channel already
  * open, returns 0 without re-opening.
  *
- * Its channel identity lives in cluster core. owner_id selects one immutable
- * data transport for this client's lifetime; a topology refresh may move the
- * same backend endpoint but cannot switch TCP and UB for that owner. */
+ * Its channel identity lives in cluster core. The client startup contract has
+ * already fixed one data transport for every owner; a topology refresh may
+ * move an endpoint but cannot change its transport. */
 static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
 {
-    if (!client || owner_id >= VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS)
-        return -1;
+    assert(owner_id < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS);
 
     const vemb_v16_topology_endpoint_t *ep =
         vemb_v16_client_topology_find_endpoint(
@@ -1387,22 +1378,10 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
         return -1;
     }
     const vemb_v16_data_transport_ops_t *transport =
-        sdk_transport_for_endpoint(ep);
-    if (!transport) {
-        fprintf(stderr, "vemb_v16_client: unsupported transport for owner_id=%u\n",
-                owner_id);
-        return -1;
-    }
+        client->transport_type == VEMB_V16_TRANSPORT_AERON ?
+            &sdk_ub_data_transport_ops : &sdk_tcp_data_transport_ops;
 
     sdk_backend_t *b = &client->owner_channels[owner_id];
-    /* b->ops remains after close, so it is the owner's first-bound data-plane
-     * identity even while a same-backend channel is being reattached. */
-    if (b->ops && b->ops != transport) {
-        fprintf(stderr,
-                "vemb_v16_client: transport identity changed for owner_id=%u\n",
-                owner_id);
-        return -1;
-    }
     const vemb_v16_client_topology_t *topology =
         vemb_v16_cluster_core_topology(&client->cluster);
     /* A topology epoch alone does not close an endpoint-stable channel. On
@@ -1436,7 +1415,7 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
             return -1;
         sdk_owner_channel_close(client, owner_id);
     }
-    /* The owner slot survives same-backend reattach so its local generation
+    /* The owner slot survives reattach so its local generation
      * remains monotonic and invalidates handles produced by the old mapping. */
     if (!b->ops)
         sdk_backend_init(b, transport);
@@ -1475,7 +1454,7 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
             "[sdk] owner channel open begin owner=%u endpoint=%s:%u "
             "transport=%s epoch=%llu\n",
             owner_id, ep->host, ep->tcp_port,
-            ep->transport_type == VEMB_V16_TRANSPORT_AERON ? "aeron" : "tcp",
+            vemb_v16_transport_name(client->transport_type),
             (unsigned long long)topology->current_topology_epoch);
     if (sdk_backend_open(b, client->dim, client->connect_timeout_ms,
                          owner_id, backend_context) != 0) {
@@ -1514,7 +1493,7 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
 }
 
 /* ------------------------------------------------------------------ */
-/* Common-core asynchronous VEMB_HANDLE session (UB owners only)     */
+/* Common-core asynchronous VEMB_HANDLE session (AERON clients only) */
 /* ------------------------------------------------------------------ */
 
 #define SDK_HANDLE_SESSION_MAX_PENDING VEMB_V16_CLI_L0_MAX_FOLLOWERS
@@ -1928,23 +1907,16 @@ static uint32_t sdk_handle_session_route_requests(
                                                    priv);
             continue;
         }
-        int supports_handle = sdk_owner_supports_handle(session->client,
-                                                         route.owner_id);
-        int channel_rc = supports_handle ?
-            ensure_owner_channel(session->client, route.owner_id) : -1;
-        int channel_is_ub =
-            session->client->owner_channels[route.owner_id].ops ==
-            &sdk_ub_data_transport_ops;
+        int channel_rc = ensure_owner_channel(session->client, route.owner_id);
         if (request->operation.operation_id <= 8 ||
             request->operation.operation_id % 1024 == 0) {
             fprintf(stderr,
                     "[sdk] handle route decision op=%llu owner=%u "
-                    "supports_handle=%d channel_rc=%d channel_ub=%d\n",
+                    "channel_rc=%d\n",
                     (unsigned long long)request->operation.operation_id,
-                    route.owner_id, supports_handle, channel_rc,
-                    channel_is_ub);
+                    route.owner_id, channel_rc);
         }
-        if (!supports_handle || channel_rc != 0 || !channel_is_ub) {
+        if (channel_rc != 0) {
             vemb_v16_resp_t error = sdk_handle_session_error_response();
             callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                    priv);
@@ -2185,8 +2157,6 @@ static void sdk_handle_session_owner_quiesce(
     vemb_v16_client_t *client, uint32_t owner_id)
 {
     vemb_v16_client_handle_session_t *session = client->handle_session;
-    if (!session)
-        return;
     sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
     if (v2->l0)
         vemb_v16_cli_l0_drain_pending(v2->l0,
@@ -2203,11 +2173,10 @@ vemb_v16_client_handle_session_t *vemb_v16_client_handle_session_create(
     vemb_v16_client_t *client,
     const vemb_v16_client_handle_session_options_t *options)
 {
-    if (!client || client->handle_session || client->vector_session)
-        return NULL;
+    RETURN_IF(client->vector_read_op != VEMB_V16_OP_VEMB_HANDLE ||
+              client->handle_session || client->vector_session, NULL);
     vemb_v16_client_handle_session_t *session = calloc(1, sizeof(*session));
-    if (!session)
-        return NULL;
+    assert(session != NULL);
     uint64_t delay_ns = options ?
         (uint64_t)options->max_batch_delay_us * 1000u : 0;
     if (delay_ns)
@@ -2226,9 +2195,9 @@ int vemb_v16_client_handle_session_submit(
     vemb_v16_client_handle_session_t *session, const char *set_name,
     const char *elem_name, uint64_t caller_cookie)
 {
-    if (!session || session->closing || !elem_name || !elem_name[0] ||
-        session->active_requests == SDK_HANDLE_SESSION_MAX_PENDING)
-        return -1;
+    RETURN_IF(session->closing ||
+              session->active_requests == SDK_HANDLE_SESSION_MAX_PENDING,
+              -1);
     uint32_t request_id = SDK_HANDLE_SESSION_NO_ENTRY;
     for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
         if (session->requests[i].state == SDK_HANDLE_SESSION_REQUEST_FREE) {
@@ -2236,8 +2205,7 @@ int vemb_v16_client_handle_session_submit(
             break;
         }
     }
-    if (request_id == SDK_HANDLE_SESSION_NO_ENTRY)
-        return -1;
+    assert(request_id != SDK_HANDLE_SESSION_NO_ENTRY);
 
     char key[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
@@ -2262,8 +2230,7 @@ int vemb_v16_client_handle_session_submit(
 int vemb_v16_client_handle_session_flush(
     vemb_v16_client_handle_session_t *session)
 {
-    if (!session || session->closing)
-        return -1;
+    RETURN_IF(session->closing, -1);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
         if (sdk_handle_session_flush_owner(session, owner, NULL, NULL, 0) != 0)
@@ -2276,8 +2243,7 @@ int vemb_v16_client_handle_session_poll(
     vemb_v16_client_handle_session_t *session,
     vemb_v16_client_handle_completion_cb cb, void *priv)
 {
-    if (!session || session->closing)
-        return -1;
+    RETURN_IF(session->closing, -1);
     uint32_t callbacks = 0;
     callbacks += sdk_handle_session_route_requests(session, cb, priv);
     for (uint32_t owner = 0;
@@ -2298,8 +2264,7 @@ int vemb_v16_client_handle_session_poll(
 uint64_t vemb_v16_client_handle_session_next_flush_deadline_ns(
     const vemb_v16_client_handle_session_t *session)
 {
-    if (!session || session->closing)
-        return 0;
+    RETURN_IF(session->closing, 0);
     uint64_t earliest = 0;
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
@@ -2314,8 +2279,7 @@ void vemb_v16_client_handle_session_close(
     vemb_v16_client_handle_session_t *session,
     vemb_v16_client_handle_completion_cb cb, void *priv)
 {
-    if (!session || session->closing)
-        return;
+    RETURN_IF(session->closing);
     session->closing = 1;
     vemb_v16_resp_t error = sdk_handle_session_error_response();
     for (uint32_t owner = 0;
@@ -2507,13 +2471,10 @@ static int sdk_vector_session_submit_v1(
     sdk_backend_t *backend = &session->client->owner_channels[route->owner_id];
     uint32_t vector_bytes = session->client->dim * sizeof(float);
     float *vector = malloc(vector_bytes);
-    if (!vector)
-        return -1;
+    assert(vector != NULL);
 
-    uint8_t op = sdk_owner_supports_handle(session->client, route->owner_id) ?
-        VEMB_V16_OP_VEMB_HANDLE : VEMB_V16_OP_VEMB_INLINE;
     vemb_v16_req_t wire_request = {
-        .op = op,
+        .op = session->client->vector_read_op,
         .flags = route->request_flags,
         .req_id = session->client->req_id++,
         .channel_id = backend->channel_id,
@@ -2693,16 +2654,7 @@ static uint32_t sdk_vector_session_route_requests(
         vemb_v16_cli_l0_t *l0 = session->l0[route.owner_id];
         if (!l0) {
             l0 = vemb_v16_cli_l0_create(1);
-            if (l0)
-                session->l0[route.owner_id] = l0;
-        }
-        if (!l0) {
-            if (sdk_vector_session_submit_v1(session, i, &route) != 0) {
-                vemb_v16_resp_t error = sdk_vector_session_error_response();
-                callbacks += sdk_vector_session_finish(session, i, &error,
-                                                       NULL, cb, priv);
-            }
-            continue;
+            session->l0[route.owner_id] = l0;
         }
 
         vemb_v16_owner_session_identity_t identity = {
@@ -2750,17 +2702,20 @@ static void sdk_vector_session_materialize(
         return;
 
     uint32_t expected_bytes = session->client->dim * sizeof(float);
-    if (response->vector_bytes != expected_bytes || !request->vector) {
+    if (response->vector_bytes != expected_bytes) {
         *response = sdk_vector_session_error_response();
         return;
     }
-    if (response->op == VEMB_V16_OP_VEMB_INLINE) {
+    if (response->op != session->client->vector_read_op) {
+        *response = sdk_vector_session_error_response();
+        return;
+    }
+    if (session->client->vector_read_op == VEMB_V16_OP_VEMB_INLINE) {
         if (inline_bytes != expected_bytes)
             *response = sdk_vector_session_error_response();
         return;
     }
-    if (response->op != VEMB_V16_OP_VEMB_HANDLE ||
-        sdk_backend_read_warm_vector(
+    if (sdk_backend_read_warm_vector(
             &session->client->owner_channels[owner_id], response->region_id,
             response->vector_offset, response->vector_bytes, request->vector,
             expected_bytes) != 0) {
@@ -2861,10 +2816,10 @@ static void sdk_vector_session_owner_quiesce(
     vemb_v16_client_t *client, uint32_t owner_id)
 {
     vemb_v16_client_vector_session_t *session = client->vector_session;
-    if (session && session->l0[owner_id])
+    if (session->l0[owner_id])
         vemb_v16_cli_l0_drain_pending(
             session->l0[owner_id], sdk_vector_session_requeue_fanout, session);
-    if (session && session->cache)
+    if (session->cache)
         vemb_v16_cli_l1_clear(session->cache);
 }
 
@@ -2879,11 +2834,9 @@ vemb_v16_client_vector_session_create_with_options(
     vemb_v16_client_t *client,
     const vemb_v16_client_vector_session_options_t *options)
 {
-    if (!client || client->handle_session || client->vector_session)
-        return NULL;
+    RETURN_IF(client->handle_session || client->vector_session, NULL);
     vemb_v16_client_vector_session_t *session = calloc(1, sizeof(*session));
-    if (!session)
-        return NULL;
+    assert(session != NULL);
     session->client = client;
     for (uint32_t i = 0; i < SDK_VECTOR_SESSION_MAX_PENDING; i++)
         session->requests[i].l0_entry_id = SDK_VECTOR_SESSION_NO_ENTRY;
@@ -2914,9 +2867,9 @@ int vemb_v16_client_vector_session_submit(
     vemb_v16_client_vector_session_t *session, const char *set_name,
     const char *elem_name, uint64_t caller_cookie)
 {
-    if (!session || session->closing || !elem_name || !elem_name[0] ||
-        session->active_requests == SDK_VECTOR_SESSION_MAX_PENDING)
-        return -1;
+    RETURN_IF(session->closing ||
+              session->active_requests == SDK_VECTOR_SESSION_MAX_PENDING,
+              -1);
     uint32_t request_id = SDK_VECTOR_SESSION_NO_ENTRY;
     for (uint32_t i = 0; i < SDK_VECTOR_SESSION_MAX_PENDING; i++) {
         if (session->requests[i].state == SDK_VECTOR_SESSION_REQUEST_FREE) {
@@ -2924,8 +2877,7 @@ int vemb_v16_client_vector_session_submit(
             break;
         }
     }
-    if (request_id == SDK_VECTOR_SESSION_NO_ENTRY)
-        return -1;
+    assert(request_id != SDK_VECTOR_SESSION_NO_ENTRY);
 
     char key[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
@@ -2948,14 +2900,7 @@ int vemb_v16_client_vector_session_submit(
         if (vemb_v16_cli_l1_lookup(session->cache, request->key,
                                     request->key_len, key_hash, &value) == 1) {
             request->vector = malloc(value.vector_bytes);
-            if (!request->vector) {
-                (void)vemb_v16_cli_l1_release(session->cache, &value.ref);
-                *request = (sdk_vector_session_request_t){
-                    .state = SDK_VECTOR_SESSION_REQUEST_FREE,
-                    .l0_entry_id = SDK_VECTOR_SESSION_NO_ENTRY,
-                };
-                return -1;
-            }
+            assert(request->vector != NULL);
             memcpy(request->vector, value.vector, value.vector_bytes);
             assert(vemb_v16_cli_l1_release(session->cache, &value.ref) == 0);
             request->state = SDK_VECTOR_SESSION_REQUEST_CACHE;
@@ -2968,8 +2913,7 @@ int vemb_v16_client_vector_session_submit(
 int vemb_v16_client_vector_session_flush(
     vemb_v16_client_vector_session_t *session)
 {
-    if (!session || session->closing)
-        return -1;
+    RETURN_IF(session->closing, -1);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
         if (sdk_vector_session_flush_owner(session, owner, NULL, NULL) != 0)
@@ -2982,8 +2926,7 @@ int vemb_v16_client_vector_session_poll(
     vemb_v16_client_vector_session_t *session,
     vemb_v16_client_vector_completion_cb cb, void *priv)
 {
-    if (!session || session->closing)
-        return -1;
+    RETURN_IF(session->closing, -1);
     uint32_t callbacks = 0;
     callbacks += sdk_vector_session_poll_cache(session, cb, priv);
     callbacks += sdk_vector_session_route_requests(session, cb, priv);
@@ -2999,8 +2942,7 @@ void vemb_v16_client_vector_session_close(
     vemb_v16_client_vector_session_t *session,
     vemb_v16_client_vector_completion_cb cb, void *priv)
 {
-    if (!session || session->closing)
-        return;
+    RETURN_IF(session->closing);
     session->closing = 1;
     vemb_v16_resp_t error = sdk_vector_session_error_response();
     for (uint32_t i = 0; i < SDK_VECTOR_SESSION_MAX_PENDING; i++) {
@@ -3049,19 +2991,16 @@ void vemb_v16_client_vector_session_close(
  * On return, out_resp is populated with the last server response. For
  * VEMB_INLINE, the inline vector bytes are streamed into out_inline /
  * out_inline_cap (caller-allocated). For other ops, pass NULL/0. */
-static int client_execute_with_redirect_impl(
+static int client_execute_with_redirect(
         vemb_v16_client_t *client,
         uint8_t  op_type,
-        int tcp_handle_as_inline,
         const char *key, uint32_t key_len,
         const float *payload, uint32_t dim,
         vemb_v16_resp_t *out_resp,
         uint8_t *out_inline, uint32_t out_inline_cap,
         uint32_t *out_inline_bytes)
 {
-    if (!client || client->handle_session || client->vector_session || !key ||
-        key_len == 0 || !out_resp)
-        return -1;
+    RETURN_IF(client->handle_session || client->vector_session, -1);
     memset(out_resp, 0, sizeof(*out_resp));
     if (out_inline_bytes) *out_inline_bytes = 0;
 
@@ -3090,38 +3029,18 @@ static int client_execute_with_redirect_impl(
             return 0;
         }
 
-        uint8_t request_op = op_type;
-        if (op_type == VEMB_V16_OP_VEMB_HANDLE &&
-            !sdk_owner_supports_handle(client, route.owner_id)) {
-            if (!tcp_handle_as_inline) {
-                *out_resp = (vemb_v16_resp_t){
-                    .status = VEMB_V16_STATUS_ERR,
-                    .op = VEMB_V16_OP_VEMB_HANDLE,
-                };
-                vemb_v16_cluster_core_complete(&client->cluster, &operation,
-                                               out_resp->status);
-                return 0;
-            }
-            request_op = VEMB_V16_OP_VEMB_INLINE;
-        }
-
         if (ensure_owner_channel(client, route.owner_id) != 0) {
             vemb_v16_cluster_core_complete(&client->cluster, &operation,
                                            VEMB_V16_STATUS_ERR);
             return -1;
         }
         sdk_backend_t *target = &client->owner_channels[route.owner_id];
-
-        if (!sdk_backend_ready(target)) {
-            vemb_v16_cluster_core_complete(&client->cluster, &operation,
-                                           VEMB_V16_STATUS_ERR);
-            return -1;
-        }
+        assert(sdk_backend_ready(target));
 
         /* Build request */
         vemb_v16_req_t req;
         memset(&req, 0, sizeof(req));
-        req.op = request_op;
+        req.op = op_type;
         req.flags = route.request_flags;
         req.req_id = client->req_id++;
         req.channel_id = target->channel_id;
@@ -3131,24 +3050,14 @@ static int client_execute_with_redirect_impl(
         req.topology_epoch = route.topology_epoch;
         req.dim = dim;
 
-        switch (request_op) {
+        switch (op_type) {
         case VEMB_V16_OP_VADD:
         case VEMB_V16_OP_VSIM_INLINE:
-            if (!payload || dim == 0) {
-                vemb_v16_cluster_core_complete(&client->cluster, &operation,
-                                               VEMB_V16_STATUS_ERR);
-                return -1;
-            }
             req.vector_bytes = dim * sizeof(float);
             memcpy(req.vector, payload, req.vector_bytes);
             break;
         case VEMB_V16_OP_VEMB_HANDLE:
         case VEMB_V16_OP_VEMB_INLINE:
-            if (dim == 0) {
-                vemb_v16_cluster_core_complete(&client->cluster, &operation,
-                                               VEMB_V16_STATUS_ERR);
-                return -1;
-            }
             req.vector_bytes = dim * sizeof(float);
             break;
         case VEMB_V16_OP_VREM:
@@ -3156,9 +3065,7 @@ static int client_execute_with_redirect_impl(
             req.vector_bytes = 0;
             break;
         default:
-            vemb_v16_cluster_core_complete(&client->cluster, &operation,
-                                           VEMB_V16_STATUS_ERR);
-            return -1;
+            assert(0 && "unsupported SDK operation");
         }
 
         vemb_v16_transport_submission_t submission = {
@@ -3217,20 +3124,6 @@ static int client_execute_with_redirect_impl(
     }
 }
 
-static int client_execute_with_redirect(
-        vemb_v16_client_t *client,
-        uint8_t op_type,
-        const char *key, uint32_t key_len,
-        const float *payload, uint32_t dim,
-        vemb_v16_resp_t *out_resp,
-        uint8_t *out_inline, uint32_t out_inline_cap,
-        uint32_t *out_inline_bytes)
-{
-    return client_execute_with_redirect_impl(
-        client, op_type, 0, key, key_len, payload, dim, out_resp, out_inline,
-        out_inline_cap, out_inline_bytes);
-}
-
 /* ------------------------------------------------------------------ */
 /* Pipeline retry engine                                               */
 /* ------------------------------------------------------------------ */
@@ -3278,8 +3171,7 @@ static void pipeline_build_req(vemb_v16_req_t *req,
     case VEMB_V16_OP_VADD:
     case VEMB_V16_OP_VSIM_INLINE:
         req->vector_bytes = dim * sizeof(float);
-        if (payload)
-            memcpy(req->vector, payload, req->vector_bytes);
+        memcpy(req->vector, payload, req->vector_bytes);
         break;
     case VEMB_V16_OP_VEMB_HANDLE:
     case VEMB_V16_OP_VEMB_INLINE:
@@ -3290,7 +3182,7 @@ static void pipeline_build_req(vemb_v16_req_t *req,
         req->vector_bytes = 0;
         break;
     default:
-        break;
+        assert(0 && "unsupported pipeline operation");
     }
 }
 
@@ -3299,7 +3191,7 @@ static void pipeline_fill_aux(vemb_v16_pipe_entry_aux_t *aux,
                               const vemb_v16_resp_t *resp,
                               uint32_t client_dim)
 {
-    if (!aux) return;
+    RETURN_IF(aux == NULL);
     aux->offset    = resp->vector_offset;
     aux->bytes     = resp->vector_bytes;
     aux->dim       = resp->dim > 0 ? resp->dim : client_dim;
@@ -3591,16 +3483,6 @@ static int client_pipeline_execute_with_redirect(
         for (uint32_t oi = 0; oi < distinct_count; oi++) {
             uint32_t owner = distinct_owners[oi];
 
-            if (op_type == VEMB_V16_OP_VEMB_HANDLE &&
-                !sdk_owner_supports_handle(client, owner)) {
-                for (uint32_t i = 0; i < count; i++) {
-                    if (out_entry_status[i] == PIPE_ENTRY_PENDING &&
-                        owners[i] == owner)
-                        out_entry_status[i] = PIPE_ENTRY_ERR;
-                }
-                continue;
-            }
-
             if (ensure_owner_channel(client, owner) != 0) {
                 /* Can't open channel — mark this owner's entries ERR. */
                 for (uint32_t i = 0; i < count; i++) {
@@ -3612,14 +3494,7 @@ static int client_pipeline_execute_with_redirect(
                 continue;
             }
             sdk_backend_t *target = &client->owner_channels[owner];
-            if (!sdk_backend_ready(target)) {
-                for (uint32_t i = 0; i < count; i++) {
-                    if (out_entry_status[i] == PIPE_ENTRY_PENDING &&
-                        owners[i] == owner)
-                        out_entry_status[i] = PIPE_ENTRY_ERR;
-                }
-                continue;
-            }
+            assert(sdk_backend_ready(target));
 
             /* Collect the indices of pending entries for this owner. */
             uint32_t group_indices[count];
@@ -3760,8 +3635,6 @@ static int client_pipeline_execute_with_redirect(
                         &client->cluster, &operations[src_idx],
                         &ask_route) != VEMB_V16_CLUSTER_PREPARE_READY ||
                     ask_route.owner_id == owner ||
-                    (op_type == VEMB_V16_OP_VEMB_HANDLE &&
-                     !sdk_owner_supports_handle(client, ask_route.owner_id)) ||
                     ensure_owner_channel(client, ask_route.owner_id) != 0) {
                     out_entry_status[src_idx] = PIPE_ENTRY_ERR;
                     continue;
@@ -3873,8 +3746,8 @@ int vemb_v16_client_vadd(vemb_v16_client_t *c,
                          const float *vector,
                          uint32_t dim)
 {
-    if (!c || !elem_name || !vector || unlikely(dim != c->dim))
-        return -1;
+    assert(vector != NULL);
+    RETURN_IF(dim != c->dim, -1);
 
     char combined[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
@@ -3900,8 +3773,7 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *c,
                                 uint32_t *out_dim,
                                 uint32_t *out_region_id)
 {
-    if (!c || !elem_name)
-        return -1;
+    RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_HANDLE, -1);
 
     char combined[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
@@ -3932,9 +3804,6 @@ int vemb_v16_client_vrem(vemb_v16_client_t *c,
                          const char *set_name,
                          const char *elem_name)
 {
-    if (!c || !elem_name)
-        return -1;
-
     char combined[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
     if (vemb_v16_build_combined_key(combined, sizeof(combined),
@@ -3963,9 +3832,7 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
                                 uint32_t out_cap,
                                 uint32_t *out_dim)
 {
-    if (!c || !elem_name || !out_vector || out_cap == 0)
-        return -1;
-
+    assert(out_vector != NULL && out_cap > 0);
     char combined[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
     if (vemb_v16_build_combined_key(combined, sizeof(combined),
@@ -3975,8 +3842,8 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
     vemb_v16_resp_t resp;
     uint32_t inline_bytes = 0;
     uint32_t inline_cap_bytes = out_cap * sizeof(float);
-    if (client_execute_with_redirect_impl(
-            c, VEMB_V16_OP_VEMB_HANDLE, 1, combined, key_len, NULL, c->dim,
+    if (client_execute_with_redirect(
+            c, c->vector_read_op, combined, key_len, NULL, c->dim,
             &resp, (uint8_t *)out_vector, inline_cap_bytes,
             &inline_bytes) != 0) {
         return -1;
@@ -4016,9 +3883,8 @@ int vemb_v16_client_vsim(vemb_v16_client_t *c,
                          uint32_t dim,
                          float *out_score)
 {
-    if (!c || !elem_name ||
-        !query_vector || unlikely(dim != c->dim) || !out_score)
-        return -1;
+    assert(query_vector != NULL && out_score != NULL);
+    RETURN_IF(dim != c->dim, -1);
 
     char combined[VEMB_V16_MAX_KEY_LEN];
     uint32_t key_len;
@@ -4053,9 +3919,8 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
                                   uint32_t count,
                                   uint32_t max_inflight)
 {
-    if (!c || c->handle_session || c->vector_session || count == 0 ||
-        !set_names || !elem_names || !vectors)
-        return -1;
+    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    assert(set_names != NULL && elem_names != NULL && vectors != NULL);
 
     /* Build combined keys + flat arrays for the engine. */
     char combined_keys[count][VEMB_V16_MAX_KEY_LEN];
@@ -4064,6 +3929,7 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
     const float *payload_ptrs[count];
 
     for (uint32_t i = 0; i < count; i++) {
+        assert(vectors[i] != NULL);
         if (vemb_v16_build_combined_key(combined_keys[i], VEMB_V16_MAX_KEY_LEN,
                                         set_names[i], elem_names[i],
                                         &key_lens[i]) != 0)
@@ -4096,9 +3962,9 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   vemb_v16_pipeline_resp_t *out_resps,
                                   uint32_t max_inflight)
 {
-    if (!c || c->handle_session || c->vector_session || count == 0 ||
-        !set_names || !elem_names || !out_resps)
-        return -1;
+    RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_INLINE ||
+              c->handle_session || c->vector_session || count == 0, -1);
+    assert(set_names != NULL && elem_names != NULL && out_resps != NULL);
 
     /* Build combined keys + flat arrays for the engine. */
     char combined_keys[count][VEMB_V16_MAX_KEY_LEN];
@@ -4121,10 +3987,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
      * for large count × dim. */
     uint8_t *inline_blob = malloc((size_t)count * vec_bytes);
     uint8_t **inline_ptrs = malloc((size_t)count * sizeof(uint8_t *));
-    if (!inline_blob || !inline_ptrs) {
-        free(inline_blob); free(inline_ptrs);
-        return -1;
-    }
+    assert(inline_blob != NULL && inline_ptrs != NULL);
     for (uint32_t i = 0; i < count; i++)
         inline_ptrs[i] = inline_blob + (size_t)i * vec_bytes;
 
@@ -4173,9 +4036,9 @@ int vemb_v16_client_vemb_handle_pipeline(vemb_v16_client_t *c,
                                          vemb_v16_pipeline_resp_t *out_resps,
                                          uint32_t max_inflight)
 {
-    if (!c || c->handle_session || c->vector_session || count == 0 ||
-        !set_names || !elem_names || !out_resps)
-        return -1;
+    RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_HANDLE ||
+              c->handle_session || c->vector_session || count == 0, -1);
+    assert(set_names != NULL && elem_names != NULL && out_resps != NULL);
 
     char combined_keys[count][VEMB_V16_MAX_KEY_LEN];
     uint32_t key_lens[count];
@@ -4222,7 +4085,6 @@ int vemb_v16_client_vemb_handle_pipeline(vemb_v16_client_t *c,
 
 int vemb_v16_client_ping(vemb_v16_client_t *c)
 {
-    if (!c) return -1;
     vemb_v16_cluster_operation_t operation;
     vemb_v16_cluster_operation_init(&c->cluster, &operation, 0);
 
@@ -4302,7 +4164,7 @@ int vemb_v16_client_ping(vemb_v16_client_t *c)
 
 int vemb_v16_client_stats(vemb_v16_client_t *c, vemb_v16_stats_t *out_stats)
 {
-    if (!c || !out_stats) return -1;
+    assert(out_stats != NULL);
     uint32_t start = c->next_topology_seed % c->bootstrap_seed_count;
     uint32_t timeout_ms = c->connect_timeout_ms ? c->connect_timeout_ms : 5000;
     for (uint32_t attempt = 0; attempt < c->bootstrap_seed_count; attempt++) {
@@ -4339,22 +4201,19 @@ int vemb_v16_client_stats(vemb_v16_client_t *c, vemb_v16_stats_t *out_stats)
 
 int vemb_v16_client_topology_refresh(vemb_v16_client_t *client)
 {
-    if (!client) return -1;
     return fetch_topology_via_bootstrap_seeds(client);
 }
 
 void vemb_v16_client_set_retry_budget(vemb_v16_client_t *client,
                                        uint32_t max_attempts)
 {
-    if (client)
-        vemb_v16_cluster_core_set_retry_budget(&client->cluster,
-                                               max_attempts);
+    vemb_v16_cluster_core_set_retry_budget(&client->cluster, max_attempts);
 }
 
 void vemb_v16_client_get_redirect_stats(const vemb_v16_client_t *client,
                                          vemb_v16_redirect_stats_t *out)
 {
-    if (!client || !out) return;
+    assert(out != NULL);
     const vemb_v16_cluster_stats_t *stats =
         vemb_v16_cluster_core_stats(&client->cluster);
     out->ask_redirects            = stats->ask_redirects;
@@ -4366,8 +4225,7 @@ void vemb_v16_client_get_redirect_stats(const vemb_v16_client_t *client,
 void vemb_v16_client_get_logical_stats(const vemb_v16_client_t *client,
                                        vemb_v16_logical_stats_t *out)
 {
-    if (!client || !out)
-        return;
+    assert(out != NULL);
     const vemb_v16_cluster_stats_t *stats =
         vemb_v16_cluster_core_stats(&client->cluster);
     *out = (vemb_v16_logical_stats_t){
@@ -4380,8 +4238,7 @@ void vemb_v16_client_get_logical_stats(const vemb_v16_client_t *client,
 void vemb_v16_client_get_fanout_stats(const vemb_v16_client_t *client,
                                       vemb_v16_fanout_stats_t *out)
 {
-    if (!client || !out)
-        return;
+    assert(out != NULL);
     *out = (vemb_v16_fanout_stats_t){0};
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
@@ -4405,14 +4262,13 @@ int vemb_v16_client_read_vector(vemb_v16_client_t *c,
                                 float *out_vector,
                                 uint32_t out_cap)
 {
-    if (!c || !out_vector || bytes == 0 ||
-        out_cap > UINT32_MAX / sizeof(*out_vector))
-        return -1;
+    assert(out_vector != NULL && out_cap > 0);
+    RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_HANDLE || bytes == 0 ||
+              out_cap > UINT32_MAX / sizeof(*out_vector), -1);
     sdk_backend_t *channel = c->last_handle_channel;
-    if (!channel || !sdk_backend_ready(channel) ||
-        channel->generation != c->last_handle_generation ||
-        channel->ops != &sdk_ub_data_transport_ops)
-        return -1;
+    RETURN_IF(channel == NULL || !sdk_backend_ready(channel) ||
+              channel->generation != c->last_handle_generation ||
+              channel->ops != &sdk_ub_data_transport_ops, -1);
     return sdk_backend_read_warm_vector(
         channel, c->last_handle_region_id, offset, bytes, out_vector,
         out_cap * sizeof(*out_vector));
@@ -4430,10 +4286,9 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
                                   float *out_scores,
                                   uint32_t max_inflight)
 {
-    if (!c || c->handle_session || c->vector_session || count == 0 ||
-        !set_names || !elem_names ||
-        !query_vector || !out_scores)
-        return -1;
+    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    assert(set_names != NULL && elem_names != NULL && query_vector != NULL &&
+           out_scores != NULL);
 
     /* Build combined keys + flat arrays for the engine. VSIM uses the same
      * query_vector for all entries, so payloads[i] = query_vector for all i. */
@@ -4482,11 +4337,12 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
 
 float *vemb_v16_parse_vector_csv(const char *str, uint32_t expected_dim)
 {
+    assert(str != NULL && expected_dim > 0);
     float *vec = malloc(expected_dim * sizeof(float));
-    if (!vec) return NULL;
+    assert(vec != NULL);
 
     char *copy = strdup(str);
-    if (!copy) { free(vec); return NULL; }
+    assert(copy != NULL);
 
     char *p = copy;
     uint32_t parsed = 0;
@@ -4510,6 +4366,7 @@ float *vemb_v16_parse_vector_csv(const char *str, uint32_t expected_dim)
 float *vemb_v16_parse_vector_argv(char **argv, int argc, int start_idx,
                                    uint32_t expected_dim, int *out_consumed)
 {
+    assert(argv != NULL && expected_dim > 0);
     if (start_idx >= argc) return NULL;
 
     /* Case 1: single token with comma-separated values */
@@ -4522,7 +4379,7 @@ float *vemb_v16_parse_vector_argv(char **argv, int argc, int start_idx,
     /* Case 2: individual float tokens */
     if (start_idx + (int)expected_dim > argc) return NULL;
     float *vec = malloc(expected_dim * sizeof(float));
-    if (!vec) return NULL;
+    assert(vec != NULL);
     for (uint32_t i = 0; i < expected_dim; i++) {
         char *end = NULL;
         float v = strtof(argv[start_idx + i], &end);
@@ -4542,8 +4399,7 @@ int vemb_v16_client_vsim_repeat(vemb_v16_client_t *c,
                                  float *out_score, int *out_found,
                                  uint32_t max_inflight)
 {
-    if (!c || !elem_name || !query_vector || repeat == 0)
-        return -1;
+    RETURN_IF(repeat == 0, -1);
 
 #define REPEAT_BATCH 4096
     const char *batch_sets[REPEAT_BATCH];
@@ -4579,8 +4435,7 @@ int vemb_v16_client_vemb_repeat(vemb_v16_client_t *c,
                                  const char *set_name, const char *elem_name,
                                  uint32_t repeat, uint32_t max_inflight)
 {
-    if (!c || !elem_name || repeat == 0)
-        return -1;
+    RETURN_IF(repeat == 0, -1);
 
 #define REPEAT_BATCH 4096
     const char *batch_sets[REPEAT_BATCH];
@@ -4595,8 +4450,12 @@ int vemb_v16_client_vemb_repeat(vemb_v16_client_t *c,
         uint32_t n = (repeat - offset < REPEAT_BATCH)
                      ? (repeat - offset) : REPEAT_BATCH;
         memset(batch_resps, 0, sizeof(batch_resps[0]) * n);
-        if (vemb_v16_client_vemb_pipeline(c, batch_sets, batch_elems,
-                                          n, NULL, batch_resps, max_inflight) != 0) {
+        int rc = c->vector_read_op == VEMB_V16_OP_VEMB_HANDLE ?
+            vemb_v16_client_vemb_handle_pipeline(
+                c, batch_sets, batch_elems, n, batch_resps, max_inflight) :
+            vemb_v16_client_vemb_pipeline(
+                c, batch_sets, batch_elems, n, NULL, batch_resps, max_inflight);
+        if (rc != 0) {
             return -1;
         }
     }
@@ -4609,8 +4468,7 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
                                  const float *vector, uint32_t repeat,
                                  uint32_t max_inflight)
 {
-    if (!c || !elem_name || !vector || repeat == 0)
-        return -1;
+    RETURN_IF(repeat == 0, -1);
 
 #define REPEAT_BATCH 4096
     const char *batch_sets[REPEAT_BATCH];
@@ -5002,8 +4860,6 @@ static int vemb_v16_aeron_batch_resource_valid(
 
 static void vemb_v16_aeron_batch_unmap(
     vemb_v16_aeron_batch_channel_t *ch) {
-    if (!ch)
-        return;
     if (ch->request_descriptor_mapping)
         munmap(ch->request_descriptor_mapping,
                ch->request_descriptor_mapping_bytes);
@@ -5039,7 +4895,7 @@ static void vemb_v16_aeron_notify_close(const char *endpoint,
 static vemb_v16_transport_resource_state_t
 vemb_v16_aeron_check_resource(const vemb_v16_aeron_channel_t *ch)
 {
-    if (!ch || !ch->control_endpoint[0] || ch->resource_generation == 0)
+    if (!ch->control_endpoint[0] || ch->resource_generation == 0)
         return VEMB_V16_TRANSPORT_RESOURCE_FAILED;
     int fd = vemb_v16_aeron_control_connect(ch->control_endpoint);
     if (fd < 0)
@@ -5170,10 +5026,7 @@ vemb_v16_aeron_open_remote_batch_with_peer_view(
             (unsigned long long)resp.response_arena.mmap_offset);
 
     vemb_v16_aeron_batch_channel_t *ch = calloc(1, sizeof(*ch));
-    if (!ch) {
-        vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
-        return NULL;
-    }
+    assert(ch != NULL);
     snprintf(ch->control_endpoint, sizeof(ch->control_endpoint),
              "tcp://%s:%u", host, (unsigned)port);
     ch->channel_id = resp.channel_id;
@@ -5233,7 +5086,6 @@ vemb_v16_aeron_batch_channel_t *vemb_v16_aeron_open_remote_batch(
 }
 
 void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch) {
-    if (!ch) return;
     vemb_v16_aeron_batch_unmap(ch);
     vemb_v16_aeron_notify_close(ch->control_endpoint, ch->channel_id);
     free(ch);
@@ -5241,19 +5093,18 @@ void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch) {
 
 uint64_t vemb_v16_aeron_batch_channel_id(
     const vemb_v16_aeron_batch_channel_t *ch) {
-    return ch ? ch->channel_id : 0;
+    return ch->channel_id;
 }
 
 uint64_t vemb_v16_aeron_batch_topology_epoch(
     const vemb_v16_aeron_batch_channel_t *ch) {
-    return ch ? ch->topology_epoch : 0;
+    return ch->topology_epoch;
 }
 
-int vemb_v16_aeron_batch_get_resources(
+void vemb_v16_aeron_batch_get_resources(
     const vemb_v16_aeron_batch_channel_t *ch,
     vemb_v16_aeron_batch_resources_t *out) {
-    if (!ch || !out)
-        return -1;
+    assert(out != NULL);
     *out = (vemb_v16_aeron_batch_resources_t){
         .request_descriptor_ring = ch->request_descriptor_ring,
         .request_arena = ch->request_arena,
@@ -5264,24 +5115,26 @@ int vemb_v16_aeron_batch_get_resources(
         .effective_batch_size = ch->effective_batch_size,
         .max_batch_bytes = ch->max_batch_bytes,
     };
-    return 0;
 }
 
 int vemb_v16_aeron_batch_publish_handle_at_epoch(
     vemb_v16_aeron_batch_channel_t *ch, uint64_t batch_id,
     uint64_t submit_epoch, const char *const *keys,
     const uint16_t *key_lens, uint32_t item_count) {
-    RETURN_IF(item_count > ch->effective_batch_size, RING_ERR_INVALID);
+    assert(keys != NULL && key_lens != NULL);
+    RETURN_IF(batch_id == 0 || item_count == 0 ||
+              item_count > ch->effective_batch_size, RING_ERR_INVALID);
 
     uint32_t key_bytes = 0;
     for (uint32_t i = 0; i < item_count; i++) {
+        assert(keys[i] != NULL);
+        RETURN_IF(key_lens[i] == 0 || key_lens[i] > VEMB_V16_MAX_KEY_LEN,
+                  RING_ERR_INVALID);
         key_bytes += key_lens[i];
     }
     size_t frame_len = batch_request_encoded_len(key_bytes, item_count);
-    if (frame_len > VEMB_V16_BATCH_MAX_BYTES_MAX ||
-        frame_len > ch->max_batch_bytes) {
-        return RING_ERR_INVALID;
-    }
+    RETURN_IF(frame_len > VEMB_V16_BATCH_MAX_BYTES_MAX ||
+              frame_len > ch->max_batch_bytes, RING_ERR_INVALID);
     uint8_t frame[VEMB_V16_BATCH_MAX_BYTES_MAX];
     batch_request_encode(frame, batch_id, submit_epoch,
                          keys, key_lens,
@@ -5302,11 +5155,11 @@ int vemb_v16_aeron_batch_publish_handle(
 int vemb_v16_aeron_batch_poll_response(
     vemb_v16_aeron_batch_channel_t *ch, uint64_t *batch_id,
     uint64_t *topology_epoch, vemb_v16_resp_t *entries) {
+    assert(batch_id != NULL && topology_epoch != NULL && entries != NULL);
     batch_desc_t desc;
     int peek = batch_desc_peek(ch->response_descriptor_ring, &desc);
-    if (!peek) return 0;
-    if (!batch_desc_is_current(ch->response_descriptor_ring, &desc))
-        return 0;
+    RETURN_IF(!peek, 0);
+    RETURN_IF(!batch_desc_is_current(ch->response_descriptor_ring, &desc), 0);
     if (desc.bytes == 0 || desc.bytes > ch->max_batch_bytes ||
         desc.start % ch->max_batch_bytes + desc.bytes > ch->max_batch_bytes) {
         fprintf(stderr,
@@ -5346,7 +5199,7 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *control_endpoint,
     if (!control_endpoint || !control_endpoint[0] || dim == 0) return NULL;
 
     vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
-    if (!ch) return NULL;
+    assert(ch != NULL);
     strncpy(ch->control_endpoint, control_endpoint,
             sizeof(ch->control_endpoint) - 1);
 
@@ -5452,10 +5305,7 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
     }
 
     vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
-    if (!ch) {
-        vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
-        return NULL;
-    }
+    assert(ch != NULL);
     memcpy(ch->control_endpoint, endpoint, sizeof(ch->control_endpoint));
     ch->remote = 1;
     ch->desc.channel_id          = resp.channel_id;
@@ -5562,7 +5412,6 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
 }
 
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
-    if (!ch) return;
     for (uint32_t i = 0; i < ch->warm_count; i++) {
         if (ch->warm[i].valid && ch->warm[i].mapping_addr) {
             munmap(ch->warm[i].mapping_addr, ch->warm[i].mapping_bytes);
@@ -5600,20 +5449,19 @@ int vemb_v16_aeron_close_all(const char *control_endpoint) {
 }
 
 uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch) {
-    if (!ch) return 0;
     return ch->desc.channel_id;
 }
 
 uint64_t vemb_v16_aeron_channel_resource_generation(
     const vemb_v16_aeron_channel_t *ch)
 {
-    return ch ? ch->resource_generation : 0;
+    return ch->resource_generation;
 }
 
 int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
                                    const void *buf, uint32_t len) {
+    assert(buf != NULL);
     static uint32_t s_diag_printed = 0;
-    if (!ch) return -3;
     int rc = vemb_v16_client_publish(ch->req_ring, buf, len);
     if (rc != 0 && !__sync_lock_test_and_set(&s_diag_printed, 1)) {
         fprintf(stderr, "[sdk] first publish FAIL rc=%d len=%u slot_size=%u slot_count=%u head=%llu tail=%llu\n",
@@ -5628,14 +5476,14 @@ int vemb_v16_aeron_publish_request_batch(vemb_v16_aeron_channel_t *ch,
                                          const void *const *bufs,
                                          const uint32_t *lens,
                                          uint32_t count) {
-    if (!ch) return -3;
+    assert(count == 0 || (bufs != NULL && lens != NULL));
     return vemb_v16_client_publish_ptr_batch(ch->req_ring, bufs, lens, count);
 }
 
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
                                  void *buf, uint32_t max_len) {
-    if (!ch) return -3;
-    if (!buf || max_len < sizeof(vemb_v16_resp_t)) return -2;
+    assert(buf != NULL);
+    RETURN_IF(max_len < sizeof(vemb_v16_resp_t), -2);
     uint8_t wire[VEMB_V16_AERON_RESP_WIRE_MAX_LEN];
     int got = vemb_v16_client_poll(ch->resp_ring, wire, sizeof(wire));
     if (got <= 0) return got;
@@ -5649,8 +5497,8 @@ int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
 uint32_t vemb_v16_aeron_poll_response_batch_ex(
     vemb_v16_aeron_channel_t *ch, void *slots, uint32_t *wire_lens,
     uint32_t max_len, uint32_t max_count) {
-    if (!ch || !slots || max_len < sizeof(vemb_v16_resp_t) ||
-        max_count == 0) return 0;
+    RETURN_IF(max_len < sizeof(vemb_v16_resp_t) || max_count == 0, 0);
+    assert(slots != NULL);
     uint32_t local_lens[VEMB_V16_CLIENT_RING_SIZE];
     uint32_t *lengths = wire_lens ? wire_lens : local_lens;
     if (max_count > VEMB_V16_CLIENT_RING_SIZE)
@@ -5708,7 +5556,6 @@ static int aeron_mmap_one_region(const char *path,
 }
 
 int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
-    if (!ch) return -1;
     /* Idempotent: unmap previous mappings. */
     for (uint32_t i = 0; i < ch->warm_count; i++) {
         if (ch->warm[i].valid && ch->warm[i].mapping_addr)
@@ -5778,8 +5625,8 @@ int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
                                uint32_t region_id,
                                uint64_t offset, uint32_t bytes,
                                void *out, uint32_t cap) {
-    if (!ch || !out)                                   return -1;
-    if (bytes == 0 || bytes > cap)                     return -1;
+    assert(out != NULL);
+    RETURN_IF(bytes == 0 || bytes > cap, -1);
     /* Find the mapping matching region_id (linear scan, N <= 16). */
     const uint8_t *base = NULL;
     uint64_t region_bytes = 0;
@@ -5790,10 +5637,10 @@ int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
             break;
         }
     }
-    if (!base) return -1;
+    RETURN_IF(base == NULL, -1);
     /* Bounds check against the server-reported region size. */
-    if (offset > region_bytes ||
-        (uint64_t)bytes > region_bytes - offset) return -1;
+    RETURN_IF(offset > region_bytes ||
+              (uint64_t)bytes > region_bytes - offset, -1);
     sve_streaming_load_f32(base + offset, out, bytes);
     return (int)bytes;
 }
@@ -5818,8 +5665,7 @@ static int sdk_ub_pending_reserve(sdk_ub_channel_t *state)
         return -1;
     }
     sdk_ub_pending_t *pending = realloc(state->pending, pending_bytes);
-    if (!pending)
-        return -1;
+    assert(pending != NULL);
     state->pending = pending;
     state->pending_cap = next_cap;
     return 0;
@@ -5853,13 +5699,11 @@ static int sdk_ub_open_owner_channel(
     vemb_v16_data_channel_t *channel,
     const vemb_v16_transport_open_spec_t *spec)
 {
-    if (channel->state)
-        return 0;
+    assert(channel->state == NULL);
 
     const sdk_ub_owner_open_context_t *peer_view = spec->backend_context;
-    if (!peer_view || !peer_view->peer_view_manifest ||
-        !peer_view->client_host || !peer_view->client_host[0])
-        return -1;
+    assert(peer_view != NULL && peer_view->peer_view_manifest != NULL &&
+           peer_view->client_host != NULL && peer_view->client_host[0]);
     vemb_v16_aeron_channel_t *aeron =
         vemb_v16_aeron_open_remote_with_peer_view(
             spec->host, spec->port, spec->vector_dim,
@@ -5869,10 +5713,7 @@ static int sdk_ub_open_owner_channel(
         return -1;
 
     sdk_ub_channel_t *state = calloc(1, sizeof(*state));
-    if (!state) {
-        vemb_v16_aeron_close(aeron);
-        return -1;
-    }
+    assert(state != NULL);
     state->aeron = aeron;
     channel->state = state;
     channel->channel_id = vemb_v16_aeron_channel_id(aeron);
@@ -6049,8 +5890,6 @@ static int sdk_ub_fence(vemb_v16_data_channel_t *channel)
 static void sdk_ub_close_channel(vemb_v16_data_channel_t *channel)
 {
     sdk_ub_channel_t *state = sdk_ub_state(channel);
-    if (!state)
-        return;
     channel->warm = (vemb_v16_warm_view_t){0};
     vemb_v16_aeron_close(state->aeron);
     free(state->pending);

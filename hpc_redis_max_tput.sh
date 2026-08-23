@@ -259,10 +259,16 @@ run_client() {
         runops="$ops"
     else
         local tot; tot=$(grep '^Totals' "$raw" | tail -1)
-        ops=$(echo "$tot" | awk '{print $2}')
-        hits=$(echo "$tot" | awk '{print $3}')
-        p50=$(echo "$tot" | awk '{print $6}')
-        p99=$(echo "$tot" | awk '{print $7}')
+        read -r ops hits p50 p99 < <(printf '%s\n' "$tot" | awk '
+            # Totals formats (including the leading "Totals" token):
+            #   NF=11: ops hits misses moved ask avg p50 p99 p99.9 kb
+            #   NF=9 : ops hits misses avg p50 p99 p99.9 kb
+            #   NF=7 : ops avg p50 p99 p99.9 kb
+            NF >= 11 { printf "%s %s %s %s", $2, $3, $8, $9; next }
+            NF == 9  { printf "%s %s %s %s", $2, $3, $6, $7; next }
+            NF >= 7  { printf "%s NA %s %s", $2, $4, $5; next }
+            { printf "0 NA NA NA" }
+        ')
         runops=$(grep 'RUN #1 100%' "$raw" | grep -oE 'avg: *[0-9.,]+' | head -1 | grep -oE '[0-9.,]+')
     fi
     [ -z "$ops" ] && ops=0; [ -z "$runops" ] && runops=0

@@ -123,7 +123,7 @@ echo "Remote: root@$NODE:$REMOTE_DIR"
 echo "Local : $LOCAL_LOG_DIR"
 echo "Config: batch=$BATCH pipeline=$PIPELINE keys=$NUM_KEYS workers=$WORKERS ts=$TS cs=$CS test=${TEST_TIME}s flame=${FLAME_DURATION}s event=$EVENT build=$BUILD profile=$PROFILE"
 
-ssh -p "$SSH_PORT" "root@$NODE" bash -s -- \
+ssh -q -p "$SSH_PORT" "root@$NODE" bash -s -- \
     "$REMOTE_DIR" "$REMOTE_GROUP_DIR" "$REMOTE_FLAMEGRAPH_DIR" \
     "$PORT" "$BATCH" "$PIPELINE" "$NUM_KEYS" "$WORKERS" "$PIO" "$SNW" \
     "$TS" "$CS" "$TEST_TIME" "$FLAME_DURATION" "$FREQ" "$EVENT" \
@@ -262,7 +262,15 @@ status "benchmark driver completed"
 if [ "$PROFILE" = "1" ]; then
     rm -f "$PERF_SCRIPT"
 fi
-cat "$REMOTE_GROUP_DIR/summary.tsv"
+awk -F '\t' '
+    NR == 1 {
+        printf "%-4s %-4s %-3s %-3s %-5s %-14s %-14s %-10s %-10s %-11s %-12s %-13s %-13s %-13s\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+        next
+    }
+    {
+        printf "%-4s %-4s %-3s %-3s %-5s %-14s %-14s %-10s %-10s %-11s %-12s %-13s %-13s %-13s\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+    }
+' "$REMOTE_GROUP_DIR/summary.tsv"
 if [ "$PROFILE" = "1" ]; then
     printf 'REMOTE_GROUP_DIR=%s\nSVG=%s\nCOLLAPSED=%s\n' \
         "$REMOTE_GROUP_DIR" "$SVG" "$COLLAPSED"
@@ -275,7 +283,7 @@ REMOTE_SCRIPT
 # chapter. Raw per-request memtier logs stay on the remote host because they
 # are large and are not needed to inspect or reproduce the flamegraph result.
 if [ "$PROFILE" = "1" ]; then
-    scp -P "$SSH_PORT" \
+    scp -q -P "$SSH_PORT" \
         "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.perf.data" \
         "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.collapsed.txt" \
         "root@$NODE:$REMOTE_GROUP_DIR/${LABEL}.meta.txt" \
@@ -285,7 +293,7 @@ if [ "$PROFILE" = "1" ]; then
         "root@$NODE:$REMOTE_GROUP_DIR/driver.log" \
         "$LOCAL_GROUP_DIR/"
 else
-    scp -P "$SSH_PORT" \
+    scp -q -P "$SSH_PORT" \
         "root@$NODE:$REMOTE_GROUP_DIR/summary.tsv" \
         "root@$NODE:$REMOTE_GROUP_DIR/build.log" \
         "root@$NODE:$REMOTE_GROUP_DIR/driver.log" \

@@ -25,7 +25,8 @@ int main(int argc, char **argv)
     const char *seeds[] = {seed};
 
     /* ========== TCP Client ========== */
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, DIM, 0);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, DIM, 0, VEMB_V16_TRANSPORT_TCP);
     if (!client) {
         fprintf(stderr, "failed to connect to %s:%u\n", host, port);
         return 1;
@@ -146,10 +147,11 @@ int main(int argc, char **argv)
     printf("\n--- VEMB Pipeline ---\n");
     const char *sets_vemb[3]  = {"myset", "myset", "myset"};
     const char *elems_vemb[3] = {"elem1", "elem2", "elem3"};
+    float vemb_vectors[3 * DIM];
     vemb_v16_pipeline_resp_t resps[3];
     memset(resps, 0, sizeof(resps));
     if (vemb_v16_client_vemb_pipeline(client, sets_vemb, elems_vemb,
-                                      3, resps, 16) == 0) {
+                                      3, vemb_vectors, resps, 16) == 0) {
         for (int i = 0; i < 3; i++) {
             printf("resp[%d]: status=%d offset=%llu bytes=%u\n",
                    i, resps[i].status,

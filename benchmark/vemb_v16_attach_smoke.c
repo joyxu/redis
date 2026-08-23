@@ -25,8 +25,10 @@ int main(int argc, char **argv) {
     if (!first || !second) {
         fprintf(stderr, "v1 ATTACH failed: %s:%u dim=%u\n",
                 host, (unsigned)port, dim);
-        vemb_v16_aeron_close(first);
-        vemb_v16_aeron_close(second);
+        if (first)
+            vemb_v16_aeron_close(first);
+        if (second)
+            vemb_v16_aeron_close(second);
         return 1;
     }
 

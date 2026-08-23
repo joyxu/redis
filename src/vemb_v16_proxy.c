@@ -2135,9 +2135,8 @@ int vemb_v16_proxy_attach_cross_node_batch_channel(
 
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
-    if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
-        return;
-    }
+    RETURN_IF(atomic_load_explicit(&ch->slot_channel_id,
+                                  memory_order_acquire) == 0);
     serverLog(LL_NOTICE,
               "vemb_v16 channel closing: index=%u channel_id=%llu transport=%u net_fd=%d active=%d",
               ch->index,
@@ -4239,6 +4238,26 @@ static int proxy_peer_view_map_req_valid(vemb_v16_proxy_t *proxy,
     return 0;
 }
 
+static int proxy_topology_transport_matches_startup(
+        vemb_v16_proxy_t *proxy,
+        const vemb_v16_topology_control_req_t *req) {
+    RETURN_IF(req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
+              -1);
+    for (uint32_t i = 0; i < req->endpoint_count; i++) {
+        const vemb_v16_topology_endpoint_t *endpoint = &req->endpoints[i];
+        if (endpoint->transport_type == proxy->data_transport_type)
+            continue;
+        serverLog(LL_WARNING,
+                  "vemb_v16 topology endpoint transport rejected: "
+                  "server=%s endpoint=%s owner=%u port=%u",
+                  vemb_v16_transport_name(proxy->data_transport_type),
+                  vemb_v16_transport_name(endpoint->transport_type),
+                  endpoint->owner_id, endpoint->tcp_port);
+        return -1;
+    }
+    return 0;
+}
+
 // Attach peer owners from stored mapping before the next topology publish.
 static int proxy_topology_attach_peer_owners_from_mapping(
         vemb_v16_proxy_t *proxy,
@@ -4289,9 +4308,11 @@ int vemb_v16_proxy_topology_set(
     vemb_v16_topology_control_resp_t *resp) {
     vemb_v16_topology_ring_t active_ring;
     vemb_v16_topology_ring_t standby_ring;
-    int rc = vemb_v16_storage_build_topology_rings(req,
-                                                   &active_ring,
-                                                   &standby_ring);
+    int rc = proxy_topology_transport_matches_startup(proxy, req);
+    GOTO_IF(rc != 0, label);
+    rc = vemb_v16_storage_build_topology_rings(req,
+                                              &active_ring,
+                                              &standby_ring);
     GOTO_IF(rc != 0, label);
     rc = proxy_topology_attach_peer_owners_from_mapping(proxy,
                                                         req,
@@ -4325,6 +4346,9 @@ int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
     resp->peer_view_map_status = VEMB_V16_STATUS_ERR;
     resp->topology_status = VEMB_V16_STATUS_ERR;
 
+    if (proxy_topology_transport_matches_startup(
+            proxy, &req->topology_req) != 0)
+        return -1;
     if (proxy_peer_view_map_req_valid(proxy, &req->peer_view_map_req) != 0)
         return -1;
 

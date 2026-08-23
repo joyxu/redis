@@ -281,7 +281,7 @@ static int common_core_prepare_slot(common_core_slot *slot)
     common_core_worker *worker = slot->worker;
     slot->client = vemb_v16_client_create(
         worker->seeds->data(), (int)worker->seeds->size(),
-        worker->cfg->vemb_v16_dim, 10000);
+        worker->cfg->vemb_v16_dim, 10000, VEMB_V16_TRANSPORT_AERON);
     if (!slot->client)
         return -1;
 

@@ -44,6 +44,8 @@ INIT_EPOCH="${INIT_EPOCH:-$((EPOCH_BASE + 1))}"
 MIGRATION_EPOCH="${MIGRATION_EPOCH:-$((EPOCH_BASE + 101))}"
 CUTOVER_EPOCH="${CUTOVER_EPOCH:-$((MIGRATION_EPOCH + 1))}"
 KEEP_SERVERS="${KEEP_SERVERS:-0}"
+# Record remote workload artifact paths locally by default. Logs remain on the
+# remote nodes for postmortem inspection and are not copied or transformed.
 ARCHIVE_LOCAL="${ARCHIVE_LOCAL:-1}"
 RUN_ID="${RUN_ID:-ub_scaleout_$(date +%Y%m%d_%H%M%S)}"
  # The checked-in manifests carry the only complete two-node allocation:
@@ -96,6 +98,7 @@ CLIENT_WARM_PATH="${CLIENT_WARM_PATH:-/dev/obmm_shmdev3}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 LOCAL_RESULT_DIR="${LOCAL_RESULT_DIR:-$ROOT_DIR/benchmark/results/scaleout/$RUN_ID}"
+REMOTE_ARTIFACTS_FILE="$LOCAL_RESULT_DIR/remote_artifacts.txt"
 REMOTE_SUBDIR="benchmark/results/scaleout/$RUN_ID"
 REMOTE_RESULT_DIR="$REMOTE_DIR/$REMOTE_SUBDIR"
 NODE0_MANIFEST="$REMOTE_RESULT_DIR/node0_server.yaml"
@@ -225,7 +228,50 @@ printf 'run_id=%s\nnode0_ssh=%s:%s\nnode1_ssh=%s:%s\nnode0_data=%s\nnode1_data=%
 summary_row() {
     printf '%-32s %-15s %-10s %-10s %-8s %s\n' "$@"
 }
+
+record_remote_artifacts() {
+    local node="$1" host port log_suffix control_log migration_summary
+    case "$node" in
+        "$NODE0_HOST")
+            host="$NODE0_SSH_HOST"
+            port="$NODE0_SSH_PORT"
+            log_suffix=0
+            control_log=coordinator.out
+            migration_summary=node0_migration_summary.log
+            ;;
+        "$NODE1_HOST")
+            host="$NODE1_SSH_HOST"
+            port="$NODE1_SSH_PORT"
+            log_suffix=1
+            control_log=topology_candidate_node1.out
+            migration_summary=node1_migration_summary.log
+            ;;
+        *) die "unknown archive node: $node" ;;
+    esac
+
+    {
+        printf 'node=%s\n' "$node"
+        printf 'ssh=%s@%s:%s\n' "$SSH_USER" "$host" "$port"
+        printf 'remote_result_dir=%s\n' "$REMOTE_RESULT_DIR"
+        printf 'scaleout_baseline=%s\n' "$REMOTE_RESULT_DIR/scaleout_baseline.out"
+        printf 'scaleout_during=%s\n' "$REMOTE_RESULT_DIR/scaleout_during.out"
+        printf 'scaleout_after_old_keys=%s\n' "$REMOTE_RESULT_DIR/scaleout_after_old_keys.out"
+        printf 'scaleout_after=%s\n' "$REMOTE_RESULT_DIR/scaleout_after.out"
+        printf 'server_log=%s\n' "$REMOTE_RESULT_DIR/server_node${log_suffix}.log"
+        printf 'control_log=%s\n' "$REMOTE_RESULT_DIR/$control_log"
+        printf 'migration_summary=%s\n' "$REMOTE_RESULT_DIR/$migration_summary"
+        printf '\n'
+    } >>"$REMOTE_ARTIFACTS_FILE"
+}
+
 summary_row phase ops_sec p50_ms p99_ms wall_s note >"$LOCAL_RESULT_DIR/summary.tsv"
+if [ "$ARCHIVE_LOCAL" = "1" ]; then
+    : >"$REMOTE_ARTIFACTS_FILE"
+    printf '# Remote artifacts for run_id=%s (logs are not copied locally)\n\n' "$RUN_ID" \
+        >>"$REMOTE_ARTIFACTS_FILE"
+    record_remote_artifacts "$NODE0_HOST"
+    record_remote_artifacts "$NODE1_HOST"
+fi
 
 step "Prepare result directories and verify UB throughput build stamps"
 ssh_run "$NODE0_HOST" "mkdir -p '$REMOTE_RESULT_DIR'"
@@ -573,33 +619,13 @@ ssh_run "$NODE0_HOST" "grep -E 'runtime warm region attached|runtime remote_meta
 ssh_run "$NODE1_HOST" "grep -E 'migration auto plan|scaleout auto|local done|migration_active|batch rejected|ATTACH rejected' '$NODE1_LOG' >'$REMOTE_RESULT_DIR/node1_migration_summary.log' || true"
 
 if [ "$KEEP_SERVERS" = "0" ]; then
-    step "Stop runner-owned processes before archiving"
+    step "Stop runner-owned processes before recording artifacts"
     stop_owned_processes
 fi
 
-archive_remote_results() {
-    local node="$1" destination="$2" host port
-    case "$node" in
-        "$NODE0_HOST") host="$NODE0_SSH_HOST"; port="$NODE0_SSH_PORT" ;;
-        "$NODE1_HOST") host="$NODE1_SSH_HOST"; port="$NODE1_SSH_PORT" ;;
-        *) die "unknown archive node: $node" ;;
-    esac
-
-    # Keep the largest workload output out of the recursive copy. Transfer it
-    # separately in compressed form while retaining the raw file remotely.
-    ssh -p "$port" "${SSH_USER}@${host}" \
-        "cd '$REMOTE_RESULT_DIR' && tar --exclude='./scaleout_after.out' -cf - ." \
-        | tar -xf - -C "$destination"
-    ssh -p "$port" "${SSH_USER}@${host}" \
-        "gzip -c '$REMOTE_RESULT_DIR/scaleout_after.out'" \
-        >"$destination/scaleout_after.out.gz"
-}
-
 if [ "$ARCHIVE_LOCAL" = "1" ]; then
-    step "Archive remote P7 artifacts locally"
-    mkdir -p "$LOCAL_RESULT_DIR/node0" "$LOCAL_RESULT_DIR/node1"
-    archive_remote_results "$NODE0_HOST" "$LOCAL_RESULT_DIR/node0"
-    archive_remote_results "$NODE1_HOST" "$LOCAL_RESULT_DIR/node1"
+    step "Record remote P7 artifact locations"
+    printf 'Remote artifact locations: %s\n' "$REMOTE_ARTIFACTS_FILE"
 fi
 
 printf 'UB/Aeron memtier scaleout passed. Artifacts: %s\n' "$LOCAL_RESULT_DIR"

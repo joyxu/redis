@@ -64,6 +64,68 @@ static void completion_set_ask(vemb_v16_completion_t *completion,
     completion->redirect_owner = info ? info->target_owner : UINT32_MAX;
 }
 
+typedef enum vemb_v16_lookup_miss_kind {
+    VEMB_V16_LOOKUP_MISS_NOT_FOUND = 0,
+    VEMB_V16_LOOKUP_MISS_STALE_TOPOLOGY = 1,
+    VEMB_V16_LOOKUP_MISS_MOVED = 2,
+} vemb_v16_lookup_miss_kind_t;
+
+/* Lookup misses are rare; classify them from per-key metadata so a released
+ * migration-active counter cannot hide a source cutover fence. */
+static vemb_v16_lookup_miss_kind_t classify_lookup_miss(
+        vemb_v16_tlc_t *tlc,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash,
+        tlc_core_key_migration_info_t *info) {
+    assert(info != NULL);
+    *info = (tlc_core_key_migration_info_t){
+        .source_owner = UINT32_MAX,
+        .target_owner = UINT32_MAX,
+    };
+    if (tlc_core_get_migration_info(tlc->core,
+                                    key,
+                                    key_len,
+                                    key_hash,
+                                    info) != 0) {
+        return VEMB_V16_LOOKUP_MISS_NOT_FOUND;
+    }
+
+    switch (info->migration_state) {
+    case TLC_CORE_KEY_CUTOVER:
+    case TLC_CORE_KEY_SOURCE_GC:
+        return VEMB_V16_LOOKUP_MISS_MOVED;
+    case TLC_CORE_KEY_MIGRATING:
+    case TLC_CORE_KEY_DEST_PREPARED:
+    case TLC_CORE_KEY_DEST_COMMITTED:
+        return VEMB_V16_LOOKUP_MISS_STALE_TOPOLOGY;
+    case TLC_CORE_KEY_SOURCE_ACTIVE:
+    default:
+        return VEMB_V16_LOOKUP_MISS_NOT_FOUND;
+    }
+}
+
+static void completion_set_lookup_miss(
+        vemb_v16_completion_t *completion,
+        vemb_v16_tlc_t *tlc,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash) {
+    tlc_core_key_migration_info_t info;
+    vemb_v16_lookup_miss_kind_t kind = classify_lookup_miss(tlc,
+                                                             key,
+                                                             key_len,
+                                                             key_hash,
+                                                             &info);
+    if (kind == VEMB_V16_LOOKUP_MISS_MOVED) {
+        completion_set_moved(completion, &info);
+    } else if (kind == VEMB_V16_LOOKUP_MISS_STALE_TOPOLOGY) {
+        completion->status = VEMB_V16_STATUS_STALE_TOPOLOGY;
+    } else {
+        completion->status = VEMB_V16_STATUS_NOT_FOUND;
+    }
+}
+
 static void completion_set_vector_handle(
     vemb_v16_completion_t *completion,
     const vemb_v16_vector_handle_t *handle) {
@@ -282,22 +344,17 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                 &handle,
                                 &warm_slot);
     if (handle_rc != 0) {
-        tlc_core_key_migration_info_t redirect_info = {0};
-        if (migration_active &&
-            job_key_is_source_cutover(tlc,
-                                      vemb_job->key,
-                                      vemb_job->key_len,
-                                      job->key_hash,
-                                      &redirect_info)) {
-            completion_set_moved(&completion, &redirect_info);
-        } else {
-            serverLog(LL_WARNING,
-                      "vemb_v16 handle miss: req_id=%u batch_token=%llu hash=%llu key=%.*s rc=%d",
-                      job->req_id, (unsigned long long)job->batch_token,
-                      (unsigned long long)job->key_hash, (int)vemb_job->key_len,
-                      vemb_job->key, handle_rc);
-            completion.status = VEMB_V16_STATUS_NOT_FOUND;
-        }
+        completion_set_lookup_miss(&completion,
+                                   tlc,
+                                   vemb_job->key,
+                                   vemb_job->key_len,
+                                   job->key_hash);
+        serverLog(LL_WARNING,
+                  "vemb_v16 handle miss: req_id=%u batch_token=%llu hash=%llu key=%.*s rc=%d status=%u migration_active=%d",
+                  job->req_id, (unsigned long long)job->batch_token,
+                  (unsigned long long)job->key_hash, (int)vemb_job->key_len,
+                  vemb_job->key, handle_rc, completion.status,
+                  migration_active);
     } else {
         completion_set_vector_handle(&completion, &handle);
         if (needs_payload_snapshot) {
@@ -390,17 +447,11 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
 
     if (vemb_v16_tlc_get_handle(tlc, vsim_job->key, vsim_job->key_len,
                                 job->key_hash, &handle, &warm_slot) != 0) {
-        tlc_core_key_migration_info_t redirect_info = {0};
-        if (migration_active &&
-            job_key_is_source_cutover(tlc,
-                                      vsim_job->key,
-                                      vsim_job->key_len,
-                                      job->key_hash,
-                                      &redirect_info)) {
-            completion_set_moved(&completion, &redirect_info);
-        } else {
-            completion.status = VEMB_V16_STATUS_NOT_FOUND;
-        }
+        completion_set_lookup_miss(&completion,
+                                   tlc,
+                                   vsim_job->key,
+                                   vsim_job->key_len,
+                                   job->key_hash);
         goto finish_vsim_job;
     }
 
@@ -414,23 +465,18 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
                                       vsim_job->key2_hash,
                                       &handle2,
                                       &key2_source) != 0) {
-        tlc_core_key_migration_info_t redirect_info = {0};
-        if (migration_active &&
-            job_key_is_source_cutover(tlc,
-                                      vsim_job->key2,
-                                      vsim_job->key2_len,
-                                      vsim_job->key2_hash,
-                                      &redirect_info)) {
-            completion_set_moved(&completion, &redirect_info);
-        } else {
-            serverLog(LL_NOTICE,
-                      "vemb_v16 vsim key-key key2 lookup miss: req_id=%u key_hash=%llu key2_hash=%llu key2_len=%u",
-                      job->req_id,
-                      (unsigned long long)job->key_hash,
-                      (unsigned long long)vsim_job->key2_hash,
-                      vsim_job->key2_len);
-            completion.status = VEMB_V16_STATUS_NOT_FOUND;
-        }
+        completion_set_lookup_miss(&completion,
+                                   tlc,
+                                   vsim_job->key2,
+                                   vsim_job->key2_len,
+                                   vsim_job->key2_hash);
+        serverLog(LL_NOTICE,
+                  "vemb_v16 vsim key-key key2 lookup miss: req_id=%u key_hash=%llu key2_hash=%llu key2_len=%u status=%u",
+                  job->req_id,
+                  (unsigned long long)job->key_hash,
+                  (unsigned long long)vsim_job->key2_hash,
+                  vsim_job->key2_len,
+                  completion.status);
         goto finish_vsim_job;
     }
 
@@ -548,15 +594,12 @@ void vemb_v16_supernode_handle_vrem_job(vemb_v16_supernode_ctx_t *ctx,
                                     job->key_hash,
                                     &existing,
                                     &warm_slot) != 0) {
-            memset(&redirect_info, 0, sizeof(redirect_info));
-            if (!ask_redirect &&
-                migration_active &&
-                job_key_is_source_cutover(tlc,
-                                          vrem_job->key,
-                                          vrem_job->key_len,
-                                          job->key_hash,
-                                          &redirect_info)) {
-                completion_set_moved(&completion, &redirect_info);
+            if (!ask_redirect) {
+                completion_set_lookup_miss(&completion,
+                                           tlc,
+                                           vrem_job->key,
+                                           vrem_job->key_len,
+                                           job->key_hash);
             } else {
                 completion.status = VEMB_V16_STATUS_NOT_FOUND;
                 completion.vector_bytes = 0;
@@ -730,20 +773,13 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     } else if (job->op == VEMB_V16_OP_VSIM_INLINE) {
         uint32_t warm_slot = 0;
         vemb_v16_vector_handle_t handle = {0};
-        int migration_active = vemb_v16_storage_migration_active(storage);
         if (vemb_v16_tlc_get_handle(tlc, vadd_job->key, vadd_job->key_len,
                                     job->key_hash, &handle, &warm_slot) != 0) {
-            tlc_core_key_migration_info_t redirect_info = {0};
-            if (migration_active &&
-                job_key_is_source_cutover(tlc,
-                                          vadd_job->key,
-                                          vadd_job->key_len,
-                                          job->key_hash,
-                                          &redirect_info)) {
-                completion_set_moved(&completion, &redirect_info);
-            } else {
-                completion.status = VEMB_V16_STATUS_NOT_FOUND;
-            }
+            completion_set_lookup_miss(&completion,
+                                       tlc,
+                                       vadd_job->key,
+                                       vadd_job->key_len,
+                                       job->key_hash);
         } else {
             const uint8_t *stored_bytes = NULL;
             uint32_t stored_len = 0;

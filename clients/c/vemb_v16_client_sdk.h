@@ -29,9 +29,10 @@ typedef struct vemb_v16_client vemb_v16_client_t;
 /*
  * Configure seed_count TCP bootstrap seeds. 'seeds' is an array of
  * "host:port" control addresses; creating the client does not open a data
- * channel. Every keyed operation obtains its authoritative owner routing and
- * TCP/UB data transport identity from server topology, fetched explicitly or
- * lazily through the seed set.
+ * channel. transport_type fixes this client to either TCP or AERON for its
+ * lifetime. Every keyed operation obtains its authoritative owner routing
+ * from server topology, fetched explicitly or lazily through the seed set;
+ * every advertised owner endpoint must match the configured transport.
  *
  * All keyed operations (vadd / vemb_vector / vsim / *_pipeline / *_repeat)
  * select their owner internally; callers do not pick a backend. Pipeline
@@ -52,16 +53,27 @@ typedef struct vemb_v16_client vemb_v16_client_t;
  * internally. Callers see only OK / NOT_FOUND / ERR. For
  * observability of redirect activity, use
  * vemb_v16_client_get_redirect_stats().
+ *
+ * REQUIRED ARGUMENTS: except for create functions, every client/session
+ * argument is a required live object and is not revalidated on the data path.
+ * Per-operation key, vector and required output arguments must also be
+ * non-NULL, and capacities must be positive; these call-local preconditions
+ * assert at the public boundary. set_name, callbacks, and outputs explicitly
+ * documented as optional may be NULL. Reusing an object after destroy / close
+ * is a programming error. Create functions return NULL only for invalid
+ * external configuration or a lifecycle conflict; allocation failure triggers
+ * the Redis assertion path.
  */
 vemb_v16_client_t *vemb_v16_client_create(const char *seeds[],
                                            int seed_count,
                                            uint32_t dim,
-                                           uint32_t timeout_ms);
+                                           uint32_t timeout_ms,
+                                           uint32_t transport_type);
 
 /* Configure fixed client-local UB peer views before the first UB owner
  * channel opens. owner_id in the manifest is the topology owner identity,
- * not a host-number alias. Entries that do not match an AERON owner leave
- * that owner on its direct-local UB path. */
+ * not a host-number alias. Every AERON owner requires matching entries;
+ * same-host mappings use identical provider and client paths. */
 int vemb_v16_client_configure_ub_peer_view(
     vemb_v16_client_t *client, const char *manifest_path,
     const char *client_host);
@@ -79,9 +91,9 @@ int vemb_v16_client_vadd(vemb_v16_client_t *client,
                          const float *vector,
                          uint32_t dim);
 
-/* UB/AERON-only zero-copy read. A topology owner advertised as TCP is
- * rejected before any data channel is opened; use vemb_vector() for its
- * VEMB_INLINE fallback. */
+/* UB/AERON-only zero-copy read. A TCP client is rejected at this public API
+ * boundary before topology or data-channel work begins. Result outputs are
+ * optional; non-NULL outputs receive the corresponding handle fields. */
 int vemb_v16_client_vemb_handle(vemb_v16_client_t *client,
                                 const char *set_name,
                                 const char *elem_name,
@@ -90,6 +102,8 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *client,
                                 uint32_t *out_dim,
                                 uint32_t *out_region_id);
 
+/* out_vector is required and out_cap is measured in floats. out_dim is
+ * optional. */
 int vemb_v16_client_vemb_vector(vemb_v16_client_t *client,
                                 const char *set_name,
                                 const char *elem_name,
@@ -161,14 +175,14 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   const char **set_names,
                                   const char **elem_names,
                                   uint32_t count,
-                                  float *out_vectors,      /* [count * dim], caller-allocated */
+                                  float *out_vectors,      /* optional [count * dim] */
                                   vemb_v16_pipeline_resp_t *out_resps,
                                   uint32_t max_inflight);
 
 /* UB/AERON-only VEMB_HANDLE pipeline. Stable remote-UB owner groups may use
  * the optional v2 batch channel; topology changes, migration, ATTACH/publish
- * failures, and ASK redirects always use the v1 owner channel. A TCP-routed
- * entry is returned as error without opening or submitting a data channel. */
+ * failures, and ASK redirects always use the v1 owner channel. TCP-configured
+ * clients are rejected at this API boundary. */
 int vemb_v16_client_vemb_handle_pipeline(vemb_v16_client_t *c,
                                          const char **set_names,
                                          const char **elem_names,
@@ -253,10 +267,10 @@ void vemb_v16_client_get_fanout_stats(const vemb_v16_client_t *client,
  * This is the common-core asynchronous handle API. submit() copies the key,
  * assigns a logical operation before any L0 grouping, and returns immediately.
  * poll() drives routing, v1/v2 publication, completion fanout, and redirect
- * retry. It accepts only AERON/UB owners; a TCP-routed request completes as
- * ERR without opening a data channel. A live session is exclusive with the synchronous
- * keyed APIs on its client because both own that client's owner channels and
- * core state.
+ * retry. Session creation accepts only an AERON-configured client; TCP clients
+ * are rejected before topology or data I/O. A live session is exclusive with
+ * the synchronous keyed APIs on its client because both own that client's
+ * owner channels and core state.
  */
 typedef struct vemb_v16_client_handle_session
     vemb_v16_client_handle_session_t;
@@ -286,7 +300,7 @@ int vemb_v16_client_handle_session_flush(
     vemb_v16_client_handle_session_t *session);
 
 /* Drive nonblocking v1/v2 receives and retry work. Returns callback count,
- * zero when no completion is available, or -1 for an invalid session. */
+ * zero when no completion is available, or -1 when the session is closing. */
 int vemb_v16_client_handle_session_poll(
     vemb_v16_client_handle_session_t *session,
     vemb_v16_client_handle_completion_cb cb, void *priv);
@@ -307,8 +321,9 @@ void vemb_v16_client_handle_session_close(
  * -------------------------------------------------------------------
  *
  * submit() groups equal key-only vector reads after cluster_core selected the
- * owner route. A TCP leader uses VEMB_INLINE. An AERON leader uses
- * VEMB_HANDLE and materializes its warm-region vector once. The callback's
+ * owner route. The client-wide startup mode fixes every request to
+ * VEMB_INLINE for TCP or VEMB_HANDLE for AERON; AERON materializes its
+ * warm-region vector once. The callback's
  * vector view is valid only for the callback; callers must copy it to retain
  * it. This session deliberately does not coalesce writes or VSIM requests.
  *
@@ -358,8 +373,8 @@ int vemb_v16_client_vector_session_flush(
     vemb_v16_client_vector_session_t *session);
 
 /* Drive routing, nonblocking receives, completion fanout, and redirect retry.
- * Returns callback count, zero when no completion is available, or -1 for an
- * invalid session. */
+ * Returns callback count, zero when no completion is available, or -1 when
+ * the session is closing. */
 int vemb_v16_client_vector_session_poll(
     vemb_v16_client_vector_session_t *session,
     vemb_v16_client_vector_completion_cb cb, void *priv);
@@ -388,8 +403,8 @@ float *vemb_v16_parse_vector_argv(char **argv, int argc, int start_idx,
 
 /* Repeat VSIM on the same (set_name, elem_name) pair 'repeat' times.
  * Returns 0 on success, -1 on error.
- * out_score receives the last response's score.
- * out_found receives 1 if last response was OK, 0 if NOT_FOUND.
+ * Optional out_score receives the last response's score. Optional out_found
+ * receives 1 if the last response was OK, 0 if NOT_FOUND.
  */
 int vemb_v16_client_vsim_repeat(vemb_v16_client_t *c,
                                  const char *set_name, const char *elem_name,
@@ -599,14 +614,15 @@ vemb_v16_aeron_open_remote_batch_with_peer_view(
     const char *client_host, uint32_t owner_id);
 
 /* Unmap all four v2 resources and best-effort notify the server to close the
- * v2 logical channel. Safe to call with NULL. */
+ * v2 logical channel. ch must be a live non-NULL channel. */
 void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch);
 
 uint64_t vemb_v16_aeron_batch_channel_id(
     const vemb_v16_aeron_batch_channel_t *ch);
 uint64_t vemb_v16_aeron_batch_topology_epoch(
     const vemb_v16_aeron_batch_channel_t *ch);
-int vemb_v16_aeron_batch_get_resources(
+/* Copies the mappings negotiated by a live batch channel. */
+void vemb_v16_aeron_batch_get_resources(
     const vemb_v16_aeron_batch_channel_t *ch,
     vemb_v16_aeron_batch_resources_t *out);
 
@@ -615,9 +631,10 @@ int vemb_v16_aeron_batch_get_resources(
  * frame, not of the channel's ATTACH response. `ch` must be a live channel;
  * batch_id and item_count must be nonzero; keys and key_lens must point to
  * item_count entries, each key must be non-NULL, and each length must be in
- * [1, VEMB_V16_MAX_KEY_LEN]. Violating these preconditions is undefined
- * behavior. The key array describes unique items; CLI L0 coalescing remains
- * the caller's next layer. Returns RING_OK, RING_ERR_INVALID, or RING_ERR_FULL.
+ * [1, VEMB_V16_MAX_KEY_LEN]. Required pointer violations assert; invalid
+ * batch ids, counts, or key lengths return RING_ERR_INVALID. The key array
+ * describes unique items; CLI L0 coalescing remains the caller's next layer.
+ * Returns RING_OK, RING_ERR_INVALID, or RING_ERR_FULL.
  */
 int vemb_v16_aeron_batch_publish_handle_at_epoch(
     vemb_v16_aeron_batch_channel_t *ch, uint64_t batch_id,
@@ -716,8 +733,8 @@ typedef struct vemb_v16_aeron_batch_client_stats {
 } vemb_v16_aeron_batch_client_stats_t;
 
 /* Opens the permanent v1 fallback channel and required v2 batch channel.
- * Returns NULL when v2 ATTACH, its resource mapping, or CLI L0 setup fails;
- * this API never returns a v1-only batch session. */
+ * Returns NULL when v1/v2 ATTACH or resource mapping fails; this API never
+ * returns a v1-only batch session. Allocation failure asserts. */
 vemb_v16_aeron_batch_client_t *vemb_v16_aeron_batch_client_open_remote(
     const char *host, uint16_t port, uint32_t dim,
     const vemb_v16_aeron_batch_client_options_t *options);
@@ -729,9 +746,9 @@ vemb_v16_aeron_batch_client_open_remote_with_peer_view(
     const vemb_v16_ub_peer_view_manifest_t *peer_view_manifest,
     const char *client_host, uint32_t owner_id);
 
-/* Submits one logical VEMB_HANDLE read for final key bytes. Returns 0 once
- * the caller cookie is owned by the session, -2 if v1 fallback pressure
- * prevents acceptance, and -1 for invalid input or a closed session. */
+/* Submits one logical VEMB_HANDLE read for required final key bytes. Returns 0
+ * once the caller cookie is owned by the session, -2 if v1 fallback pressure
+ * prevents acceptance, and -1 for invalid key length or a closing session. */
 int vemb_v16_aeron_batch_client_submit_handle(
     vemb_v16_aeron_batch_client_t *client, const char *final_key,
     uint16_t key_len, uint64_t caller_cookie);
@@ -748,8 +765,8 @@ uint64_t vemb_v16_aeron_batch_client_next_flush_deadline_ns(
 
 /* Polls v1 and v2 completions and invokes cb once per logical caller. The
  * return value is the number of callbacks made, zero if no response is
- * available, or -1 on invalid input. poll flushes on the configured deadline
- * and retries a deadline-expired frame after v2 ring/arena backpressure. */
+ * available, or -1 while closing. poll flushes on the configured deadline and
+ * retries a deadline-expired frame after v2 ring/arena backpressure. */
 int vemb_v16_aeron_batch_client_poll(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_completion_cb cb, void *priv);
@@ -784,14 +801,14 @@ void vemb_v16_aeron_batch_client_get_stats(
     vemb_v16_aeron_batch_client_stats_t *out);
 
 /* Stops submit, reports every retained caller as ERR through cb, and releases
- * both channels plus all fixed-pool state. Safe with a NULL client. */
+ * both channels plus all fixed-pool state. client must be live and non-NULL. */
 void vemb_v16_aeron_batch_client_close(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_completion_cb cb, void *priv);
 
-/* Close one channel: unmaps both rings and notifies the server through TCP
- * control to release its state. Safe to call with NULL (no-op). Control
- * errors are swallowed because the rings are already unmapped locally. */
+/* Close one live channel: unmaps both rings and notifies the server through
+ * TCP control to release its state. Control errors are swallowed because the
+ * rings are already unmapped locally. */
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch);
 
 /* Close every channel currently registered on the given control endpoint.
@@ -800,13 +817,11 @@ void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch);
 int vemb_v16_aeron_close_all(const char *control_endpoint);
 
 /* Channel id — stamp this into vemb_v16_req_t::channel_id when building
- * request frames via vemb_v16_serialize_* or by hand. Returns 0 if ch
- * is NULL. */
+ * request frames via vemb_v16_serialize_* or by hand. ch is required. */
 uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch);
 
-/* Server-owned UB allocation identity for this channel. It changes when a
- * channel is re-attached to different backing resources and is zero for a
- * NULL channel. */
+/* Server-owned UB allocation identity for this required channel. It changes
+ * when a channel is re-attached to different backing resources. */
 uint64_t vemb_v16_aeron_channel_resource_generation(
     const vemb_v16_aeron_channel_t *ch);
 
@@ -815,7 +830,7 @@ uint64_t vemb_v16_aeron_channel_resource_generation(
  *    0   on success
  *   -1   if the ring is full (drain responses and retry)
  *   -2   if len > slot_size (programming error)
- *   -3   if ch is NULL */
+ * ch and buf are required. */
 int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
                                    const void *buf, uint32_t len);
 
@@ -827,10 +842,9 @@ int vemb_v16_aeron_publish_request_batch(vemb_v16_aeron_channel_t *ch,
                                          const uint32_t *lens,
                                          uint32_t count);
 
-/* Non-blocking poll from the response ring.
- * Returns bytes copied into buf (>0) on success, 0 if empty, -3 if
- * ch is NULL. If max_len exceeds the ring slot size, only slot_size
- * bytes are copied. */
+/* Non-blocking poll from the response ring. ch and buf are required. Returns
+ * bytes copied into buf (>0) on success or 0 if empty. If max_len exceeds the
+ * ring slot size, only slot_size bytes are copied. */
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
                                  void *buf, uint32_t max_len);
 

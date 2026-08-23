@@ -1,4 +1,5 @@
 #include "internal/vemb_v16_cli_l0.h"
+#include "../../src/redisassert.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -109,19 +110,17 @@ static char *vemb_v16_cli_l0_key_ptr(vemb_v16_cli_l0_t *l0,
     return slab->bytes + (size_t)entry->key_slot * slab->slot_size;
 }
 
-static int vemb_v16_cli_l0_key_slab_init(vemb_v16_cli_l0_key_slab_t *slab,
-                                          uint32_t slot_size,
-                                          uint32_t capacity) {
+static void vemb_v16_cli_l0_key_slab_init(vemb_v16_cli_l0_key_slab_t *slab,
+                                           uint32_t slot_size,
+                                           uint32_t capacity) {
     slab->slot_size = slot_size;
     slab->capacity = capacity;
     slab->free_head = capacity ? 0 : VEMB_V16_CLI_L0_NONE;
     slab->next = calloc(capacity, sizeof(*slab->next));
     slab->bytes = calloc(capacity, slot_size);
-    if (!slab->next || !slab->bytes)
-        return -1;
+    assert(slab->next != NULL && slab->bytes != NULL);
     for (uint32_t i = 0; i < capacity; i++)
         slab->next[i] = i + 1u < capacity ? i + 1u : VEMB_V16_CLI_L0_NONE;
-    return 0;
 }
 
 static void vemb_v16_cli_l0_key_slab_destroy(vemb_v16_cli_l0_key_slab_t *slab) {
@@ -244,18 +243,17 @@ static vemb_v16_cli_l0_batch_record_t *vemb_v16_cli_l0_batch_record_acquire(
 }
 
 vemb_v16_cli_l0_t *vemb_v16_cli_l0_create(uint32_t channel_count) {
+    assert(channel_count > 0);
     vemb_v16_cli_l0_t *l0 = calloc(1, sizeof(*l0));
-    if (!l0)
-        return NULL;
+    assert(l0 != NULL);
     l0->channel_count = channel_count;
     l0->pending_head = malloc((size_t)channel_count * sizeof(*l0->pending_head));
     l0->pending_tail = malloc((size_t)channel_count * sizeof(*l0->pending_tail));
     l0->pending_count = calloc(channel_count, sizeof(*l0->pending_count));
     l0->pending_payload_bytes =
         calloc(channel_count, sizeof(*l0->pending_payload_bytes));
-    if (!l0->pending_head || !l0->pending_tail || !l0->pending_count ||
-        !l0->pending_payload_bytes)
-        goto fail;
+    assert(l0->pending_head != NULL && l0->pending_tail != NULL &&
+           l0->pending_count != NULL && l0->pending_payload_bytes != NULL);
     for (uint32_t i = 0; i < channel_count; i++) {
         l0->pending_head[i] = VEMB_V16_CLI_L0_NONE;
         l0->pending_tail[i] = VEMB_V16_CLI_L0_NONE;
@@ -269,16 +267,11 @@ vemb_v16_cli_l0_t *vemb_v16_cli_l0_create(uint32_t channel_count) {
         l0->follower_next[i] = i + 1u < VEMB_V16_CLI_L0_MAX_FOLLOWERS ?
             i + 1u : VEMB_V16_CLI_L0_NONE;
     for (uint32_t i = 0; i < 4; i++) {
-        if (vemb_v16_cli_l0_key_slab_init(&l0->key_slabs[i],
-                                           vemb_v16_cli_l0_key_slab_sizes[i],
-                                           vemb_v16_cli_l0_key_slab_capacities[i]) != 0)
-            goto fail;
+        vemb_v16_cli_l0_key_slab_init(&l0->key_slabs[i],
+                                      vemb_v16_cli_l0_key_slab_sizes[i],
+                                      vemb_v16_cli_l0_key_slab_capacities[i]);
     }
     return l0;
-
-fail:
-    vemb_v16_cli_l0_destroy(l0);
-    return NULL;
 }
 
 void vemb_v16_cli_l0_destroy(vemb_v16_cli_l0_t *l0) {

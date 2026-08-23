@@ -147,7 +147,8 @@ static void test_pipeline_routes_out_of_order_tcp_completions(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
 
     const char *sets[] = {"set", "set"};
@@ -366,8 +367,8 @@ static void test_same_endpoint_survives_topology_epoch_change(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *endpoints[] = {endpoint, endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(endpoints, 2, 1,
-                                                         1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        endpoints, 2, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
 
     const float vector[] = {1.0f};
@@ -430,7 +431,8 @@ static void test_topology_fetch_fails_over_to_next_seed(void)
     snprintf(healthy_seed, sizeof(healthy_seed), "127.0.0.1:%u",
              server.healthy_seed_port);
     const char *seeds[] = {failed_seed, healthy_seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 2, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 2, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
 
     const float vector[] = {1.0f};
@@ -447,11 +449,6 @@ typedef struct tcp_handle_reject_server {
 static void *tcp_handle_reject_server(void *arg)
 {
     tcp_handle_reject_server_t *server = arg;
-    int fd = accept_connection(server->listen_fd);
-    read_topology_get(fd);
-    write_topology_response(fd, 23, server->port);
-    close(fd);
-
     struct pollfd pfd = {
         .fd = server->listen_fd,
         .events = POLLIN,
@@ -461,7 +458,7 @@ static void *tcp_handle_reject_server(void *arg)
     return NULL;
 }
 
-static void test_tcp_handle_is_rejected_before_data_channel_open(void)
+static void test_tcp_handle_is_rejected_at_api_boundary(void)
 {
     tcp_handle_reject_server_t server = {
         .listen_fd = vemb_v16_net_listen("127.0.0.1", 0, 2),
@@ -476,7 +473,8 @@ static void test_tcp_handle_is_rejected_before_data_channel_open(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
 
     assert(vemb_v16_client_vemb_handle(client, "set", "entry", NULL, NULL,
@@ -485,8 +483,7 @@ static void test_tcp_handle_is_rejected_before_data_channel_open(void)
     const char *elements[] = {"entry"};
     vemb_v16_pipeline_resp_t response;
     assert(vemb_v16_client_vemb_handle_pipeline(client, sets, elements, 1,
-                                                 &response, 1) == 0);
-    assert(response.status == -1);
+                                                 &response, 1) == -1);
 
     vemb_v16_client_destroy(client);
     assert(pthread_join(thread, NULL) == 0);
@@ -535,7 +532,8 @@ static void test_tcp_vemb_vector_uses_inline_without_handle_error(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
 
     float vector = 0.0f;
@@ -587,7 +585,8 @@ static void test_tcp_vector_session_coalesces_inline_read(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
     vemb_v16_client_vector_session_options_t options = {
         .cache_mode = VEMB_V16_CLIENT_VECTOR_CACHE_IMMUTABLE_SNAPSHOT,
@@ -684,7 +683,8 @@ static void test_tcp_vector_session_epoch_change_invalidates_cache(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
     vemb_v16_client_vector_session_options_t options = {
         .cache_mode = VEMB_V16_CLIENT_VECTOR_CACHE_IMMUTABLE_SNAPSHOT,
@@ -772,7 +772,8 @@ static void test_tcp_vector_session_default_cache_repeats_read(void)
     char endpoint[64];
     snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
     const char *seeds[] = {endpoint};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, 1, 1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
     assert(client != NULL);
     vemb_v16_client_vector_session_t *session =
         vemb_v16_client_vector_session_create(client);
@@ -856,12 +857,26 @@ static void *tcp_vector_session_redirect_server(void *arg)
         write_vector_session_topology_response(topology_fd, 72, server->port);
         close(topology_fd);
 
-        read_request(owner_fd, &request);
-        assert(request.op == VEMB_V16_OP_VEMB_INLINE);
-        assert(request.flags == 0);
-        assert(request.topology_epoch == 72);
-        write_inline_response(owner_fd, server->channel_id, request.req_id,
-                              72.0f);
+        if (server->redirect_status == VEMB_V16_STATUS_MOVED) {
+            int target_fd = accept_connection(server->listen_fd);
+            read_hello(target_fd);
+            write_welcome(target_fd, server->channel_id + 1);
+            read_request(target_fd, &request);
+            assert(request.op == VEMB_V16_OP_VEMB_INLINE);
+            assert(request.flags == 0);
+            assert(request.topology_epoch == 72);
+            write_inline_response(target_fd, server->channel_id + 1,
+                                  request.req_id, 72.0f);
+            read_close_channel(target_fd);
+            close(target_fd);
+        } else {
+            read_request(owner_fd, &request);
+            assert(request.op == VEMB_V16_OP_VEMB_INLINE);
+            assert(request.flags == 0);
+            assert(request.topology_epoch == 72);
+            write_inline_response(owner_fd, server->channel_id, request.req_id,
+                                  72.0f);
+        }
         read_close_channel(owner_fd);
         close(owner_fd);
     }
@@ -893,8 +908,8 @@ static void test_tcp_vector_session_redirect_retries(void)
         char endpoint[64];
         snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", server.port);
         const char *seeds[] = {endpoint};
-        vemb_v16_client_t *client =
-            vemb_v16_client_create(seeds, 1, 1, 1000);
+        vemb_v16_client_t *client = vemb_v16_client_create(
+            seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_TCP);
         assert(client != NULL);
         vemb_v16_client_vector_session_t *session =
             vemb_v16_client_vector_session_create(client);
@@ -937,7 +952,7 @@ int main(void)
     test_pipeline_routes_out_of_order_tcp_completions();
     test_same_endpoint_survives_topology_epoch_change();
     test_topology_fetch_fails_over_to_next_seed();
-    test_tcp_handle_is_rejected_before_data_channel_open();
+    test_tcp_handle_is_rejected_at_api_boundary();
     test_tcp_vemb_vector_uses_inline_without_handle_error();
     test_tcp_vector_session_coalesces_inline_read();
     test_tcp_vector_session_epoch_change_invalidates_cache();

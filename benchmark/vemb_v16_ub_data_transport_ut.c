@@ -54,13 +54,70 @@ static uint16_t listener_port(int fd)
     return ntohs(addr.sin_port);
 }
 
-static vemb_v16_client_t *create_ub_client(uint16_t port)
+static void write_local_peer_view_manifest(
+    const fake_ub_server_t *server, const char *path)
+{
+    FILE *fp = fopen(path, "w");
+    assert(fp != NULL);
+    fprintf(fp,
+            "version: 1\n"
+            "peer_views:\n"
+            "  - client_host: local\n"
+            "    owner_id: 0\n"
+            "    resource_role: v1_request_ring\n"
+            "    resource_id: request\n"
+            "    generation: 1\n"
+            "    provider_path: %s\n"
+            "    client_path: %s\n"
+            "    map_from_start: true\n"
+            "    cache_policy: noncacheable\n"
+            "  - client_host: local\n"
+            "    owner_id: 0\n"
+            "    resource_role: v1_response_ring\n"
+            "    resource_id: response\n"
+            "    generation: 1\n"
+            "    provider_path: %s\n"
+            "    client_path: %s\n"
+            "    map_from_start: true\n"
+            "    cache_policy: cacheable\n",
+            server->request_path, server->request_path,
+            server->response_path, server->response_path);
+    if (server->serve_handle_read) {
+        fprintf(fp,
+                "  - client_host: local\n"
+                "    owner_id: 0\n"
+                "    resource_role: warm_region\n"
+                "    resource_id: warm\n"
+                "    generation: 1\n"
+                "    provider_path: %s\n"
+                "    client_path: %s\n"
+                "    map_from_start: true\n"
+                "    cache_policy: noncacheable\n",
+                server->warm_path, server->warm_path);
+    }
+    assert(fclose(fp) == 0);
+}
+
+static vemb_v16_client_t *create_ub_client(const fake_ub_server_t *server)
 {
     char seed[64];
     const char *seeds[] = {seed};
+    char manifest_path[128];
 
-    snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)port);
-    return vemb_v16_client_create(seeds, 1, 1, 1000);
+    snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)server->port);
+    snprintf(manifest_path, sizeof(manifest_path),
+             "/tmp/vemb_v16_ub_transport_%ld_%u.yaml", (long)getpid(),
+             (unsigned)server->port);
+    write_local_peer_view_manifest(server, manifest_path);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, 1, 1000, VEMB_V16_TRANSPORT_AERON);
+    if (client && vemb_v16_client_configure_ub_peer_view(
+                      client, manifest_path, "local") != 0) {
+        vemb_v16_client_destroy(client);
+        client = NULL;
+    }
+    assert(unlink(manifest_path) == 0);
+    return client;
 }
 
 static void write_aeron_topology_epoch(int fd, uint16_t port, uint64_t epoch)
@@ -474,7 +531,7 @@ static void test_aeron_backend_routes_and_matches_completions(int corrupt)
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_ub_server_main, &server) == 0);
 
-    vemb_v16_client_t *client = create_ub_client(server.port);
+    vemb_v16_client_t *client = create_ub_client(&server);
     assert(client != NULL);
     assert(vemb_v16_client_topology_refresh(client) == 0);
 
@@ -523,7 +580,7 @@ static void test_aeron_backend_materializes_owner_warm_handle(void)
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_ub_server_main, &server) == 0);
 
-    vemb_v16_client_t *client = create_ub_client(server.port);
+    vemb_v16_client_t *client = create_ub_client(&server);
     assert(client != NULL);
     assert(vemb_v16_client_topology_refresh(client) == 0);
     float vector = 0;
@@ -588,7 +645,7 @@ static void test_ub_vector_session_coalesces_handle_read(void)
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_ub_server_main, &server) == 0);
 
-    vemb_v16_client_t *client = create_ub_client(server.port);
+    vemb_v16_client_t *client = create_ub_client(&server);
     assert(client != NULL);
     vemb_v16_client_vector_session_t *session =
         vemb_v16_client_vector_session_create(client);
@@ -653,7 +710,7 @@ static void test_aeron_backend_rechecks_resource_on_new_topology_epoch(void)
                           fake_ub_resource_lifecycle_server_main,
                           &server) == 0);
 
-    vemb_v16_client_t *client = create_ub_client(server.port);
+    vemb_v16_client_t *client = create_ub_client(&server);
     assert(client != NULL);
     assert(vemb_v16_client_topology_refresh(client) == 0);
     uint64_t offset = 0;
@@ -707,7 +764,7 @@ static void test_aeron_backend_redirect(uint8_t redirect_status)
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_ub_redirect_server_main,
                           &server) == 0);
-    vemb_v16_client_t *client = create_ub_client(server.port);
+    vemb_v16_client_t *client = create_ub_client(&server);
     assert(client != NULL);
     assert(vemb_v16_client_topology_refresh(client) == 0);
     float query[] = {1.0f};

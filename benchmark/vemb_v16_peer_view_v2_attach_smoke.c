@@ -50,8 +50,8 @@ int main(int argc, char **argv) {
     }
 
     vemb_v16_aeron_batch_resources_t resources;
-    if (vemb_v16_aeron_batch_get_resources(channel, &resources) != 0 ||
-        !resources.request_descriptor_ring || !resources.request_arena ||
+    vemb_v16_aeron_batch_get_resources(channel, &resources);
+    if (!resources.request_descriptor_ring || !resources.request_arena ||
         !resources.response_descriptor_ring || !resources.response_arena ||
         resources.descriptor_slot_size != VEMB_V16_BATCH_DESCRIPTOR_SLOT_SIZE ||
         resources.descriptor_ring_slots != VEMB_V16_CLIENT_RING_SIZE ||

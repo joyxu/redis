@@ -1,0 +1,5 @@
+phase                            ops_sec         p50_ms     p99_ms     wall_s   note
+scaleout_baseline                11619564.03     0.61500    0.94300    31       active={0}
+during_scaleout                  12238984.23     0.59900    0.90300    5        active={0}->{0,1}, memtier-client-topology-retry, endpoints=192.168.1.111:6391,192.168.1.112:6391
+scaleout_after_old_keys          11769461.98     1.24700    1.93500    33       active={0,1}, automatic-topology, old_keys=1-10000, endpoints=192.168.1.111:6391,192.168.1.112:6391
+scaleout_after                   11806971.28     1.21500    1.92700    36       active={0,1}, automatic-topology, steady_keys=10001-20000, endpoints=192.168.1.111:6391,192.168.1.112:6391

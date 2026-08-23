@@ -32,6 +32,34 @@ static vemb_v16_client_topology_t make_topology(uint64_t epoch)
     return topology;
 }
 
+static vemb_v16_client_topology_t make_source_cutover_topology(uint64_t epoch)
+{
+    const uint32_t active_owners[] = {0};
+    const uint32_t standby_owners[] = {0, 1};
+    vemb_v16_topology_control_resp_t response;
+    vemb_v16_client_topology_t topology;
+
+    memset(&response, 0, sizeof(response));
+    response.status = VEMB_V16_STATUS_OK;
+    response.current_topology_epoch = epoch;
+    response.min_write_epoch = epoch;
+    response.vnode_count = VEMB_V16_TOPOLOGY_DEFAULT_VNODES;
+    response.active_owner_count = 1;
+    response.standby_owner_count = 2;
+    response.endpoint_count = 2;
+    memcpy(response.active_owners, active_owners, sizeof(active_owners));
+    memcpy(response.standby_owners, standby_owners, sizeof(standby_owners));
+    for (uint32_t i = 0; i < response.endpoint_count; i++) {
+        response.endpoints[i].owner_id = i;
+        response.endpoints[i].transport_type = VEMB_V16_TRANSPORT_TCP;
+        response.endpoints[i].tcp_port = (uint16_t)(6400 + i);
+        snprintf(response.endpoints[i].host,
+                 sizeof(response.endpoints[i].host), "127.0.0.%u", i + 1);
+    }
+    assert(vemb_v16_client_topology_from_response(&response, &topology) == 0);
+    return topology;
+}
+
 static void test_single_owner_route_and_completion(void)
 {
     vemb_v16_cluster_core_t core;
@@ -150,11 +178,56 @@ static void test_dual_owner_canonical_hash_distribution(void)
     assert(routed[1] != 0);
 }
 
+static void test_moved_redirect_owner_survives_topology_refresh(void)
+{
+    vemb_v16_cluster_core_t core;
+    vemb_v16_cluster_operation_t operation;
+    vemb_v16_cluster_route_t route;
+    vemb_v16_client_topology_t topology =
+        make_source_cutover_topology(20);
+    vemb_v16_resp_t response;
+
+    vemb_v16_cluster_core_init(&core, 1, 4);
+    vemb_v16_cluster_operation_init(&core, &operation, 0xabcdefULL);
+    vemb_v16_cluster_core_publish_topology(&core, &topology);
+    assert(vemb_v16_cluster_core_prepare(&core, &operation, &route) ==
+           VEMB_V16_CLUSTER_PREPARE_READY);
+    assert(route.owner_id == 0);
+
+    response = (vemb_v16_resp_t){
+        .status = VEMB_V16_STATUS_MOVED,
+        .redirect_owner = 1,
+    };
+    assert(vemb_v16_cluster_core_on_response(&core, &operation, &response) ==
+           VEMB_V16_CLUSTER_RESPONSE_REFRESH);
+    assert(operation.moved_retry_pending);
+    assert(operation.moved_owner == 1);
+    assert(!vemb_v16_cluster_core_topology_ready(&core));
+
+    topology = make_source_cutover_topology(21);
+    vemb_v16_cluster_core_publish_topology(&core, &topology);
+    assert(vemb_v16_cluster_core_prepare(&core, &operation, &route) ==
+           VEMB_V16_CLUSTER_PREPARE_READY);
+    assert(route.owner_id == 1);
+    assert(route.topology_epoch == 21);
+    assert(route.request_flags == 0);
+    assert(!operation.moved_retry_pending);
+    assert(operation.attempts == 2);
+
+    response = (vemb_v16_resp_t){.status = VEMB_V16_STATUS_OK};
+    assert(vemb_v16_cluster_core_on_response(&core, &operation, &response) ==
+           VEMB_V16_CLUSTER_RESPONSE_FINAL);
+    vemb_v16_cluster_core_complete(&core, &operation, response.status);
+    assert(vemb_v16_cluster_core_stats(&core)->logical_successes == 1);
+    assert(vemb_v16_cluster_core_stats(&core)->moved_redirects == 1);
+}
+
 int main(void)
 {
     test_single_owner_route_and_completion();
     test_dual_owner_retry_state_machine();
     test_dual_owner_canonical_hash_distribution();
+    test_moved_redirect_owner_survives_topology_refresh();
     printf("vemb_v16_cluster_core_ut: all tests passed\n");
     return 0;
 }

@@ -280,14 +280,16 @@ gcc my_app.c -I$HPCREDIS_DIR/clients/c/build/include -I$HPCREDIS_DIR/src \
 
 int main(void)
 {
-    /* 1. 配置 TCP bootstrap seed；数据 owner 由 topology 决定 */
+    /* 1. 配置 TCP bootstrap seed，并在启动时固定 TCP 数据面 */
     const char *seeds[] = {"127.0.0.1:6379"};
-    vemb_v16_client_t *c = vemb_v16_client_create(seeds, 1, DIM, 0);
+    vemb_v16_client_t *c = vemb_v16_client_create(
+        seeds, 1, DIM, 0, VEMB_V16_TRANSPORT_TCP);
     if (!c) { fprintf(stderr, "connect failed\n"); return 1; }
 
     /* 多 seed 容错：
      * const char *eps[] = {"192.168.90.111:6379", "192.168.90.112:6379"};
-     * vemb_v16_client_t *c = vemb_v16_client_create(eps, 2, DIM, 0);
+     * vemb_v16_client_t *c = vemb_v16_client_create(
+     *     eps, 2, DIM, 0, VEMB_V16_TRANSPORT_TCP);
      */
 
     /* 2. VADD — 写入向量 */
@@ -338,15 +340,17 @@ VSIM score=1.0000
 
 ### Pipeline 批量调用示例
 
-`*_pipeline` 系列接口用于高吞吐批量场景，单次调用发送多个请求并等待全部响应。注意 pipeline 内所有 key 会路由到 `set_names[0]` 选定的后端，跨节点 key 需按业务侧分组。
+`*_pipeline` 系列接口用于高吞吐批量场景，单次调用发送多个请求并等待全部响应。SDK 根据每个 key 的 hash 路由 owner，并按 owner 分组提交。
 
 ```c
 /* 批量 VEMB 读取 */
 const char *sets[3]  = {"myset", "myset", "myset"};
 const char *elems[3] = {"e1", "e2", "e3"};
+float vectors[3 * DIM];
 vemb_v16_pipeline_resp_t resps[3] = {0};
 
-int rc = vemb_v16_client_vemb_pipeline(c, sets, elems, 3, resps, 16);
+int rc = vemb_v16_client_vemb_pipeline(
+    c, sets, elems, 3, vectors, resps, 16);
 if (rc == 0) {
     for (int i = 0; i < 3; i++) {
         printf("[%d] status=%d offset=%llu bytes=%u\n",
@@ -394,7 +398,7 @@ ssize_t used = vemb_v16_parse_response(buf, buf_len, &resp, &inline_bytes);
 
 | API | 用途 | 返回值 |
 | --- | --- | --- |
-| `vemb_v16_client_create(seeds[], seed_count, dim, timeout_ms)` | 创建 client；seeds 是 TCP topology bootstrap 地址 | client 句柄，失败返回 NULL |
+| `vemb_v16_client_create(seeds[], seed_count, dim, timeout_ms, transport_type)` | 创建固定 TCP 或 AERON transport 的 client；seeds 是 TCP topology bootstrap 地址 | client 句柄，失败返回 NULL |
 | `vemb_v16_client_configure_ub_peer_view(c, manifest, client_host)` | 首次 UB channel 前配置固定 remote UB peer-view；manifest owner_id 必须是 topology owner | 0=OK, -1=配置无效或 UB 身份已固定 |
 | `vemb_v16_client_destroy(c)` | 释放 client | void |
 | `vemb_v16_client_vadd(c, set, elem, vec, dim)` | 写入向量 | 0=OK, -1=ERR |
@@ -458,7 +462,8 @@ static void *worker(void *arg)
 
     /* 1. 每线程独立 client（句柄非线程安全） */
     vemb_v16_client_t *c = vemb_v16_client_create(
-        ENDPOINTS, N_EP, DIM, /*timeout_ms=*/0);
+        ENDPOINTS, N_EP, DIM, /*timeout_ms=*/0,
+        VEMB_V16_TRANSPORT_TCP);
     if (!c) {
         fprintf(stderr, "[t%d] connect failed\n", ctx->tid);
         return NULL;
@@ -491,9 +496,10 @@ static void *worker(void *arg)
             continue;
         }
 
+        float out_vectors[BATCH * DIM];
         vemb_v16_pipeline_resp_t resps[BATCH] = {0};
         if (vemb_v16_client_vemb_pipeline(c, sets, elems,
-                                          BATCH, resps, 16) == 0) {
+                                          BATCH, out_vectors, resps, 16) == 0) {
             for (int i = 0; i < BATCH; i++) {
                 if      (resps[i].status == 0) ctx->ok++;
                 else if (resps[i].status == 1) ctx->miss++;
@@ -551,8 +557,10 @@ gcc -I$HPCREDIS_DIR/clients/c/build/include -I$HPCREDIS_DIR/src \
 关键点：
 
 - 每线程一个 `vemb_v16_client_t`，禁止跨线程共享句柄。
-- `vemb_v16_client_create` 接受一个或多个 TCP bootstrap seed；SDK 从服务端 topology
-  选择 key 的 owner 和 TCP/UB 数据面，seed 列表不参与数据路由。
+- `vemb_v16_client_create` 接受一个或多个 TCP bootstrap seed，并固定 TCP 或 AERON
+  数据面；SDK 从服务端 topology 选择 key 的 owner。Server 在 topology-set 边界拒绝
+  transport 不匹配的 endpoint；SDK 若意外收到错配 snapshot 只记录 `WARNING`，
+  不改变启动时固定的数据面。
 - 跨节点 UB 场景在首次 UB 请求前调用 `vemb_v16_client_configure_ub_peer_view`；
   manifest 的 `owner_id` 使用 topology 逻辑编号，而非主机名中的 111/112 编号。
 - 业务侧只需调 `vadd_pipeline` / `vemb_pipeline` / `vsim_pipeline`，`ASK` / `MOVED` / `STALE_TOPOLOGY` 由 SDK 透明重试。

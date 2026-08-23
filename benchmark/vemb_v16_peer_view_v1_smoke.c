@@ -114,7 +114,13 @@ int main(int argc, char **argv) {
         vemb_v16_aeron_channel_t *channel =
             vemb_v16_aeron_open_remote_with_peer_view(
                 argv[1], (uint16_t)port, dim, &manifest, argv[4], owner_id);
-        if (!channel || vemb_v16_aeron_open_warm_region(channel) != 0) {
+        if (!channel) {
+            fprintf(stderr, "peer-view ATTACH failed: cycle=%u\n", cycle);
+            free(expected);
+            free(actual);
+            return 1;
+        }
+        if (vemb_v16_aeron_open_warm_region(channel) != 0) {
             fprintf(stderr, "peer-view ATTACH/warm map failed: cycle=%u\n", cycle);
             vemb_v16_aeron_close(channel);
             free(expected);

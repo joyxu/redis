@@ -95,6 +95,33 @@ vemb_v16_cluster_prepare_result_t vemb_v16_cluster_core_prepare(
         return VEMB_V16_CLUSTER_PREPARE_RETRY_EXHAUSTED;
     }
 
+    if (operation->moved_retry_pending) {
+        if (!vemb_v16_client_topology_find_endpoint(
+                &core->topology, operation->moved_owner)) {
+            core->stats.moved_target_unavailable++;
+            if (operation->moved_refresh_attempts++ < core->retry_budget) {
+                vemb_v16_cluster_core_mark_topology_stale(core);
+                return VEMB_V16_CLUSTER_PREPARE_NEEDS_TOPOLOGY;
+            }
+            operation->moved_retry_pending = 0;
+            operation->exhausted = 1;
+            core->stats.retry_exhaustions++;
+            return VEMB_V16_CLUSTER_PREPARE_RETRY_EXHAUSTED;
+        }
+        operation->target_owner = operation->moved_owner;
+        operation->topology_epoch = core->topology.current_topology_epoch;
+        operation->moved_retry_pending = 0;
+        operation->attempts++;
+        *route = (vemb_v16_cluster_route_t){
+            .topology_epoch = operation->topology_epoch,
+            .owner_channel_generation =
+                core->owner_channels[operation->target_owner].generation,
+            .owner_id = operation->target_owner,
+            .request_flags = 0,
+        };
+        return VEMB_V16_CLUSTER_PREPARE_READY;
+    }
+
     vemb_v16_client_write_plan_t plan;
     if (core->topology_enabled) {
         if (vemb_v16_client_topology_plan_write(&core->topology,
@@ -152,6 +179,12 @@ vemb_v16_cluster_response_action_t vemb_v16_cluster_core_on_response(
                     (unsigned long long)operation->key_hash,
                     operation->target_owner, response->redirect_owner,
                     (unsigned long long)operation->topology_epoch);
+        }
+        if (response->redirect_owner <
+            VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS) {
+            operation->moved_owner = response->redirect_owner;
+            operation->moved_retry_pending = 1;
+            operation->moved_refresh_attempts = 0;
         }
         vemb_v16_cluster_core_mark_topology_stale(core);
         return VEMB_V16_CLUSTER_RESPONSE_REFRESH;

@@ -3,6 +3,7 @@
 #include "vemb_v16_cli_tcp.h"
 #include "vemb_v16_protocol.h"
 #include "vemb_v16_net.h"
+#include "redisassert.h"
 #include "../clients/c/vemb_v16_client_sdk.h"
 
 #ifndef REDIS_OK
@@ -28,11 +29,9 @@ int vemb_v16_cli_tcp_init_multi(const char **endpoints,
 
     vemb_v16_cli_tcp_cleanup();
 
-    g_client = vemb_v16_client_create(endpoints, endpoint_count, dim, 0);
-    if (!g_client) {
-        fprintf(stderr, "vemb_v16_cli_tcp_init_multi: connect failed\n");
-        return -1;
-    }
+    g_client = vemb_v16_client_create(
+        endpoints, endpoint_count, dim, 0, VEMB_V16_TRANSPORT_TCP);
+    assert(g_client != NULL);
     g_cli_dim = dim;
     return 0;
 }
@@ -45,7 +44,7 @@ int vemb_v16_cli_tcp_init(const char *host, uint16_t port, uint32_t dim) {
 }
 
 int vemb_v16_cli_tcp_vadd(int argc, char **argv) {
-    if (!g_client || argc < 4) return -1;
+    if (argc < 4) return -1;
 
     const char *set_name = argv[1];
     int idx = 2;
@@ -111,13 +110,13 @@ int vemb_v16_cli_tcp_vadd(int argc, char **argv) {
 }
 
 int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output) {
-    if (!g_client || argc < 3) return -1;
+    if (argc < 3) return -1;
 
     const char *set_name  = argv[1];
     const char *elem_name = argv[2];
 
     float *vec = malloc(g_cli_dim * sizeof(float));
-    if (!vec) return -1;
+    assert(vec != NULL);
 
     uint32_t out_dim = 0;
     int rc = vemb_v16_client_vemb_vector(g_client, set_name, elem_name,
@@ -145,7 +144,7 @@ int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output) {
 
 int vemb_v16_cli_tcp_vemb_pipeline(int argc, char **argv,
                                    int raw_output, int repeat) {
-    if (!g_client || argc < 3 || repeat <= 0) return -1;
+    if (argc < 3 || repeat <= 0) return -1;
 
     if (vemb_v16_client_vemb_repeat(g_client, argv[1], argv[2],
                                     (uint32_t)repeat, 64) != 0) {
@@ -160,7 +159,7 @@ int vemb_v16_cli_tcp_vemb_pipeline(int argc, char **argv,
 
 int vemb_v16_cli_tcp_vsim(int argc, char **argv, int raw_output) {
     (void)raw_output;
-    if (!g_client || argc < 4) return -1;
+    if (argc < 4) return -1;
 
     const char *set_name  = argv[1];
     const char *elem_name = argv[2];
@@ -192,7 +191,7 @@ int vemb_v16_cli_tcp_vsim(int argc, char **argv, int raw_output) {
 
 int vemb_v16_cli_tcp_vsim_pipeline(int argc, char **argv, int raw_output, int repeat) {
     (void)raw_output;
-    if (!g_client || argc < 4 || repeat <= 0) return -1;
+    if (argc < 4 || repeat <= 0) return -1;
 
     const char *set_name  = argv[1];
     const char *elem_name = argv[2];
@@ -226,9 +225,8 @@ int vemb_v16_cli_tcp_vsim_pipeline(int argc, char **argv, int raw_output, int re
 }
 
 void vemb_v16_cli_tcp_cleanup(void) {
-    if (g_client) {
-        vemb_v16_client_destroy(g_client);
-        g_client = NULL;
-    }
     g_cli_dim = 0;
+    RETURN_IF(g_client == NULL);
+    vemb_v16_client_destroy(g_client);
+    g_client = NULL;
 }
