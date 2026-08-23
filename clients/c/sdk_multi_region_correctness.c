@@ -60,7 +60,8 @@ int main(int argc, char **argv) {
     char seed[80];
     snprintf(seed, sizeof(seed), "%s:%u", host, port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *tcp = vemb_v16_client_create(seeds, 1, dim, 10000);
+    vemb_v16_client_t *tcp = vemb_v16_client_create(
+        seeds, 1, dim, 10000, VEMB_V16_TRANSPORT_TCP);
     if (!tcp) {
         fprintf(stderr, "FAIL: TCP connect to %s:%u\n", host, port);
         return 1;

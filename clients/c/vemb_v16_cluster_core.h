@@ -24,6 +24,7 @@ typedef struct vemb_v16_cluster_owner_channel {
 typedef struct vemb_v16_cluster_stats {
     uint64_t ask_redirects;
     uint64_t moved_redirects;
+    uint64_t moved_target_unavailable;
     uint64_t stale_topology_responses;
     uint64_t topology_refresh_calls;
     uint64_t retry_exhaustions;
@@ -48,9 +49,12 @@ typedef struct vemb_v16_cluster_operation {
     uint64_t key_hash;
     uint64_t topology_epoch;
     uint32_t target_owner;
+    uint32_t moved_owner;
     uint32_t attempts;
+    uint32_t moved_refresh_attempts;
     uint8_t ask_retry_pending;
     uint8_t ask_retry_used;
+    uint8_t moved_retry_pending;
     uint8_t exhausted;
     uint8_t completed;
 } vemb_v16_cluster_operation_t;

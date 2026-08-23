@@ -32,7 +32,8 @@ int main(int argc, char **argv)
 
     const char *seeds[] = {argv[1], argv[2]};
     vemb_v16_client_t *client =
-        vemb_v16_client_create(seeds, 2, dim, 5000);
+        vemb_v16_client_create(seeds, 2, dim, 5000,
+                               VEMB_V16_TRANSPORT_TCP);
     if (!client) {
         fprintf(stderr, "create failed\n");
         return 1;

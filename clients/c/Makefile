@@ -51,7 +51,8 @@ SDK_SOURCES := \
 	$(SRC_DIR)/vemb_v16_net.c \
 	$(SRC_DIR)/vemb_v16_client_topology.c \
 	$(SRC_DIR)/vemb_v16_topology.c \
-	$(SRC_DIR)/monotonic.c
+	$(SRC_DIR)/monotonic.c \
+	$(SRC_DIR)/redisassert.c
 
 # ---- build dirs ----
 BUILD_DIR := build
@@ -129,6 +130,10 @@ $(OBJ_DIR)/vemb_v16_topology.o: $(SRC_DIR)/vemb_v16_topology.c
 $(OBJ_DIR)/monotonic.o: $(SRC_DIR)/monotonic.c
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(ALL_CFLAGS) -DVEMB_V16_CLIENT_SDK -MMD -c $< -o $@
+
+$(OBJ_DIR)/redisassert.o: $(SRC_DIR)/redisassert.c
+	@mkdir -p $(OBJ_DIR)
+	$(CC) $(ALL_CFLAGS) -MMD -c $< -o $@
 
 # Static library
 static: $(LIB_DIR)/libvemb_v16_client.a

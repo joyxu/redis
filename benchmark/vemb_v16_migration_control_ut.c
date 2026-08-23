@@ -889,6 +889,237 @@ static void run_vrem_job_with_flags(vemb_v16_storage_ctx_t *storage,
                   completion);
 }
 
+static void run_vemb_handle_job(vemb_v16_storage_ctx_t *storage,
+                                const char *key,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t dim,
+                                vemb_v16_completion_t *completion) {
+    vemb_v16_completion_t completion_slots[4];
+    vemb_v16_aeron_ring_t completion_ring;
+    atomic_int active;
+    atomic_int running;
+    atomic_int notify_armed;
+    int notify_fd = -1;
+    vemb_v16_channel_counters_t stats;
+    vemb_v16_vemb_job_t job;
+    uint32_t key_len = (uint32_t)strlen(key);
+
+    memset(completion_slots, 0, sizeof(completion_slots));
+    memset(&completion_ring, 0, sizeof(completion_ring));
+    memset(&stats, 0, sizeof(stats));
+    memset(&job, 0, sizeof(job));
+    atomic_init(&active, 1);
+    atomic_init(&running, 1);
+    atomic_init(&notify_armed, 0);
+    assert(vemb_v16_aeron_ring_init(&completion_ring,
+                                    completion_slots,
+                                    sizeof(completion_slots[0]),
+                                    4) == 0);
+
+    vemb_v16_supernode_ctx_t ctx = {
+        .channel_active = &active,
+        .running = &running,
+        .completion_notify_armed = &notify_armed,
+        .completion_notify_fd = &notify_fd,
+        .completion_ring = &completion_ring,
+        .storage = storage,
+        .stats = &stats,
+    };
+    job.base.op = VEMB_V16_OP_VEMB_HANDLE;
+    job.base.req_id = 7101;
+    job.base.channel_id = 1101;
+    job.base.key_hash = key_hash;
+    job.base.topology_epoch = topology_epoch;
+    job.key_len = key_len;
+    job.dim = dim;
+    job.vector_bytes = dim * sizeof(float);
+    memcpy(job.key, key, key_len);
+
+    vemb_v16_supernode_handle_vemb_job(&ctx, &job);
+    assert(vemb_v16_aeron_poll(&completion_ring, completion) == 1);
+}
+
+static void test_supernode_lookup_miss_classification(void) {
+    enum { dim = 2, max_vectors = 16 };
+    float region[dim * max_vectors];
+    float value[dim];
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 991,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .value_size = sizeof(value),
+        .region_bytes = sizeof(region),
+        .mapped_addr = (uint8_t *)region,
+        .slot_meta = NULL,
+    };
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_storage_ctx_t storage;
+    vemb_v16_vector_handle_t handle = {0};
+    tlc_core_key_migration_info_t info = {0};
+    vemb_v16_completion_t completion = {0};
+    uint32_t warm_slot = UINT32_MAX;
+
+    memset(region, 0, sizeof(region));
+    fill_vector(value, dim, 9100);
+    assert(vemb_v16_tlc_create(&tlc,
+                               dim,
+                               max_vectors,
+                               &warm,
+                               1,
+                               1) == 0);
+    memset(&storage, 0, sizeof(storage));
+    storage.local_owner_id = 0;
+    storage.tlc = tlc;
+    init_storage_runtime_fields(&storage, 0, 0);
+    assert(pthread_mutex_init(&storage.topology_lock, NULL) == 0);
+    assert(pthread_mutex_init(&storage.migration_outbox_lock, NULL) == 0);
+
+    const char *missing_key = "lookup-miss-no-metadata";
+    uint64_t missing_hash = vemb_v16_xxh3_64_str(missing_key,
+                                                 strlen(missing_key));
+    run_vemb_handle_job(&storage,
+                        missing_key,
+                        missing_hash,
+                        10,
+                        dim,
+                        &completion);
+    assert(completion.status == VEMB_V16_STATUS_NOT_FOUND);
+
+    const char *migrating_key = "lookup-miss-migrating";
+    uint64_t migrating_hash = vemb_v16_xxh3_64_str(migrating_key,
+                                                   strlen(migrating_key));
+    assert(vemb_v16_tlc_put(tlc,
+                            migrating_key,
+                            strlen(migrating_key),
+                            migrating_hash,
+                            value,
+                            sizeof(value),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(tlc_core_mark_migrating_in_shard(tlc->core,
+                                            migrating_key,
+                                            strlen(migrating_key),
+                                            migrating_hash,
+                                            10,
+                                            2,
+                                            0,
+                                            &info) == 0);
+    assert(tlc_core_delete_with_epoch(tlc->core,
+                                      migrating_key,
+                                      strlen(migrating_key),
+                                      migrating_hash,
+                                      10,
+                                      &info) == 0);
+    memset(&completion, 0, sizeof(completion));
+    run_vemb_handle_job(&storage,
+                        migrating_key,
+                        migrating_hash,
+                        10,
+                        dim,
+                        &completion);
+    assert(completion.status == VEMB_V16_STATUS_STALE_TOPOLOGY);
+
+    const char *cutover_key = "lookup-miss-cutover";
+    uint64_t cutover_hash = vemb_v16_xxh3_64_str(cutover_key,
+                                                 strlen(cutover_key));
+    warm_slot = UINT32_MAX;
+    assert(vemb_v16_tlc_put(tlc,
+                            cutover_key,
+                            strlen(cutover_key),
+                            cutover_hash,
+                            value,
+                            sizeof(value),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(tlc_core_mark_migrating_in_shard(tlc->core,
+                                            cutover_key,
+                                            strlen(cutover_key),
+                                            cutover_hash,
+                                            10,
+                                            2,
+                                            0,
+                                            &info) == 0);
+    assert(tlc_core_delete_with_epoch(tlc->core,
+                                      cutover_key,
+                                      strlen(cutover_key),
+                                      cutover_hash,
+                                      10,
+                                      &info) == 0);
+    assert(tlc_core_mark_cutover(tlc->core,
+                                 cutover_key,
+                                 strlen(cutover_key),
+                                 cutover_hash,
+                                 11,
+                                 2,
+                                 &info) == 0);
+    memset(&completion, 0, sizeof(completion));
+    run_vemb_handle_job(&storage,
+                        cutover_key,
+                        cutover_hash,
+                        11,
+                        dim,
+                        &completion);
+    assert(completion.status == VEMB_V16_STATUS_MOVED);
+    assert(completion.redirect_owner == 2);
+
+    const char *source_gc_key = "lookup-miss-source-gc";
+    uint64_t source_gc_hash = vemb_v16_xxh3_64_str(source_gc_key,
+                                                   strlen(source_gc_key));
+    warm_slot = UINT32_MAX;
+    assert(vemb_v16_tlc_put(tlc,
+                            source_gc_key,
+                            strlen(source_gc_key),
+                            source_gc_hash,
+                            value,
+                            sizeof(value),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_storage_migration_mark_migrating(&storage,
+                                                     source_gc_key,
+                                                     strlen(source_gc_key),
+                                                     source_gc_hash,
+                                                     10,
+                                                     2,
+                                                     &info) == 0);
+    assert(vemb_v16_storage_migration_active(&storage));
+    assert(tlc_core_delete_with_epoch(tlc->core,
+                                      source_gc_key,
+                                      strlen(source_gc_key),
+                                      source_gc_hash,
+                                      10,
+                                      &info) == 0);
+    assert(tlc_core_mark_cutover(tlc->core,
+                                 source_gc_key,
+                                 strlen(source_gc_key),
+                                 source_gc_hash,
+                                 11,
+                                 2,
+                                 &info) == 0);
+    assert(vemb_v16_storage_migration_mark_source_gc(&storage,
+                                                     source_gc_key,
+                                                     strlen(source_gc_key),
+                                                     source_gc_hash,
+                                                     11,
+                                                     2,
+                                                     &info) == 0);
+    assert(!vemb_v16_storage_migration_active(&storage));
+    memset(&completion, 0, sizeof(completion));
+    run_vemb_handle_job(&storage,
+                        source_gc_key,
+                        source_gc_hash,
+                        11,
+                        dim,
+                        &completion);
+    assert(completion.status == VEMB_V16_STATUS_MOVED);
+    assert(completion.redirect_owner == 2);
+
+    pthread_mutex_destroy(&storage.migration_outbox_lock);
+    pthread_mutex_destroy(&storage.topology_lock);
+    vemb_v16_tlc_destroy(tlc);
+}
+
 static void test_proxy_migration_control_primitives(void) {
     enum { dim = 2, max_vectors = 4 };
     char manifest_path[128];
@@ -4923,6 +5154,7 @@ int main(void) {
     test_storage_coordinated_scaleout_waits_for_full_active();
     test_supernode_vadd_pushes_migration_delta();
     test_migration_retry_worker_drains_when_target_becomes_ready();
+    test_supernode_lookup_miss_classification();
     printf("vemb_v16_migration_control_ut: all tests passed\n");
     return 0;
 }

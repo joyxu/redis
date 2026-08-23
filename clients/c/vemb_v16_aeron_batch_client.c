@@ -4,9 +4,9 @@
 #include "vemb_v16_client_sdk.h"
 #include "internal/vemb_v16_cli_deadline.h"
 #include "internal/vemb_v16_cli_l0.h"
+#include "../../src/redisassert.h"
 #include "../../src/vemb_v16_util.h"
 
-#include <assert.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -337,15 +337,13 @@ vemb_v16_aeron_batch_client_open_remote_with_peer_view(
         !peer_view_manifest || !client_host || !client_host[0])
         return NULL;
     vemb_v16_aeron_batch_client_t *client = calloc(1, sizeof(*client));
-    if (!client)
-        return NULL;
+    assert(client != NULL);
     client->dim = dim;
     client->next_req_id = 1;
     client->next_batch_id = 1;
     client->shared_vector = calloc(dim, sizeof(float));
     client->direct_vector = calloc(dim, sizeof(float));
-    if (!client->shared_vector || !client->direct_vector)
-        goto fail;
+    assert(client->shared_vector != NULL && client->direct_vector != NULL);
     client->legacy_channel = vemb_v16_aeron_open_remote_with_peer_view(
         host, port, dim, peer_view_manifest, client_host, owner_id);
     if (!client->legacy_channel ||
@@ -367,9 +365,8 @@ vemb_v16_aeron_batch_client_open_remote_with_peer_view(
     if (!client->batch_channel)
         goto fail;
     vemb_v16_aeron_batch_resources_t resources;
-    if (vemb_v16_aeron_batch_get_resources(client->batch_channel, &resources) != 0 ||
-        !(client->l0 = vemb_v16_cli_l0_create(1)))
-        goto disable_batch;
+    vemb_v16_aeron_batch_get_resources(client->batch_channel, &resources);
+    client->l0 = vemb_v16_cli_l0_create(1);
     client->effective_batch_size = resources.effective_batch_size;
     client->max_batch_bytes = resources.max_batch_bytes;
     client->route_identity = (vemb_v16_owner_session_identity_t){
@@ -382,10 +379,6 @@ vemb_v16_aeron_batch_client_open_remote_with_peer_view(
     client->batch_enabled = 1;
     return client;
 
-disable_batch:
-    vemb_v16_aeron_batch_close(client->batch_channel);
-    client->batch_channel = NULL;
-    goto fail;
 fail:
     if (client->legacy_channel)
         vemb_v16_aeron_close(client->legacy_channel);
@@ -407,8 +400,7 @@ vemb_v16_aeron_batch_client_t *vemb_v16_aeron_batch_client_open_remote(
 
 static int batch_client_flush(vemb_v16_aeron_batch_client_t *client,
                               enum batch_client_flush_reason reason) {
-    if (!client || client->closing)
-        return -1;
+    RETURN_IF(client->closing, -1);
     if (!client->batch_enabled)
         return 0;
     vemb_v16_cli_l0_batch_draft_t draft;
@@ -484,9 +476,9 @@ static int batch_client_flush_if_due(vemb_v16_aeron_batch_client_t *client) {
 int vemb_v16_aeron_batch_client_submit_handle(
     vemb_v16_aeron_batch_client_t *client, const char *final_key,
     uint16_t key_len, uint64_t caller_cookie) {
-    if (!client || client->closing || !final_key || key_len == 0 ||
-        key_len > VEMB_V16_MAX_KEY_LEN)
-        return -1;
+    assert(final_key != NULL);
+    RETURN_IF(client->closing || key_len == 0 ||
+              key_len > VEMB_V16_MAX_KEY_LEN, -1);
     if (!client->batch_enabled)
         return batch_client_submit_direct(client, final_key, key_len, caller_cookie);
     uint32_t entry_id, channel_index;
@@ -669,8 +661,7 @@ static int batch_client_poll_v2_shared(
 int vemb_v16_aeron_batch_client_poll(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_completion_cb cb, void *priv) {
-    if (!client || client->closing)
-        return -1;
+    RETURN_IF(client->closing, -1);
     (void)batch_client_flush_if_due(client);
     int callbacks = 0;
     int rc = batch_client_poll_v2(client, cb, priv);
@@ -693,8 +684,7 @@ int vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_materialized_group_cb group_cb, void *group_priv,
     vemb_v16_aeron_batch_vector_completion_cb cb, void *priv) {
-    if (!client || client->closing)
-        return -1;
+    RETURN_IF(client->closing, -1);
     (void)batch_client_flush_if_due(client);
     int callbacks = 0;
     int rc = batch_client_poll_v2_shared(client, group_cb, group_priv, cb,
@@ -709,30 +699,27 @@ int vemb_v16_aeron_batch_client_poll_shared_vector_with_materialization_hook(
 
 uint64_t vemb_v16_aeron_batch_client_next_flush_deadline_ns(
     const vemb_v16_aeron_batch_client_t *client) {
-    if (!client || client->closing || !client->batch_enabled)
-        return 0;
+    RETURN_IF(client->closing || !client->batch_enabled, 0);
     return client->flush_deadline.deadline_ns;
 }
 
 int vemb_v16_aeron_batch_client_read_vector(
     vemb_v16_aeron_batch_client_t *client, uint32_t region_id,
     uint64_t offset, uint32_t bytes, float *out, uint32_t out_cap) {
-    if (!client)
-        return -1;
+    assert(out != NULL && out_cap > 0);
     return vemb_v16_aeron_read_vector(client->legacy_channel, region_id,
                                       offset, bytes, out, out_cap);
 }
 
 int vemb_v16_aeron_batch_client_batch_enabled(
     const vemb_v16_aeron_batch_client_t *client) {
-    return client ? client->batch_enabled : 0;
+    return client->batch_enabled;
 }
 
 void vemb_v16_aeron_batch_client_get_stats(
     const vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_client_stats_t *out) {
-    if (!client || !out)
-        return;
+    assert(out != NULL);
     *out = client->stats;
     out->batch_enabled = client->batch_enabled;
     out->effective_batch_size = client->effective_batch_size;
@@ -755,8 +742,6 @@ void vemb_v16_aeron_batch_client_get_stats(
 void vemb_v16_aeron_batch_client_close(
     vemb_v16_aeron_batch_client_t *client,
     vemb_v16_aeron_batch_completion_cb cb, void *priv) {
-    if (!client)
-        return;
     client->closing = 1;
     vemb_v16_resp_t error = {
         .status = VEMB_V16_STATUS_ERR,

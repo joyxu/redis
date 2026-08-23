@@ -1,6 +1,6 @@
 #include "internal/vemb_v16_cli_l1.h"
+#include "../../src/redisassert.h"
 
-#include <assert.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -158,7 +158,8 @@ static uint32_t vemb_v16_cli_l1_choose_victim(vemb_v16_cli_l1_t *l1,
 
 vemb_v16_cli_l1_t *vemb_v16_cli_l1_create(
     const vemb_v16_cli_l1_config_t *config) {
-    if (!config || config->dim == 0 || config->dim > VEMB_V16_MAX_DIM ||
+    assert(config != NULL);
+    if (config->dim == 0 || config->dim > VEMB_V16_MAX_DIM ||
         config->entry_count < VEMB_V16_CLI_L1_WAYS ||
         config->entry_count % VEMB_V16_CLI_L1_WAYS != 0)
         return NULL;
@@ -182,8 +183,7 @@ vemb_v16_cli_l1_t *vemb_v16_cli_l1_create(
         return NULL;
 
     vemb_v16_cli_l1_t *l1 = calloc(1, sizeof(*l1));
-    if (!l1)
-        return NULL;
+    assert(l1 != NULL);
     l1->entry_count = config->entry_count;
     l1->set_count = set_count;
     l1->key_slot_count = key_slot_count;
@@ -196,17 +196,9 @@ vemb_v16_cli_l1_t *vemb_v16_cli_l1_create(
         malloc((size_t)vector_slot_count * sizeof(*l1->vector_next));
     l1->key_slab = malloc((size_t)key_slot_count * VEMB_V16_MAX_KEY_LEN);
     l1->vector_pool = malloc((size_t)vector_slot_count * vector_bytes);
-    if (!l1->sets || !l1->entries || !l1->key_next || !l1->vector_next ||
-        !l1->key_slab || !l1->vector_pool) {
-        free(l1->sets);
-        free(l1->entries);
-        free(l1->key_next);
-        free(l1->vector_next);
-        free(l1->key_slab);
-        free(l1->vector_pool);
-        free(l1);
-        return NULL;
-    }
+    assert(l1->sets != NULL && l1->entries != NULL && l1->key_next != NULL &&
+           l1->vector_next != NULL && l1->key_slab != NULL &&
+           l1->vector_pool != NULL);
     vemb_v16_cli_l1_init_free_list(l1->key_next, key_slot_count,
                                     &l1->key_free_head);
     vemb_v16_cli_l1_init_free_list(l1->vector_next, vector_slot_count,

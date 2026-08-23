@@ -149,7 +149,8 @@
    {
        /* 1. 配置 TCP bootstrap seed；数据 owner 由 topology 决定 */
        const char *seeds[] = {"127.0.0.1:6379"};
-       vemb_v16_client_t *c = vemb_v16_client_create(seeds, 1, DIM, 0);
+       vemb_v16_client_t *c = vemb_v16_client_create(
+           seeds, 1, DIM, 0, VEMB_V16_TRANSPORT_TCP);
        if (!c) { fprintf(stderr, "connect failed\n"); return 1; }
 
        /* 2. 构造一个待写入的向量 */

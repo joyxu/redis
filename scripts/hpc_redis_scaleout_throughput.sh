@@ -6,10 +6,10 @@
 #   段2 during      — 后台 VEMB 读 + 触发扩容，等完成后停止
 #   段3 after       — 新稳态 VEMB 读 TEST_TIME 秒
 #
-# 用法: bash benchmark/hpc_redis_scaleout_throughput.sh
-#   smoke: TEST_TIME=3 PREFILL_KEYS=1000 bash benchmark/hpc_redis_scaleout_throughput.sh
+# 用法: bash scripts/hpc_redis_scaleout_throughput.sh
+#   smoke: TEST_TIME=3 PREFILL_KEYS=1000 bash scripts/hpc_redis_scaleout_throughput.sh
 #
-# 所有产物（yaml、log、tsv、raw）写 benchmark/results/scaleout/<run_id>/ 下，不放 /tmp。
+# summary.tsv 和远端日志指针写入 benchmark/results/scaleout/<run_id>/；原始日志保留在远端。
 set -euo pipefail
 
 # TCP uses the established VEMB memtier path. UB dispatches to the matching
@@ -19,7 +19,7 @@ DATA_TRANSPORT="${DATA_TRANSPORT:-tcp}"
 case "$DATA_TRANSPORT" in
     tcp) ;;
     ub)
-        exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/vemb_v16_scaleout_ub_cluster_111_to_112.sh"
+        exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh"
         ;;
     *)
         echo "DATA_TRANSPORT must be tcp or ub: $DATA_TRANSPORT" >&2
@@ -98,6 +98,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOCAL_RUN_DIR="$RESULTS_DIR/$RUN_ID"
 mkdir -p "$LOCAL_RUN_DIR"
 TSV="$LOCAL_RUN_DIR/summary.tsv"
+REMOTE_ARTIFACTS_FILE="$LOCAL_RUN_DIR/remote_artifacts.txt"
 
 # 远端产物子目录（相对 REMOTE_DIR；node0/node1 同路径）
 REMOTE_SUBDIR="benchmark/results/scaleout/$RUN_ID"
@@ -110,6 +111,22 @@ COORD_OUT="$REMOTE_DIR/$REMOTE_SUBDIR/coord.out"
 COORD_ERR="$REMOTE_DIR/$REMOTE_SUBDIR/coord.err"
 PREFILL_LOG="$REMOTE_DIR/$REMOTE_SUBDIR/prefill.log"
 RAW_DIR="$REMOTE_DIR/$REMOTE_SUBDIR/raw"
+
+cat >"$REMOTE_ARTIFACTS_FILE" <<EOF
+# Remote artifacts for run_id=$RUN_ID (logs are not copied locally)
+node0=$SSH_USER@$NODE0_SSH_HOST:$NODE0_SSH_PORT:$REMOTE_DIR/$REMOTE_SUBDIR
+node1=$SSH_USER@$NODE1_SSH_HOST:$NODE1_SSH_PORT:$REMOTE_DIR/$REMOTE_SUBDIR
+node0_server_log=$NODE0_LOG
+node1_server_log=$NODE1_LOG
+coordinator_log=$COORD_OUT
+coordinator_error=$COORD_ERR
+prefill_log=$PREFILL_LOG
+raw_baseline=$RAW_DIR/scaleout_baseline.txt
+raw_during=$RAW_DIR/scaleout_during.txt
+raw_after_old_keys=$RAW_DIR/scaleout_after_old_keys.txt
+raw_after_prefill=$RAW_DIR/scaleout_after_prefill.txt
+raw_after=$RAW_DIR/scaleout_after.txt
+EOF
 
 # 工具函数
 # 直连内网 ssh (port 22): 脚本在内网执行, 任意节点 (含负载机) 可达。
@@ -670,3 +687,4 @@ fi
 
 log "DONE — $TSV"
 cat "$TSV"
+printf 'Remote artifact locations: %s\n' "$REMOTE_ARTIFACTS_FILE"

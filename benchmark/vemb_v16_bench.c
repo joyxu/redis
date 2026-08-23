@@ -1658,7 +1658,8 @@ static vemb_v16_client_t *open_common_core_client(const bench_cfg_t *cfg)
     }
 
     vemb_v16_client_t *client = vemb_v16_client_create(
-        seeds, (int)cfg->node_count, cfg->dim, cfg->timeout_ms);
+        seeds, (int)cfg->node_count, cfg->dim, cfg->timeout_ms,
+        cfg->transport_type);
     if (!client)
         return NULL;
     if ((cfg->ub_peer_view_manifest_path || cfg->ub_peer_view_client_host) &&

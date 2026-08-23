@@ -104,7 +104,10 @@ typedef enum vemb_v16_transport_resource_state {
  * fence() has the strict precondition that the core already delivered every
  * completion for this owner; it returns 0 only when the transport has no
  * submitted request left. The core owns the actual completion drain so no
- * confirmed result is silently discarded during a reattach.
+ * confirmed result is silently discarded during a reattach. POLL_FAILED may
+ * invalidate broken transport state immediately; the owner lifecycle still
+ * clears its logical state through the backend wrapper. close_channel() itself
+ * is called only for live transport state.
  */
 struct vemb_v16_data_transport_ops {
     int (*open_owner_channel)(vemb_v16_data_channel_t *channel,

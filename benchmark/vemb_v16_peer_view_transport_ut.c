@@ -131,7 +131,7 @@ static void create_warm_file(char *path, size_t path_cap, void **out_mapping,
     *out_mapping_bytes = sizeof(value);
 }
 
-static void write_manifest_entry(FILE *fp, const char *role,
+static void write_manifest_entry(FILE *fp, uint32_t owner_id, const char *role,
                                  const char *resource_id,
                                  const char *provider_path,
                                  const char *client_path,
@@ -146,26 +146,51 @@ static void write_manifest_entry(FILE *fp, const char *role,
             "    client_path: %s\n"
             "    map_from_start: true\n"
             "    cache_policy: %s\n",
-            TEST_OWNER, role, resource_id, provider_path, client_path,
+            owner_id, role, resource_id, provider_path, client_path,
             cache_policy);
 }
 
-static void write_v1_manifest(const char *path, const char *request_path,
-                              const char *response_path, const char *warm_path,
-                              int include_request) {
+static void write_v1_manifest_for_owner(
+    const char *path, const char *request_path, const char *response_path,
+    const char *warm_path, uint32_t owner_id, int include_request)
+{
     FILE *fp = fopen(path, "w");
     assert(fp != NULL);
     fprintf(fp, "version: 1\npeer_views:\n");
     if (include_request) {
-        write_manifest_entry(fp, "v1_request_ring", "request",
+        write_manifest_entry(fp, owner_id, "v1_request_ring", "request",
                              "/provider/v1-request", request_path,
                              "noncacheable");
     }
-    write_manifest_entry(fp, "v1_response_ring", "response",
+    write_manifest_entry(fp, owner_id, "v1_response_ring", "response",
                          "/provider/v1-response", response_path,
                          "cacheable");
-    write_manifest_entry(fp, "warm_region", "warm", "/provider/v1-warm",
-                         warm_path, "noncacheable");
+    write_manifest_entry(fp, owner_id, "warm_region", "warm",
+                         "/provider/v1-warm", warm_path, "noncacheable");
+    assert(fclose(fp) == 0);
+}
+
+static void write_v1_manifest(const char *path, const char *request_path,
+                              const char *response_path, const char *warm_path,
+                              int include_request)
+{
+    write_v1_manifest_for_owner(path, request_path, response_path, warm_path,
+                                TEST_OWNER, include_request);
+}
+
+static void write_direct_v1_manifest(
+    const char *path, const char *request_path, const char *response_path,
+    const char *warm_path)
+{
+    FILE *fp = fopen(path, "w");
+    assert(fp != NULL);
+    fprintf(fp, "version: 1\npeer_views:\n");
+    write_manifest_entry(fp, TEST_DIRECT_OWNER, "v1_request_ring", "request",
+                         request_path, request_path, "noncacheable");
+    write_manifest_entry(fp, TEST_DIRECT_OWNER, "v1_response_ring", "response",
+                         response_path, response_path, "cacheable");
+    write_manifest_entry(fp, TEST_DIRECT_OWNER, "warm_region", "warm",
+                         warm_path, warm_path, "noncacheable");
     assert(fclose(fp) == 0);
 }
 
@@ -174,16 +199,16 @@ static void write_v2_manifest(const char *path,
     FILE *fp = fopen(path, "w");
     assert(fp != NULL);
     fprintf(fp, "version: 1\npeer_views:\n");
-    write_manifest_entry(fp, "v2_request_descriptor", "request-desc",
+    write_manifest_entry(fp, TEST_OWNER, "v2_request_descriptor", "request-desc",
                          "/provider/v2-request-desc",
                          server->request_descriptor_path, "noncacheable");
-    write_manifest_entry(fp, "v2_request_arena", "request-arena",
+    write_manifest_entry(fp, TEST_OWNER, "v2_request_arena", "request-arena",
                          "/provider/v2-request-arena",
                          server->request_arena_path, "noncacheable");
-    write_manifest_entry(fp, "v2_response_descriptor", "response-desc",
+    write_manifest_entry(fp, TEST_OWNER, "v2_response_descriptor", "response-desc",
                          "/provider/v2-response-desc",
                          server->response_descriptor_path, "cacheable");
-    write_manifest_entry(fp, "v2_response_arena", "response-arena",
+    write_manifest_entry(fp, TEST_OWNER, "v2_response_arena", "response-arena",
                          "/provider/v2-response-arena",
                          server->response_arena_path, "cacheable");
     assert(fclose(fp) == 0);
@@ -194,24 +219,24 @@ static void write_sdk_v2_manifest(const char *path,
     FILE *fp = fopen(path, "w");
     assert(fp != NULL);
     fprintf(fp, "version: 1\npeer_views:\n");
-    write_manifest_entry(fp, "v1_request_ring", "request",
+    write_manifest_entry(fp, TEST_OWNER, "v1_request_ring", "request",
                          "/provider/v1-request", server->v1.request_path,
                          "noncacheable");
-    write_manifest_entry(fp, "v1_response_ring", "response",
+    write_manifest_entry(fp, TEST_OWNER, "v1_response_ring", "response",
                          "/provider/v1-response", server->v1.response_path,
                          "cacheable");
-    write_manifest_entry(fp, "warm_region", "warm", "/provider/v1-warm",
+    write_manifest_entry(fp, TEST_OWNER, "warm_region", "warm", "/provider/v1-warm",
                          server->v1.warm_path, "noncacheable");
-    write_manifest_entry(fp, "v2_request_descriptor", "request-desc",
+    write_manifest_entry(fp, TEST_OWNER, "v2_request_descriptor", "request-desc",
                          "/provider/v2-request-desc",
                          server->request_descriptor_path, "noncacheable");
-    write_manifest_entry(fp, "v2_request_arena", "request-arena",
+    write_manifest_entry(fp, TEST_OWNER, "v2_request_arena", "request-arena",
                          "/provider/v2-request-arena",
                          server->request_arena_path, "noncacheable");
-    write_manifest_entry(fp, "v2_response_descriptor", "response-desc",
+    write_manifest_entry(fp, TEST_OWNER, "v2_response_descriptor", "response-desc",
                          "/provider/v2-response-desc",
                          server->response_descriptor_path, "cacheable");
-    write_manifest_entry(fp, "v2_response_arena", "response-arena",
+    write_manifest_entry(fp, TEST_OWNER, "v2_response_arena", "response-arena",
                          "/provider/v2-response-arena",
                          server->response_arena_path, "cacheable");
     assert(fclose(fp) == 0);
@@ -248,8 +273,7 @@ static void write_v1_attach_response(int fd,
     assert(memcmp(request.magic, VEMB_V16_AERON_ATTACH_MAGIC,
                   VEMB_V16_AERON_ATTACH_MAGIC_LEN) == 0);
     assert(request.dim == TEST_DIM);
-    assert(request.flags == (server->remote_attach ?
-                             VEMB_V16_AERON_ATTACH_F_REMOTE_PATH : 0));
+    assert(request.flags == VEMB_V16_AERON_ATTACH_F_REMOTE_PATH);
     memcpy(response.magic, VEMB_V16_AERON_ATTACHED_MAGIC,
            VEMB_V16_AERON_ATTACHED_MAGIC_LEN);
     memcpy(response.request_shmdev_path, request_path,
@@ -1123,8 +1147,8 @@ static void test_sdk_cluster_uses_peer_view_for_matching_owner(void) {
     char seed[64];
     snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)server.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1147,7 +1171,7 @@ static void test_sdk_cluster_uses_peer_view_for_matching_owner(void) {
     teardown_v1_server(&server);
 }
 
-static void test_sdk_cluster_keeps_unmapped_owner_direct(void) {
+static void test_sdk_cluster_uses_manifest_for_direct_owner(void) {
     peer_view_fake_server_t server;
     setup_v1_server(&server);
     server.cycles = 1;
@@ -1156,8 +1180,8 @@ static void test_sdk_cluster_keeps_unmapped_owner_direct(void) {
     char manifest_path[128];
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_peer_view_sdk_direct_%ld.yaml", (long)getpid());
-    write_v1_manifest(manifest_path, server.request_path, server.response_path,
-                      server.warm_path, 1);
+    write_direct_v1_manifest(manifest_path, server.request_path,
+                             server.response_path, server.warm_path);
 
     pthread_t thread;
     assert(pthread_create(&thread, NULL, v1_sdk_direct_server_main,
@@ -1166,8 +1190,8 @@ static void test_sdk_cluster_keeps_unmapped_owner_direct(void) {
     char seed[64];
     snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)server.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1260,7 +1284,7 @@ static void test_v2_peer_view_maps_all_resources(void) {
             TEST_OWNER);
     assert(channel != NULL);
     vemb_v16_aeron_batch_resources_t resources;
-    assert(vemb_v16_aeron_batch_get_resources(channel, &resources) == 0);
+    vemb_v16_aeron_batch_get_resources(channel, &resources);
     assert(resources.request_descriptor_ring != NULL);
     assert(resources.request_arena != NULL);
     assert(resources.response_descriptor_ring != NULL);
@@ -1295,8 +1319,8 @@ static void test_sdk_cluster_handle_pipeline_uses_v2(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1360,8 +1384,8 @@ static void test_sdk_handle_session_coalesces_cross_call_l0(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1418,8 +1442,8 @@ static void test_sdk_handle_session_v2_attach_falls_back_to_ub_v1(void) {
     char seed[64];
     snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)server.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1472,8 +1496,8 @@ static void test_sdk_handle_session_quiesce_drains_pending_l0_to_ub_v1(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1531,8 +1555,8 @@ static void test_sdk_cluster_handle_pipeline_v2_attach_falls_back_v1(void) {
     char seed[64];
     snprintf(seed, sizeof(seed), "127.0.0.1:%u", (unsigned)server.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1577,8 +1601,8 @@ static void test_sdk_cluster_handle_pipeline_stale_retries_v1(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1623,8 +1647,8 @@ static void test_sdk_cluster_handle_pipeline_mixed_response_retries_only_stale(v
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1666,8 +1690,8 @@ static void test_sdk_cluster_handle_pipeline_ask_retries_v1(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1709,8 +1733,8 @@ static void test_sdk_cluster_handle_pipeline_migration_recovers_v2(void) {
     snprintf(seed, sizeof(seed), "127.0.0.1:%u",
              (unsigned)server.v1.port);
     const char *seeds[] = {seed};
-    vemb_v16_client_t *client = vemb_v16_client_create(seeds, 1, TEST_DIM,
-                                                        1000);
+    vemb_v16_client_t *client = vemb_v16_client_create(
+        seeds, 1, TEST_DIM, 1000, VEMB_V16_TRANSPORT_AERON);
     assert(client != NULL);
     assert(vemb_v16_client_configure_ub_peer_view(
                client, manifest_path, TEST_CLIENT_HOST) == 0);
@@ -1741,7 +1765,7 @@ static void test_sdk_cluster_handle_pipeline_migration_recovers_v2(void) {
 int main(void) {
     test_v1_peer_view_data_and_reattach();
     test_sdk_cluster_uses_peer_view_for_matching_owner();
-    test_sdk_cluster_keeps_unmapped_owner_direct();
+    test_sdk_cluster_uses_manifest_for_direct_owner();
     test_v1_peer_view_failure_closes_before_publication();
     test_v2_peer_view_maps_all_resources();
     test_sdk_cluster_handle_pipeline_uses_v2();

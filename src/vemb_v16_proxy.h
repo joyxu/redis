@@ -80,6 +80,8 @@ int vemb_v16_proxy_epoch_set(
 int vemb_v16_proxy_epoch_get(
     vemb_v16_proxy_t *proxy,
     vemb_v16_epoch_control_resp_t *resp);
+/* Topology-set callers must first fix the proxy data transport with one of
+ * the enable_tcp/enable_aeron entry points. */
 int vemb_v16_proxy_topology_set(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_topology_control_req_t *req,

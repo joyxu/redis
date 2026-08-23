@@ -453,7 +453,7 @@ REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet
                     vemb_v16_control_listener.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_client_sdk.o vemb_v16_cluster_core.o vemb_v16_ub_peer_view.o vemb_v16_net.o vemb_v16_client_topology.o vemb_v16_topology.o
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_client_sdk.o vemb_v16_cli_l0.o vemb_v16_cli_l1.o vemb_v16_cluster_core.o vemb_v16_owner_session.o vemb_v16_ub_peer_view.o vemb_v16_net.o vemb_v16_client_topology.o vemb_v16_topology.o
 REDIS_BENCHMARK_NAME=$(OUT_DIR)/redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 # HPC-Redis: link the VEMB V16 client SDK as a static archive (per CLAUDE.md
@@ -573,7 +573,16 @@ DEP = $(addprefix $(OUT_DIR)/,$(REDIS_SERVER_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR
 $(OUT_DIR)/vemb_v16_client_sdk.o: ../clients/c/vemb_v16_client_sdk.c .make-prerequisites
 	@mkdir -p $(OUT_DIR)
 	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_cli_l0.o: ../clients/c/vemb_v16_cli_l0.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_cli_l1.o: ../clients/c/vemb_v16_cli_l1.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
 $(OUT_DIR)/vemb_v16_cluster_core.o: ../clients/c/vemb_v16_cluster_core.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_owner_session.o: ../clients/c/vemb_v16_owner_session.c .make-prerequisites
 	@mkdir -p $(OUT_DIR)
 	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
 $(OUT_DIR)/vemb_v16_ub_peer_view.o: ../clients/c/vemb_v16_ub_peer_view.c .make-prerequisites

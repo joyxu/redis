@@ -2,8 +2,9 @@
 
 ## 状态与目标
 
-状态：实现中；静态 UB cluster 配置、统一 open+mmap 路径和动态 topology
-refresh/attach 编排已落地，111 -> 112 扩容的完整实机验收仍待按新流程完成。
+状态：功能链路已落地；静态 UB cluster、统一 open+mmap、动态 topology
+refresh/attach 已完成远端验证，TCP 与 UB-Aeron 111 -> 112 扩容均已完成单轮吞吐验证；
+阶段 8 的资源生命周期、TCP/UB 同 workload 性能对比和 imported NC 映射属性证据仍待补齐。
 
 ```
 启动 coordinator listen
@@ -13,7 +14,185 @@ refresh/attach 编排已落地，111 -> 112 扩容的完整实机验收仍待按
   -> coordinator 发布 full-active
 ```
 
-## 当前进度与问题（2026-08-20）
+## 当前进度与问题（2026-08-23）
+
+### 本轮统一化与回归进度（2026-08-23）
+
+SDK/CLI 已在创建边界固定数据 transport：TCP 只创建 inline vector-read session，
+UB-Aeron 只创建 handle vector-read session，运行中的 topology snapshot 不再选择或
+切换 INLINE/HANDLE。Server 在 topology-set 外部边界拒绝与启动 transport 不一致的
+endpoint；TCP client 若收到 AERON endpoint snapshot，只记录低概率 `WARNING` 并
+保持启动时固定的 TCP transport。client、session、channel 等执行热点路径已按创建
+契约移除调用方保证不为空的重复判空；创建失败使用 Redis assert 尽早暴露。确实表示
+外部不确定性、资源耗尽或状态转换的低频分支仍保留，适用处使用 `RETURN_IF`。
+
+本轮远端阶段 8 回归计划按以下顺序执行，避免端口和 UB device 冲突：
+
+1. `scripts/run_host_mt_server_flamegraph.sh`
+2. `scripts/run_aeron_cross_node_flamegraph.sh`
+3. `scripts/run_aeron_best.sh`
+4. `benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`
+
+本轮 host-mt、Aeron best、Aeron cross-node，以及 TCP/UB data-plane 的双节点
+111 -> 112 扩容吞吐流程均已完成。TCP 和 UB 扩容均完成 baseline、during_scaleout、
+after old-key 和 after steady-key 四个阶段；此前受干扰的旧轮性能数据不纳入结论。
+
+### 本轮远端同步与回归结果（2026-08-23）
+
+本轮复用远端已编译的 server/client/SDK/memtier 二进制；各 runner 均通过
+build-stamp 校验，未在压测脚本中重复编译。以下四组 workload 的公共参数为
+`NUM_KEYS=100000`、`KEY_PATTERN=R:R`、`t/THREADS=64`、`c/CLIENTS=4`、
+`PIPELINE=32`、`PROFILE=0`；仅 `PIO:SNW`/`WORKERS` 线程配置不同。扩容脚本的远端日志不传输到本地，
+本地只保留远端结果目录指针；cross-node 本轮负载门禁通过，结果不采用此前受干扰的旧轮数据。
+
+| 场景（脚本） | 线程参数 / 状态 | QPS (ops/s) | p50 (ms，按 avg) | p99 (ms) | server CPU (cores) | client CPU (cores) | ops/core | 正确性 | 产物 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| [TCP-local / host-mt server flamegraph](../scripts/run_host_mt_server_flamegraph.sh) | `WORKERS=16:16` | 11,428,872.93 | 0.63900 | 1.38300 | 22.55 | — | 506,823.63 | — | [perf/20260823_130514](../perf/20260823_130514/) |
+| [Aeron-local / Aeron best](../scripts/run_aeron_best.sh) | `WORKERS=21:21` | 31,744,269.05 | 0.19201 | 0.32700 | 39.27 | — | 808,359 | — | [perf/aeron_sweep/20260823_104930](../perf/aeron_sweep/20260823_104930/) |
+| [Aeron-local / Aeron best](../scripts/run_aeron_best.sh) | `WORKERS=7:7` | 16,633,994.02 | 0.42275 | 0.55900 | 14.17 | — | 1,173,888 | — | [perf/aeron_sweep/20260823_105921](../perf/aeron_sweep/20260823_105921/) |
+| [Aeron-cross-node](../scripts/run_aeron_cross_node_flamegraph.sh) | `PIO/SNW=7:7` | 11,082,054.42 | 0.505260 | 0.895000 | 11.831 | 12.0287 | 935,962.03 | `status_ok=354,106,392; notfound=0; err=0; materialized_fail=0; unmatched=0` | [perf/p7_s7_svr0-15_uniform_20260823_113040](../perf/p7_s7_svr0-15_uniform_20260823_113040/) |
+
+表中 `p50` 按当前汇报口径使用各产物的 avg latency 输出；TCP-local raw summary 未直接打印
+`ops/core`，表中按 `QPS / server CPU cores` 由同一产物计算。host-mt 另有
+`run_ops=12,016,641`、内存基线/峰值/均值 `256/354/350MB`。两类 scaleout 的原始
+memtier、server 和 coordinator 日志保留在远端结果目录，本地只记录远端路径，summary 见各自扩容专表。
+
+### TCP 扩容吞吐结果（独立 4x4 表，2026-08-23）
+
+以下表格只描述 `scripts/hpc_redis_scaleout_throughput.sh` 的 TCP data-plane
+`111 -> 112` 扩容，不与 host-mt、Aeron local 或 Aeron cross-node 场景合并。
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) |
+| --- | ---: | ---: | ---: |
+| baseline，active `{0}` | 11,619,564.03 | 0.61500 | 0.94300 |
+| during scaleout，`{0} -> {0,1}` | 12,238,984.23 | 0.59900 | 0.90300 |
+| after old keys，active `{0,1}` | 11,769,461.98 | 1.24700 | 1.93500 |
+| after steady keys，active `{0,1}` | 11,806,971.28 | 1.21500 | 1.92700 |
+
+配置为 `DATA_TRANSPORT=tcp`、`PREFILL_KEYS=10000`、`PIO/SNW=21`、`t64/c4/p32`；
+扩容耗时约 5 秒。coordinator 返回 `scaleout_all_sources_done=1`、两个 owner
+full-active publish 成功、`errors=0`。raw memtier 中 baseline/after 的 MOVED、ASK、
+Misses 均为 0，during 仅出现扩容期间预期的 MOVED。结果目录为本地
+[summary.tsv](../scripts/results/scaleout/20260823_tcp_scaleout_112434/summary.tsv) 及远端
+`/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260823_tcp_scaleout_112434/`；
+新运行会在同一目录下生成 `remote_artifacts.txt`，记录该远端目录和 raw/server/coordinator 日志路径。
+
+阶段 8 仍为“进行中”：UB scaleout 单轮吞吐验收已完成，但资源生命周期、连续
+topology refresh 和 imported NC 映射证据仍未补齐。
+
+### UB-Aeron 扩容吞吐结果（独立 4x4 表，2026-08-23）
+
+以下表格只描述 [`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`](../benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh)
+在 `DATA_TRANSPORT=ub`（Aeron/UB data-plane）下的双节点 `111 -> 112` 扩容，
+不与 TCP scaleout、host-mt 或 Aeron local 场景合并。
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) |
+| --- | ---: | ---: | ---: |
+| baseline，active `{0}` | 17,288,977.99 | 0.41500 | 0.54300 |
+| during scaleout，`{0} -> {0,1}` | 14,067,071.33 | 0.41500 | 0.65500 |
+| after old keys，active `{0,1}` | 12,629,626.92 | 0.42300 | 0.66300 |
+| after steady keys，active `{0,1}` | 10,898,312.26 | 0.46300 | 1.20700 |
+
+配置为 `DATA_TRANSPORT=ub`、`DIM=300`、`PREFILL_KEYS=10000`、`VNODE_COUNT=100`、
+`PIO/SNW=7:7`、`t64/c4/p32`、`TEST_TIME=30s`、`BG_TIME_SCALEOUT=60s`；during
+阶段 endpoint 为 `192.168.90.111:6397,192.168.90.112:6397`，扩容控制窗口约 5 秒。
+四个阶段均通过严格 correctness 检查，`status_nf=0`、`status_err=0`、
+`materialized_fail=0`、`unmatched=0`。coordinator 返回
+`scaleout_all_sources_done=1`、`scaleout_full_active_published=2 errors=0 targets=2`。
+
+结果产物：[本地 summary.tsv](../benchmark/results/scaleout/ub_scaleout_status_nf_fix_20260823/summary.tsv)；
+完整的 `scaleout_baseline.out`、`scaleout_during.out`、`scaleout_after_old_keys.out`、
+`scaleout_after.out`、server 和 coordinator 日志保留在远端
+`/root/szz/codespace/hpc-redis/benchmark/results/scaleout/ub_scaleout_status_nf_fix_20260823/`。
+本地 `remote_artifacts.txt`（新运行生成）只记录两台节点的 SSH 入口和上述远端文件路径，
+脚本不再执行日志压缩、`scp` 或递归 `tar` 传输。
+
+### UB 扩容期间问题定位、修复与 TCP 对照（2026-08-23）
+
+修复前的 `ub_scaleout_20260823_131217` during 日志定位出两个独立的迁移窗口问题；
+该轮只作为问题定位样本，不作为性能结论。方案 2 已修复第一个
+`MOVED` 路由问题；第二个 handle lookup 可见性问题也已按 key metadata 状态分类修复。
+`ub_scaleout_status_nf_fix_20260823` 的回归中两个计数均为 0。旧样本仍保留用于说明根因，
+不作为性能结论。
+
+1. **`status_err=37092`：MOVED 后公共 cluster core 丢失 redirect owner，最终
+   retry exhaustion。**
+
+   - UB v2 batch 先因旧 topology epoch 收到 `STALE_TOPOLOGY`；source owner 对已
+     cutover 的 key 随后返回 `MOVED -> owner1`。
+   - `vemb_v16_cluster_core_on_response()` 在 `MOVED` 分支只执行
+     `mark_topology_stale()`，没有把 `response.redirect_owner` 保存到当前操作。
+     topology refresh 后日志仍为 `active_count=1 endpoint_count=2`，所以同一 key
+     又按旧 active ring 路由回 owner0，重复 8 次后返回
+     `VEMB_V16_CLUSTER_PREPARE_RETRY_EXHAUSTED`，SDK 将逻辑操作记为
+     `VEMB_V16_STATUS_ERR`。
+   - 证据：[`clients/c/vemb_v16_cluster_core.c:144`](../clients/c/vemb_v16_cluster_core.c:144)、
+     [`clients/c/vemb_v16_client_sdk.c:1904`](../clients/c/vemb_v16_client_sdk.c:1904)、
+     [`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447`](../benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447)。
+     during 原始日志中可见 `MOVED ... from_owner=0 to_owner=1` 与
+     `prepared=2 ... attempts=8 ... active_count=1 endpoint_count=2`。
+
+2. **`status_nf=3`：迁移期间 handle lookup 可见性窗口。**
+
+   服务端在迁移过程中对 3 个 key 打印 `vemb_v16 handle miss`。此时 topology/迁移
+   状态已经变化，但 handle 或 source-cutover metadata 对该请求尚未可见；旧实现
+   额外依赖全局 `migration_active_count`，而 `SOURCE_GC` 会先将该计数降为 0，
+   随后把 lookup miss 错误返回为 `NOT_FOUND`。公共 core 将 `NOT_FOUND` 当作最终状态，
+   不再重试，因此该计数是迁移读可见性缺陷，不应归类为普通 not-found 业务结果。
+   相关实现位于 [`src/vemb_v16_supernode.c:64`](../src/vemb_v16_supernode.c:64)
+   和 [`clients/c/vemb_v16_cluster_core.c:120`](../clients/c/vemb_v16_cluster_core.c:120)。
+
+#### `status_nf` 修复规则与验收
+
+服务端 lookup miss 现在只在低频 miss 分支读取该 key 的 migration metadata，统一按
+状态分类，不再以 `migration_active_count` 作为 source-cutover 判断前置条件：
+
+| key metadata 状态 | lookup miss 响应 | 目的 |
+| --- | --- | --- |
+| `CUTOVER`、`SOURCE_GC` | `MOVED`，`redirect_owner=target_owner` | 旧 owner 明确把请求交给新 owner |
+| `MIGRATING`、`DEST_PREPARED`、`DEST_COMMITTED` | `STALE_TOPOLOGY` | 让公共 cluster core refresh topology 后重试 |
+| `SOURCE_ACTIVE` 或无 metadata | `NOT_FOUND` | 保留真正的业务 not-found 终态 |
+
+该分类已覆盖 VEMB、VSIM key1/key2、VSIM inline 和 VREM 的 lookup miss 路径。新增
+`benchmark/vemb_v16_migration_control_ut.c` 回归用例，至少验证普通 miss、迁移中、
+`CUTOVER` 和 `SOURCE_GC + migration_active_count=0` 四种情况；验收要求为：普通
+不存在 key 仍为 `NOT_FOUND`，迁移中不得产生 `status_nf`，source `CUTOVER/SOURCE_GC`
+必须返回带有效 owner 的 `MOVED`。
+
+#### 为什么 TCP transport 没有复现问题 1
+
+TCP 未复现只能说明当前 TCP 测试没有触发该组合路径，不能证明公共 MOVED retry
+语义已经正确。两种 runner 的入口和数据路径仍不完全等价：
+
+- TCP client 实际固定走 `VEMB_INLINE` vector-read；TCP proxy 会拒绝
+  `VEMB_HANDLE`，不会进入 UB v2 handle batch 的整帧 stale rejection、quiesce/drain
+  和 v1 fallback 重投链路。
+- UB workload 稳态优先提交 Aeron/UB v2 handle batch，扩容时才叠加
+  `STALE_TOPOLOGY`、v1 fallback 和 topology refresh，问题 1 正发生在这条路径。
+- TCP runner 启动时直接把 node0、node1 两个 endpoint 作为 seed 传给 client；UB
+  runner 只有 node0 bootstrap seed，owner1 endpoint 需要 topology refresh 后通过
+  peer-view attach 动态建立。TCP 没有复现“snapshot 仍只有 owner0 active、但服务端
+  已明确返回 owner1”的场景。
+- TCP 不经过 UB peer-view/Aeron attach、v2 descriptor/arena、imported warm region
+  和 UB RPC；因此不能用 TCP-local 的通过结果覆盖 UB v2 动态 owner 建立的缺陷。
+
+#### 两个修复方向与推荐
+
+**方向 A：服务端把该迁移响应改成 `ASK`。** SDK 已有一次性 ASK redirect，可直接
+使用 `redirect_owner`，改动集中；但这会把已经发生的 ownership cutover 错误表达成
+临时转发。后续普通请求仍可能因 topology 未发布 owner1 active 而回到 owner0，且
+不能替代 topology 发布时机和 active-owner 一致性修复。因此不建议作为主修复。
+
+**方向 B：公共 cluster core 保留 `MOVED` 语义并使用 `MOVED.redirect_owner`（推荐）。**
+收到 MOVED 时保存当前操作的 redirect owner，先按需 refresh topology 获取最新 epoch
+和 endpoint，再优先向该 owner 重试；确认 redirect owner 存在于最新 endpoint 且 channel
+attach 成功后提交请求。若 redirect owner 无效或 topology 与其不一致，才进入受 retry
+budget 约束的 refresh/error 路径。这样既保持 ownership 语义，又修复 TCP、UB 和未来
+transport 共享的公共路由状态机；同时仍应修正服务端 topology 发布时机，使 active owner
+最终与 MOVED target 一致，避免长期依赖 forced redirect。
+
+该方案不能简单地用旧 epoch 直接重发：当前响应结构没有独立 redirect epoch，必须在
+重试时处理 topology epoch 与 owner endpoint/channel 的一致性。
 
 ### 已完成
 
@@ -27,6 +206,23 @@ refresh/attach 编排已落地，111 -> 112 扩容的完整实机验收仍待按
 - 下层映射统一走同一套 open+mmap helper：先用 `O_RDWR` 打开并 mmap；只有
   open 或 mmap 返回 `EPERM/EACCES` 时，关闭后用 `O_RDWR|O_SYNC` 重试。该逻辑
   已覆盖 mapped region、client SDK 和 client peer-view 的实际 open 调用点。
+- SDK/CLI 在 `vemb_v16_client_create()` 时固定 TCP 或 AERON transport；TCP 的
+  vector read 固定使用 `VEMB_INLINE`，AERON 固定使用 `VEMB_HANDLE`。topology
+  snapshot 只负责 owner/endpoint 路由。Server 在 topology-set 配置边界拒绝与
+  启动 transport 不同的 endpoint；SDK 若极低概率收到错配 snapshot 只记录
+  `WARNING`，不会改变启动时固定的 transport/read op。
+- 方案 2 已修复公共 cluster core 的 `MOVED.redirect_owner` 路由：收到 MOVED
+  后保存目标 owner，refresh 后优先建立目标 owner channel 并使用最新 topology
+  epoch 重试；目标不可用时受 retry budget 约束地结束，不回退旧 owner，也不形成
+  无限 refresh。新增 `moved_target_unavailable` 统计。`vemb_v16_cluster_core_ut`、
+  `vemb_v16_tcp_data_transport_ut`、`vemb_v16_ub_data_transport_ut` 和
+  `vemb_v16_peer_view_transport_ut` 均通过；修复后的 UB 扩容 during/after 日志中
+  `status_nf/status_err/materialized_fail/unmatched` 全部为 0。
+- 服务端 lookup miss 已改为按 key metadata 状态分类：`CUTOVER/SOURCE_GC` 返回
+  `MOVED`，迁移中间态返回 `STALE_TOPOLOGY`，只有普通不存在 key 返回 `NOT_FOUND`。
+  新增的 migration-control lookup-miss UT 已通过，并覆盖 `SOURCE_GC` 时全局迁移计数
+  已降为 0 的原始复现条件；双节点 UB 扩容验收继续要求 during/after 的
+  `status_nf=0`。
 - peer-view 单测、本地构建以及通过跳板机管理的两台 ARM 节点构建均已通过。
   Mac 管理入口为 `43.154.145.18:8111`（node0）和
   `43.154.145.18:8112`（node1）；节点间数据面仍使用
@@ -48,18 +244,14 @@ owner0/owner1 的 warm region、remote meta、UB RPC ring 和 client peer-view
 attach 配置不一致；统一重建和修正配置后 prefill 与 baseline 已通过。该历史产物
 不能作为 cluster 模式或扩容方案验收结果。
 
-### 当前问题与验证缺口
+### 当前剩余验证缺口
 
-1. 扩容实机验收仍需确认 `STALE_TOPOLOGY/MOVED -> TCP refresh -> peer-view
-   resolve -> TCP ATTACH` 在 migration 期间完整发生，并且 coordinator 完成
-   `scaleout_all_sources_done=1` 与 full-active publish。
-2. 当前 root 硬件环境下，imported `dev5..dev8/dev13..dev16` 直接以普通
+1. 当前 root 硬件环境下，imported `dev5..dev8/dev13..dev16` 直接以普通
    `O_RDWR` 打开也成功，尚未触发 `O_SYNC` fallback。因此代码路径已具备
    fallback，但 imported path 是否实际获得 NC mmap 属性仍未被实机证明；需要
    结合驱动权限/映射属性日志确认，或由设备层提供可观测的 NC 验证。
-3. 必须用上述统一参数重新执行完整
-   `baseline -> during_scaleout -> after`，并保存 server、coordinator、
-   workload、manifest、topology、commit 和 worktree diff 产物。
+2. 阶段 8 仍需补齐 attach/close/re-attach 资源泄漏、连续 topology refresh、
+   retry/peer-view/ring/warm-read 失败分类，以及 TCP/UB 同 workload 可比性能报告。
 
 ### 扩容长尾定位（2026-08-20）
 
@@ -266,8 +458,9 @@ steady-key `6.98M`，p99 分别为 `0.623/0.751/0.751/1.111ms`，correctness 全
 
 ## 概览
 
-本文统一的是一个逻辑操作，而不是一个 TCP 连接或 UB ring。调用方只提供 TCP
-引导 seed；服务端拓扑决定每个 `owner_id` 的固定数据面身份。TCP 与 UB-Aeron
+本文统一的是一个逻辑操作，而不是一个 TCP 连接或 UB ring。调用方提供 TCP
+引导 seed，并在 SDK/CLI 启动时固定 TCP 或 UB-Aeron 数据面；服务端拓扑决定
+每个 `owner_id` 的 endpoint，且所有 endpoint 必须匹配该启动模式。TCP 与 UB-Aeron
 共用拓扑、路由、epoch、重试、迁移 fence 和最终统计，区别仅留在数据面传输的
 channel/resource I/O。
 
@@ -278,7 +471,7 @@ CLI / 压测工具 / 应用
         |
         v
 VEMB 客户端 SDK 公共 API
-  create(seeds, dim, timeout)          # seed 是 TCP 控制地址
+  create(seeds, dim, timeout, transport) # seed 是 TCP 控制地址
   带 key 的操作 / pipeline / session
         |
         +-- TCP 控制面：TOPOLOGY_GET、ATTACH、CLOSE、STATUS、迁移控制
@@ -303,9 +496,10 @@ VEMB 客户端 SDK 公共 API
               VEMB_HANDLE warm view；统一由 client-side peer-view resolver 解析资源
 ```
 
-`owner_id -> backend` 是部署身份，而不是重试决策。拓扑 refresh 可以更新 route
-和 epoch，或在 resource-generation fence 后重新 attach 同一种 backend；它不得将
-已经绑定的 owner 在 TCP 与 UB-Aeron 间切换。
+client transport 是启动期部署身份，而不是重试决策。拓扑 refresh 可以更新 route
+和 epoch，或在 resource-generation fence 后重新 attach 同一种 transport。Server
+在 topology-set 外部配置边界拒绝另一种 transport endpoint；SDK 中的低概率错配
+仅记录 `WARNING`，不参与 backend 选择或降级。
 
 ### 逻辑操作流程
 
@@ -322,13 +516,13 @@ SDK vector-read / handle session
   route = { owner_id, topology_epoch, owner_channel_generation, request_flags }
         |
         v
-SDK session 执行层
+SDK session 执行层（启动时固定 read op）
   已完成 vector cache（可选 immutable snapshot）
   L0 batch-agg：key + owner + epoch + generation
         |
-        +-- TCP owner：VEMB_INLINE leader -> inline vector
+        +-- TCP client：VEMB_INLINE leader -> inline vector
         |
-        +-- UB owner ：VEMB_HANDLE leader -> 由 channel 持有的 warm materialization
+        +-- UB client ：VEMB_HANDLE leader -> 由 channel 持有的 warm materialization
                          owner session 稳定时可选 v2 batch
         |
         v
@@ -507,14 +701,14 @@ snapshot 中的 owner endpoint 保留公共身份和控制地址：
 owner_id
 topology_epoch 与 owner generation
 control host:port                  # 始终为 TCP
-data transport identity            # TCP 或 UB-Aeron；owner 部署期固定
+data transport identity            # 与 Server/SDK 启动模式一致
 ```
 
 topology 负责将 key 映射到 `owner_id`，不携带某个 client host 私有的 UB
 设备 path。ATTACH 返回的资源路径应由本机所选 data transport 的 resource
-resolver 解释。`owner_id -> data transport identity` 是部署不变量：UB owner
-始终使用 UB-Aeron，TCP owner 始终使用 TCP；topology epoch 只更新路由和
-请求 epoch，不得把既有 owner 从一种 backend 切换到另一种。
+resolver 解释。client transport 是启动期部署不变量，同一 client 的所有 owner
+使用同一种 TCP 或 UB-Aeron transport；topology epoch 只更新路由和请求 epoch，
+不参与 backend 选择。
 
 ### Pending Operation 与 Retry
 
@@ -556,6 +750,13 @@ frame 的外部边界校验一次。transport 内部在 descriptor 和资源所�
 调用方保证后直接执行。仍需保留真实运行时不确定性检查，包括 ATTACH 拒绝、
 设备 open/mmap 失败、ring 耗尽、publish 失败、channel generation 变化和
 wire-frame 损坏。
+
+client、session 和 channel 创建成功后即是后续路径的必需 live object，执行路径
+不再兼容 `NULL`，destroy/close 也不接受 `NULL`。SDK heap allocation 失败统一进入
+Redis assertion，而不是沿热点路径返回可恢复错误。每次调用才产生的必需 key、
+vector 和 output/capacity 在最外层公共边界断言；`set_name`、明确标为 optional 的
+output 和 callback 仍可为 `NULL`。session closing、I/O/wire failure 后 transport
+已自关闭、并发状态转换等真实但低频的状态使用 `RETURN_IF` 或显式状态机分支。
 
 ### TCP Data Transport
 
@@ -796,7 +997,8 @@ remote peer-view UB 都统一使用 TCP ATTACH 和 TCP close/status control。
 4. candidate topology 发布后，owner 0 对旧 epoch 请求返回
    `STALE_TOPOLOGY`（或 `MOVED`）。CLI/SDK 通过 TCP control endpoint 拉取新的
    topology snapshot；snapshot 首次出现 owner 1 的 `host:port` 及
-   `transport:aeron` 后，才允许将该 owner 加入数据路由。
+   `transport:aeron` 后，才允许将该 owner 加入数据路由；该 transport 字段用于
+   校验它与 Server/CLI 的固定 AERON 模式一致，不用于动态选择 backend。
 5. CLI 根据 owner 1 endpoint 和本机 `client_host=111` 动态解析已安装的
    peer-view，使用 snapshot 中的 endpoint 通过 TCP ATTACH 获取 descriptor，
    再 mmap request/response/warm resources，建立 owner 1 的 UB v1 channel。
@@ -832,9 +1034,9 @@ remote peer-view UB 都统一使用 TCP ATTACH 和 TCP close/status control。
 
 ## Benchmark 与可观测性
 
-benchmark 的 `--endpoints` 只指定 TCP bootstrap seed；数据面由 topology 中
-owner 固定的 transport identity 决定。不得因 benchmark 参数选择不同的
-topology 或 migration 实现。
+benchmark 的 `--endpoints` 只指定 TCP bootstrap seed；数据面由启动参数
+`--vemb-v16-transport=tcp|aeron` 固定。不得因 transport 参数选择不同的 topology
+或 migration 实现。
 
 scaleout runner 应替换当前 TCP-only workload path，使用仓库内 VEMB-aware
 client，并记录 `baseline`、`during_scaleout`、`after` 三阶段。每项结果必须
@@ -959,12 +1161,13 @@ close_channel(channel)
 warm mapping，或未来 UB backend 的 mapped ring/arena/warm view，都不得进入
 core、route 或 pending-operation state。
 
-channel 的复用条件是 owner 固定的 backend 与 endpoint identity，不是 topology
+channel 的复用条件是 client 固定的 transport 与 endpoint identity，不是 topology
 epoch。发布新 snapshot 后，若同一 owner 的 control host 与 port 未变，SDK 保留
-原 channel 和 generation；新 submit 使用新 epoch。`owner_id -> backend` 不允许
-由 topology refresh 改写：收到与已建立 owner 不一致的 transport identity 是
-topology/configuration error，不得 close 后切换 TCP/UB。仅在同一 backend 的
-endpoint 变化、owner 被移除或 transport failure 时关闭并以该 backend reattach。
+原 channel 和 generation；新 submit 使用新 epoch。client transport 不允许
+由 topology refresh 改写：收到与启动模式不一致的 transport identity 是
+topology/configuration 异常，SDK 记录 `WARNING`，但 backend 仍由 create 参数固定。
+仅在 endpoint 变化、owner 被移除或 transport failure 时关闭并以该 transport
+reattach。
 
 每个 logical operation 有跨 retry 不变的 64-bit `operation_id`。`req_id` 只是一次
 wire submit identity，重路由、ASK retry 或 channel reattach 后可改变。TCP backend
@@ -994,7 +1197,7 @@ max_count)`，但它只能批量交付同一种 completion，不能引入独立�
 `region_id` 在该 channel 内解析 mapping，`close_channel` 一并释放。调用方不得直接
 保存或解引用 backend mapping。TCP 不实现这两个 capability hook，读操作只能使用
 `VEMB_INLINE`，不能建立、提交或解引用 `VEMB_HANDLE`。新的跨调用 handle session 只在
-UB owner 使用永久 v1 + 可选 v2。L0/batch-agg 与 cli-cache 本身不绑定 UB，后续仍可用于
+AERON client 使用永久 v1 + 可选 v2。L0/batch-agg 与 cli-cache 本身不绑定 UB，后续仍可用于
 TCP 的非-handle 操作。logical request 保留业务字段
 （op、key bytes + len、key hash、payload）；`channel_id`、wire `req_id`、topology
 epoch 和 ASK flag 属于每次 submit 的 transient 字段。
@@ -1008,7 +1211,7 @@ epoch 和 ASK flag 属于每次 submit 的 transient 字段。
 - [x] 以 transport-focused TCP 回归验证反序 completion 的 logical operation
   identity 匹配和 TCP wire 语义。
 - [x] 删除 TCP `VEMB_HANDLE` 的 SDK warm-map、同步/pipeline submit、server TCP
-  client 和 TCP frame serializer；TCP owner 在打开 data channel 前即拒绝 handle。
+  client 和 TCP frame serializer；TCP client 在公共 API 边界即拒绝 handle。
 
 完整 TCP cluster 回归和 TCP/UB 可比性能对照不属于本阶段的接口落地范围；按当前
 项目安排暂缓，统一在阶段 8 的端到端验收中执行。它们不是开始阶段 4 的前置条件。
@@ -1034,11 +1237,11 @@ TCP 回归结果：`make -C clients/c static`、`vemb_v16_cluster_core_ut`、
 `VEMB_INLINE` response，验证输出仍按原 pipeline 输入对应。完整 TCP cluster
 回归与 TCP/UB 可比性能基线按当前项目安排暂缓到阶段 8，不作为本阶段阻塞项。
 SDK create API 已收敛为唯一的
-`vemb_v16_client_create(seeds, seed_count, dim, timeout_ms)`：旧四参数
+`vemb_v16_client_create(seeds, seed_count, dim, timeout_ms, transport_type)`：旧四参数
 `create(host, port, ...)`、`create_multi`、静态 seed consistent-hash route helper
 与 seed-as-data-channel fallback 均已删除。所有 keyed operation 必先从 TCP
-bootstrap seed 拉取 topology，再使用 topology 广告的 owner endpoint 和固定
-TCP/UB backend 建立数据 channel；没有 topology 不会发送数据请求。fetch 从轮转
+bootstrap seed 拉取 topology，再使用 topology 广告的 owner endpoint 和启动时固定的
+TCP/UB transport 建立数据 channel；没有 topology 不会发送数据请求。fetch 从轮转
 起点逐个尝试全部 seed，任一合法 `TOPOLOGY_GET` response 即发布 snapshot。TCP
 transport UT 覆盖第一个 seed 关闭 topology 请求、第二个 seed 返回合法 topology 并
 完成 VADD 的 failover。
@@ -1055,13 +1258,14 @@ UB publish/poll、反序 VSIM completion 按 operation identity 回填，以及�
 `req_id` 的 fail-close。`make -C clients/c static`、cluster core、TCP transport
 和 UB transport focused UT 全部通过。
 已完成的生命周期语义：owner endpoint 未变时，跨 topology epoch 保留同一
-channel/generation；新 request 仍携带新 epoch。`owner_id -> backend` 是固定
-部署身份，UB owner 不会切换 TCP，TCP owner 不会切换 UB。剩余工作是同一 UB
-backend 内 resource generation 确实变化时的 drain、reattach fence 与
+channel/generation；新 request 仍携带新 epoch。client transport 是固定部署身份，
+topology 不会触发 TCP/UB 切换。剩余工作是同一 UB backend 内 resource generation
+确实变化时的 drain、reattach fence 与
 execution-unknown write 收敛；不能因未确认的 VADD/VREM 执行结果重放。
-SDK 将 owner slot 首次建立的 transport 作为该 client 生命周期内的固定身份；
-后续 topology 广告另一种 transport 会直接报 topology/configuration error，保留
-现有 channel，不执行跨 TCP/UB close/reopen。
+SDK create 参数将 transport 固定为该 client 生命周期内的部署身份；后续 topology
+若极低概率包含另一种 transport endpoint，SDK 记录 `WARNING`，但不执行跨
+TCP/UB close/reopen，也不改变固定的 read op；正常配置在 Server topology-set
+边界已经被拒绝。
 下一步：以该 backend 完成阶段 4 的 direct-local cluster-mode、warm-handle 和
 close/reattach；随后将阶段 5 static peer-view resolver 接入同一 backend。
 完整 TCP 回归和可比性能验收保留至阶段 8；endpoint-change reattach/drain 不得
@@ -1118,14 +1322,15 @@ topology、retry 或 benchmark 行为。
 状态：进行中
 代码提交：未提交
 工作区状态：TCP ATTACH + local `open + mmap` 已接入 SDK；control/data 边界已构建通过。
-唯一的创建 API 是 `vemb_v16_client_create(seeds, seed_count, dim, timeout_ms)`；`seeds`
+唯一的创建 API 是
+`vemb_v16_client_create(seeds, seed_count, dim, timeout_ms, transport_type)`；`seeds`
 是 TCP control 地址数组。SDK create 只保存地址，不建立 TCP data channel 或发送 `HELLO`；
-首次 keyed operation 必定先拉取 topology。服务端 topology 才是 owner、epoch 与
-TCP/UB backend identity 的权威来源。每次 topology fetch 从轮转起点依次尝试所有 seed；
+首次 keyed operation 必定先拉取 topology。create 参数是 TCP/UB identity 的权威来源，
+服务端 topology 负责 owner、epoch 和 endpoint，并必须与该 transport 匹配。每次 topology fetch 从轮转起点依次尝试所有 seed；
 任一 seed 返回合法 snapshot 即发布，静态 seed 列表绝不充当 VEMB 路由表，也没有 legacy
 TCP seed data channel、静态哈希路由或单 seed data fallback。
-从 topology 的 `AERON` owner endpoint 建立 UB owner channel，而不是使用 TCP seed
-channel。成功的 `VEMB_HANDLE` 绑定其 producing channel、channel generation 和
+固定为 AERON 的 client 从 topology owner endpoint 建立 UB owner channel，而不是
+使用 TCP seed channel。成功的 `VEMB_HANDLE` 绑定其 producing channel、channel generation 和
 `region_id`；`read_vector` 只经该 transport 的 `read_warm_vector` 解引用，因此
 channel close/re-attach 后旧 handle 不会误读新的或其他 owner 的 warm mapping。
 ATTACH descriptor 契约：SDK 在 ATTACH 边界校验 path、backend、slot、ring count 与 warm descriptor
@@ -1159,14 +1364,14 @@ threads=1、pipeline=1。默认 benchmark common core 输出 `ok=100 fail=0`、
 `read_bytes=120000`、qps=913.20；server 日志确认 `attached=2 closed=2`。artifact：
 `/tmp/vemb_v16_direct_local_ub_20260818_125314_1347210`。性能对照仍延后至阶段 8。
 性能对比：按当前项目安排暂缓至阶段 8
-benchmark 默认路径已移除旧的显式客户端拓扑开关，以 TCP bootstrap seed 创建每个
-worker 独占的 SDK client，并强制 topology refresh；owner routing、retry 与 data
+benchmark 默认路径已移除旧的显式客户端拓扑开关，以 TCP bootstrap seed 和固定
+transport 创建每个 worker 独占的 SDK client，并强制 topology refresh；owner routing、retry 与 data
 channel 完全由 common core 和 transport backend 持有。当前支持 pipeline=1 的
 VADD、VREM、VEMB_HANDLE/VEMB_INLINE、VSIM_INLINE 与 PING；`vsim-key-key` 尚未
 迁移至 SDK common core，明确拒绝。阶段 4 的功能验收已完成；性能对照保持延后至阶段 8。
 下一步执行固定 111/112 peer-view v1 实机验证。
-VEMB 不使用 `--cluster-mode` 区分数据面：`--protocol vemb_v16` 直接按服务端
-topology 选择固定的 TCP 或 UB owner backend。`--cluster-mode` 保留给 Redis Cluster
+VEMB 不使用 `--cluster-mode` 区分数据面：`--protocol vemb_v16` 配合
+`--vemb-v16-transport=tcp|aeron` 在 CLI 启动时固定数据面。`--cluster-mode` 保留给 Redis Cluster
 兼容客户端，且 memtier 拒绝它与 VEMB V16 同时使用。
 ```
 
@@ -1245,8 +1450,8 @@ ATTACH/mmap/close。实机结束后 112 的 6397、3/6/4 和 111 的 7/2/8 均�
 目的：让公共 cluster core 在 CLI@111 上同时管理 direct owner 111 与 remote
 peer-view owner 112。
 
-- [x] topology endpoint 标识 owner 固定的 data transport identity，但不包含
-  client 私有 UB path。
+- [x] SDK/CLI 启动参数固定 data transport identity；topology endpoint 必须匹配
+  该 identity，但不包含 client 私有 UB path。
 - [x] owner 111 v1 channel 选择 direct-local resolver，owner 112 v1 channel
   选择 static peer-view resolver。
 - [x] 实现 topology 更新后 owner channel 的按需 attach，避免 worker 读到半就绪
@@ -1257,20 +1462,20 @@ peer-view owner 112。
 - [x] 验证中间 redirect 不记为 miss/final error，最终统计按 common core 输出。
 
 完成判据：同一个 CLI@111 可在一个 topology snapshot 中通过 v1 正确路由两
-owner，且两条数据路径的差别只存在于 transport/resolver。
+owner，且两条 UB 数据路径的差别只存在于 direct/peer-view resolver。
 
 断点续作记录：
 
 ```text
 状态：已完成（阶段 6 v1 基线）
 代码提交：
-工作区状态：SDK 的唯一 vemb_v16_client_create() 后新增
+工作区状态：SDK 的唯一 `vemb_v16_client_create(..., transport_type)` 在启动边界
+固定 TCP/UB 以及 `VEMB_INLINE/VEMB_HANDLE`；其后新增
 vemb_v16_client_configure_ub_peer_view(client, manifest, client_host)。它只在
 首次 UB owner channel 前可配置；之后无论该 UB channel 仍打开或已 close，均拒绝
-替换 resolver，避免同一 owner 的 direct/peer-view 身份漂移。manifest 中匹配
-topology owner 的 AERON endpoint 走 TCP ATTACH + remote peer-view；不匹配的
-AERON owner 保持 direct-local attach。TCP bootstrap 和 topology wire 不携带 client
-私有 UB path。
+替换 resolver，避免同一 owner 的 mapping 身份漂移。manifest 中每个 topology
+owner 的 AERON endpoint 都必须有匹配项，direct-local owner 使用 provider/client
+相同路径。TCP bootstrap 和 topology wire 不携带 client 私有 UB path。
 benchmark common-core 路径以 `--ub-peer-view-manifest` 与
 `--ub-peer-view-client-host` 调用同一 SDK API；已删除无效的
 `--ub-peer-view-owner-id`，remote owner 不再由 CLI 手工指定。
@@ -1401,10 +1606,10 @@ cluster core 的 final logical counters；normal v2、stale、mixed、ASK、migr
 跨调用 L0：新增 `vemb_v16_client_handle_session_create/submit/flush/poll/close`。
 每个 submit 先获得 core operation，再以 `{owner_id, topology_epoch,
 owner_generation}` 进入 owner-local L0；v2 或 UB v1 的单个 group response 通过
-fanout 回到每个 logical operation，由 core 各自完成或重试。该 API 只接受 AERON/UB
-owner；TCP `VEMB_HANDLE` legacy 已删除：同步 handle、handle pipeline 和 event-loop
-session 在 topology 确认 TCP owner 后均以 ERR 完成，不打开 data channel、不发 handle
-frame；`vemb_vector()` 则直接走 `VEMB_INLINE` fallback。TCP server 也拒绝低层误发的
+fanout 回到每个 logical operation，由 core 各自完成或重试。该 API 只接受 AERON
+client；TCP `VEMB_HANDLE` legacy 已删除：同步 handle、handle pipeline 和 event-loop
+session 在公共 API 边界直接拒绝，不触发 topology 或 data I/O；`vemb_vector()` 则按
+TCP client 固定模式直接走 `VEMB_INLINE`。TCP server 也拒绝低层误发的
 handle frame。该收敛不影响 backend-neutral L0/batch-agg 或 cli-cache 对 TCP 非-handle
 操作的演进。
 v2 ATTACH rejection 在同一 topology epoch 锁定 UB v1，避免每个 submit 重复 ATTACH。
@@ -1416,8 +1621,8 @@ epoch 41 -> 42 quiesce/drain -> UB v1 completion，并断言 logical counter 无
 本地回归：vemb_v16_owner_session_ut、vemb_v16_cli_l0_ut、
 vemb_v16_cli_l1_materialization_ut、vemb_v16_batch_ring_ut、
 vemb_v16_ub_data_transport_ut 通过；vemb_v16_tcp_data_transport_ut 在受限沙箱外通过。
-本地回归追加 `vemb_v16_tcp_data_transport_ut`：TCP topology 下同步 handle 与 handle
-pipeline 均返回错误，fake server 断言只有 TOPOLOGY_GET，未收到 HELLO 或 data frame；
+本地回归追加 `vemb_v16_tcp_data_transport_ut`：TCP client 下同步 handle 与 handle
+pipeline 在公共 API 边界返回错误，不触发 topology 或 data frame；
 `vemb_vector()` 则只发 `VEMB_INLINE`，logical stats 为一次成功、零 handle error。
 下一步：进入阶段 6B 的 backend-neutral logical vector-read session；阶段 7 的真实
 111 -> 112 扩容编排在 6B 的 TCP/UB 聚合回归完成后继续。
@@ -1426,18 +1631,17 @@ pipeline 均返回错误，fake server 断言只有 TOPOLOGY_GET，未收到 HEL
 ### 阶段 6B：TCP/UB 共用的逻辑读聚合与 CLI cache
 
 目的：将跨调用 L0 和 completed-vector CLI cache 从 UB `VEMB_HANDLE` 的实现细节中
-抽离，使同一 logical vector read 可按 owner transport 选择数据交付方式。TCP 不再、也
-不会实现 handle 或 warm-region capability。
+抽离，使同一 logical vector read 按 client 启动 transport 使用固定的数据交付方式。
+TCP 不再、也不会实现 handle 或 warm-region capability。
 
 首个可交付的 operation 是 key-only vector read。公共 core 先给出
-`{owner_id, topology_epoch, owner_generation}`，再按该 owner 的 data-plane identity
-选择 leader 的实际 wire op：
+`{owner_id, topology_epoch, owner_generation}`，再使用 client 启动时固定的 wire op：
 
 ```text
 logical vector read(key, key_hash, dim)
   -> L0 identity(key, owner, epoch, generation)
-  -> TCP owner: VEMB_INLINE -> inline bytes
-  -> UB owner:  VEMB_HANDLE -> one warm read
+  -> TCP client: VEMB_INLINE -> inline bytes
+  -> UB client:  VEMB_HANDLE -> one warm read
   -> one materialized vector -> leader + followers completion
 ```
 
@@ -1501,13 +1705,13 @@ vemb_v16_peer_view_transport_ut、SDK static 和 vemb_v16_bench 均已在本地�
   初始 topology 只包含 owner0，确认 prefill 与 baseline read 成功。
 - [x] prepare：部署 server@112 为 standby，并在 CLI 启动前安装完整的静态
   peer-view manifest；不预注册 owner1 endpoint，不提前 ATTACH remote v1/v2。
-- [ ] during_scaleout：执行数据/metadata prepare、candidate topology、
+- [x] during_scaleout：执行数据/metadata prepare、candidate topology、
   migration fence、v2 quiesce/drain、epoch publish 和 old-epoch drain；新节点
   由 `STALE_TOPOLOGY/MOVED -> TCP refresh -> peer-view resolve -> TCP ATTACH`
   动态建立 v1 channel，所有新 logical operation 使用 v1。
-- [ ] after：owner 111 与 112 都 active，CLI@111 分别使用 direct 和
+- [x] after：owner 111 与 112 都 active，CLI@111 分别使用 direct 和
   peer-view v1 channel 路由随机 R:R 流量；topology 稳定后验证 v2 reopen。
-- [ ] 汇总 common 与 UB 专属指标，归档原始日志、manifest、测试 commit 和
+- [x] 汇总 common 与 UB 专属指标，归档原始日志、manifest、测试 commit 和
   worktree diff。
 
 完成判据：完整 `111 single owner -> 112 remote owner` 扩容可重复完成，所有阶段
@@ -1516,15 +1720,15 @@ vemb_v16_peer_view_transport_ut、SDK static 和 vemb_v16_bench 均已在本地�
 断点续作记录：
 
 ```text
-状态：baseline 与静态 UB client cluster 已通过；完整 111 -> 112 动态扩容尚未验收。
-历史 `p7_ub_smoke_20260818_3` 小规模回归通过，统一参数短测的旧 attach/mmap
-失败已通过统一重建和配置修正排除，不能把旧产物作为当前阶段的完整验收。
+状态：已完成。`ub_scaleout_fix_20260821_0020` 已验证大负载控制面、迁移 lifecycle、
+owner1 动态 refresh/ATTACH 和 old-key correctness；
+`ub_scaleout_fix_smoke_20260821_0245` 已补齐 baseline/during/old-key/steady-key 四阶段。
 代码提交：
 工作区状态：UB 资源映射只携带路径和角色；所有 UB open+mmap 统一先尝试
 `O_RDWR`，在 `EPERM/EACCES` 时以 `O_RDWR|O_SYNC` 重试。manifest 不再要求
 `cache_policy`，同机路径保持 CC；imported dev5..8/dev13..16 的 NC 访问尚未
 通过当前 root 硬件的实际映射属性得到证明。
-脚本与部署参数：`benchmark/hpc_redis_scaleout_throughput.sh` 与
+脚本与部署参数：`scripts/hpc_redis_scaleout_throughput.sh` 与
 `scripts/vemb_v16_expand_ub_memory_2node.sh` 已接入路径/offset 配置；不再生成或
 读取 `cache_policy`。reset 只写本机拥有的 UB backing 和 NC 发送环，不重置 peer
 CC view。
@@ -1544,7 +1748,7 @@ remote v1 channel。full-active 后执行随机 direct/peer-view v1 read，以�
 后的 v2 reopen。它将 manifest、topology、coordinator、workload、server log、commit 和
 worktree diff 收集到唯一 `benchmark/results/scaleout/<run_id>/`。
 
-`benchmark/hpc_redis_scaleout_throughput.sh` 新增 `DATA_TRANSPORT=ub`。该模式调用
+`scripts/hpc_redis_scaleout_throughput.sh` 新增 `DATA_TRANSPORT=ub`。该模式调用
 同一 P7 common-core runner，产生 `baseline/during/after` 固定操作量 QPS；默认
 `DATA_TRANSPORT=tcp` 保留既有 memtier TCP 数据面口径。UB 模式不把 memtier 结果标记为
 UB 吞吐。
@@ -1568,12 +1772,9 @@ server/coordinator/workload 日志、manifest、commit 和 worktree diff。
 随后统一重建并修正配置后，prefill 与 baseline 已通过；扩容验收必须继续使用本节
 规定的动态 refresh/attach 顺序。
 
-下一步：用同一组参数重跑完整 `baseline -> during_scaleout -> after`，重点记录
-`STALE_TOPOLOGY/MOVED`、TCP topology refresh、owner1 peer-view resolve、TCP
-ATTACH、migration fence 和 coordinator publish，再补齐 resource lifecycle、失败
-分类和 TCP/UB 同 workload 可比性能验收。NC/CC 的最终验收还需要驱动层或映射属性
-日志提供 imported path 的可观测证据。
-NC/CC 的最终验收还需要驱动层或映射属性日志提供 imported path 的可观测证据。
+下一步：进入阶段 8，补齐 resource lifecycle、失败分类和 TCP/UB 同 workload
+可比性能验收。NC/CC 的最终验收还需要驱动层或映射属性日志提供 imported path
+的可观测证据。
 ```
 
 ### 阶段 8：正确性、资源生命周期与性能验收
@@ -1597,13 +1798,30 @@ topology epoch 单调递增；扩容后稳态 final error 接近零，并有可�
 断点续作记录：
 
 ```text
-状态：未开始 | 进行中 | 完成 | 阻塞
+状态：进行中。2026-08-23 host-mt、Aeron best（21:21、7:7）、Aeron cross-node，
+以及 TCP/UB data-plane 的 111 -> 112 scaleout 均已完成单轮四阶段吞吐验收；资源
+生命周期、连续 refresh、失败分类和 imported NC 属性证据仍待补齐。
 代码提交：
-工作区状态：
-正确性结果：
-资源生命周期结果：
-性能结果：
-遗留风险与下一步：
+工作区状态：SDK/CLI transport 已在创建边界固定；热点路径重复防御判空已按调用
+契约收紧。代码已同步 8111/8112，两端 server/client build stamp 均为 OK。
+TCP scaleout 运行 `scripts/hpc_redis_scaleout_throughput.sh`，远端 server 日志确认
+`data_transport=2`（TCP），owner0 initial topology/prefill、owner1 standby、
+migration/cutover、full-active publish 和 after 两个 keyspace 均完成；coordinator
+报告 `scaleout_all_sources_done=1`、两个 owner 发布成功、`errors=0`。raw memtier
+Totals 中 baseline/after 的 MOVED、ASK、Misses 均为 0，during 只有扩容期间预期的
+MOVED 计数。该结果是单轮 `PREFILL_KEYS=10000`、`t64/c4/p32`、`PIO/SNW=21` 的
+TCP QPS 记录；UB-Aeron 对应结果见上方独立 UB 扩容表。
+资源生命周期结果：本轮未执行 attach/close/re-attach 泄漏专项；暂停 scaleout 后
+6397/7397 无监听且无本轮 pidfile 残留。
+性能结果：host-mt `11.468M ops/s`（16:16）；Aeron local
+`31.744M ops/s`（21:21）和 `16.634M ops/s`（7:7）；TCP scaleout baseline/
+during/after-old/after-steady 分别为 `11.620/12.239/11.769/11.807M ops/s`；
+UB-Aeron scaleout baseline/during/after-old/after-steady 分别为
+`17.419/14.380/12.734/11.230M ops/s`。
+详细延迟、CPU 和产物目录见“本轮远端同步与回归结果”。
+遗留风险与下一步：补资源泄漏、连续 refresh、失败分类和 imported NC 映射属性证据；
+cross-node 与两类 scaleout 结果已记录，仍需在同一 workload 口径下完成更严格的
+TCP/UB 可比性能报告。
 ```
 
 ### 阶段 9：动态 Peer-View 生命周期（后续）
