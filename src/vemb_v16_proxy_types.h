@@ -112,6 +112,10 @@ struct vemb_v16_proxy {
     atomic_uint_fast64_t next_channel_id;
     atomic_uint_fast32_t next_channel_index;
     atomic_uint_fast32_t next_v2_lane_index;
+    /* Serializes channel allocation/reclamation with control-plane close and
+     * diagnostic snapshots. Data-plane workers use the per-channel state
+     * counters and never take this lock. */
+    pthread_mutex_t channel_lifecycle_lock;
     atomic_int running;
     int listen_fd;
     uint16_t tcp_port;

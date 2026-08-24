@@ -10,7 +10,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
-#include <string.h>
 #include <sys/socket.h>
 
 /*
@@ -24,35 +23,6 @@
 
 static atomic_int g_control_active_count = 0;
 
-/* Stub-respond to channel-management frames (CLOSE_CHANNEL,
- * CLOSE_ALL_CHANNELS) without touching proxy->channels[] from a control
- * pthread. The data-plane channels are owned by the proxy IO thread; calling
- * vemb_v16_proxy_close_channel_by_id from a detached pthread races with
- * the proxy IO thread's own channel lifecycle ops and crashes in free().
- *
- * These frames are pure client-side cleanup courtesy: the proxy's
- * reap_inactive_tcp_channels path will reclaim the channel once the TCP
- * connection drops. Stub OK is sufficient — clients get a clean ACK and
- * proceed with their own shutdown.
- *
- * Mirrors tcp_write_status() in vemb_v16_tcp_transport.c (which we can't
- * call directly because it's static). */
-static void stub_close_frame_response(int fd, uint64_t closed_count) {
-    vemb_v16_net_status_t st;
-    memset(&st, 0, sizeof(st));
-    st.status = VEMB_V16_STATUS_OK;
-    st.value = closed_count;
-    uint8_t payload[16];
-    size_t payload_len = 0;
-    if (vemb_v16_net_status_encode(payload, sizeof(payload), &st,
-                                   &payload_len) != 0)
-        return;
-    vemb_v16_net_write_frame(fd,
-                             VEMB_V16_NET_CONTROL_STATUS,
-                             0, 0, 0,
-                             payload, (uint32_t)payload_len);
-}
-
 static void *control_fd_worker(void *arg) {
     int fd = *(int *)arg;
     zfree(arg);
@@ -60,33 +30,7 @@ static void *control_fd_worker(void *arg) {
     int prev = atomic_fetch_sub(&g_control_active_count, 1);
     (void)prev;
 
-    /* Peek the frame type (offset 6 in vemb_v16_net_hdr_t: magic[0-3] +
-     * version[4-5] + type[6-7]). Intercept CLOSE_CHANNEL and
-     * CLOSE_ALL_CHANNELS — see stub_close_frame_response comment for why. */
-    uint8_t peek[8];
-    ssize_t n = recv(fd, peek, sizeof(peek), MSG_PEEK);
-    if (n >= (ssize_t)sizeof(peek)) {
-        uint16_t ftype;
-        memcpy(&ftype, peek + 6, sizeof(ftype));
-        if (ftype == VEMB_V16_NET_CLOSE_CHANNEL) {
-            serverLog(LL_VERBOSE,
-                      "vemb_v16 control CLOSE_CHANNEL on fd=%d stub-ack (proxy reaper handles cleanup)",
-                      fd);
-            stub_close_frame_response(fd, 1);
-            close(fd);
-            return NULL;
-        }
-        if (ftype == VEMB_V16_NET_CLOSE_ALL_CHANNELS) {
-            serverLog(LL_VERBOSE,
-                      "vemb_v16 control CLOSE_ALL_CHANNELS on fd=%d stub-ack (proxy reaper handles cleanup)",
-                      fd);
-            stub_close_frame_response(fd, 0);
-            close(fd);
-            return NULL;
-        }
-    }
-
-    serverLog(LL_DEBUG,
+    serverLog(LL_NOTICE,
               "vemb_v16 control fd worker start: fd=%d",
               fd);
 
