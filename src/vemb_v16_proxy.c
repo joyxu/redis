@@ -1784,10 +1784,10 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
 }
 
 /// Control plane: allocate channel state for either TCP sockets or UB rings.
-static int alloc_channel_common(vemb_v16_proxy_t *proxy,
-                                uint32_t transport_type,
-                                int net_fd,
-                                vemb_v16_channel_desc_t *desc) {
+static int alloc_channel_common_locked(vemb_v16_proxy_t *proxy,
+                                        uint32_t transport_type,
+                                        int net_fd,
+                                        vemb_v16_channel_desc_t *desc) {
     uint32_t idx = VEMB_V16_MAX_CHANNELS;
     uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
                                                memory_order_relaxed);
@@ -1924,23 +1924,31 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
 /// UB/SHM control plane: allocate a shared-memory client channel.
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
+    int rc = alloc_channel_common_locked(proxy, VEMB_V16_TRANSPORT_AERON,
+                                          -1, desc);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
+    return rc;
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                       int net_fd,
                       vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy,
-                                VEMB_V16_TRANSPORT_TCP,
-                                net_fd,
-                                desc);
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
+    int rc = alloc_channel_common_locked(proxy,
+                                          VEMB_V16_TRANSPORT_TCP,
+                                          net_fd,
+                                          desc);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
+    return rc;
 }
 
 /// Cross-node aeron control plane: adopt pre-built shmdev rings into a
 /// new proxy channel.  Mirrors alloc_channel_common minus the ring
 /// creation step (rings already exist in the shmdev mapping).
-int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
+static int attach_cross_node_channel_locked(
+                                             vemb_v16_proxy_t *proxy,
                                              void *req_ring, void *resp_ring,
                                              uint32_t req_slot, uint32_t resp_slot,
                                              const char *req_path,
@@ -2044,7 +2052,22 @@ int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
     return 0;
 }
 
-int vemb_v16_proxy_attach_cross_node_batch_channel(
+int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
+                                             void *req_ring, void *resp_ring,
+                                             uint32_t req_slot, uint32_t resp_slot,
+                                             const char *req_path,
+                                             const char *resp_path,
+                                             uint64_t req_off, uint64_t resp_off,
+                                             uint64_t *out_channel_id) {
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
+    int rc = attach_cross_node_channel_locked(
+        proxy, req_ring, resp_ring, req_slot, resp_slot, req_path, resp_path,
+        req_off, resp_off, out_channel_id);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
+    return rc;
+}
+
+static int attach_cross_node_batch_channel_locked(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_aeron_batch_channel_allocation_t *allocation,
     uint32_t effective_batch_size, uint32_t max_batch_bytes,
@@ -2133,8 +2156,22 @@ int vemb_v16_proxy_attach_cross_node_batch_channel(
     return 0;
 }
 
+int vemb_v16_proxy_attach_cross_node_batch_channel(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_aeron_batch_channel_allocation_t *allocation,
+    uint32_t effective_batch_size, uint32_t max_batch_bytes,
+    uint64_t *out_channel_id) {
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
+    int rc = attach_cross_node_batch_channel_locked(
+        proxy, allocation, effective_batch_size, max_batch_bytes,
+        out_channel_id);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
+    return rc;
+}
+
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
-static void close_channel(vemb_v16_channel_t *ch) {
+/// The caller holds proxy->channel_lifecycle_lock.
+static void close_channel_locked(vemb_v16_channel_t *ch) {
     RETURN_IF(atomic_load_explicit(&ch->slot_channel_id,
                                   memory_order_acquire) == 0);
     serverLog(LL_NOTICE,
@@ -2186,17 +2223,26 @@ static void close_channel(vemb_v16_channel_t *ch) {
     reset_closed_channel(ch);
 }
 
+static void close_channel(vemb_v16_channel_t *ch) {
+    pthread_mutex_lock(&ch->proxy->channel_lifecycle_lock);
+    close_channel_locked(ch);
+    pthread_mutex_unlock(&ch->proxy->channel_lifecycle_lock);
+}
+
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
     assert(proxy != NULL);
     RETURN_IF(channel_id == 0, -1);
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->slot_channel_id,
                                  memory_order_acquire) == channel_id) {
-            close_channel(ch);
+            close_channel_locked(ch);
+            pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
             return 0;
         }
     }
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
     return -1;
 }
 
@@ -2225,15 +2271,17 @@ int vemb_v16_proxy_aeron_channel_resource_generation(
 
 uint64_t vemb_v16_proxy_close_all_channels(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
     uint64_t closed = 0;
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->slot_channel_id,
                                  memory_order_acquire) != 0) {
-            close_channel(ch);
+            close_channel_locked(ch);
             closed++;
         }
     }
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
     return closed;
 }
 
@@ -3637,6 +3685,7 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     atomic_init(&proxy->scaleout_notify_stop, 0);
     proxy->scaleout_notify_interval_us =
         VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US;
+    pthread_mutex_init(&proxy->channel_lifecycle_lock, NULL);
     pthread_mutex_init(&proxy->stats_lock, NULL);
     proxy->storage = storage;
     if (manifest &&
@@ -3842,6 +3891,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++)
         close_channel(&proxy->channels[i]);
     if (proxy->listen_fd >= 0) close(proxy->listen_fd);
+    pthread_mutex_destroy(&proxy->channel_lifecycle_lock);
     pthread_mutex_destroy(&proxy->stats_lock);
     zfree(proxy);
 }
