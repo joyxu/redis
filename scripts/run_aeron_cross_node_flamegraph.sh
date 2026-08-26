@@ -518,7 +518,7 @@ setsid -f taskset -c "$cpu_mask" ./src/redis-server \
     --vemb-v16-proxy-io-threads "$proxy_io_threads" \
     --vemb-v16-supernode-workers "$supernode_workers" \
     --vemb-v16-batch-request-size "$batch_size" \
-    --daemonize yes --pidfile "$pidfile" --logfile "$log" --loglevel notice
+    --daemonize yes --pidfile "$pidfile" --logfile "$log" --loglevel warning
 
 for _ in $(seq 1 100); do
     [ -r "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null &&

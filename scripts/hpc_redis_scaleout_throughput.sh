@@ -54,6 +54,8 @@ RESPONSE_PEER_PATH="${RESPONSE_PEER_PATH:-/dev/obmm_shmdev8}"
 # ============================================================================
 PORT="${PORT:-6391}"
 COORD_PORT="${COORD_PORT:-7391}"
+# coordinator 等待全部 source 迁移完成的窗口; 1M keys 量级需远超 60s
+COORD_WAIT_MS="${COORD_WAIT_MS:-600000}"
 DIM="${DIM:-300}"
 VECTOR_BYTES="${VECTOR_BYTES:-$((DIM * 4))}"
 MAX_VECTORS="${MAX_VECTORS:-65536}"
@@ -349,7 +351,7 @@ run_memtier() {
         $route_args -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE \
         --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
         --key-minimum=$key_min --key-maximum=$key_max \
-        --test-time=$tt $extra >$outfile 2>&1" || true
+        --test-time=$tt $extra --hide-histogram >$outfile 2>&1" || true
     local tot; tot=$(ssh_run "$host" "grep '^Totals' $outfile 2>/dev/null | tail -1")
     local ops p50 p99
     ops=$(echo "$tot" | awk '{print $2}')
@@ -370,7 +372,7 @@ run_memtier_target() {
         -s $target_host -p $PORT -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE \
         --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
         --key-minimum=$key_min --key-maximum=$key_max \
-        --test-time=$tt $extra >$outfile 2>&1" || true
+        --test-time=$tt $extra --hide-histogram >$outfile 2>&1" || true
     local tot; tot=$(ssh_run "$exec_host" "grep '^Totals' $outfile 2>/dev/null | tail -1")
     local ops hits p50 p99
     ops=$(echo "$tot" | awk '{print $2}')
@@ -393,7 +395,7 @@ run_memtier_bg() {
         $route_args -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE \
         --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
         --key-minimum=1 --key-maximum=$PREFILL_KEYS \
-        --test-time=$bg_time $extra >$outfile 2>&1 &" || true
+        --test-time=$bg_time $extra --hide-histogram >$outfile 2>&1 &" || true
 }
 
 # 强制 kill 后台 memtier（清理用）
@@ -571,7 +573,7 @@ ssh_run "$NODE0_HOST" "cd $REMOTE_DIR && setsid -f ./benchmark/vemb_v16_topology
     --vnode-count $VNODE_COUNT \
     --expected-sources 0 --migration-epoch $MIGRATION_EPOCH --cutover-epoch $CUTOVER_EPOCH \
     --standby 0,1 --owner-endpoints 0=$NODE0_HOST:$PORT,1=$NODE1_HOST:$PORT \
-    --wait-ms 60000 --timeout-ms $CONTROL_TIMEOUT >$COORD_OUT 2>$COORD_ERR </dev/null"
+    --wait-ms $COORD_WAIT_MS --timeout-ms $CONTROL_TIMEOUT >$COORD_OUT 2>$COORD_ERR </dev/null"
 sleep 1
 
 # 发布候选拓扑到 node1

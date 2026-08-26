@@ -68,6 +68,7 @@ echo "============================================================"
 
 # ── 启动 server ──
 echo ">>> starting server..."
+rm -f "$SERVER_LOG"
 # Aeron transport requires the explicit transport/aeron-control config so the
 # Redis listener accepts ATTACH frames (plain sniff mode ignores them).
 AERON_ARGS=""
@@ -96,7 +97,7 @@ taskset -c "$SERVER_MASK" $REDIS \
     $AERON_ARGS \
     --vemb-v16-proxy-io-threads 21 \
     --vemb-v16-supernode-workers 21 \
-    --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
+    --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel warning \
     >/dev/null 2>&1
 
 for _ in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.2; done

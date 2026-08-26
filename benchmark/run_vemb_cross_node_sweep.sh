@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_vemb_cross_node_sweep.sh
 # 跨节点 100G 网卡 VEMB/VSIM/VADD/VREM 吞吐/延迟 sweep
@@ -46,6 +47,9 @@ HPC_MEMTIER=${HPC_MEMTIER:-$HPC_DIR/memtier_benchmark/memtier_benchmark}
 CLIENT_BASELINE_MEMTIER=${CLIENT_BASELINE_MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin/memtier_benchmark}
 CLIENT_HPC_MEMTIER=${CLIENT_HPC_MEMTIER:-/root/gqs/codespace/UnifiedBus/hpc-redis/memtier_benchmark/memtier_benchmark}
 MANIFEST=${MANIFEST:-$HPC_DIR/examples/vemb_v16_warm_regions_111.yaml}
+# baseline 免 prefill: 兼容 RDB 存在则加载 (auto), 不存在走 prefill; 0=强制 prefill
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$HPC_DIR/benchmark/baseline_rdb}
 if [ "${DIM:-300}" = "8" ] && [ -z "${MANIFEST_OVERRIDE+x}" ]; then
     MANIFEST=$HPC_DIR/examples/vemb_v16_warm_regions_111_dim8.yaml
 fi
@@ -158,17 +162,44 @@ wait_port() {
 
 # ----------------------------------------------------------------------------
 # SERVER 本地起 redis-server (不 ssh)
+# 返回兼容 RDB 路径 (不存在返回空)。VADD 是纯写测试, 永不加载。
+baseline_rdb_path() {
+    [ "$BASELINE_RDB" = "0" ] && return 1
+    [ "$OP_TYPE" = "VADD" ] && return 1
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    local f="$RDB_DIR/${NUM_KEYS}K_${DIM}D_${tag}_myset.rdb"
+    [ -f "$f" ] || return 1
+    echo "$f"
+}
+
 start_baseline() {
     log "  启动 baseline redis-server (io-threads=$BASELINE_IO_THREADS)..."
+    local rdb
+    rdb=$(baseline_rdb_path || true)
+    local dir_args=(--dir $DATA_DIR)
+    if [ -n "$rdb" ]; then
+        dir_args=(--dir "$(dirname "$rdb")" --dbfilename "$(basename "$rdb")")
+        log "  加载预填充 RDB: $rdb (跳过 prefill)"
+    fi
     taskset -c $BASELINE_SERVER_CPUSET \
         $REDIS_DIR/src/redis-server \
             --port $SERVER_PORT --bind 0.0.0.0 --protected-mode no \
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --appendonly no --save '' \
-            --dir $DATA_DIR --logfile $DATA_DIR/baseline.log \
+            "${dir_args[@]}" --logfile $DATA_DIR/baseline.log \
             --daemonize yes
     wait_port $SERVER_PORT || { log "FAIL: baseline server"; exit 1; }
+    if [ -n "$rdb" ]; then
+        # 就绪判据: VCARD 为数字 (PING 在 LOADING 期间也有回复)
+        local v=""
+        for _ in $(seq 1 300); do
+            v=$($REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $SERVER_PORT VCARD myset 2>/dev/null | grep -E '^[0-9]+$') && break
+            sleep 0.1
+        done
+        [ "$v" = "$NUM_KEYS" ] || { log "FAIL: RDB 加载校验 VCARD=$v != $NUM_KEYS ($rdb)"; exit 1; }
+        log "  RDB 加载完成: VCARD=$v"
+    fi
 }
 
 start_hpc() {
@@ -188,7 +219,7 @@ start_hpc() {
             --vemb-v16-warm-regions-manifest $MANIFEST \
             --vemb-v16-reset-warm-regions yes \
             --appendonly no --save '' \
-            --dir $DATA_DIR --logfile $DATA_DIR/hpc.log \
+            --dir $DATA_DIR --logfile $DATA_DIR/hpc.log --loglevel warning \
             --daemonize yes
     wait_port $SERVER_PORT || { log "FAIL: hpc server"; exit 1; }
 }
@@ -211,6 +242,11 @@ prefill() {
 
     local prefix kmin kmax
     read prefix kmin kmax < <(op_key_range)
+    # baseline 已由 RDB 预填充 → 跳过 (FLUSHDB 也跳过)
+    if [ "$server_type" = "baseline" ] && [ -n "$(baseline_rdb_path || true)" ]; then
+        log "  [$server_type] OP_TYPE=$OP_TYPE 使用 RDB 预填充, 跳过 prefill"
+        return 0
+    fi
     log "  [$server_type] prefill OP=$OP_TYPE key=$prefix[$kmin..$kmax] (DIM=$DIM)..."
     $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $SERVER_PORT FLUSHDB >/dev/null 2>&1
 
@@ -227,7 +263,7 @@ prefill() {
             for (i=1; i<=n; i++) {
                 printf "VADD myset VALUES %d", dim;
                 for (j=0; j<dim; j++) printf " %f", rand()*j*0.001;
-                printf " item:%d\n", i;
+                printf " item:%d%s\n", i, (ENVIRON["BASELINE_NOQUANT"]=="0" ? "" : " NOQUANT");
             }
         }' | $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $SERVER_PORT --pipe >"$RAWDIR/${server_type}_${OP_TYPE}_prefill_pipe.log" 2>&1
         local pipe_rc=$?
@@ -289,7 +325,7 @@ case "$op_type" in
         if [ "$is_hpc" = "1" ]; then
             cmd+=(--protocol vemb_v16 --vemb-v16-dim "$dim" --ratio=1:0 --key-pattern=S:S)
         else
-            cmd+=(--protocol=resp3 --command="VADD myset VALUES $dim $fixed_vec __key__" --command-key-pattern=S)
+            cmd+=(--protocol=resp3 --command="VADD myset VALUES $dim $fixed_vec __key__$( [ "${BASELINE_NOQUANT:-1}" != 0 ] && echo " NOQUANT" )" --command-key-pattern=S)
         fi ;;
     VREM)
         if [ "$is_hpc" = "1" ]; then
@@ -373,13 +409,14 @@ run_one_config() {
     nic_util=$(awk -v iface="$NIC_IFACE" '$2==iface && NF>=9 {sum+=$NF; n++} END {if(n>0) printf "%.1f", sum/n; else print "0.0"}' "$sar_log" 2>/dev/null)
     [ -z "$nic_util" ] && nic_util="N/A"
 
-    # === memtier Totals 解析 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通) ===
+    # === memtier Totals 解析 (按 NF 自动判: NF>=11 新vemb格式 / NF>=9 带Hits/Misses / NF>=7 普通) ===
     local totals ops avg p50 p99 kb
     totals=$(grep "^Totals" "$raw_local" | tail -1)
     read ops avg p50 p99 kb < <(
         echo "$totals" | awk '{
-            if (NF>=9)      printf "%s %s %s %s %s", $2,$5,$6,$7,$9
-            else if (NF>=7) printf "%s %s %s %s %s", $2,$3,$4,$5,$7
+            if (NF>=11)      printf "%s %s %s %s %s", $2,$7,$8,$9,$11
+            else if (NF>=9)  printf "%s %s %s %s %s", $2,$5,$6,$7,$9
+            else if (NF>=7)  printf "%s %s %s %s %s", $2,$3,$4,$5,$7
             else            printf "0 NA NA NA NA"
         }'
     )

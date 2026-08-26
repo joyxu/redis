@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_redis_cluster_scaleout_vemb.sh
 # 4 节点 redis cluster 扩容过程 VEMB 吞吐测试 (baseline redis-8.6.3)
@@ -33,8 +34,10 @@
 set -uo pipefail
 
 # === 节点 (顺序很重要: 前 N_INIT 个是初始 master, 后面是扩容目标) ===
-declare -a NODES=("HW01" "HW02" "HW05" "HW04")
-declare -a IPS=("192.168.1.111" "192.168.1.112" "192.168.1.20" "192.168.1.21")
+declare -a NODES=("HW01" "HW02" "HW04" "HW05")
+declare -a IPS=("192.168.1.111" "192.168.1.112" "192.168.1.21" "192.168.1.20")
+# BASELINE_ONLY=1: 只跑段1 baseline (验证 RDB 加载), 不做扩容
+BASELINE_ONLY=${BASELINE_ONLY:-0}
 NNODES=${#NODES[@]}
 
 # === 路径 ===
@@ -80,6 +83,9 @@ RAW_SUFFIX=""
 
 # === 数据规模 ===
 NUM_VSETS=${NUM_VSETS:-16}
+# baseline 免 prefill: 初始 N_INIT master 各一份 RDB (扩容迁移仍在线发生, RDB 只覆盖初始态)
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/benchmark/baseline_rdb}
 VECTORS_PER_VSET=${VECTORS_PER_VSET:-6250}
 DIM=${DIM:-300}
 
@@ -128,6 +134,24 @@ start_node_pair() {
     local mddir="$DATA_DIR/inst0"
     local rddir="$DATA_DIR/inst1"
     local c0=$((CORES_PER_MASTER))
+    # RDB 预放置到 master 目录 (replica 不加载, 由主从同步获得数据)
+    local base; base=$(cluster_rdb_base 2>/dev/null)
+    if [ "$BASELINE_RDB" != "0" ] && [ -f "${base}.layout" ]; then
+        local idx=0 m mip
+        while IFS= read -r m; do
+            mip=${m%%:*}
+            if [ "$mip" = "$ip" ] && [ -f "${base}_m${idx}.rdb" ]; then
+                ssh -n $SSH_OPTS "${NODES[$i]}" "mkdir -p $mddir" >/dev/null 2>&1
+                ssh $SSH_OPTS "${NODES[$i]}" "cat > $mddir/prefill.rdb" < "${base}_m${idx}.rdb" 2>/dev/null
+                log "  ${NODES[$i]}: 预放置 RDB m$idx ($(stat -c%s ${base}_m${idx}.rdb)B)"
+                break
+            fi
+            idx=$((idx+1))
+        done <<< "$(cat ${base}.layout)"
+    fi
+    local RDB_FLAG=" --dbfilename prefill.rdb"
+    ssh -n $SSH_OPTS "${NODES[$i]}" "test -f $mddir/prefill.rdb" >/dev/null 2>&1 || RDB_FLAG=""
+    [ -n "$RDB_FLAG" ] && log "  ${NODES[$i]} master: 将加载 prefill.rdb"
     log "  ${NODES[$i]}: master=$mport(cores 0-$((c0-1))) replica=$rport(cores $c0-$((CORES_PER_NODE-1)))"
     ssh_node $i "mkdir -p $mddir $rddir && cd $REDIS_DIR && \
         numactl --membind=0 taskset -c 0-$((c0-1)) ./src/redis-server \
@@ -135,7 +159,7 @@ start_node_pair() {
             --cluster-enabled yes --cluster-config-file nodes.conf \
             --cluster-node-timeout $CLUSTER_TIMEOUT --cluster-announce-ip $ip \
             --io-threads $IO_THREADS --io-threads-do-reads yes \
-            --appendonly no --save '' --dir $mddir --logfile $mddir/redis.log --daemonize yes && \
+            --appendonly no --save '' --dir $mddir --logfile $mddir/redis.log --daemonize yes${RDB_FLAG} && \
         numactl --membind=0 taskset -c $c0-$((CORES_PER_NODE-1)) ./src/redis-server \
             --port $rport --bind 0.0.0.0 --protected-mode no \
             --cluster-enabled yes --cluster-config-file nodes.conf \
@@ -153,6 +177,74 @@ wait_port() {
 }
 
 # ----------------------------------------------------------------------------
+rdb_tag() { [ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT; }
+cluster_rdb_base() { echo "$RDB_DIR/${NUM_VSETS}V${VECTORS_PER_VSET}_${DIM}D_$(rdb_tag)_so"; }
+
+masters_list() {
+    $REDIS_CLI -h ${IPS[0]} -p $PORT CLUSTER NODES 2>/dev/null \
+        | awk '$3 ~ /master/ {sub(/@.*/, "", $2); print $2}' | sort
+}
+
+# 注意: redis-cli 收到 ERR 时 exit code 仍为 0, 必须判输出
+fill_node_slots() {
+    local ip=$1 from=$2 to=$3 try mine_id missing out
+    for try in 1 2 3 4 5; do
+        out=$($REDIS_CLI -h $ip -p $PORT CLUSTER ADDSLOTS $(seq $from $to) 2>&1)
+        [ "$out" = "OK" ] && return 0
+        mine_id=$($REDIS_CLI -h $ip -p $PORT CLUSTER MYID 2>/dev/null)
+        [ -z "$mine_id" ] && { sleep 1; continue; }
+        missing=$($REDIS_CLI -h $ip -p $PORT CLUSTER NODES 2>/dev/null | awk -v me="$mine_id" -v f="$from" -v t="$to" '
+            $1==me { for(i=9;i<=NF;i++){ if($i ~ /-/) { split($i,a,"-"); for(s=a[1];s<=a[2];s++) have[s]=1 } else have[$i+0]=1 } }
+            END { for(s=f;s<=t;s++) if(!(s in have)) print s }')
+        [ -z "$missing" ] && return 0
+        out=$($REDIS_CLI -h $ip -p $PORT CLUSTER ADDSLOTS $missing 2>&1)
+        [ "$out" = "OK" ] && return 0
+        sleep 1
+    done
+    log "WARN: fill_node_slots $ip [$from,$to] 未完全成功"
+    return 1
+}
+
+# prefill 成功后捕获初始 N_INIT master 的 RDB
+capture_scaleout_rdb() {
+    [ "$BASELINE_RDB" = "0" ] && return 0
+    local base; base=$(cluster_rdb_base)
+    mkdir -p "$RDB_DIR"
+    local masters
+    masters=$(masters_list)
+    [ -z "$masters" ] && return 0
+    printf '%s\n' "$masters" > "${base}.layout"
+    local idx=0 m ip port node
+    while IFS= read -r m; do
+        ip=${m%%:*}; port=${m##*:}
+        node=HW01
+        for ((i=0; i<NNODES; i++)); do [[ "${IPS[$i]}" == "$ip" ]] && node=${NODES[$i]}; done
+        $REDIS_CLI -h $ip -p $port SAVE >/dev/null 2>&1
+        local d="$DATA_DIR/inst$((port - PORT))/dump.rdb"
+        ssh -n $SSH_OPTS "$node" "[ -f $d ]" >/dev/null 2>&1 || continue
+        ssh -n $SSH_OPTS "$node" "cat $d" > "${base}_m${idx}.rdb" && chmod 444 "${base}_m${idx}.rdb"
+        ssh -n $SSH_OPTS "$node" "rm -f $d" 2>/dev/null
+        log "    [rdb] m$idx ← $node:$port"
+        idx=$((idx+1))
+    done <<< "$masters"
+    log "  [rdb] 捕获 $idx masters → ${base}_m*.rdb"
+}
+
+cluster_rdb_ready() {
+    [ "$BASELINE_RDB" = "0" ] && return 1
+    local base; base=$(cluster_rdb_base)
+    [ -f "${base}.layout" ] || return 1
+    local masters
+    masters=$(masters_list)
+    [ "$masters" != "$(cat ${base}.layout)" ] && return 1
+    local idx=0
+    while IFS= read -r _; do
+        [ -f "${base}_m${idx}.rdb" ] || return 1
+        idx=$((idx+1))
+    done <<< "$(cat ${base}.layout)"
+    return 0
+}
+
 # 用前 N_INIT 节点的 master+replica 建 cluster (master=PORT, replica=PORT+1)
 create_initial_cluster() {
     local endpoints=""
@@ -160,8 +252,36 @@ create_initial_cluster() {
         endpoints="$endpoints ${IPS[$i]}:$PORT ${IPS[$i]}:$((PORT + REPL_PORT_OFF))"
     done
     log "create initial cluster: $N_INIT masters + $N_INIT replicas (--cluster-replicas 1)..."
-    echo yes | $REDIS_CLI --cluster create $endpoints --cluster-replicas 1 2>&1 \
-        | grep -E "Slots|Master|Replica|slots:|OK|All|coverage|agree|Can't|err" | head -40
+    # 空 cluster 走原生 create; RDB 预加载模式 create 拒绝非空节点,
+    # 改 MEET + 均分 slot + fill 补差 (replica 由 CLUSTER REPLICATE 挂接)
+    if [ ! -f "$DATA_DIR/inst0/prefill.rdb" ]; then
+        echo yes | $REDIS_CLI --cluster create $endpoints --cluster-replicas 1 2>&1 \
+            | grep -E "Slots|Master|Replica|slots:|OK|All|coverage|agree|Can't|err" | head -40
+        return $?
+    fi
+    log "  RDB 模式: MEET + 均分 slot + REPLICATE"
+    # master 间 MEET
+    for ((i=1; i<N_INIT; i++)); do
+        $REDIS_CLI -h ${IPS[0]} -p $PORT CLUSTER MEET ${IPS[$i]} $PORT >/dev/null 2>&1
+    done
+    # replica MEET 后 REPLICATE 到对应 master
+    for ((i=0; i<N_INIT; i++)); do
+        $REDIS_CLI -h ${IPS[$i]} -p $PORT CLUSTER MEET ${IPS[$i]} $((PORT + REPL_PORT_OFF)) >/dev/null 2>&1
+    done
+    sleep 3
+    # 均分 slot 到 N_INIT 个 master
+    local n_per=$((16384 / N_INIT))
+    for ((k=0; k<N_INIT; k++)); do
+        local f=$((k * n_per)) t=$(( (k+1) * n_per - 1 ))
+        [ $k -eq $((N_INIT-1)) ] && t=16383
+        fill_node_slots ${IPS[$k]} $f $t
+    done
+    # replica REPLICATE
+    for ((i=0; i<N_INIT; i++)); do
+        local mid=$($REDIS_CLI -h ${IPS[$i]} -p $PORT CLUSTER MYID 2>/dev/null)
+        [ -n "$mid" ] && $REDIS_CLI -h ${IPS[$i]} -p $((PORT + REPL_PORT_OFF)) CLUSTER REPLICATE $mid >/dev/null 2>&1
+    done
+    sleep 2
 }
 
 check_cluster() {
@@ -285,6 +405,21 @@ wait_cluster_stable() {
 # ----------------------------------------------------------------------------
 prefill() {
     local v0=$KEY_OFFSET v1=$((KEY_OFFSET + NUM_VSETS - 1))
+    # RDB 已加载 → 校验样本后跳过
+    if cluster_rdb_ready; then
+        # replica 同步期间集群可能短暂 CLUSTERDOWN, 重试等待稳定
+        local card w
+        for w in $(seq 1 30); do
+            card=$($REDIS_CLI -c -h ${IPS[0]} -p $PORT VCARD vset$v0 2>/dev/null)
+            [ "$card" = "$VECTORS_PER_VSET" ] && break
+            sleep 1
+        done
+        if [ "$card" = "$VECTORS_PER_VSET" ]; then
+            log "prefill skipped: using pre-loaded RDBs (vset$v0 VCARD=$card)"
+            return 0
+        fi
+        log "WARN: RDB VCARD=$card != $VECTORS_PER_VSET, 回退 prefill"
+    fi
     log "prefill: vset$v0..vset$v1 ($NUM_VSETS vsets) x $VECTORS_PER_VSET vectors (dim=$DIM)..."
     $REDIS_CLI -c -h ${IPS[0]} -p $PORT FLUSHALL >/dev/null 2>&1
     awk -v off=$KEY_OFFSET -v m=$NUM_VSETS -v k=$VECTORS_PER_VSET -v dim=$DIM 'BEGIN{
@@ -294,7 +429,7 @@ prefill() {
             for (e=0; e<k; e++) {
                 printf "VADD vset%d VALUES %d", v, dim;
                 for (j=0; j<dim; j++) printf " %f", rand()*0.001;
-                printf " elem%d\n", e;
+                printf " elem%d%s\n", e, (ENVIRON["BASELINE_NOQUANT"]=="0" ? "" : " NOQUANT");
             }
         }
     }' | $REDIS_CLI -c -h ${IPS[0]} -p $PORT >/dev/null 2>&1
@@ -303,6 +438,7 @@ prefill() {
         printf "  vset%d VCARD=%s\n" "$v" \
             "$($REDIS_CLI -c -h ${IPS[0]} -p $PORT VCARD vset$v 2>/dev/null)"
     done
+    capture_scaleout_rdb
 }
 
 # ----------------------------------------------------------------------------
@@ -403,10 +539,12 @@ log "=== STEP 1: cleanup residuals ==="
 cleanup_all
 sleep 1
 
-log "=== STEP 2: start $NNODES x 2 redis instances (master+replica per node) ==="
-for ((i=0; i<NNODES; i++)); do start_node_pair $i; done
+START_N=$NNODES
+[ "$BASELINE_ONLY" = "1" ] && START_N=$N_INIT
+log "=== STEP 2: start $START_N x 2 redis instances (master+replica per node) ==="
+for ((i=0; i<START_N; i++)); do start_node_pair $i; done
 sleep 2
-for ((i=0; i<NNODES; i++)); do
+for ((i=0; i<START_N; i++)); do
     wait_port ${IPS[$i]} $PORT || {
         log "FAIL: ${IPS[$i]}:$PORT not up"
         log "  --- diagnostic on ${NODES[$i]} ---"
@@ -451,6 +589,11 @@ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
 log "  => baseline: ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
 
 # ----------------------------------------------------------------------------
+if [ "" = "1" ]; then
+    log "BASELINE_ONLY=1: 段1 完成, 跳过扩容与后续段"
+    cleanup_all
+    exit 0
+fi
 log "=== STEP 6: 段2 during scaleout (扩容 N_INIT -> N_FINAL, memtier 后台持续打) ==="
 # 后台启动 memtier, 跑 DURING_TIME 秒 (期间完成 add-node + reshard)
 read jb_ut jb_st < <(snapshot_jiffies_all)

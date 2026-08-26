@@ -483,7 +483,7 @@ cleanup() {
         [ -n "$p" ] && { kill "$p" 2>/dev/null; sleep 0.3; kill -9 "$p" 2>/dev/null; }
     fi
     pkill -9 -f "redis-server.*:$PORT " 2>/dev/null || true
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$SERVER_LOG"
 }
 
 # ============================================================================
@@ -611,7 +611,7 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
         -t "$t" -c "$c" --pipeline="$p"
         --ratio=0:1 --key-pattern=R:R
         --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
-        --test-time="$TEST_TIME"
+        --test-time="$TEST_TIME" --hide-histogram
     )
     workload_log="$RAWDIR/t${t}_c${c}_p${p}.log"
 
