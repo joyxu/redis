@@ -1,0 +1,118 @@
+# Fixed CLI@111 view for the two-owner active ring.
+# Scenario 1: correct NC -> CC response direction. Owner 1 publishes the
+# response ring through imported NC dev15; CLI@111 consumes it via export CC
+# dev11. Owner 0 uses local dev1/dev2/dev3.
+version: 1
+peer_views:
+  - client_host: 111
+    owner_id: 0
+    resource_role: v1_request_ring
+    resource_id: owner111-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: v1_response_ring
+    resource_id: owner111-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: warm_region
+    resource_id: owner111-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev3
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: v2_request_descriptor
+    resource_id: owner111-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: v2_request_arena
+    resource_id: owner111-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: v2_response_descriptor
+    resource_id: owner111-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 111
+    owner_id: 0
+    resource_role: v2_response_arena
+    resource_id: owner111-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v1_request_ring
+    resource_id: owner112-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev10
+    client_path: /dev/obmm_shmdev14
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v1_response_ring
+    resource_id: owner112-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: warm_region
+    resource_id: owner112-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev12
+    client_path: /dev/obmm_shmdev16
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v2_request_descriptor
+    resource_id: owner112-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev10
+    client_path: /dev/obmm_shmdev14
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v2_request_arena
+    resource_id: owner112-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev10
+    client_path: /dev/obmm_shmdev14
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v2_response_descriptor
+    resource_id: owner112-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
+    map_from_start: true
+  - client_host: 111
+    owner_id: 1
+    resource_role: v2_response_arena
+    resource_id: owner112-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
+    map_from_start: true

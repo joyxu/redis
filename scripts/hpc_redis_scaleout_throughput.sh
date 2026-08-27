@@ -19,7 +19,7 @@ DATA_TRANSPORT="${DATA_TRANSPORT:-tcp}"
 case "$DATA_TRANSPORT" in
     tcp) ;;
     ub)
-        exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh"
+        exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh"
         ;;
     *)
         echo "DATA_TRANSPORT must be tcp or ub: $DATA_TRANSPORT" >&2

@@ -1,5 +1,6 @@
 # Owner 1 @ 112.
-# dev12 is the sole local warm/meta export; dev10/dev11 are CLI rings.
+# dev12 is the sole local warm/meta export; dev10 is the CLI request export,
+# while dev15 is the imported NC response-write view.
 local_ub_node_id: 1
 local_region_weight: 4
 

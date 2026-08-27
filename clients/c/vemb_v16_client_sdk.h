@@ -252,6 +252,11 @@ int vemb_v16_client_stats(vemb_v16_client_t *client,
  * Returns 0 on success, -1 on failure. */
 int vemb_v16_client_topology_refresh(vemb_v16_client_t *client);
 
+/* Prepare all owners in the current active ring for an Aeron handle session.
+ * Preconditions: peer-view configuration, batch size, and topology refresh
+ * have completed; the caller owns the client setup thread. */
+int vemb_v16_client_prepare_active_owner_channels(vemb_v16_client_t *client);
+
 /* Configure max retry attempts per op for transparent redirect handling.
  * Default 256. Set to 0 to disable retry (first redirect surfaces as ERR —
  * debug only). Takes effect on the next op call. */

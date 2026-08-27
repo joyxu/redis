@@ -26,6 +26,11 @@ STEADY_KEY_MIN="${STEADY_KEY_MIN:-$((PREFILL_KEYS + 1))}"
 STEADY_KEY_MAX="${STEADY_KEY_MAX:-$((PREFILL_KEYS + STEADY_KEYS))}"
 TEST_TIME="${TEST_TIME:-30}"
 BG_TIME_SCALEOUT="${BG_TIME_SCALEOUT:-60}"
+# Keep steady-key semantics as write-after-scaleout, then allow asynchronous
+# write-side work (for example remote metadata publication) to quiesce before
+# measuring reads.  Set to 0 only for an explicit write-then-immediate-read
+# diagnostic comparison.
+STEADY_SETTLE_SEC="${STEADY_SETTLE_SEC:-5}"
 PIPELINE="${PIPELINE:-32}"
 BATCH_MAX_DELAY_US="${BATCH_MAX_DELAY_US:-10}"
 MEMTIER_T="${MEMTIER_T:-64}"
@@ -88,12 +93,13 @@ NODE1_RPC_REQUEST_PATH="${NODE1_RPC_REQUEST_PATH:-/dev/obmm_shmdev9}"
 NODE1_RPC_RESPONSE_PATH="${NODE1_RPC_RESPONSE_PATH:-/dev/obmm_shmdev8}"
 
 # Owner 0 shares its local UB pair with the workload client on node 111.
-# Owner 1 keeps the cross-node provider pair translated by the fixed
-# CLI@111 peer-view manifest to imported dev14/dev15/dev16.
+# Owner 1 reads CLI requests from export dev10 and writes responses through
+# imported dev15.  CLI@111 uses imported dev14 for requests, export dev11 for
+# responses, and imported dev16 for owner1 warm reads.
 NODE0_AERON_REQUEST_PATH="${NODE0_AERON_REQUEST_PATH:-/dev/obmm_shmdev1}"
 NODE0_AERON_RESPONSE_PATH="${NODE0_AERON_RESPONSE_PATH:-/dev/obmm_shmdev2}"
 NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev10}"
-NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev11}"
+NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev15}"
 CLIENT_WARM_PATH="${CLIENT_WARM_PATH:-/dev/obmm_shmdev3}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -192,7 +198,7 @@ cleanup() {
 trap cleanup EXIT
 
 for setting in SERVER_PORT COORD_PORT DIM MAX_VECTORS PREFILL_KEYS STEADY_KEYS \
-               TEST_TIME BG_TIME_SCALEOUT PIPELINE BATCH_MAX_DELAY_US MEMTIER_T MEMTIER_C PIO SNW \
+               TEST_TIME BG_TIME_SCALEOUT STEADY_SETTLE_SEC PIPELINE BATCH_MAX_DELAY_US MEMTIER_T MEMTIER_C PIO SNW \
                CONTROL_TIMEOUT_MS \
                COMBINED_CONTROL_TIMEOUT_MS COORD_WAIT_MS VNODE_COUNT \
                INIT_EPOCH MIGRATION_EPOCH CUTOVER_EPOCH SERVER_WARM_REGION_BYTES \
@@ -224,6 +230,7 @@ printf 'run_id=%s\nnode0_ssh=%s:%s\nnode1_ssh=%s:%s\nnode0_data=%s\nnode1_data=%
     "$DIM" "$PREFILL_KEYS" "$VNODE_COUNT" "$PIO" "$SNW" \
     "$MEMTIER_T" "$MEMTIER_C" "$PIPELINE" \
     >"$LOCAL_RESULT_DIR/run.conf"
+printf 'steady_settle_sec=%s\n' "$STEADY_SETTLE_SEC" >>"$LOCAL_RESULT_DIR/run.conf"
 
 summary_row() {
     printf '%-32s %-15s %-10s %-10s %-8s %s\n' "$@"
@@ -605,11 +612,15 @@ record_phase scaleout_after_old_keys "$ops" "$p50" "$p99" "$((T1 - T0))" "active
 
 step "After scaleout steady-key read"
 prefill_steady_data "$BOOTSTRAP_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX"
+runner_log "steady prefill complete; waiting ${STEADY_SETTLE_SEC}s before steady-key read"
+if [ "$STEADY_SETTLE_SEC" -gt 0 ]; then
+    sleep "$STEADY_SETTLE_SEC"
+fi
 T0=$(date +%s)
 result=$(run_memtier "$TEST_TIME" "$AFTER_OUT" "$BOOTSTRAP_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
 T1=$(date +%s)
 read ops p50 p99 <<<"$result"
-record_phase scaleout_after "$ops" "$p50" "$p99" "$((T1 - T0))" "active={0,1}, steady_keys=$STEADY_KEY_MIN-$STEADY_KEY_MAX"
+record_phase scaleout_after "$ops" "$p50" "$p99" "$((T1 - T0))" "active={0,1}, steady_keys=$STEADY_KEY_MIN-$STEADY_KEY_MAX, settle=${STEADY_SETTLE_SEC}s"
 
 step "Capture topology and migration evidence"
 for node in "$NODE0_HOST" "$NODE1_HOST"; do
