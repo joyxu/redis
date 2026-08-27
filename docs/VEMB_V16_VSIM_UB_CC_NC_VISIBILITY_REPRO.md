@@ -33,6 +33,19 @@ vector。
 | 112 `/dev/obmm_shmdev3` | 111 `/dev/obmm_shmdev7` |
 | 112 `/dev/obmm_shmdev4` | 111 `/dev/obmm_shmdev8` |
 
+第二组设备使用相同的编号偏移规则：
+
+| 本地 Export 设备 | 对端 Import 设备 |
+|---|---|
+| 111 `/dev/obmm_shmdev9` | 112 `/dev/obmm_shmdev13` |
+| 111 `/dev/obmm_shmdev10` | 112 `/dev/obmm_shmdev14` |
+| 111 `/dev/obmm_shmdev11` | 112 `/dev/obmm_shmdev15` |
+| 111 `/dev/obmm_shmdev12` | 112 `/dev/obmm_shmdev16` |
+| 112 `/dev/obmm_shmdev9` | 111 `/dev/obmm_shmdev13` |
+| 112 `/dev/obmm_shmdev10` | 111 `/dev/obmm_shmdev14` |
+| 112 `/dev/obmm_shmdev11` | 111 `/dev/obmm_shmdev15` |
+| 112 `/dev/obmm_shmdev12` | 111 `/dev/obmm_shmdev16` |
+
 当前设备配置模式为：
 
 - 本地 Export：CC。
@@ -56,7 +69,7 @@ benchmark/ub_cc_nc_visibility_ut.c
 benchmark/Makefile
 ```
 
-UT 有两个运行模式：
+UT 有四个 line 运行模式：
 
 ### Writer
 
@@ -72,6 +85,11 @@ UT 有两个运行模式：
 - 使用 `open(path, O_RDWR | O_SYNC)`，即远端 NC mapping。
 - 使用 `MAP_SHARED` mmap。
 - 每秒读取并校验一次指定的完整 64B cacheline。
+
+`writer-nc`/`reader-cc` 是反向访问模式对照：writer 使用
+`O_RDWR|O_SYNC(NC)`，reader 使用本地 `O_RDWR(CC)`。其中 imported 设备不保证
+允许普通 `O_RDWR` 打开；若驱动返回 `EPERM`，应使用 NC reader，而不能据此判定
+Export/Import 映射失败。
 
 UT 特意不使用以下机制：
 
@@ -211,6 +229,23 @@ attempt=0 result=VISIBLE
 - `3 -> 7`
 - `4 -> 8`
 
+2026-08-24 使用新的 64B 对齐 scratch offset 对第二组设备完成同口径双向复测：
+
+- `111:9 -> 112:13`、`111:10 -> 112:14`、`111:11 -> 112:15`、`111:12 -> 112:16`
+- `112:9 -> 111:13`、`112:10 -> 111:14`、`112:11 -> 111:15`、`112:12 -> 111:16`
+
+八组均为本地 Export `writer`（`O_RDWR/CC`）写入、对端 Import `reader`
+（`O_RDWR|O_SYNC/NC`）在 `attempt=0` 返回 `VISIBLE`。因此第二组当前实机的
+映射规则可以固定为 `9 -> 13`、`10 -> 14`、`11 -> 15`、`12 -> 16`，且两个
+方向都成立。
+
+两台机器上的 imported `dev5/6/7/8` 与 `dev13/14/15/16` 分别强制使用普通
+`O_RDWR(CC)`，当前驱动全部返回 `EPERM`，不是 `dev15` 特例。使用
+`O_RDWR|O_SYNC(NC)` 后相应路径均可见；此前对 imported `dev15` 做的 NC writer
+到 local `dev11` reader 也已通过。这是 imported 访问模式的统一限制，不是某个
+设备对的物理可见性失败。后续业务路径不能把 imported path 的 `O_RDWR` 打开失败
+或强制 CC 失败误报为 UB 映射错误。
+
 并且在这次 UT 中，没有复现“必须等 `munmap` 后远端才可见”的旧现象。
 
 ## 8. 已确认的事实
@@ -224,14 +259,18 @@ attempt=0 result=VISIBLE
 5. 当前真实双机上，四组映射都能在 writer 持有 mmap 期间直接被远端 reader 读到。
 6. 这次结果不支持“当前机器必须等 `munmap` 后才可见”的旧结论。
 7. 该 UT 仍然不依赖 VSIM、remote meta、atomic RMW 或 ownership API。
+8. 第二组 `dev9..dev12/dev13..dev16` 的八个双向组合也已通过同一 UT；两台机器
+   上 imported `dev5..dev8` 和 `dev13..dev16` 的 CC 打开均被 `EPERM` 拒绝，
+   需要由 O_SYNC fallback 处理。
 
 ## 9. 对当前扩容调试的影响
 
 这次 UT 的意义主要是两点：
 
 - 可以把当前双机环境的 UB 路径基线明确固定为
-  `1/5, 2/6, 3/7, 4/8`
-- 当前扩容问题不能再归因于“peer-view path 选错成 3/4 这一组”
+  `1/5, 2/6, 3/7, 4/8` 和 `9/13, 10/14, 11/15, 12/16`
+- 当前扩容问题不能再归因于“peer-view path 选错成 3/4 或 11/15 这一组”；
+  这两组的最小 CC/NC 可见性均已通过
 
 ## 10. 若后续仍出现可见性异常
 
@@ -357,6 +396,29 @@ FRAME_VISIBILITY_FAILURE type=mixed generation=N descriptor=N index=3 ... header
 
 这验证了 generation、反向 ack、检查逻辑和真实 UB 范围级部分可见性。后续复测必须按
 12.1 的无注入路径执行，不能以注入自验证替代。
+
+### 12.3.1 第二组 dev9-dev16 frame 对照
+
+按同样的 data/ack 角色把第二组设备平移 8 个编号：
+
+```text
+111 writer: data dev14 (imported NC), ack dev11 (local CC)
+112 reader: data dev10 (local CC), ack dev15 (imported NC)
+```
+
+使用 `frame_bytes=4096`、无注入、100 代复用时，第 1 代可以完成握手；第 2 代
+两端分别出现：
+
+```text
+reader: TIMEOUT waiting for descriptor=2 actual=1
+writer: TIMEOUT waiting for ack=2 actual=1
+```
+
+反向角色 `112 dev13/dev12 -> 111 dev9/dev16` 也在第 2 代停止推进。该结果不否定
+前述八个 64B line 映射，因为 line 的 CC writer/NC reader 和 imported-to-local
+NC writer/CC reader 都已通过；它说明多 cacheline frame 的 descriptor/ack 连续发布
+还没有得到稳定的范围级可见性。因而当前只能结论为“dev9-dev16 的 line 映射正常”，
+不能把它扩展为“v2 response frame 在该 pair 上已验证正常”。
 
 ### 12.4 response frame cacheline 隔离复测（已撤回）
 
