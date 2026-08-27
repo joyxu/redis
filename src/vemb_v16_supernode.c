@@ -70,8 +70,9 @@ typedef enum vemb_v16_lookup_miss_kind {
     VEMB_V16_LOOKUP_MISS_MOVED = 2,
 } vemb_v16_lookup_miss_kind_t;
 
-/* Lookup misses are rare; classify them from per-key metadata so a released
- * migration-active counter cannot hide a source cutover fence. */
+/* Lookup misses are rare; classify them from local per-key migration metadata
+ * so a released migration-active counter cannot hide a source cutover fence.
+ * This is not the VSIM remote-meta lookup path. */
 static vemb_v16_lookup_miss_kind_t classify_lookup_miss(
         vemb_v16_tlc_t *tlc,
         const char *key,
@@ -124,6 +125,8 @@ static void completion_set_lookup_miss(
     } else {
         completion->status = VEMB_V16_STATUS_NOT_FOUND;
     }
+    if (completion->op == VEMB_V16_OP_VEMB_HANDLE)
+        vemb_v16_tlc_note_handle_lookup_miss(tlc, completion->status);
 }
 
 static void completion_set_vector_handle(

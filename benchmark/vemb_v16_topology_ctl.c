@@ -27,6 +27,8 @@ typedef enum topology_ctl_action {
     TOPOLOGY_CTL_COORDINATOR_LISTEN = 7,
     TOPOLOGY_CTL_APPLY_PEER_VIEW_MAP = 8,
     TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP = 9,
+    TOPOLOGY_CTL_STATS = 10,
+    TOPOLOGY_CTL_DIAGNOSTIC_STATS = 11,
 } topology_ctl_action_t;
 
 typedef struct topology_ctl_cfg {
@@ -67,7 +69,7 @@ typedef struct topology_ctl_cfg {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s --get|--set [--ctl-endpoint tcp|aeron] [--data-endpoint tcp|aeron] "
+            "usage: %s --get|--set|--stats|--diagnostic-stats [--ctl-endpoint tcp|aeron] [--data-endpoint tcp|aeron] "
             "[--host HOST --port PORT] "
             "[--epoch N] [--min-write-epoch N] "
             "[--active 0,1] [--standby 0,1,2] [--dual-write] "
@@ -687,6 +689,26 @@ static int topology_control_tcp(const topology_ctl_cfg_t *cfg,
     return 0;
 }
 
+static int stats_control_tcp(const topology_ctl_cfg_t *cfg,
+                             uint16_t type,
+                             void *payload,
+                             uint32_t payload_len) {
+    int fd = vemb_v16_net_connect(cfg->host, cfg->port, cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (vemb_v16_net_write_frame(fd, type, 0, 0, 0, NULL, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    int rc = vemb_v16_net_read_header(fd, &hdr) == 0 &&
+        hdr.type == type && hdr.flags == 0 &&
+        hdr.payload_len == payload_len &&
+        vemb_v16_net_read_full(fd, payload, payload_len) == 0 ? 0 : -1;
+    close(fd);
+    return rc;
+}
+
 static int topology_control_endpoint(
         const topology_ctl_cfg_t *cfg,
         const vemb_v16_topology_endpoint_t *endpoint,
@@ -863,6 +885,141 @@ static void print_response(const vemb_v16_topology_control_resp_t *resp) {
                vemb_v16_transport_name(endpoint->transport_type),
                endpoint->host,
                endpoint->tcp_port);
+    }
+}
+
+static void print_stats(const vemb_v16_stats_t *stats) {
+#define P(field) printf(#field "=%llu\n", (unsigned long long)stats->field)
+    printf("type=stats\n");
+    P(total_requests);
+    P(vadd_requests);
+    P(vemb_requests);
+    P(vsim_requests);
+    P(not_found);
+    P(published_jobs);
+    P(completed_jobs);
+    P(active_channels);
+    P(proxy_vemb_ring_full);
+    P(proxy_vadd_ring_full);
+    P(proxy_response_ring_full);
+    P(supernode_completion_publish);
+    P(supernode_completion_ring_full);
+    P(read_pool_alloc_ok);
+    P(read_pool_alloc_fail);
+    P(read_pool_inuse_peak);
+    P(read_pool_free_min);
+    P(request_ring_depth);
+    P(response_ring_depth);
+    P(job_shard_queue_depth);
+    P(completion_ring_depth);
+    P(warm_region_count);
+    P(warm_region_full_count);
+    P(warm_alloc_local);
+    P(warm_alloc_remote);
+    P(warm_alloc_fallback);
+    P(warm_alloc_cold_spill);
+    P(warm_alloc_fail);
+    P(warm_eviction_success);
+    P(warm_eviction_fail);
+    P(warm_same_key_overwrite);
+    P(warm_stale_handle_reject);
+    P(remote_meta_stale);
+    P(remote_meta_lookup_hit);
+    P(remote_meta_lookup_miss);
+    P(remote_meta_lookup_busy);
+    P(remote_meta_lookup_way_probe);
+    P(remote_meta_publish_async_enqueue);
+    P(remote_meta_publish_async_drop);
+    P(remote_meta_publish_async_coalesce);
+    P(remote_meta_publish_ok);
+    P(remote_meta_publish_busy);
+    P(remote_meta_publish_insert);
+    P(remote_meta_publish_update);
+    P(remote_meta_publish_evict);
+    P(remote_meta_publish_ns);
+    P(ub_lookup_rpc_count);
+    P(ub_lookup_rpc_ok);
+    P(ub_lookup_rpc_not_found);
+    P(ub_lookup_rpc_busy);
+    P(ub_lookup_rpc_timeout);
+    P(ub_lookup_rpc_error);
+    P(ub_lookup_rpc_handle);
+    P(ub_lookup_rpc_snapshot);
+    P(ub_lookup_rpc_ns);
+    P(remote_meta_repair_enqueue);
+    P(remote_meta_repair_ok);
+    P(remote_meta_repair_drop);
+    P(moved_count);
+    P(stale_count);
+    P(ask_count);
+    P(forward_count);
+    P(duplicate_request_count);
+#undef P
+}
+
+static void print_diagnostic_stats(
+        const vemb_v16_diagnostic_stats_t *stats) {
+    printf("type=diagnostic_stats\n");
+    printf("version=%u\n", stats->version);
+    printf("bytes=%u\n", stats->bytes);
+    printf("lookup_cache_hit=%llu\n",
+           (unsigned long long)stats->lookup_cache_hit);
+    printf("lookup_cache_miss=%llu\n",
+           (unsigned long long)stats->lookup_cache_miss);
+    printf("warm_local_hit=%llu\n",
+           (unsigned long long)stats->warm_local_hit);
+    printf("warm_imported_hit=%llu\n",
+           (unsigned long long)stats->warm_imported_hit);
+    printf("cold_promote=%llu\n",
+           (unsigned long long)stats->cold_promote);
+    printf("lookup_final_miss=%llu\n",
+           (unsigned long long)stats->lookup_final_miss);
+    printf("handle_lookup_miss=%llu\n",
+           (unsigned long long)stats->handle_lookup_miss);
+    printf("handle_lookup_miss_not_found=%llu\n",
+           (unsigned long long)stats->handle_lookup_miss_not_found);
+    printf("handle_lookup_miss_moved=%llu\n",
+           (unsigned long long)stats->handle_lookup_miss_moved);
+    printf("handle_lookup_miss_stale=%llu\n",
+           (unsigned long long)stats->handle_lookup_miss_stale);
+    printf("region_count=%u\n", stats->region_count);
+    for (uint32_t i = 0; i < stats->region_count; i++) {
+        const vemb_v16_diagnostic_region_stats_t *region =
+            &stats->regions[i];
+        printf("region[%u].id=%u\n", i, region->region_id);
+        printf("region[%u].index=%u\n", i, region->region_index);
+        printf("region[%u].local=%u\n", i, region->is_local);
+        printf("region[%u].lookup_hits=%llu\n", i,
+               (unsigned long long)region->lookup_hits);
+        printf("region[%u].cold_promotes=%llu\n", i,
+               (unsigned long long)region->cold_promotes);
+    }
+    printf("channel_count=%u\n", stats->channel_count);
+    printf("active_channel_count=%u\n", stats->active_channel_count);
+    printf("closing_channel_count=%u\n", stats->closing_channel_count);
+    printf("channel_stats_truncated=%u\n", stats->channel_stats_truncated);
+    for (uint32_t i = 0; i < stats->channel_count; i++) {
+        const vemb_v16_diagnostic_channel_stats_t *channel =
+            &stats->channels[i];
+        printf("channel[%u].id=%llu\n", i,
+               (unsigned long long)channel->channel_id);
+        printf("channel[%u].index=%u\n", i, channel->index);
+        printf("channel[%u].transport=%u\n", i, channel->transport_type);
+        printf("channel[%u].proxy_io_worker=%u\n", i,
+               channel->proxy_io_worker_id);
+        printf("channel[%u].supernode_worker=%u\n", i,
+               channel->supernode_worker_id);
+        printf("channel[%u].active=%u\n", i, channel->active);
+        printf("channel[%u].proxy_io_closing=%u\n", i,
+               channel->proxy_io_closing);
+        printf("channel[%u].supernode_closing=%u\n", i,
+               channel->supernode_closing);
+        printf("channel[%u].request_ring_depth=%llu\n", i,
+               (unsigned long long)channel->request_ring_depth);
+        printf("channel[%u].response_ring_depth=%llu\n", i,
+               (unsigned long long)channel->response_ring_depth);
+        printf("channel[%u].completion_ring_depth=%llu\n", i,
+               (unsigned long long)channel->completion_ring_depth);
     }
 }
 
@@ -1371,6 +1528,10 @@ int main(int argc, char **argv) {
             cfg.action = TOPOLOGY_CTL_GET;
         } else if (!strcmp(argv[i], "--set")) {
             cfg.action = TOPOLOGY_CTL_SET;
+        } else if (!strcmp(argv[i], "--stats")) {
+            cfg.action = TOPOLOGY_CTL_STATS;
+        } else if (!strcmp(argv[i], "--diagnostic-stats")) {
+            cfg.action = TOPOLOGY_CTL_DIAGNOSTIC_STATS;
         } else if (!strcmp(argv[i], "--set-with-peer-view-map") &&
                    i + 1 < argc) {
             cfg.action = TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP;
@@ -1575,6 +1736,29 @@ int main(int argc, char **argv) {
         }
         print_peer_view_map_response(&resp);
         return resp.status == VEMB_V16_STATUS_OK ? 0 : 1;
+    }
+    if (cfg.action == TOPOLOGY_CTL_STATS) {
+        vemb_v16_stats_t stats;
+        if (stats_control_tcp(&cfg, VEMB_V16_NET_STATS,
+                              &stats, sizeof(stats)) != 0) {
+            fprintf(stderr, "stats request failed\n");
+            return 1;
+        }
+        print_stats(&stats);
+        return 0;
+    }
+    if (cfg.action == TOPOLOGY_CTL_DIAGNOSTIC_STATS) {
+        vemb_v16_diagnostic_stats_t stats;
+        if (stats_control_tcp(&cfg, VEMB_V16_NET_DIAGNOSTIC_STATS,
+                              &stats, sizeof(stats)) != 0 ||
+            stats.version != VEMB_V16_DIAGNOSTIC_STATS_VERSION ||
+            stats.bytes != sizeof(stats) ||
+            stats.region_count > VEMB_V16_DIAGNOSTIC_MAX_REGIONS) {
+            fprintf(stderr, "diagnostic stats request failed\n");
+            return 1;
+        }
+        print_diagnostic_stats(&stats);
+        return 0;
     }
 
     vemb_v16_topology_control_req_t req;

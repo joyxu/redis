@@ -242,6 +242,13 @@ int vemb_v16_client_ping(vemb_v16_client_t *client);
 int vemb_v16_client_stats(vemb_v16_client_t *client,
                           vemb_v16_stats_t *out_stats);
 
+/* Versioned, cumulative diagnostics for phase-boundary snapshots. Unlike
+ * vemb_v16_client_stats(), this payload is separate from the legacy stats
+ * wire layout and includes TLC lookup source and region counters. */
+int vemb_v16_client_diagnostic_stats(
+    vemb_v16_client_t *client,
+    vemb_v16_diagnostic_stats_t *out_stats);
+
 /* -------------------------------------------------------------------
  * Topology / redirect observability (advanced)
  * ------------------------------------------------------------------- */
@@ -292,6 +299,182 @@ typedef struct {
 } vemb_v16_fanout_stats_t;
 void vemb_v16_client_get_fanout_stats(const vemb_v16_client_t *client,
                                       vemb_v16_fanout_stats_t *out);
+
+/* Client-local owner diagnostics. Values are cumulative and intended for
+ * phase-boundary deltas. submitted/completed count logical operations routed
+ * to the owner; v1_requests/v2_items count actual transport work. */
+typedef struct {
+    uint64_t submitted;
+    uint64_t completed;
+    uint64_t ok;
+    uint64_t not_found;
+    uint64_t errors;
+    uint64_t retries;
+    uint64_t v1_requests;
+    uint64_t v2_items;
+    uint64_t v2_frames;
+    uint64_t fallback_v1;
+    uint64_t channel_reopen;
+    uint64_t handle_region_count;
+    uint64_t materialize_ok;
+    uint64_t materialize_fail;
+    uint64_t materialize_bytes;
+    uint64_t pending_peak;
+    uint64_t pending_current;
+    uint64_t active_groups_current;
+    uint64_t poll_calls;
+    uint64_t poll_empty;
+    uint64_t poll_callbacks;
+    uint64_t poll_latency_sample_count;
+    uint64_t poll_latency_ns_sum;
+    uint64_t poll_latency_ns_min;
+    uint64_t poll_latency_ns_max;
+    uint64_t poll_flush_sample_count;
+    uint64_t poll_flush_ns_sum;
+    uint64_t poll_v2_sample_count;
+    uint64_t poll_v2_ns_sum;
+    uint64_t poll_v1_sample_count;
+    uint64_t poll_v1_ns_sum;
+    uint64_t callback_sample_index;
+    uint64_t callback_sample_count;
+    uint64_t callback_ns_sum;
+    uint64_t callback_ns_min;
+    uint64_t callback_ns_max;
+    uint64_t submit_to_callback_ns_sum;
+    uint64_t submit_to_callback_ns_min;
+    uint64_t submit_to_callback_ns_max;
+    uint64_t response_to_finish_sample_count;
+    uint64_t response_to_finish_ns_sum;
+    uint64_t response_to_finish_ns_min;
+    uint64_t response_to_finish_ns_max;
+    uint64_t finish_sample_count;
+    uint64_t finish_ns_sum;
+    uint64_t finish_ns_min;
+    uint64_t finish_ns_max;
+    uint64_t response_to_callback_sample_count;
+    uint64_t response_to_callback_ns_sum;
+    uint64_t response_to_callback_ns_min;
+    uint64_t response_to_callback_ns_max;
+    uint64_t submit_to_response_poll_sample_count;
+    uint64_t submit_to_response_poll_ns_sum;
+    uint64_t submit_to_response_poll_ns_min;
+    uint64_t submit_to_response_poll_ns_max;
+    uint64_t submit_to_publish_sample_index;
+    uint64_t submit_to_publish_sample_count;
+    uint64_t submit_to_publish_ns_sum;
+    uint64_t submit_to_publish_ns_min;
+    uint64_t submit_to_publish_ns_max;
+    uint64_t v2_batch_timing_sample_count;
+    uint64_t v2_publish_to_response_poll_ns_sum;
+    uint64_t v2_response_wait_ns_sum;
+    uint64_t callback_count_per_poll_max;
+    uint64_t v2_flush_calls;
+    uint64_t v2_flush_full;
+    uint64_t v2_flush_deadline;
+    uint64_t v2_flush_eager;
+    uint64_t v2_flush_l0_backpressure;
+    uint64_t v2_prepare_sample_count;
+    uint64_t v2_prepare_ns_sum;
+    uint64_t v2_prepare_ns_min;
+    uint64_t v2_prepare_ns_max;
+    uint64_t v2_publish_sample_count;
+    uint64_t v2_publish_ns_sum;
+    uint64_t v2_publish_ns_min;
+    uint64_t v2_publish_ns_max;
+    uint64_t v2_prepare_to_publish_ns_sum;
+    uint64_t submit_to_l0_sample_count;
+    uint64_t submit_to_l0_ns_sum;
+    uint64_t submit_to_route_start_sample_count;
+    uint64_t submit_to_route_start_ns_sum;
+    uint64_t submit_to_drive_start_sample_count;
+    uint64_t submit_to_drive_start_ns_sum;
+    uint64_t drive_start_to_slot_poll_sample_count;
+    uint64_t drive_start_to_slot_poll_ns_sum;
+    uint64_t slot_poll_to_route_start_sample_count;
+    uint64_t slot_poll_to_route_start_ns_sum;
+    uint64_t route_duration_sample_count;
+    uint64_t route_duration_ns_sum;
+    uint64_t route_to_l0_start_sample_count;
+    uint64_t route_to_l0_start_ns_sum;
+    uint64_t l0_submit_duration_sample_count;
+    uint64_t l0_submit_duration_ns_sum;
+    uint64_t route_to_channel_start_sample_count;
+    uint64_t route_to_channel_start_ns_sum;
+    uint64_t channel_duration_sample_count;
+    uint64_t channel_duration_ns_sum;
+    uint64_t channel_to_path_start_sample_count;
+    uint64_t channel_to_path_start_ns_sum;
+    uint64_t owner_path_duration_sample_count;
+    uint64_t owner_path_duration_ns_sum;
+    uint64_t owner_path_to_l0_start_sample_count;
+    uint64_t owner_path_to_l0_start_ns_sum;
+    uint64_t v2_enable_duration_sample_count;
+    uint64_t v2_enable_duration_ns_sum;
+    uint64_t v2_enable_ready_fast_count;
+    uint64_t v2_enable_attach_count;
+    uint64_t v2_enable_reopen_count;
+    uint64_t l0_to_deadline_due_sample_count;
+    uint64_t l0_to_deadline_due_ns_sum;
+    uint64_t l0_to_deadline_set_sample_count;
+    uint64_t l0_to_deadline_set_ns_sum;
+    uint64_t deadline_set_to_l0_sample_count;
+    uint64_t deadline_set_to_l0_ns_sum;
+    uint64_t deadline_set_to_due_sample_count;
+    uint64_t deadline_set_to_due_ns_sum;
+    uint64_t deadline_target_to_due_sample_count;
+    uint64_t deadline_target_to_due_ns_sum;
+    uint64_t deadline_poll_to_check_sample_count;
+    uint64_t deadline_poll_to_check_ns_sum;
+    uint64_t deadline_target_to_check_sample_count;
+    uint64_t deadline_target_to_check_ns_sum;
+    uint64_t l0_enqueue_to_deadline_target_sample_count;
+    uint64_t l0_enqueue_to_deadline_target_ns_sum;
+    uint64_t deadline_target_to_poll_check_sample_count;
+    uint64_t deadline_target_to_poll_check_ns_sum;
+    uint64_t deadline_check_duration_sample_count;
+    uint64_t deadline_check_duration_ns_sum;
+    uint64_t deadline_due_to_flush_sample_count;
+    uint64_t deadline_due_to_flush_ns_sum;
+    uint64_t flush_to_publish_sample_count;
+    uint64_t flush_to_publish_ns_sum;
+    uint64_t v2_deadline_set_count;
+    uint64_t v2_deadline_due_count;
+    uint64_t v2_deadline_age_ns_sum;
+    uint64_t v2_deadline_due_to_flush_ns_sum;
+    uint64_t v2_deadline_due_to_flush_ns_min;
+    uint64_t v2_deadline_due_to_flush_ns_max;
+    uint64_t v2_publish_ring_full;
+    uint64_t v2_publish_errors;
+} vemb_v16_client_owner_stats_t;
+
+#define VEMB_V16_CLIENT_OWNER_REGION_STATS_MAX 128u
+#define VEMB_V16_CLIENT_COPY_LATENCY_BUCKETS 21u
+
+typedef struct {
+    uint32_t owner_id;
+    uint32_t region_id;
+    uint64_t handle_count;
+    uint64_t copy_count;
+    uint64_t copy_bytes;
+    uint64_t copy_sample_count;
+    uint64_t copy_latency_ns_sum;
+    uint64_t copy_latency_ns_min;
+    uint64_t copy_latency_ns_max;
+    uint64_t copy_latency_ns_buckets[VEMB_V16_CLIENT_COPY_LATENCY_BUCKETS];
+} vemb_v16_client_owner_region_stats_t;
+
+typedef struct {
+    uint32_t owner_count;
+    vemb_v16_client_owner_stats_t
+        owners[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+    uint32_t owner_region_count;
+    vemb_v16_client_owner_region_stats_t
+        owner_regions[VEMB_V16_CLIENT_OWNER_REGION_STATS_MAX];
+} vemb_v16_client_owner_stats_snapshot_t;
+
+void vemb_v16_client_get_owner_stats(
+    const vemb_v16_client_t *client,
+    vemb_v16_client_owner_stats_snapshot_t *out);
 
 /* -------------------------------------------------------------------
  * Event-loop VEMB_HANDLE session
@@ -346,6 +529,11 @@ int vemb_v16_client_handle_session_flush(
 int vemb_v16_client_handle_session_poll(
     vemb_v16_client_handle_session_t *session,
     vemb_v16_client_handle_completion_cb cb, void *priv);
+
+int vemb_v16_client_handle_session_poll_at(
+    vemb_v16_client_handle_session_t *session,
+    vemb_v16_client_handle_completion_cb cb, void *priv,
+    uint64_t drive_sessions_start_ns);
 
 /* Earliest owner-local L0 flush deadline in monotonic nanoseconds, or zero
  * when no v2 group is pending. */

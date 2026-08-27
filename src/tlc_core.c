@@ -209,6 +209,14 @@ struct tlc_core {
     atomic_uint_fast64_t warm_same_key_overwrite;
     atomic_uint_fast64_t warm_stale_handle_reject;
     atomic_uint_fast64_t remote_meta_stale;
+    atomic_uint_fast64_t lookup_cache_hit;
+    atomic_uint_fast64_t lookup_cache_miss;
+    atomic_uint_fast64_t lookup_warm_local_hit;
+    atomic_uint_fast64_t lookup_warm_imported_hit;
+    atomic_uint_fast64_t lookup_cold_promote;
+    atomic_uint_fast64_t lookup_final_miss;
+    atomic_uint_fast64_t region_lookup_hits[TLC_CORE_MAX_TOTAL_WARM_REGIONS];
+    atomic_uint_fast64_t region_cold_promotes[TLC_CORE_MAX_TOTAL_WARM_REGIONS];
     atomic_uint_fast64_t source_fence_active_count;
     atomic_uint_fast64_t tombstone_active_count;
     tlc_core_key_meta_shard_t *key_meta_shards;
@@ -1149,6 +1157,34 @@ static int resolve_warm_region_for_location(
     return 0;
 }
 
+static void note_lookup_location(tlc_core_t *core,
+                                 const tlc_warm_location_t *location,
+                                 int cold_promote) {
+    tlc_core_warm_region_runtime_t *region = NULL;
+    uint32_t region_index = UINT32_MAX;
+    if (resolve_warm_region_for_location(core, location, &region,
+                                         &region_index) != 0)
+        return;
+    if (!cold_promote) {
+        if (region->is_local)
+            atomic_fetch_add_explicit(&core->lookup_warm_local_hit, 1,
+                                      memory_order_relaxed);
+        else
+            atomic_fetch_add_explicit(&core->lookup_warm_imported_hit, 1,
+                                      memory_order_relaxed);
+    }
+    if (region_index < TLC_CORE_MAX_TOTAL_WARM_REGIONS) {
+        if (!cold_promote)
+            atomic_fetch_add_explicit(
+                &core->region_lookup_hits[region_index], 1,
+                memory_order_relaxed);
+        else
+            atomic_fetch_add_explicit(
+                &core->region_cold_promotes[region_index], 1,
+                memory_order_relaxed);
+    }
+}
+
 static int location_cache_validate_location(tlc_core_t *core,
                                             uint64_t key_hash,
                                             const tlc_warm_location_t *cached,
@@ -2021,6 +2057,16 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     atomic_init(&core->warm_same_key_overwrite, 0);
     atomic_init(&core->warm_stale_handle_reject, 0);
     atomic_init(&core->remote_meta_stale, 0);
+    atomic_init(&core->lookup_cache_hit, 0);
+    atomic_init(&core->lookup_cache_miss, 0);
+    atomic_init(&core->lookup_warm_local_hit, 0);
+    atomic_init(&core->lookup_warm_imported_hit, 0);
+    atomic_init(&core->lookup_cold_promote, 0);
+    atomic_init(&core->lookup_final_miss, 0);
+    for (uint32_t i = 0; i < TLC_CORE_MAX_TOTAL_WARM_REGIONS; i++) {
+        atomic_init(&core->region_lookup_hits[i], 0);
+        atomic_init(&core->region_cold_promotes[i], 0);
+    }
     atomic_init(&core->source_fence_active_count, 0);
     atomic_init(&core->tombstone_active_count, 0);
     atomic_init(&core->key_meta_count, 0);
@@ -2124,13 +2170,20 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
                                           uint64_t key_hash,
                                           tlc_warm_location_t *location) {
     if (location_cache_get(core, key, key_len, key_hash, location) == 0) {
+        atomic_fetch_add_explicit(&core->lookup_cache_hit, 1,
+                                  memory_order_relaxed);
+        note_lookup_location(core, location, 0);
         return 0;
     }
+    atomic_fetch_add_explicit(&core->lookup_cache_miss, 1,
+                              memory_order_relaxed);
     int32_t hot_idx = hot_get(core, key_hash);
     if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0) {
+        note_lookup_location(core, location, 0);
         goto found;
     }
     if (warm_lookup(core, key, key_len, key_hash, location) == 0) {
+        note_lookup_location(core, location, 0);
         goto found;
     }
 
@@ -2138,11 +2191,18 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
     uint32_t cold_value_size = 0;
     int cold_rc = cold_lookup(core, key, key_len, key_hash,
                               &cold_value, &cold_value_size);
-    RETURN_IF(cold_rc != 0, -1);
+    if (cold_rc != 0) {
+        atomic_fetch_add_explicit(&core->lookup_final_miss, 1,
+                                  memory_order_relaxed);
+        return -1;
+    }
     RETURN_IF(cold_value_size != core->value_size, -1);
     int warm_rc = warm_put(core, key, key_len, key_hash,
                            cold_value, cold_value_size, location);
     RETURN_IF(warm_rc != 0, -1);
+    atomic_fetch_add_explicit(&core->lookup_cold_promote, 1,
+                              memory_order_relaxed);
+    note_lookup_location(core, location, 1);
 
 found:
     location_cache_put(core, key, key_len, key_hash, location);
@@ -3062,6 +3122,18 @@ void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
     stats->warm_same_key_overwrite = atomic_load_explicit(&core->warm_same_key_overwrite, memory_order_relaxed);
     stats->warm_stale_handle_reject = atomic_load_explicit(&core->warm_stale_handle_reject, memory_order_relaxed);
     stats->remote_meta_stale = atomic_load_explicit(&core->remote_meta_stale, memory_order_relaxed);
+    stats->lookup_cache_hit = atomic_load_explicit(
+        &core->lookup_cache_hit, memory_order_relaxed);
+    stats->lookup_cache_miss = atomic_load_explicit(
+        &core->lookup_cache_miss, memory_order_relaxed);
+    stats->lookup_warm_local_hit = atomic_load_explicit(
+        &core->lookup_warm_local_hit, memory_order_relaxed);
+    stats->lookup_warm_imported_hit = atomic_load_explicit(
+        &core->lookup_warm_imported_hit, memory_order_relaxed);
+    stats->lookup_cold_promote = atomic_load_explicit(
+        &core->lookup_cold_promote, memory_order_relaxed);
+    stats->lookup_final_miss = atomic_load_explicit(
+        &core->lookup_final_miss, memory_order_relaxed);
     uint64_t total = stats->warm_alloc_local + stats->warm_alloc_remote;
     if (total)
         stats->warm_region_hash_local_pct =
@@ -3086,6 +3158,12 @@ uint32_t tlc_core_get_region_stats(tlc_core_t *core,
             .region_id = region->region_id,
             .is_local = region->is_local,
             .used_slots = warm_region_used_slots(region),
+            .lookup_hits = i < TLC_CORE_MAX_TOTAL_WARM_REGIONS ?
+                atomic_load_explicit(&core->region_lookup_hits[i],
+                                     memory_order_relaxed) : 0,
+            .cold_promotes = i < TLC_CORE_MAX_TOTAL_WARM_REGIONS ?
+                atomic_load_explicit(&core->region_cold_promotes[i],
+                                     memory_order_relaxed) : 0,
             .full = warm_region_full(region),
         };
     }

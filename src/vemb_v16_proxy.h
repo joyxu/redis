@@ -41,6 +41,8 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy);
 void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy);
 void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats);
+void vemb_v16_proxy_get_diagnostic_stats(
+    vemb_v16_proxy_t *proxy, vemb_v16_diagnostic_stats_t *stats);
 int vemb_v16_proxy_migration_mark_migrating(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_migration_control_req_t *req,

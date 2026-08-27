@@ -141,6 +141,8 @@ enum vemb_v16_net_frame_type {
     /* Read-only status for an existing v1/v2 UB channel. The response is
      * CONTROL_STATUS.value = server resource generation. */
     VEMB_V16_NET_AERON_CHANNEL_STATUS = 0x22,
+    /* Versioned, non-hot-path diagnostics for phase snapshots. */
+    VEMB_V16_NET_DIAGNOSTIC_STATS = 0x23,
 };
 
 enum vemb_v16_data_op {
@@ -696,6 +698,62 @@ typedef struct vemb_v16_stats {
     uint64_t migration_baseline_retry_sent;
     uint64_t migration_baseline_retry_pending;
 } vemb_v16_stats_t;
+
+/* Diagnostic stats are deliberately separate from vemb_v16_stats_t.  The
+ * latter is an existing wire payload used by older clients; adding fields to
+ * it would silently change the NET_STATS contract. */
+#define VEMB_V16_DIAGNOSTIC_STATS_VERSION 2u
+#define VEMB_V16_DIAGNOSTIC_MAX_REGIONS 256u
+#define VEMB_V16_DIAGNOSTIC_MAX_CHANNELS VEMB_V16_MAX_CHANNELS
+
+typedef struct vemb_v16_diagnostic_region_stats {
+    uint32_t region_id;
+    uint32_t region_index;
+    uint32_t is_local;
+    uint32_t reserved;
+    uint64_t lookup_hits;
+    uint64_t cold_promotes;
+} vemb_v16_diagnostic_region_stats_t;
+
+typedef struct vemb_v16_diagnostic_channel_stats {
+    uint64_t channel_id;
+    uint32_t index;
+    uint32_t transport_type;
+    uint32_t proxy_io_worker_id;
+    uint32_t supernode_worker_id;
+    uint32_t active;
+    uint32_t proxy_io_closing;
+    uint32_t supernode_closing;
+    uint32_t reserved;
+    uint64_t request_ring_depth;
+    uint64_t response_ring_depth;
+    uint64_t completion_ring_depth;
+} vemb_v16_diagnostic_channel_stats_t;
+
+typedef struct vemb_v16_diagnostic_stats {
+    uint32_t version;
+    uint32_t bytes;
+    uint64_t lookup_cache_hit;
+    uint64_t lookup_cache_miss;
+    uint64_t warm_local_hit;
+    uint64_t warm_imported_hit;
+    uint64_t cold_promote;
+    uint64_t lookup_final_miss;
+    uint64_t handle_lookup_miss;
+    uint64_t handle_lookup_miss_not_found;
+    uint64_t handle_lookup_miss_moved;
+    uint64_t handle_lookup_miss_stale;
+    uint32_t region_count;
+    uint32_t reserved0;
+    vemb_v16_diagnostic_region_stats_t
+        regions[VEMB_V16_DIAGNOSTIC_MAX_REGIONS];
+    uint32_t channel_count;
+    uint32_t active_channel_count;
+    uint32_t closing_channel_count;
+    uint32_t channel_stats_truncated;
+    vemb_v16_diagnostic_channel_stats_t
+        channels[VEMB_V16_DIAGNOSTIC_MAX_CHANNELS];
+} vemb_v16_diagnostic_stats_t;
 
 static inline size_t vemb_v16_req_handle_len(void) {
     return offsetof(vemb_v16_req_t, vector);
