@@ -5154,10 +5154,11 @@ static pthread_mutex_t g_shmdev_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static vemb_v16_shmdev_pool_t g_shmdev_pools[2];
 
 static int open_ub_path_spec(const char *path_spec, int open_flags,
-                             char selected[256]) {
+                             char selected[256], int *used_sync) {
     if (!path_spec || !path_spec[0]) return -1;
 
-    int fd = open(path_spec, open_flags);
+    int fd = vemb_v16_open_ub_with_fallback(path_spec, open_flags,
+                                            used_sync);
     if (fd >= 0) {
         strncpy(selected, path_spec, 255);
         selected[255] = '\0';
@@ -5186,7 +5187,8 @@ static int open_ub_path_spec(const char *path_spec, int open_flags,
         int written = snprintf(candidate, sizeof(candidate), "%.*s%lu",
                            (int)prefix_len, path_spec, id);
         if (written < 0 || (size_t)written >= sizeof(candidate)) return -1;
-        fd = open(candidate, open_flags);
+        fd = vemb_v16_open_ub_with_fallback(candidate, open_flags,
+                                             used_sync);
         if (fd >= 0) {
             strncpy(selected, candidate, 255);
             selected[255] = '\0';
@@ -5204,12 +5206,8 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
     (void)cache_policy;
     char selected_path[256];
     int used_sync = 0;
-    int fd = open_ub_path_spec(path_spec, O_RDWR, selected_path);
-    if (fd < 0 && (errno == EPERM || errno == EACCES)) {
-        fd = open_ub_path_spec(path_spec, O_RDWR | O_SYNC, selected_path);
-        if (fd >= 0)
-            used_sync = 1;
-    }
+    int fd = open_ub_path_spec(path_spec, O_RDWR, selected_path,
+                               &used_sync);
     if (fd < 0) {
         serverLog(LL_WARNING, "aeron ub pool: no usable path in %s errno=%d (%s)",
                   path_spec, errno, strerror(errno));
@@ -5219,7 +5217,9 @@ static int shmdev_pool_init(vemb_v16_shmdev_pool_t *pool,
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED && (errno == EPERM || errno == EACCES)) {
         close(fd);
-        fd = open_ub_path_spec(path_spec, O_RDWR | O_SYNC, selected_path);
+        fd = vemb_v16_open_ub_with_fallback(selected_path,
+                                            O_RDWR | O_SYNC,
+                                            &used_sync);
         if (fd >= 0) {
             used_sync = 1;
             p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,

@@ -2,8 +2,9 @@
 # owner_id is the topology identity; it is not the host-number alias 112.
 # ATTACH offsets remain per-channel dynamic; this manifest selects only the
 # client-visible device and mapping policy for each resource role.
-# The ordered dev0..dev8 mapping is used here: owner1 receives requests on
-# dev2, responds through imported dev7, and exports warm/meta backing on dev1.
+# Owner1 receives CLI requests through its export dev10 and writes responses
+# through imported dev15.  CLI@111 writes requests through imported dev14 and
+# reads responses through export dev11; owner1 warm reads use imported dev16.
 version: 1
 peer_views:
   - client_host: 111
@@ -19,8 +20,8 @@ peer_views:
     resource_role: v1_response_ring
     resource_id: owner112-v1-response
     generation: 1
-    provider_path: /dev/obmm_shmdev11
-    client_path: /dev/obmm_shmdev15
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
     map_from_start: true
   - client_host: 111
     owner_id: 1
@@ -51,14 +52,14 @@ peer_views:
     resource_role: v2_response_descriptor
     resource_id: owner112-v2-response-descriptor
     generation: 1
-    provider_path: /dev/obmm_shmdev11
-    client_path: /dev/obmm_shmdev15
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
     map_from_start: true
   - client_host: 111
     owner_id: 1
     resource_role: v2_response_arena
     resource_id: owner112-v2-response-arena
     generation: 1
-    provider_path: /dev/obmm_shmdev11
-    client_path: /dev/obmm_shmdev15
+    provider_path: /dev/obmm_shmdev15
+    client_path: /dev/obmm_shmdev11
     map_from_start: true

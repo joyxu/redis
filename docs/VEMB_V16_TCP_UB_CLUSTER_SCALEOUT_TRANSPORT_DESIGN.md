@@ -6,6 +6,11 @@
 refresh/attach 已完成远端验证，TCP 与 UB-Aeron 111 -> 112 扩容均已完成单轮吞吐验证；
 阶段 8 的资源生命周期、TCP/UB 同 workload 性能对比和 imported NC 映射属性证据仍待补齐。
 
+**阶段状态修订（2026-08-24）**：本轮未提交代码只完成 P0 的 channel close 清理、
+生命周期串行化和 occupancy 统计口径修正。P1 的 owner/region 统计、copy latency、
+client/server profile 与硬件计数仍未完成端到端实现和验收；已有埋点只能作为探索样本。
+old-key/steady-key 的 QPS 差异仍未定位，本轮没有针对该差异的生产数据面修复。
+
 ```
 启动 coordinator listen
   -> 提交 node1 candidate
@@ -31,7 +36,8 @@ endpoint；TCP client 若收到 AERON endpoint snapshot，只记录低概率 `WA
 1. `scripts/run_host_mt_server_flamegraph.sh`
 2. `scripts/run_aeron_cross_node_flamegraph.sh`
 3. `scripts/run_aeron_best.sh`
-4. `benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`
+4. `scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh`
+5. `scripts/vemb_v16_ub_active_2node_111_to_112.sh`
 
 本轮 host-mt、Aeron best、Aeron cross-node，以及 TCP/UB data-plane 的双节点
 111 -> 112 扩容吞吐流程均已完成。TCP 和 UB 扩容均完成 baseline、during_scaleout、
@@ -82,7 +88,7 @@ topology refresh 和 imported NC 映射证据仍未补齐。
 
 ### UB-Aeron 扩容吞吐结果（独立 4x4 表，2026-08-23）
 
-以下表格只描述 [`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`](../benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh)
+以下表格只描述 [`scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh`](../scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh)
 在 `DATA_TRANSPORT=ub`（Aeron/UB data-plane）下的双节点 `111 -> 112` 扩容，
 不与 TCP scaleout、host-mt 或 Aeron local 场景合并。
 
@@ -93,8 +99,17 @@ topology refresh 和 imported NC 映射证据仍未补齐。
 | after old keys，active `{0,1}` | 12,629,626.92 | 0.42300 | 0.66300 |
 | after steady keys，active `{0,1}` | 10,898,312.26 | 0.46300 | 1.20700 |
 
+这里的 `steady keys` 必须保持“扩容完成后现场写入新 key，再读取同一批
+新 key”的语义，不能在扩容前预填充后把它当作 steady-read。旧脚本在
+steady-key VADD 完成后立即启动读压；因此这张 2026-08-23 历史表中的
+`10.898M QPS` 可能包含写入完成后尚未静默的异步后台活动，不能直接作为与
+`after old keys` 等价的稳态读吞吐结论。当前脚本在新 key 写入成功后
+默认等待 `STEADY_SETTLE_SEC=5` 秒再启动 steady read；设置为 `0` 仅用于复现
+“写完立即读”的诊断对照。两种口径应分别记录，不能混在同一张最终性能表中。
+
 配置为 `DATA_TRANSPORT=ub`、`DIM=300`、`PREFILL_KEYS=10000`、`VNODE_COUNT=100`、
-`PIO/SNW=7:7`、`t64/c4/p32`、`TEST_TIME=30s`、`BG_TIME_SCALEOUT=60s`；during
+`PIO/SNW=7:7`、`t64/c4/p32`、`TEST_TIME=30s`、`BG_TIME_SCALEOUT=60s`；当前脚本的
+正式 steady-read 口径另有 `STEADY_SETTLE_SEC=5s`；during
 阶段 endpoint 为 `192.168.90.111:6397,192.168.90.112:6397`，扩容控制窗口约 5 秒。
 四个阶段均通过严格 correctness 检查，`status_nf=0`、`status_err=0`、
 `materialized_fail=0`、`unmatched=0`。coordinator 返回
@@ -106,6 +121,1253 @@ topology refresh 和 imported NC 映射证据仍未补齐。
 `/root/szz/codespace/hpc-redis/benchmark/results/scaleout/ub_scaleout_status_nf_fix_20260823/`。
 本地 `remote_artifacts.txt`（新运行生成）只记录两台节点的 SSH 入口和上述远端文件路径，
 脚本不再执行日志压缩、`scp` 或递归 `tar` 传输。
+
+### settle=5s 复测结果（2026-08-23 21:39）
+
+按当前脚本重新执行一轮，steady 阶段严格采用“扩容后现场 VADD
+`item:10001..20000`，等待 `STEADY_SETTLE_SEC=5s`，再读取同一批 key”的口径：
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) |
+| --- | ---: | ---: | ---: |
+| baseline，active `{0}` | 17,240,354.87 | 0.41500 | 0.54300 |
+| during scaleout，`{0} -> {0,1}` | 14,074,730.41 | 0.41500 | 0.65500 |
+| after old keys，active `{0,1}` | 12,658,571.96 | 0.42300 | 0.67100 |
+| after steady keys，active `{0,1}` | 10,615,908.00 | 0.46300 | 1.35900 |
+
+steady VADD 为 `14,884 ops/s`、平均延迟约 `2.128ms`，写入完成时间为
+`21:42:35`，读压在 `21:42:44` 启动，5 秒等待已实际生效。即使排除立即读干扰，
+steady 仍比 old 低 `2.043M QPS`（`16.14%`），且 p99 更高。两段 key 的精确
+owner 分布为 `52.74/47.26%` 与 `53.22/46.78%`，按 warm-region ring 的
+local/remote 分布为 `82.88/17.12%` 与 `82.95/17.05%`，均不足以解释该差异。
+
+本轮两节点在 steady VADD 窗口出现 `remote_meta publish busy/evict`，但这只是写侧
+remote-meta 发布事件，不能推导出 steady `VEMB_HANDLE` 读走了 remote-meta miss
+或 UB RPC fallback。普通 `VEMB_HANDLE` 服务端路径是
+`vemb_v16_supernode_handle_vemb_job()` -> `vemb_v16_tlc_get_handle()`；只有
+`VEMB_V16_OP_VSIM_KEY_KEY` 的 `key2` 才进入
+`vemb_v16_tlc_lookup_vsim_key2()`，在那里才有 remote-meta lookup 和 UB lookup RPC。
+VEMB_HANDLE 的 lookup miss 分支调用的 `completion_set_lookup_miss()` 只读取本地
+per-key migration metadata，用于把迁移中的源端 miss 分类为 `MOVED`/
+`STALE_TOPOLOGY`，不是 VSIM remote-meta 路径。
+
+因此这轮数据不能把 steady 与 old 的吞吐差异归因于 remote-meta miss；在本轮
+埋点落地前运行时 counters 仍是 no-op，尚不能定量给出 VSIM remote-meta hit/miss
+或 RPC 比例。
+需要增加按操作类型和 lookup source 的统计后再定位该差异。产物目录为
+`benchmark/results/scaleout/ub_scaleout_settle5_20260823_213927/`，远端日志路径见其中的
+`remote_artifacts.txt`。
+
+### 口径修订与已完成尝试（2026-08-23）
+
+此前的几轮尝试已经分别验证了以下事项，结果不能互相替代：
+
+1. **写完立即读。** 初始扩容脚本在 steady-key VADD 返回后立即启动
+   `VEMB_HANDLE` 读压，得到 `after steady keys=10.898M QPS`。该结果可能把写侧
+   异步 publish、channel 建立或队列排空的尾部开销计入读阶段，所以不能作为稳态
+   steady-read 结论；脚本现已增加 `STEADY_SETTLE_SEC`，默认等待 5 秒。
+2. **写后静置再读。** `ub_scaleout_settle5_20260823_213927` 在相同 workload 下
+   复测为 `after old keys=12.659M`、`after steady keys=10.616M QPS`，steady
+   仍低 `16.14%`，说明“写完立即读”不是全部原因。steady key 是扩容后现场
+   VADD `item:10001..20000`，不是扩容前预填充；等待只改变读压起始时间，不改变
+   key 的生成和 owner 归属。
+3. **归属分布对照。** old/steady 两批 key 的 owner 分布约为 `52.74/47.26%` 和
+   `53.22/46.78%`，warm-region local/remote 分布约为 `82.88/17.12%` 和
+   `82.95/17.05%`，没有观察到足以解释 16% 差距的分布偏斜。
+4. **`metadata miss` 语义核对。** 普通 `VEMB_HANDLE` 只走
+   `vemb_v16_supernode_handle_vemb_job()` -> `vemb_v16_tlc_get_handle()`；其
+   `completion_set_lookup_miss()` 读取本地 per-key migration metadata，用于
+   `MOVED`/`STALE_TOPOLOGY` 分类。只有 VSIM `key2` 才走
+   `vemb_v16_tlc_lookup_vsim_key2()` 的 remote-meta lookup/UB lookup RPC，因此
+   不能把日志中的 `vemb_v16 handle miss` 直接解释为 VSIM remote-meta miss。
+5. **当前仍缺少的定量证据。** steady VADD 窗口确实出现过
+   `remote_meta publish busy/evict`，但这是写侧事件；同时 `tlc_counter_add()` 仍是
+   当时为 no-op，无法给出按操作类型、lookup source、channel attach/retry 的计数。下一轮
+   先测“从启动即 active `{0,1}`”的双节点绝对基线，再结合两台 server 日志排查
+   v2 batch fallback/retry、channel attach/reopen、warm materialization 和队列
+   分布，避免继续用未经计数支持的 remote-meta 假设解释 QPS。
+
+上述记录明确区分了“写后立即读诊断口径”和“等待后稳态口径”；最终性能表只能使用
+后者，并保留每轮的 `run.conf`、summary 和远端日志路径。
+
+### 不扩容双节点 active ring 基线（2026-08-23 22:27）
+
+为区分“扩容迁移代价”和“双节点数据面本身的代价”，新增
+[`scripts/vemb_v16_ub_active_2node_111_to_112.sh`](../scripts/vemb_v16_ub_active_2node_111_to_112.sh)：
+两台 server 从启动开始就发布同一 `epoch=1787495273`、`active=0,1`、
+`standby=0,1` 的 Aeron/UB topology，不执行 candidate、migration、cutover 或
+full-active publish。参数仍为 `DIM=300`、`VNODE_COUNT=100`、`PIO/SNW=7:7`、
+`t64/c4/p32`；steady key 是现场写入 `item:10001..20000`，写完等待 5 秒再读。
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) | correctness |
+| --- | ---: | ---: | ---: | --- |
+| prefill，active `{0,1}` | 12,467 writes/s | 2.239 | 2.271 | pass |
+| old keys read，active `{0,1}` | 13,719,209.47 | 0.415 | 0.663 | pass |
+| steady VADD，active `{0,1}` | 19,086 writes/s | 1.199 | 2.271 | pass |
+| steady keys read，写后静置 5s | 11,862,121.77 | 0.455 | 0.743 | pass |
+
+两台 `topology_final.out` 均返回 `status=0`、`active_owners=0,1`、
+`endpoint_count=2`；四个 workload 的 `status_nf=0`、`status_err=0`、
+`materialized_fail=0`、`unmatched=0`。两台 server 的数据面摘要没有
+`vemb_v16 handle miss`、`batch rejected` 或 `ATTACH rejected`；只在 prefill/
+steady VADD 窗口看到 `remote_meta publish busy/evict`，再次说明这是写侧 publish
+压力，不能解释为 steady `VEMB_HANDLE` 读走了 VSIM remote-meta miss。产物为
+`benchmark/results/scaleout/ub_active_2node_20260823_222753/`（远端两节点同路径），
+本地 summary 为
+`benchmark/results/scaleout/ub_active_2node_20260823_222753/summary.tsv`。
+
+这组基线给出的双节点绝对读吞吐是 old-key `13.719M QPS`，steady-key
+`11.862M QPS`；steady 比 old 低约 `13.54%`，即使没有发生扩容也会出现相同方向
+的差距。因此 `after old keys`/`after steady keys` 的低值不能简单理解为
+`(17M local + 11M cross-node) / 2 = 14M`：17M 和 11M 是不同测试条件下的
+单 owner local 与单一 cross-node 路径吞吐，不是双节点 ring 的两个可线性相加的
+分量。双节点请求还要经过 active-ring owner 选择、owner0 上的 v2 batch 调度、
+owner1 imported peer-view channel、跨节点响应合并；瓶颈由共享 client/server
+worker、batch queue 和跨节点 channel 的组合决定。实测 old-key `13.719M` 已接近
+14M 这个数量级，但它是测量结果而非算术平均；steady-key 在没有迁移的双节点
+场景仍为 `11.862M`，表明“新 key 写入后的数据面状态/访问路径”是独立候选因素。
+
+当前证据支持继续排查：新 key 的 owner 与 warm local/remote 位置、写入后 warm
+slot materialization 是否完整、v2 channel/batch 是否发生 fallback 或 reopen，以及
+两 owner 的 worker/queue 分布。由于当时 `tlc_counter_add()` 仍是 no-op，尚不能仅凭
+现有日志定量区分这些因素；下一步应增加按 operation、owner、lookup source 和
+channel retry 的计数，再做同一 active ring 下的 keyspace 对照。
+
+### steady 写入后 old-key 回读与资源复测（2026-08-23 22:37）
+
+为验证“steady 写入是否把共享资源打满”，第二轮 active-ring runner 在 steady
+VADD 后等待 5 秒，先读 old keys，再读 steady keys：
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) | correctness |
+| --- | ---: | ---: | ---: | --- |
+| old keys read（写 steady 前） | 13,649,914.06 | 0.415 | 0.663 | pass |
+| steady VADD | 20,234 writes/s | 1.191 | 2.255 | pass |
+| old keys read（写 steady 后） | 13,486,059.61 | 0.415 | 0.663 | pass |
+| steady keys read（写后静置 5s） | 11,669,319.66 | 0.463 | 0.743 | pass |
+
+写 steady 后 old-key 只下降约 `1.20%`，仍保持 `13.486M QPS`，而 steady-key
+自身为 `11.669M QPS`。因此 steady 写入没有把整个 CLI、node0/node1 worker 或
+UB data-plane 持续压到 12M 档位；低吞吐主要绑定在新 key 的访问路径或其数据状态，
+而不是所有 key 的全局资源上限。
+
+同一轮的资源采样（`pidstat` 的 server 进程 CPU 是单核百分比，`mpstat` 是节点
+总 CPU）为：node0 三个读阶段 server 约 `10.8~11.0 cores`，节点总 CPU
+约 `33% user、66% idle`；node1 server 约 `10.7~10.9 cores`，节点总 CPU
+约 `5% user、94% idle`。两节点都没有 CPU 饱和。UB 使用的是
+`/dev/obmm_shmdev*` 共享内存 ring，当前 runner/驱动没有可直接读取的“UB 带宽
+百分比”计数；本轮以 old-key 不随 steady 写入同步下降、无 `batch rejected`/
+`ATTACH rejected`、以及无 correctness 错误作为数据面未被持续打满的证据，不能
+把它误写成硬件带宽已被精确测量。
+
+node0 的 local region、node1 的 local region，以及双方 imported warm region
+均报告 `capacity_slots=894,784`（`1GiB / 1200B`），本轮最多 20,000 keys，
+不足一个 region 容量的 `2.3%`；日志没有 `warm put failed` 或 capacity-full。
+所以 node1 warm 容量不足可以排除。仍需补充的直接证据是新旧 key 的 owner/
+region/slot 直方图，以及按 operation/owner/lookup source 的 v2 fallback、channel
+retry 和 materialization 计数。
+
+本轮产物目录为
+`benchmark/results/scaleout/ub_active_2node_20260823_223737/`（两节点远端同路径），
+CPU 采样文件随各阶段 workload 输出保留。
+
+### response ring NC→CC A/B 复测（2026-08-25）
+
+上一节的结果使用了历史 response 映射，不能回答“正确的 imported NC/CC
+方向是否造成吞吐变化”。因此在相同两节点 active-ring runner、`DIM=300`、
+`t64/c4/pipeline=32`、`PIO/SNW=7:7`、`BATCH_MAX_DELAY_US=10us` 和 30 秒读窗口下，
+只切换 owner1 response ring 的配置：正确配置为 node1 写 `dev15/NC`、CLI 读
+`dev11/CC`；诊断回退为 node1 写 `dev11/CC`、CLI 读 `dev15`。两轮 correctness
+均通过，且没有 `handle miss`、`metadata miss`、RPC timeout 或 channel close
+残留。
+
+正确 NC→CC 配置的复测结果为：`old_keys_read=6.840M QPS`，写 steady 后
+`old_keys_after_steady_read=6.396M QPS`，`steady_keys_read=6.169M QPS`。
+因此从 13M 到 6M 的主要变化已经在第一次 old-key read 出现，并不是 steady
+写入之后才发生；写入后 old-key 相比本轮第一次 old-key read 只下降约 `6.49%`。
+
+诊断回退到 CC→NC 后，`old_keys_read=13.129M QPS`、
+`old_keys_after_steady_read=13.008M QPS`、`steady_keys_read=11.016M QPS`。
+相对正确 NC→CC 配置，三个共同阶段分别恢复约 `1.92x`、`2.03x` 和 `1.79x`。
+这证明 response ring 的 CC/NC 访问模式是当前吞吐差异的主要相关变量；但
+CC→NC 回退违反当前硬件规定的 producer/consumer 方向，只能作为因果诊断，不能
+作为验收或生产配置。完整对照数据见
+[`docs/VEMB_V16_UB_RESPONSE_NC_CC_AB_REPORT_20260825.md`](VEMB_V16_UB_RESPONSE_NC_CC_AB_REPORT_20260825.md)。
+
+本轮产物：正确配置为
+`benchmark/results/scaleout/ub_active_2node_newcfg_20260825_094032/`，诊断回退为
+`benchmark/results/scaleout/ub_active_2node_oldpath_diag_20260825_095643/`。
+
+### 下一轮最小可行诊断统计（2026-08-23）
+
+当前结论已经排除了 warm region 容量不足和节点总 CPU 持续饱和，但还不能区分
+“steady key 的 server lookup 较慢”、“client 从 imported UB region materialize 较慢”
+和“owner1 的 v2 batch/channel 有额外 backpressure”。下一轮先只增加以下四组统计，
+不在 13M QPS 路径上输出逐 key 日志：
+
+1. **按 owner 的实际请求分布。** client 记录每个 active owner 的
+   `submitted/completed`、`v1/v2`、`fallback_v1`、`retry` 和 `channel_reopen`；node0/node1
+   server 通过现有 `VEMB_V16_NET_STATS` 的阶段 delta 记录实际收到的
+   `VEMB_HANDLE`、成功、`NOT_FOUND`、`ERR`、`MOVED` 和 `STALE_TOPOLOGY` 数。预期
+   old/steady 都接近当前 ring 计算的 `52.74%/47.26%`，但必须以实际请求和响应统计为准。
+
+2. **普通 `VEMB_HANDLE` 的 lookup source。** 在 TLC warm lookup 统计
+   `location_cache_hit`、`location_cache_miss`、cache validate 失败、
+   `warm_local_hit`、`warm_imported_hit`、`cold_promote` 和最终 miss；最终 miss 再按
+   `key_meta_absent`、`source_fence/tombstone`、`warm_slot_busy`、
+   `stale_generation` 分类。这里的 source 是普通 handle 数据面，不复用
+   `remote_meta_lookup_*` 或 `ub_lookup_rpc_*`，后两者仍只表示 VSIM key2 的 remote-meta
+   路径。
+
+3. **返回 handle 的 region 和 client materialize。** client 按 owner/`region_id` 统计
+   返回 handle 数量，并记录该 region 是 local 还是 imported、materialize 成功/失败、
+   `read_vector` 字节数和采样的 copy latency。当前配置中 node0 local region 为
+   `region_id=100`，node1 local region 为 `region_id=101`；统计必须同时保留稳定
+   `region_id` 和运行时 `region_index`，不能把两者混用。该组数据用于判断 steady 是否
+   产生了更高的 imported UB read 或更高的首次访问 copy 成本。
+
+4. **每 owner 的 batch/channel 压力。** 复用已有 client batch stats，按 owner 输出
+   `batch_frames`、`batch_items`、平均/最大 batch size、flush 原因、
+   `batch_flush_backpressure`、v2 fallback 和 pending peak；server 侧保留 request、
+   job-shard、completion ring 的阶段最大深度以及 ring-full 次数。
+
+四组统计均采用阶段快照的 delta，而不是进程退出时的累计总值。至少在以下边界取
+node0、node1 和 client 快照：
+
+```text
+prefill end
+old-key read start/end
+steady VADD start/end
+old-key after-steady read start/end
+steady-key read start/end
+```
+
+最小诊断结果的判定规则：
+
+* owner 请求数接近但 `warm_imported_hit` 或 client copy latency 只在 steady 增长，优先
+  排查 imported UB region、NUMA/cache 和 UB memory read；
+* server lookup/region 分布一致，但 steady 的 v2 backpressure、fallback 或 batch size
+  变差，优先排查 client batch 调度和 channel；
+* client 统计一致而某个 server 的 worker queue depth、ring-full 或 service time 变差，
+  优先排查该节点 worker/queue 分配；
+* 以上都一致时，再用第二次 steady read 对照第一次 steady read，并结合 client
+  `LLC-load-misses`/remote-memory 采样确认 cold-cache 首次访问效应。
+
+计数器应优先放在 per-worker/per-owner 本地统计中，阶段结束时再合并，避免为定位问题
+引入一个新的全局 atomic 热点；延迟只做固定比例采样并使用 monotonic clock。现有
+`vemb_v16_stats_t` 通过 TCP 返回，若字段不足，应增加版本化 diagnostic stats payload，
+不要无版本地改变现有 stats wire layout。
+
+### 最小诊断埋点已落地（2026-08-23）
+
+第一批实现遵循上述边界，保留原有 `VEMB_V16_NET_STATS` wire layout，并新增独立的
+版本化 `VEMB_V16_NET_DIAGNOSTIC_STATS` 请求。客户端可通过
+`vemb_v16_client_diagnostic_stats()` 在阶段边界读取累计 delta，服务端返回：
+
+* TLC location-cache hit/miss、warm local/imported hit、cold promote 和最终 miss；
+* 普通 `VEMB_HANDLE` miss 总数及 `NOT_FOUND`、`MOVED`、`STALE_TOPOLOGY` 分类；
+* 每个 warm region 的稳定 `region_id`、运行时 `region_index`、local/imported 标记、lookup
+  hit 和 cold-promote 计数。
+
+客户端 `vemb_v16_client_get_owner_stats()` 提供非 wire 的 per-owner 累计快照，包含逻辑
+提交/完成、v1/v2 实际工作量、v2 frame/item、fallback、retry、channel reopen、返回
+handle 数，以及 vector session materialize 成功/失败、复制字节数和 pending peak。旧
+`vemb_v16_stats_t` 未追加字段，因此旧 `NET_STATS` 客户端仍保持兼容。
+
+本批实现恢复了 TLC runtime counter 的实际 atomic 累加；此前该路径为 no-op，导致
+remote-meta 及 UB lookup RPC 统计无法反映运行时事件。计数均为进程累计值，测试脚本应
+在 `prefill end`、每个读写阶段起止分别取快照并计算 delta；尚未加入逐请求日志或延迟
+采样，下一批再根据这些计数决定是否需要补充采样点。
+
+### 同步后双节点 active-ring 复测（2026-08-24）
+
+为确认测试没有混用旧二进制，先在 `43.154.145.18:8111`（node0）和
+`43.154.145.18:8112`（node1）执行 `scripts/sync_changed_code_to_peer.sh --build all
+--verify-build all`。两端当前变更文件均为 `candidates=16 different=0`，server/client
+build stamp 均为 `OK`，`src/.make-settings` 也一致。两端二进制 SHA-256 仍可能不同：
+构建输入中只有生成的 `src/release.h` 和平台生成的 `memtier_benchmark/Makefile`
+不同；VEMB 业务源文件和构建策略一致，因此本轮结果不把两个可执行文件哈希相同作为
+验收条件。
+
+随后运行
+`scripts/vemb_v16_ub_active_2node_111_to_112.sh`，运行 ID 为
+`ub_active_2node_synced_20260824_063818`。配置为 `active={0,1}` 从启动即生效、
+`DIM=300`、`PREFILL_KEYS=10000`、`STEADY_KEYS=10000`、`PIO/SNW=7:7`、`t64/c4/p32`、
+`TEST_TIME=30s`，steady VADD 完成后等待 `5s` 再读取同一批新 key：
+
+| 阶段 | QPS (ops/s) | p50 (ms) | p99 (ms) | correctness |
+| --- | ---: | ---: | ---: | --- |
+| prefill | 4,730 writes/s | 2.239 | 2.271 | pass |
+| old keys read | 13,145,990.54 | 0.415 | 0.663 | pass |
+| steady VADD | 5,427 writes/s | 1.199 | 2.271 | pass |
+| old keys after steady | 12,683,526.10 | 0.415 | 0.663 | pass |
+| steady keys read | 10,747,840.29 | 0.463 | 0.871 | pass |
+
+相对写 steady 前，old-key 下降 `3.52%`；steady-key 比写后 old-key 低 `15.26%`，
+仍然不是 `(17M + 11M) / 2` 的算术平均。client 诊断聚合的实际 owner 分布如下，
+两批 key 均接近同一 53/47 ring 分布：
+
+| 阶段 | owner0 submitted | owner1 submitted | owner0/owner1 |
+| --- | ---: | ---: | ---: |
+| old keys | 230,431,867 | 206,515,132 | 52.74% / 47.26% |
+| old keys after steady | 227,202,324 | 203,616,724 | 52.75% / 47.25% |
+| steady keys | 199,060,139 | 174,974,086 | 53.22% / 46.78% |
+
+三个读阶段的 owner 统计均为 `completed=submitted`、`nf=0`、`err=0`、`retry=0`、
+`fallback_v1=0`、`channel_reopen=0`；v2 frame/item 和 pending peak 也没有异常跃升。
+handle session 不 materialize vector，因此 `materialize_ok=0` 是该模式的正常值，不能
+当作失败。node0 通过 diagnostic frame 看到的阶段累计 delta 全部是
+`warm_local_hit`（region 100），`warm_imported_hit=0`、`cold_promote=0`、
+`final_miss=0`、`handle_miss=0`；当前 runner 的 bootstrap seed 只有 node0，故这组
+diagnostic frame 只代表 node0，不能替代 node1 的直接快照。两台 server 日志均没有
+`vemb_v16 handle miss`、`batch rejected` 或 `ATTACH rejected`；出现的
+`remote_meta publish busy/evict` 属于 VADD 写侧 publish，不能解释成 VEMB_HANDLE 读侧
+VSIM remote-meta miss。
+
+资源采样也不支持“CLI 或节点 CPU 打爆”的假设：node0 server 在三个读阶段约
+`14.1/14.1/13.6 cores`，node0 总 CPU 分别约 `34.85%/34.48%/33.48% user`、
+`64% idle`；node1 server 约 `11.0/11.0/10.6 cores`，node1 总 CPU 约
+`5.45%/5.46%/5.23% user`、`94% idle`。本 runner/驱动没有 UB 带宽百分比计数，
+因此只能确认没有 CPU 饱和，不能声称已经精确测得 UB 硬件带宽。
+
+本轮结果说明：steady-key 的低 QPS 在没有扩容、写入后静置 5 秒、owner 分布相同且
+无 client/server 错误的条件下仍可复现；它更像新写入 key 的数据布局/访问状态或两条
+owner 路径共同的 cache/queue 影响，而不是扩容迁移窗口、warm region 容量不足或单纯
+remote-meta miss。要完成定位，仍需在 node1 直接读取同一版本 diagnostic stats，并把
+node0/node1 的阶段 delta、region-id（100/101）和 server queue/ring-full 快照同时归档；
+该段历史运行尚未完成这项采集。
+本轮本地产物为
+`benchmark/results/scaleout/ub_active_2node_synced_20260824_063818/summary.tsv`，
+两台远端保留同名结果目录及原始 CPU/runner/server 日志。
+
+随后 `ub_active_2node_fullstats_20260824_090846` 已补齐 node0/node1 的直接
+diagnostic、queue 和 CPU 快照，详见下一节。
+
+### fullstats 统计复测与分析（2026-08-24 09:08）
+
+在同步后的两台机器上再次运行同一 active-ring 配置，并保留每个阶段的 client
+owner snapshot、两台 server 的 diagnostic snapshot、每秒 queue depth 和 CPU 采样。
+运行 ID 为 `ub_active_2node_fullstats_20260824_090846`，配置为
+`active={0,1}` 从启动即生效、`DIM=300`、`PREFILL_KEYS=10000`、`STEADY_KEYS=10000`、
+`PIO/SNW=7:7`、`t64/c4/p32`、写后静置 `5s`，四个读阶段 correctness 均通过：
+
+| 阶段 | QPS | p50 (ms) | p99 (ms) | 相邻对照 |
+| --- | ---: | ---: | ---: | ---: |
+| old keys read | 13,051,380.44 | 0.415 | 0.663 | 基线 |
+| old keys after steady | 12,946,734.90 | 0.415 | 0.663 | 比 old 低 0.80% |
+| steady keys read | 10,982,354.41 | 0.463 | 0.815 | 比 old-after 低 15.17% |
+| steady keys reread | 10,619,185.90 | 0.463 | 1.087 | 比 steady 首读再低 3.31% |
+
+这轮同时验证了“写 steady 后再读 old key”仍约为 `12.95M`，所以 steady VADD
+没有把共享 CLI、server worker 或 UB data-plane 持续压到 `11M` 档位；差距绑定在
+steady-key 访问阶段。第二次 steady read 没有恢复，故不能把差距只解释成首读冷缓存。
+
+#### owner、batch 与 correctness
+
+client `.out` 中 256 个 slot 的 owner snapshot 在远端完整扫描后聚合如下。这里的
+`submitted/completed` 用于阶段内相对比较，不用它替代 memtier `Totals` 的 QPS
+分母；session 在测试截止后还会 drain 已提交请求。
+
+| 阶段 | owner0 submitted | owner1 submitted | owner0/owner1 | owner0 avg batch | owner1 avg batch | 加权 avg batch |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| old keys | 228,838,234 | 205,078,832 | 52.74% / 47.26% | 15.55 | 13.17 | 14.33 |
+| old after steady | 230,136,773 | 206,243,362 | 52.74% / 47.26% | 15.53 | 13.16 | 14.31 |
+| steady keys | 202,113,598 | 177,634,769 | 53.22% / 46.78% | 15.19 | 12.65 | 13.89 |
+| steady reread | 198,154,076 | 174,165,360 | 53.22% / 46.78% | 14.10 | 11.58 | 12.80 |
+
+四个阶段均为 `completed=submitted`；`nf=0`、`err=0`、`retry=0`、`fallback_v1=0`、
+`channel_reopen=0`、`v1=0`，全部请求走 v2 handle batch。steady 首读的 batch 只比
+old-after 小约 3.0%，但 reread 已小约 10.6%，与 completion queue 的持续积压方向
+一致；owner 比例本身没有变化，不能用 hash 偏斜解释 15% QPS 差距。
+
+#### lookup、region 与队列
+
+diagnostic lookup delta 与 client `v2_items` 逐阶段相等：old 为 node0/node1
+`228,401,350 / 204,695,685`，steady 首读为 `201,719,769 / 177,299,972`，reread
+为 `197,758,516 / 173,840,675`。两台 server 的所有 lookup 都是本地 warm region：
+node0 为 `region_id=100`、node1 为 `region_id=101`，`warm_imported_hit=0`、
+`cold_promote=0`、`lookup_final_miss=0`、`handle_lookup_miss=0`；VSIM 专用的
+`remote_meta_lookup_*` 和 `ub_lookup_rpc_*` 在读阶段也没有增加。故日志中的
+`metadata miss` 不是本轮 steady-key VEMB_HANDLE 的路径。
+
+client 侧 owner1 的 warm mapping 由 active peer-view manifest 映射到 imported
+`/dev/obmm_shmdev16`，owner0 使用 local `/dev/obmm_shmdev3`；因此可由 owner 比例
+推断本轮约 46.8% 的 vector dereference 走 imported warm view，但当前埋点尚未直接
+按 `region_id` 统计 client copy latency。
+
+| 阶段 | 节点 | active channels | request avg/max | response avg/max | job avg/max | completion avg/max |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| old | node0 | 513 | 4.04 / 10 | 87.13 / 117 | 26.22 / 91 | 36.70 / 112 |
+| old | node1 | 513 | 3.04 / 7 | 90.16 / 126 | 24.32 / 80 | 20.56 / 102 |
+| steady | node0 | 1538 | 18.42 / 45 | 69.50 / 115 | 26.04 / 83 | 129.33 / 278 |
+| steady | node1 | 1538 | 8.31 / 24 | 75.38 / 120 | 15.92 / 49 | 71.15 / 203 |
+| reread | node0 | 2050 | 42.44 / 106 | 62.28 / 105 | 15.44 / 72 | 159.36 / 363 |
+| reread | node1 | 2050 | 18.67 / 46 | 75.70 / 122 | 15.96 / 53 | 95.07 / 198 |
+
+这里的 `completion_ring_depth` 必须谨慎解释：它由 server 对所有 `active` channel
+求和，每个 channel 的 completion ring 容量为 4096，值是该时刻 `tail - head` 的
+瞬时 occupancy；不是 QPS、累计完成数，也不代表某一个 ring 中有这么多请求。本轮
+阶段边界的 `active_channels` 从 `513 -> 1026 -> 1538 -> 2050` 增长，说明前一阶段
+的 channel 在快照时仍被 server 计入（client close 到 server 清理之间存在时序窗口，或
+需要单独修复 channel 生命周期统计）。所以 `36.7 -> 129.3 -> 159.4` 的原始总和
+不能直接证明同一个队列越来越堵。粗略除以 active channel 后，node0 的 old/steady/
+reread 分别约为 `0.072/0.084/0.078` 个 completion/channel；方向仍可作为弱信号，
+但不足以单独归因于 client backpressure。
+
+ring-full 计数仍为 0。steady/reread 的 raw completion occupancy 高于 old，而 response
+depth 没有同步升高，仍值得排查 client completion 消费、`read_vector` copy 或 owner
+channel backpressure，但必须先改成按 channel 统计并等待 close 清理后再作结论。VEMB_HANDLE completion
+随后会在 client 调用 `vemb_v16_client_read_vector()` 复制 `300 * 4 = 1200B`；按
+steady QPS 估算总 warm-copy 流量约 `13.18GB/s`，其中 owner1 imported view 约
+`6.17GB/s`。这是 workload 流量估算，不是 UB 硬件带宽实测。
+
+#### CPU、容量与当前判断
+
+四个读阶段 CPU 形态基本不变：node0 server 约 `14.1~14.5 cores`、节点平均
+`35.8% busy / 64.0% idle`，node1 server 约 `11.1~11.5 cores`、节点平均
+`5.8~6.0% busy / 94.0% idle`。因此没有“CLI 或 server CPU 打爆”的证据。node0
+的 `pidstat -G memtier_benchmark` 文件为空，精确 CLI `%CPU` 尚未采到；但节点总
+CPU 仍留下约 64% idle，按 192 CPU 粗略折算，不能支持 CLI 饱和结论。下一轮应改为
+按实际 client PID 采样，避免依赖 process-group 名称。
+
+本轮 warm allocation 仍只有 local allocation，容量为每 region `894,784 slots`
+（`1GiB / 1200B`），最多 20,000 keys 只占约 2.3%；没有 `warm_alloc_remote`、
+`fallback`、`cold_spill`、`fail` 或 capacity-full，故 warm region 容量不足可以排除。
+需要注意，本轮 `NET_STATS` 的 `total_requests/vemb_requests` 在这条 v2 handle 路径
+仍返回 0，不能拿它计算 server QPS；本轮以 diagnostic lookup delta、client owner
+snapshot 和 memtier `Totals` 交叉校验。该 stats wiring gap 应单独修复。
+
+在修正 channel 生命周期统计之前，曾推测 steady 新分配 key 的 client
+`read_vector` 访问与 completion 消费可能形成 backpressure，导致 batch 变小；该段仅
+保留为历史候选，不是当前结论。P0/P1 最小补充复测见下文；在新口径下 completion
+occupancy 没有持续上升，且火焰图没有显示 steady 的 SVE/warm-copy 栈占比上升，因此
+不能继续把 client copy backpressure 写成最有证据的解释，更不能写成已证明的 UB 带宽
+瓶颈。
+
+当前阶段状态必须区分：**P0 已完成**，close 已进入真实 server 清理，并在阶段边界
+等待 `channel_count=0`；**P1 尚未完成**。当前代码只提供了部分
+`owner_id + region_id` handle/copy 累计计数和 1/1024 copy latency 采样，以及初步的
+client PID/profile 采集接口，但还没有完成阶段 delta 聚合、稳健分位数、端到端采样
+一致性和 UB/NUMA bytes/CPU 计数的正式验收。因此这些埋点和短测只能用于探索，不能把
+client copy、completion 消费、UB 带宽或 warm-region 访问写成 QPS 差异的根因。
+
+截至本轮，**old-key 与 steady-key 的 QPS 差异仍未定位，也没有针对该差异的生产数据面
+修复**。P0 只是修正 channel 生命周期和 occupancy 统计口径；P1 完成后仍需重新采集
+同一 workload 下的 old/steady client/server profile 和硬件计数，才能判断是否存在
+copy、poll、队列、NUMA 或 UB 带宽瓶颈。
+
+本轮本地产物为
+`benchmark/results/scaleout/ub_active_2node_fullstats_20260824_090846/summary.tsv`，
+原始 client 输出、两台 server 诊断快照、queue/CPU 采样均保留在两台远端同名目录。
+
+该轮 client 输出还保留了 SDK 每 1024 个 operation 的 route/batch `fprintf` trace；四个
+读阶段的 `.out` 大小约为 `99.8/100.4/87.7/86.5MB`（old/old-after/steady/reread），
+固定 trace 次数也随请求量变化。它不是 steady 独有路径，不能解释 steady 相对 old 的
+方向性差距，但会污染绝对 QPS 和 CLI CPU 对比；正式性能复测应关闭这些 trace，或把
+它们改为可配置的低频采样。
+
+#### P0/P1 最小补充复测（2026-08-24，`ub_active_2node_diag3_103536`）
+
+本轮使用当前 `USE_SVE=yes` 构建、关闭 SDK 周期性 route/batch trace，并在每个阶段结束
+等待 server 清理旧 channel 后再取边界快照。短测 `TEST_TIME=10` 只用于验证统计口径，
+不作为 30 秒性能基线：
+
+| 阶段 | QPS | p50 (ms) | p99 (ms) | correctness |
+| --- | ---: | ---: | ---: | --- |
+| old keys read | 8.514M | 0.415 | 0.663 | pass |
+| steady write | 5,658 ops/s | 1.183 | 2.255 | pass |
+| old keys after steady read | 9.455M | 0.415 | 0.655 | pass |
+| steady keys read | 8.451M | 0.447 | 0.743 | pass |
+| steady keys reread | 7.235M | 0.455 | 0.743 | pass |
+
+P0 结论：每个阶段边界的 node0/node1 都为
+`channel_count=0, active_channel_count=0, closing_channel_count=0`；运行中为
+`channel_count=512, active_channel_count=512, closing_channel_count=0`，随后在 close-wait
+期间逐步回到 0。旧 channel 已经不会混入下一阶段，先前把跨阶段累计 channel 的
+completion 总和解释成 backpressure 的结论应废弃。
+
+按运行中 512 个 channel 归一化后的 completion occupancy 很低，且各阶段相近：
+
+| 阶段 | node0 平均/最大 completion/channel | node1 平均/最大 completion/channel |
+| --- | ---: | ---: |
+| old | 0.11 / 19 | 0.05 / 19 |
+| old after steady | 0.07 / 17 | 0.04 / 18 |
+| steady 首读 | 0.04 / 20 | 0.07 / 22 |
+| steady reread | 0.06 / 19 | 0.07 / 18 |
+
+这组数据不支持当前存在持续 completion ring 堵塞；`ring_full` 仍为 0。阶段边界清零
+与运行中按 channel 统计是 P0 的完成判据。
+
+P1 部分埋点观察（非完成结论）：client PID 现在指向实际 `memtier_benchmark`，活跃窗口 `%CPU` 约 6388--6391
+（约 64 cores）；node0/node1 server 分别约 14--15 和 7--8 cores，node0 主机约 25%
+busy，不能归因于 server 或整机 CPU 打爆。owner-region 埋点显示 owner1/imported region
+约占 47% 的 handle/copy，owner0/local region 约占 53%，比例在四个读阶段没有明显漂移。
+按已有 1/1024 采样的简单均值，owner0/owner1 copy latency（ns）约为
+`47,779/277,868`（old）、`139,476/396,093`（old-after）、`101,927/375,908`
+（steady 首读）和 `263,472/596,645`（reread）。样本最大值包含约 12 秒级调度 outlier，
+均值不适合作为最终延迟结论；需要用 CLI/server 火焰图和更稳健的分位统计确认。
+
+为定位 CLI 侧瓶颈，新增了可配置的周期统计。设置
+`VEMB_V16_CLI_STATS_INTERVAL_MS=1000`（active-2node 脚本默认开启，设为 `0` 可关闭）后，
+每个 memtier worker 每秒在阶段 `.out` 中输出 `[cli-stat]` 和 `[cli-stat-region]`：
+按 owner 记录 `submitted/completed`、`v2_items/v2_frames/avg_batch`、当前 L0
+`pending`、`active_groups`、`poll_calls/poll_empty/poll_callbacks`、采样 poll 延迟、
+flush full/deadline、L0 backpressure、UB ring-full 和 publish error；按
+`owner_id + region_id` 记录 handle/copy 数、采样 copy 延迟和字节统计。阶段结束的
+`owner_region_copy_hist` 额外输出 log2(ns) latency bucket。所有值仍是 client 生命周期累计值，
+阶段内比较必须对相邻秒做 delta；该埋点只用于区分 CLI producer、batch publish、poll
+consumer 和 imported warm copy，尚未构成 QPS 根因结论。
+
+因此 P1 当前只能把“client imported warm copy / completion 消费路径”列为候选解释，
+不能据此断言 UB 带宽或 warm region 容量瓶颈；本轮 `warm_imported_hit=0`、
+`handle_lookup_miss=0`、`lookup_final_miss=0`，warm region 未满。下一步在同一 workload
+下分别采集 old-key 与 steady-key 的 CLI/server perf 栈，重点检查
+`vemb_v16_aeron_read_vector`/SVE copy、completion poll/batch drain 和 UB/Aeron poll
+是否在 steady/reread 占比上升，再决定是否增加 UB/NUMA 带宽计数器。
+
+本轮本地产物为
+`benchmark/results/scaleout/ub_active_2node_diag3_103536/summary.tsv`；两台节点的
+原始诊断、精确 PID CPU、per-channel sampler 和 owner-region 输出已从远端归档到同名
+`node0/`、`node1/` 子目录。该产物只能证明部分 P1 埋点能够输出样本，不能证明 P1
+已完成，也不能作为 QPS 根因结论。
+
+#### old/steady CLI 与 server 火焰图（2026-08-24）
+
+为初步观察 P1 候选路径，又做了两轮短 profile。有效图保存在本地
+`perf/ub_active_2node_flame3_110306/`：`old_client.svg`、`steady_client.svg`、
+`old_server.svg`、`steady_server.svg` 及对应 collapsed 栈。client 图使用了能正常
+落盘的 old/steady perf 数据；server 图使用 process attach，且单独停止了 benchmark
+的诊断 sampler。profile 只用于栈形状判断，不用于替代 30 秒 QPS 基线。
+
+client 图没有显示 steady 独有的 `vemb_v16_aeron_read_vector`、SVE load 或 warm-copy
+热点。两组样本的主要用户栈都是 `common_core_worker_main`，其次是内核
+`skb_copy_datagram_iter`/`__arch_copy_to_user`；按折叠栈样本数粗略归一化，后者约占
+old 的 53%、steady 的 38%，没有出现 steady 上升。由于 attach 时机和短时样本量不同，
+该比例只能排除“明显的 steady copy 栈膨胀”，不能作为精确 CPU 百分比。
+
+同一 profile3 短测的 workload 结果为 old `12.322M`、old-after `12.139M`、steady
+`10.028M` QPS；这确认差距仍可复现，但 profile 采样本身没有给出差距对应的 client
+函数热点。
+
+server 图仍出现大量 `vemb_v16_proxy_get_diagnostic_stats`、`tlc_core_get_stats` 和
+`tlc_core_get_region_stats`。这说明仅 kill sampler 的外层 PID 仍可能留下已经启动的
+`topology_ctl` 子进程；这组 server 图不用于判断数据面函数占比。下一轮若需要 server
+火焰图，必须在 workload 启动前禁用整个诊断采样进程树，或让 profile runner 自身拥有
+phase-aware 的采样开关。
+
+因此火焰图没有验证“steady-key 的 client copy/完成消费是主要瓶颈”，也没有验证 UB
+带宽已打满。当前应优先补充稳健的 copy latency 分位数以及 UB/NUMA bytes、CPU-set
+带宽计数；这些工作属于未完成的 P1，不能把当前 profile 结果当作正式定位结论。
+
+需要特别区分旧图中的 TCP 栈语义：`steady_client.svg` 的 `read ->
+tcp_recvmsg -> skb_copy_datagram_iter` 并不等于 VEMB 请求走了 TCP 数据面。当前
+common-core 在 `vemb_v16_client_create(... VEMB_V16_TRANSPORT_AERON)` 后，owner
+请求/响应通过 UB ring；Aeron 的 TCP 只负责 topology/bootstrap、ATTACH/资源确认和
+channel close ACK。旧图同时出现大量 `sdk_owner_channel_close`、
+`vemb_v16_aeron_batch_close`、`munmap`，说明采样覆盖了 phase client 退出时的控制面
+等待和 UB 映射销毁，TCP `read` 热点主要应按 teardown/control-plane 样本解释，不能
+直接拿来解释 steady workload 的 QPS。新的 phase profile 会按 old/steady 分别启动
+进程并关闭连续 stats sampler；正式比较仍需进一步把 perf stop 点提前到 client
+shutdown 之前，才能排除这部分 teardown 污染。
+
+#### 阶段 profile 与两个 benchmark 脚本的 runner 口径（2026-08-24）
+
+后续 old-key/steady-key 火焰图不再复用
+`scripts/run_aeron_cross_node_flamegraph.sh`。该脚本是一次性“启动单节点、prefill、
+运行一个 workload、结束后收集全进程 profile”的通用基准，适合保留历史全生命周期产物，
+不适合 active-ring runner 的多阶段对照。
+
+阶段 profile 已加入
+`scripts/vemb_v16_ub_active_2node_111_to_112.sh`：通过
+`PROFILE_PHASES=old_keys_read,steady_keys_read`（也支持
+`old_keys_after_steady_read,steady_keys_reread`）只对指定阶段的 memtier 进程生成
+`perf.data/perf.script/collapsed/svg`，产物落在本地结果目录的 `profiles/`。每个阶段
+独立启动一个 memtier 进程，profile 覆盖该进程从启动到正常退出，因此会包含 client
+setup 和退出时的 channel close；阶段之间的 settle、stats snapshot、server close-wait
+不在 profile 内。设置
+`PROFILE_PHASES` 时，连续的 `topology_ctl --stats/--diagnostic-stats` sampler 默认关闭；
+仍保留阶段边界 snapshot 和 channel close-wait。若需要保留 sampler，可显式设置
+`DISABLE_STATS_SAMPLER=0`。
+
+两个当前脚本并没有使用不同的 Aeron runner：它们都传入
+`--vemb-v16-transport=aeron`，因此都进入 `VEMB common-core runner`。差异在 workload
+生命周期和拓扑：cross-node flamegraph 是单 owner、一次性 profile；active 2-node 是
+`active={0,1}` 从启动生效、每个阶段重新启动 memtier、并在阶段之间等待旧 channel 清理。
+此前 `perf/aeron_cross_uniform_100k_20260807_154201_p14_s14_r2/` 中的
+`[aeron] side-channel runner` 日志来自 `b7000d1` 统一 TCP/UB transport 之前的旧二进制，
+不能拿来代表当前两个脚本的 runner。
+
+### 2026-08-26 CC->NC 场景 old/steady 差异：结论与待证假设
+
+在清理其它 benchmark、Redis、`redis-cli --cluster reshard` 和 flamegraph 进程后，
+active `{0,1}` 的 `cc_nc` 复测（请求 NC->CC、响应 CC->NC，`DIM=300`、`t64/c4/p32`、
+`PIO/SNW=7:7`、读压 30 秒、写后静置 5 秒）为：
+`old_keys_read=13,100,471`、`old_keys_after_steady_read=13,083,577`、
+`steady_keys_read=11,104,916` QPS。correctness、channel close、owner 分布以及
+lookup/miss/error 计数均正常；old-key 在 steady 写入后几乎不下降，所以当前不能
+把约 2M QPS 差距归因于全局 worker 或 UB ring 持续饱和。
+
+当前结论是：差异与“新写入 key 的访问路径或数据状态”相关，但根因尚未证明。
+`item:1..10000` 与 `item:10001..20000` 的 key 长度不同，可能同时影响请求编码、
+hash、key/meta 查找、warm slot 分配及页/cache 布局；因此暂不能直接声称是 UB 的
+NC/CC 映射属性导致。response-only CC->NC 的优势与双向 CC->NC 的退化仍是独立的
+方向性证据，不能替代本 key-set 差异的因果定位。
+
+按以下顺序继续定位：
+
+1. 用两个不重叠且长度完全相同的 key range 重跑 old/steady，先排除 key 长度和
+   编号混杂因素。
+2. 预写两批同长度 key，交替执行 A/B、再反向 B/A，区分分配顺序、写后
+   materialization/cache 状态和 key 内容。
+3. 对 sampled handle 补齐 `owner_id`、稳定 `region_id`、`region_index`、slot/offset/page
+   及 local/imported 统计，确认两批 key 的实际 warm 布局是否一致。
+4. 对两批读压分别采集 client `cycles`/cache/LLC 事件、两节点 NUMA/内存计数，以及
+   v2 flush、ring-full、fallback/retry、channel attach/reopen 计数，定位到 key lookup、
+   warm copy、UB channel 或 CPU/内存层次。
+
+在 slot/offset/page 布局和 server-side NUMA 计数完成前，文档只把该差距记为可复现
+现象和候选假设，不把它写成 UB 映射根因。
+
+### 2026-08-26 同长度、交替顺序与硬件计数结果
+
+runner 新增 `PREFILL_KEY_MIN`、`STEADY_KEY_MIN`，并支持
+`ALTERNATE_READS=1`：两批 key 均写入后依次执行 A/B、B/A；阶段边界 diagnostic
+快照增加了短暂控制请求失败重试，避免单次 stats timeout 中止数据面测试。
+
+同长度交替复测使用 `item:10000..19999`（A）和 `item:20000..29999`（B），两批均
+先写入，结果为：
+
+| 顺序 | QPS | p50/p99 (ms) |
+| --- | ---: | ---: |
+| A(old) | 13,105,968 | 0.431 / 0.671 |
+| B(steady) | 11,660,276 | 0.455 / 0.735 |
+| A again | 12,793,359 | 0.423 / 0.671 |
+| B again | 10,899,726 | 0.463 / 0.743 |
+
+A/B 与 B/A 均保持 B 低于 A，且第二次读取两批都下降，说明同时存在 key-set 固有
+差异和访问顺序/cache/阶段资源影响；不能只用“第一次读是 cold cache”解释全部差距。
+client owner 统计仍为 `completed=submitted`、`nf=0`、`err=0`、`retry=0`、
+`fallback_v1=0`、`reopen=0`，v2 `ring_full=0`、`publish_err=0`，owner 分布没有
+异常偏斜。
+
+两台 server 的阶段 diagnostic 显示两批请求都只命中各自 owner 的 local warm region：
+node0 为 `region_id=100`、node1 为 `region_id=101`；`warm_imported_hit=0`、
+`cold_promote=0`、`handle_lookup_miss=0`，没有观察到 imported region 或 lookup miss
+差异。client sampled warm-copy 仍显示 steady 首轮更慢（owner0/owner1 约
+`23.8/38.1us`，old 约 `7.6/4.1us`），但样本包含长尾，需结合硬件计数解释。
+
+对同长度 normal 顺序再采集 client 进程的 `perf stat`（产物
+`benchmark/results/scaleout/ub_active_2node_perfstat_numa_samelength_20260826_104458/`）
+后，old/steady 分别为 `13,122,351/11,860,863 QPS`。cycles 约为
+`11.0k/12.1k per op`；cache-misses 和 LLC-load-misses 的每操作数量没有上升。
+ARM `remote_access`/`remote_access_rd` 事件可用，并在另一轮
+`ub_active_2node_perfstat_numa_samelength_20260826_105056/` 中显示 steady 每操作
+约 `426.1/412.0` 次、old 约 `400.1/386.3` 次，steady 增加约 6.5%。这里的
+“增加”是按完成的 logical operation 归一化后的次数；因为 steady QPS 较低，其
+绝对事件总数反而更小。该 ARM PMU 事件反映 node0 client 进程观察到的远端访问，
+不是 UB ring 的字节带宽，也不保证一次事件等于一次 UB 读或一个 cache line。因此
+它只支持“steady 路径每个操作的远端访问/等待更多”这一假设；计数来自 node0 client，
+尚不能单独证明具体 UB producer/consumer 映射或某一页布局是根因。
+
+当前定位状态：key 长度混杂因素已排除但差异仍在；访问顺序会影响绝对 QPS；owner、
+region、lookup source、channel/fallback 和错误路径未显示异常；CPU cycles/op 与
+remote-access/op 的增加把重点收敛到 warm handle copy、NUMA/cache placement 或
+其等待路径。下一步应把 copy sample 与 handle 的 slot/offset/page、owner worker
+队列深度和两节点 server-side NUMA 计数关联起来，再判断是否需要调整数据布局或
+NC/CC 映射，而不是直接修改 producer/consumer 方向。
+
+### 2026-08-26 反向 key-range 交替复测
+
+为排除“`item:10000..19999` 这个数值范围天然较慢”的可能性，交换两批范围：old
+使用 `item:20000..29999`，steady 使用 `item:10000..19999`；两批均先写入，随后仍按
+old -> steady -> old -> steady 读取。结果如下：
+
+| 阶段 | QPS | p50/p99 (ms) |
+| --- | ---: | ---: |
+| old (20k..30k) | 13,011,144 | 0.423 / 0.671 |
+| steady (10k..20k) | 11,831,653 | 0.463 / 0.743 |
+| old reread | 12,582,556 | 0.423 / 0.671 |
+| steady reread | 11,230,291 | 0.463 / 0.743 |
+
+该轮产物为 `benchmark/results/scaleout/ub_active_2node_reverse_ranges_20260826_110837/`，
+correctness 全部通过。交换范围后 steady 仍低于 old，说明差异不能归因于
+`10k..20k` 数值范围本身；结合正向范围交替测试，当前更支持“写入顺序/数据状态与
+key-set 共同影响 warm copy/访问等待”的判断，仍不能直接证明 NC/CC 映射是根因。
+
+### 2026-08-26 poll/callback/copy 统计拆分结论
+
+需要明确：现有 `poll_latency` 不是阻塞等待时间。SDK 在
+`vemb_v16_client_handle_session_poll()` 中从 poll 前开始计时，计时范围覆盖 deadline
+flush、v2/v1 poll、completion callback，以及 callback 内的
+`vemb_v16_client_read_vector()` warm-handle copy。因此它不能单独回答“远端内存访问”
+还是“poll 等待”。同样，`remote_access` 是整个 node0 client 进程的 PMU 计数，不是
+warm copy 专属事件。
+
+在反向范围轮次中，现有累计 poll sample 的平均值为：owner0 old/steady
+`4.42/6.11us`，owner1 old/steady `31.85/42.86us`；但该值包含 callback/copy，不能
+直接标成 poll wait。该轮 copy sample 还出现 old 高于 steady 的结果，说明单凭当前
+1/1024 copy sample 不能稳定证明 copy 是 steady 差异的主因。
+
+因此当前可确认的结论收紧为：steady 的额外成本定位在 client 的
+`poll -> completion callback -> read_vector/copy` 复合路径，尚不能在 remote memory、
+poll/transport 处理和 callback 其它开销之间归因。runner 现已增加独立的
+`[cli-stat-completion]` sampled callback timing（同样 1/1024），它与已有 poll timing
+和 owner/region copy timing 配套输出；下一轮用三者的阶段 delta 对照：
+
+```text
+poll_total = flush + transport poll + completion callback
+callback   = completion bookkeeping + read_vector/copy
+copy       = sdk_backend_read_warm_vector
+```
+
+若 callback 增长且 copy 同步增长，优先检查 warm/NUMA；若 callback 不变而 poll_total
+增长，优先检查 v2 poll/flush/channel；若两者都不增长，再转向 server-side service
+time、completion queue 和硬件计数。该拆分完成前不把“poll 等待”或“远端内存访问”写成
+steady QPS 差异的已证根因。
+
+### 2026-08-26 拆分统计实测：steady 增量主要落在 warm-handle copy
+
+在修复 runner 统计快照的线程栈占用后，使用 CC->NC、两组同长度 key，先写入
+`item:10000..19999`（old）和 `item:20000..29999`（steady），再按
+`old -> steady -> old -> steady` 交替读取。该轮产物为
+`benchmark/results/scaleout/ub_active_2node_splitstats_samelength_20260826_115159/`，
+四个 phase 均 correctness 通过：
+
+| 阶段 | QPS | composite poll avg | callback avg | sampled copy avg |
+| --- | ---: | ---: | ---: | ---: |
+| old | 13,151,151 | 30.24 us | 3.32 us | 14.60 us |
+| steady | 11,609,282 | 32.92 us | 8.43 us | 51.18 us |
+| old reread | 12,640,581 | 28.17 us | 4.83 us | 23.37 us |
+| steady reread | 10,967,458 | 28.01 us | 11.57 us | 72.75 us |
+
+这里的 poll/callback/copy 均按全部 worker 的最终累计 snapshot 做加权平均；copy 与
+callback 是 1/1024 sampled latency，不能把 sampled 总和当作每请求总耗时，但 old 与
+steady 的同口径差异清晰。steady 的 composite poll 只比 old 高约 9%，而 callback
+约为 2.5 倍、sampled copy 约为 3.5 倍；reread 仍保持同方向。这组证据将定位从
+“poll 等待或远端内存二选一”收紧为：steady 的额外成本位于 client completion
+复合路径，包含 callback 前置处理和 `read_vector`/warm-handle copy 候选；poll/flush/channel
+处理只解释较小部分。后续异步 pipeline UT 没有复现 copy 均值增幅，因此不能把
+warm-copy 单独写成根因；当前只能确认高并发 completion 前置路径及尾延迟存在候选
+差异，仍需继续拆分 poll/flush、owner channel completion 和统计采样口径。
+
+### 2026-08-26 独立 warm-copy latency UT
+
+新增 `benchmark/vemb_v16_warm_copy_latency_ut.c` 及
+`make -C benchmark vemb_v16_warm_copy_latency_ut` target。该 integration UT 在
+远端 active={0,1} 集群中先注入 `item:10000..19999`（old）和
+`item:20000..29999`（steady），随后用同步 SDK 逐个执行
+`VEMB_HANDLE -> read_vector`，分别报告 handle lookup、warm copy 和 total 的
+avg/p50/p99；读取顺序仍为 old -> steady -> old -> steady。
+
+10,000 key、每阶段 10,000 次读取的结果如下：
+
+| 阶段 | lookup avg/p99 | copy avg/p50/p99 | total avg/p99 |
+| --- | ---: | ---: | ---: |
+| old | 1.056/1.060 ms | 1.146/0.380/19.040 us | 1.057/1.078 ms |
+| steady | 1.056/1.060 ms | 1.399/0.370/19.400 us | 1.057/1.078 ms |
+| old reread | 1.056/1.060 ms | 1.141/0.360/19.030 us | 1.057/1.078 ms |
+| steady reread | 1.056/1.060 ms | 1.396/0.360/19.430 us | 1.057/1.078 ms |
+
+该 UT 验证了两点：lookup 成本与 key 范围无关；steady 的同步 copy 平均延迟约高
+20%-23%，但 p50 基本相同，total 由约 1.056 ms 的 handle lookup 主导。它不能独立
+复现并发压测中 sampled copy 约 3.5 倍的增幅，因此完整 QPS 差距不是单线程
+`read_vector` 固定成本，而是高并发 completion callback/UB 访问下的尾延迟放大。
+后续若要进一步闭合因果链，应在该 UT 上增加多 client/多线程模式，比较并发度变化时
+copy p99、copy avg 与 completion callback 的同步增长。
+
+随后按 CLI 读阶段相同的 `threads=64, clients=4`（共 256 个独立 SDK client）重跑，
+仍使用 `dim=300`，每阶段 128,000 个同步读取样本：
+
+| 阶段 | copy avg | copy p50 | copy p99 | total avg |
+| --- | ---: | ---: | ---: | ---: |
+| old | 0.982 us | 0.390 us | 2.160 us | 1.070 ms |
+| steady | 1.236 us | 0.350 us | 19.650 us | 1.060 ms |
+| old reread | 0.973 us | 0.380 us | 1.970 us | 1.078 ms |
+| steady reread | 1.237 us | 0.350 us | 19.640 us | 1.061 ms |
+
+256 client 已经稳定复现 steady copy 的 p99 尾延迟升高，但 copy 平均仅高约 26%，
+仍没有复现 CLI `pipeline=32` 压测中约 3.5 倍的 sampled copy 平均值。
+
+随后 UT 增加了真正的异步 handle-session，保持每个 session 32 个 outstanding 请求，
+并在 completion callback 内调用 `read_vector`；用 CLI 相同的 64 threads x 4 clients
+（256 sessions）、`dim=300`、`pipeline=32` 重跑，结果为：
+
+| 阶段 | pre-copy avg/p99 | copy avg/p99 | total avg/p99 |
+| --- | ---: | ---: | ---: |
+| old | 59.8/129.7 us | 0.656/1.790 us | 60.4/130.8 us |
+| steady | 56.5/123.7 us | 0.633/1.790 us | 57.1/124.8 us |
+| old reread | 69.1/129.5 us | 0.653/1.790 us | 69.8/130.7 us |
+| steady reread | 55.8/122.8 us | 0.643/1.790 us | 56.5/123.8 us |
+
+其中 `pre-copy` 是请求提交到 completion callback 开始前的时间，不是纯 lookup；
+`copy` 是 callback 内 `read_vector` 的实际耗时。异步 pipeline 仍未复现 steady 的
+copy 均值升高，说明此前压测中 3.5 倍的 sampled copy 均值不能直接归因于
+`sdk_backend_read_warm_vector`。当前结论应改为：steady 差异主要在高并发 completion
+前置路径及其尾延迟，warm-copy 本身尚未被独立 UT 证明为根因；下一步应检查异步
+poll/flush、owner channel completion 分布和统计采样口径。
+
+### 2026-08-26 owner 阶段统计边界
+
+为区分 poll/flush 与 completion callback，SDK owner stats 又增加了
+`flush`、`v2_poll`、`v1_poll`、`callback` 和 `submit_to_callback` 分段计时；每个
+worker 的四个 client 最终累计记录按 sample count 合并。使用
+`ub_active_2node_boundary_stats_125356` 重跑 CC->NC，先写入
+`item:10000..19999`，再写入 `item:20000..29999`，读阶段为
+`old -> steady -> old -> steady`，并禁用周期 stats sampler。四个读阶段均通过
+correctness，QPS 为 `13,110,427`、`11,839,920`、`12,627,042`、`11,080,288`。
+
+| 阶段 | owner | poll avg | flush avg | v2 poll avg | v1 poll avg | callback avg | submit->callback avg |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 0 | 11.88 us | 0.72 us | 10.92 us | 0.07 us | 18.64 us | 1.19 ms |
+| old | 1 | 50.23 us | 5.46 us | 43.86 us | 0.77 us | 19.50 us | 1.34 ms |
+| steady | 0 | 11.49 us | 0.77 us | 10.49 us | 0.08 us | 44.59 us | 1.90 ms |
+| steady | 1 | 42.97 us | 5.32 us | 36.74 us | 0.76 us | 49.96 us | 2.21 ms |
+| old reread | 0 | 18.04 us | 0.68 us | 17.13 us | 0.07 us | 29.21 us | 1.99 ms |
+| old reread | 1 | 44.90 us | 5.18 us | 38.81 us | 0.77 us | 29.85 us | 2.28 ms |
+| steady reread | 0 | 42.25 us | 1.08 us | 40.92 us | 0.08 us | 35.21 us | 2.48 ms |
+| steady reread | 1 | 67.07 us | 5.22 us | 60.95 us | 0.75 us | 34.33 us | 2.81 ms |
+
+首轮 old/steady 的 poll、flush、v2 poll 和 v1 poll 没有随 steady QPS 降低而增加；
+相反 callback 平均耗时约从 `18--20 us` 升至 `45--50 us`，
+`submit_to_callback` 约从 `1.19--1.34 ms` 升至 `1.90--2.21 ms`。因此当前可确认的
+边界是：steady 的额外成本位于 response 到 callback 的等待以及 callback 内部，
+不是 flush deadline、v1 fallback 或一个可由 poll 总耗时单独解释的等待。callback
+计时包含 runner completion callback（其中会执行 `read_vector`），所以仍不能把它
+等同于纯 warm-copy；结合异步 UT 的 copy 均值稳定，warm-copy 只能保留为 callback
+内部候选。下一步应在 callback 内继续拆出 `read_vector`、L0 resolve/fanout 和用户
+回调 bookkeeping，并增加 response 到达/owner channel ring 时间戳，才能区分远端访问
+与 completion scheduling。
+
+### 2026-08-26 response/finish/callback 进一步拆分
+
+在上述统计基础上又加入了 request 的 `response_poll_ns`，并将 SDK 计时拆为
+`submit_to_response_poll`、`response_poll_to_finish`、`finish`、
+`response_poll_to_callback`；runner callback 同时拆出 pending lookup、
+`read_vector`（materialize）和 accounting。使用
+`ub_active_2node_callback_boundary_131834`（同样的 64 threads x 4 clients x
+pipeline 32、old/steady 交替读取）得到如下最终累计平均值：
+
+| 阶段/owner | submit->response poll | response poll->finish | finish | response poll->callback |
+| --- | ---: | ---: | ---: | ---: |
+| old/0 | 1.843 ms | 5.42 us | 0.062 us | 5.48 us |
+| old/1 | 2.120 ms | 17.98 us | 0.063 us | 18.04 us |
+| steady/0 | 3.034 ms | 5.35 us | 0.086 us | 5.44 us |
+| steady/1 | 3.453 ms | 22.86 us | 0.065 us | 22.92 us |
+
+同一轮 runner callback 内部加权平均为：
+
+| 阶段 | pending lookup | `read_vector` | accounting |
+| --- | ---: | ---: | ---: |
+| old | 0.114 us | 4.87 us | 0.72 us |
+| steady | 0.114 us | 7.22 us | 0.98 us |
+
+因此当前可以排除 `finish` bookkeeping 是主要原因：它只有约 `0.06--0.09 us`，
+old/steady 基本不变。steady 的主要增量发生在 response 被 SDK poll 出来之前，
+即 `submit_to_response_poll` 增加约 `1.2--1.3 ms`；owner1 在 poll 返回后到
+finish 还有约 `4.9 us` 增量。callback 内的 `read_vector` 也从约 `4.9 us` 增至
+`7.2 us`，但只解释 callback 内的一部分，pending lookup 没有变化。
+
+这里的 `response_poll_ns` 是 `aeron_batch_poll_response()` 返回之后的时间戳，
+所以尚不能观测 response 在 ring 中实际写入的时刻；目前结论是：QPS 差异主要在
+`submit -> response poll` 的 response/ring 可见性等待，其次是 callback 内
+`read_vector`，不是 `sdk_handle_session_finish`。下一步应给 server response
+publish、Aeron response ring consume 和 client poll loop 加同一时钟域的时间戳，
+确认等待发生在 server publish、ring 可见性还是 client poll 调度。
+
+### 2026-08-26 server service 与 response wait 边界
+
+为继续拆分 `submit -> response_poll`，v2 response header 新增 server 本地的
+`server_service_ns` duration。它从 server 收到 batch 开始计时，覆盖 server
+排队、处理、completion drain 到 response publish；client 只在本机计算
+`publish_to_response_poll`，并用两段 duration 相减得到 `response_wait`，没有做
+跨机器 monotonic 绝对时间戳相减。
+
+首次试验 `ub_active_2node_service_boundary_134436` 无效：远端实际启动的
+`src/redis-server` 仍是旧二进制（response header 仍为 24 bytes），而新 memtier
+按 32-byte header 解码，连续出现 `v2 batch response frame ... decode_rc=-1`，最终
+读阶段返回 `status_err`。之后两台机器均重新构建并核验了实际脚本启动的
+`src/redis-server`，再进行手工 10 秒读阶段（64 threads x 4 clients x pipeline 32，
+dim=300，数据范围 `item:10000..19999` 与 `item:20000..29999`）。
+
+| 阶段 | QPS（仅记录，不作最终性能结论） | timing samples | publish->poll | server service | response wait |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| old keys | 5,356,923 | 4,352 | 581.6 us | 23.5 us | 558.1 us |
+| steady keys | 7,546,594 | 7,316 | 244.7 us | 14.3 us | 230.4 us |
+
+本轮 old 阶段存在每 worker 一个收尾 `status_err`，所以表中的 QPS 只用于说明
+计时量级，不能用于改写 old/steady 的性能排序。可以确认的边界是：server service
+仅约 `14--24 us`，而 publish 到 client poll 的剩余等待约 `230--558 us`，额外成本
+主要位于 server service 之外的 response/ring/client 调度路径；`finish` 与 callback
+bookkeeping 仍不是主要量级。当前还不能仅凭该 duration 把剩余等待进一步归因到
+request ring、response ring 可见性或 client poll 调度。下一步应增加 response ring
+descriptor 的 tail/head 观察计数以及 poll-loop 中的 empty-to-nonempty transition
+计时，继续拆出这三者。
+
+### 2026-08-26 无错误交替复测
+
+使用重新构建后的两台 `redis-server`，运行
+`ub_active_2node_service_clean_150239`：64 threads x 4 clients、pipeline 32、
+dim=300，先写入 `item:10000..19999` 和 `item:20000..29999`，再执行
+`old -> steady -> old -> steady`。四个阶段均 correctness 通过，且没有
+`status_nf`、`status_err`、`materialized_fail` 或 `unmatched`。
+
+| 阶段 | QPS | publish->poll | server service | response wait | submit->poll |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| old | 11,771,738 | 237.179 us | 16.183 us | 220.997 us | 1.982 ms |
+| steady | 10,117,055 | 246.340 us | 14.570 us | 231.769 us | 3.752 ms |
+| old reread | 10,441,604 | 242.099 us | 15.854 us | 226.245 us | 3.998 ms |
+| steady reread | 9,317,341 | 255.979 us | 15.246 us | 240.733 us | 5.413 ms |
+
+相邻 old/steady 对比中，QPS 分别降低约 `1.65M` 和 `1.12M`；但
+`publish->poll` 只增加约 `9.2--13.9 us`，`response_wait` 只增加约
+`10.8--14.5 us`，server service 没有增加。相反，`submit->poll` 增加约
+`1.4--1.8 ms`。因此当前最明确的新增结论是：steady 的主要额外时间发生在
+client batch publish 之前的 submit/L0 聚合或 client 调度阶段；不能再把约 2M
+QPS 差距主要归因于 server service 或 response ring publish 后等待。
+
+这里的三个 client 时间点为：`submit_ns -> publish_ns -> response_poll_ns`。
+`submit_to_response_poll` 从请求进入 submit 路径开始，`publish_to_response_poll`
+从成功发布 batch 开始；前者包含后者之前的 submit、L0 group 聚合、batch 形成和
+client worker 调度。无错误复测中，首轮 old/steady 的两个均值分别为
+`1.982/3.752 ms` 和 `0.237/0.246 ms`，相减得到约 `1.745/3.506 ms`；reread
+则为 `3.756/5.157 ms`。这说明增量主要在 batch publish 之前，但两项统计的采样
+粒度不同（request 对 batch），该相减只能作为边界证据，不能作为严格逐请求分解。
+因此下一步增加独立的 `submit_to_publish` 计时，以区分 L0 聚合耗时和 client 调度
+等待。
+
+### 2026-08-26 `submit_to_publish` 独立计时
+
+在无错误交替复测 `ub_active_2node_submit_publish_151924` 中，对每个 v2 handle
+request 记录 `submit_ns`，并在其所在 batch 成功 publish 后记录 `publish_ns`。
+同时保留 batch 级 `submit_to_response_poll`、`publish_to_response_poll`、server
+service 和 response wait。测试参数为 64 threads x 4 clients、pipeline 32、dim=300，
+key 范围为 `item:10000..19999`（old）和 `item:20000..29999`（steady），顺序为
+`old -> steady -> old -> steady`；四个阶段均为 correctness pass，
+`status_nf=0`、`status_err=0`、`materialized_fail=0`、`unmatched=0`。
+
+| 阶段 | QPS | submit->publish | submit->poll | publish->poll | server service | response wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 11,639,926 | 1.169 ms | 2.329 ms | 235.742 us | 15.511 us | 220.231 us |
+| steady | 10,671,150 | 1.407 ms | 2.610 ms | 247.491 us | 14.403 us | 233.088 us |
+| old reread | 10,356,258 | 2.305 ms | 4.713 ms | 236.467 us | 15.628 us | 220.839 us |
+| steady reread | 8,801,803 | 3.517 ms | 6.659 ms | 253.869 us | 14.587 us | 239.282 us |
+
+首轮 old -> steady 的 QPS 下降约 `0.97M`，而 `submit_to_publish` 增加约
+`237 us`；`publish_to_poll` 只增加约 `11.7 us`，server service 没有增加。
+第二轮 old reread -> steady reread 的 QPS 下降约 `1.55M`，
+`submit_to_publish` 增加约 `1.212 ms`，而 `publish_to_poll` 只增加约 `17.4 us`，
+server service 仍无增加。由此可以确定 steady 的主要新增耗时在 request submit 到
+batch publish 之间，而不是 server service 或 publish 后的 response poll。
+
+`submit_to_publish` 仍跨越 L0 pending group 聚合、batch draft 构造、flush deadline
+等待及 client worker 调度，因而它本身还不是单一函数的耗时。为继续拆分，SDK 又对
+采样的 owner flush 增加了 `prepare_batch`、Aeron `publish` 调用，以及
+`prepare_batch -> publish` 的耗时和次数。下一轮应同时查看这些字段：若
+`prepare_ns`/`prepare_to_publish_ns` 随 steady 增加，边界在 L0 聚合或 batch 构造；若
+它们稳定而 `submit_to_publish` 增加，则边界在 flush 前的 client 调度或 deadline 等待。
+这些新增统计只在采样 flush 上计时，仍需以同一轮 old/steady 阶段 delta 解读。
+
+### 2026-08-26 submit/prepare/publish 边界复测
+
+随后在两台机器清理其它 `redis-server`、`memtier_benchmark`、`redis-cli` 和
+flamegraph 进程后，重新编译 client/memtier，并运行
+`ub_active_2node_submit_publish_split_20260826_160000`。参数仍为
+64 threads x 4 clients、pipeline 32、dim=300、`item:10000..19999` 与
+`item:20000..29999`，顺序为 A/B、B/A；四个读阶段均无错误。
+
+下面是所有 worker/owner 的采样累计加权平均；`prepare` 是
+`vemb_v16_cli_l0_prepare_batch()`，`publish` 是 Aeron batch publish 调用，
+`prepare->publish` 是二者之间的 batch 级时间：
+
+| 阶段 | QPS | submit->publish | submit->poll | publish->poll | prepare | publish | prepare->publish |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 12,993,508 | 0.585 ms | 1.339 ms | 232.263 us | 0.254 us | 4.227 us | 2.339 us |
+| steady | 11,864,282 | 0.842 ms | 1.617 ms | 253.536 us | 0.263 us | 4.142 us | 2.312 us |
+| old after steady | 12,664,709 | 0.977 ms | 1.794 ms | 231.499 us | 0.249 us | 4.218 us | 2.334 us |
+| steady reread | 11,269,293 | 1.400 ms | 2.650 ms | 250.246 us | 0.262 us | 4.147 us | 2.312 us |
+
+首轮 old -> steady 的 QPS 下降约 `1.129M`，`submit->publish` 增加约 `257 us`；
+但 L0 `prepare` 仅增加 `0.009 us`，`prepare->publish` 反而基本不变，Aeron
+publish 调用也不变。B/A 第二轮同样如此：`submit->publish` 增加约 `423 us`，而
+`prepare` 只有 `0.013 us` 的变化、`prepare->publish` 不变。四个阶段的 flush 统计均为
+`flush_full=0`、`flush_deadline=flush_calls`、`ring_full=0`、`publish_err=0`。
+
+因此现在可以把边界进一步收窄为：steady 的额外成本不在 L0 draft 构造，也不在
+Aeron publish 调用，而是在 **request 进入 pending/L0 后到下一次 deadline-triggered
+flush 开始之前**。这说明主要是 client worker 的 flush/poll 调度或 deadline 等待，
+而不是 L0 本身执行变慢；当前统计还不能把这段等待拆成 worker 未被调度和
+`max_batch_delay_us=10` deadline 的精确比例。后续若要完成最后一级定位，应记录每个
+leader 的 `deadline_set_ns`、`flush_enter_ns` 和 `prepare_start_ns`，直接测量
+`leader->flush_enter`，并将 deadline 到期触发与 poll 调度分开计数。
+
+### 2026-08-26 deadline 到期与 flush 调度拆分
+
+在 `ub_active_2node_deadline_split_20260826_170000` 中增加了 deadline 内部时间点：
+`deadline_set_ns`（首个 pending leader 建立 deadline）、`deadline_due_ns`（poll
+发现 deadline 到期）和紧邻的 `flush_enter_ns`。同样的 64 threads x 4 clients、
+pipeline 32、dim=300、A/B、B/A workload 四个阶段均 correctness pass。
+
+| 阶段 | QPS | submit->publish | prepare | publish | prepare->publish | deadline set->due | due->flush enter |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 13,142,391 | 0.568 ms | 0.251 us | 4.221 us | 2.337 us | 124.128 us | 0.026 us |
+| steady | 11,589,474 | 0.904 ms | 0.261 us | 4.166 us | 2.317 us | 140.208 us | 0.027 us |
+| old after steady | 12,258,481 | 1.183 ms | 0.244 us | 4.230 us | 2.329 us | 128.649 us | 0.026 us |
+| steady reread | 10,971,464 | 1.656 ms | 0.253 us | 4.153 us | 2.303 us | 142.544 us | 0.027 us |
+
+本轮 old -> steady 的 `submit_to_publish` 增加约 `336 us`，其中：
+
+* `deadline set -> due` 增加约 `16.080 us`；
+* `due -> flush enter` 只增加约 `0.001 us`，绝对值约 `26~27 ns`；
+* L0 prepare、Aeron publish 和 `prepare->publish` 均基本不变。
+
+因此可以排除“deadline 已到期但 worker 很久没有被调度进入 flush”这一解释：
+`due->flush_enter` 只有约 `26~27ns`。但必须注意，`deadline set->due` 是
+leader/deadline 样本，而 `submit_to_publish` 是 request 样本，二者采样粒度不同；
+本轮 `set->due` 只增加约 `16us`，不能算术上解释 request 级别约 `336us` 的
+`submit_to_publish` 增量。
+
+当前能确定的边界是：额外成本不在 deadline 到期后的 worker 调度、L0 prepare 或
+Aeron publish；仍位于 request submit 到 deadline 被观察/批次 publish 之间。要继续
+闭合因果链，需要把每个 batch 的 `deadline_due_ns` 传给其中的 request，新增
+`submit_to_deadline_due` request 级统计，再与 `deadline_due_to_flush` 对齐，区分
+请求在 deadline 建立前后进入 pending 的等待和 poll 检查粒度。
+
+### 2026-08-26 request 级 submit/L0/deadline/flush 拆分
+
+在 `ub_active_2node_request_split_10us_20260826_180000` 中继续增加 request 级时间点：
+`l0_enqueue_ns`，以及将 batch 的 `deadline_due_ns`、`flush_enter_ns` 绑定到其中的
+request。测试保持 delay `10us`、64 threads x 4 clients、pipeline 32、dim=300、
+同长度 key、A/B、B/A 顺序；四个阶段 correctness 全部通过。
+
+| 阶段 | QPS | submit->publish | submit->L0 | L0->deadline due | due->flush enter | flush->publish |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 13,195,637 | 0.538 ms | 381.083 us | 152.960 us | 0.026 us | 3.974 us |
+| steady | 11,952,592 | 0.829 ms | 596.813 us | 228.214 us | 0.028 us | 3.905 us |
+| old after steady | 12,556,347 | 1.020 ms | 744.234 us | 271.569 us | 0.026 us | 3.977 us |
+| steady reread | 10,817,662 | 1.671 ms | 1,239.757 us | 427.319 us | 0.028 us | 3.908 us |
+
+首轮 old -> steady 的 `submit_to_publish` 增加约 `291us`，其中约 `216us` 已经发生
+在 `submit -> L0 enqueue`，约 `75us` 发生在 L0 enqueue 后到 deadline 被观察；
+`deadline_due -> flush_enter` 和 `flush_enter -> publish` 均无实质变化。由此可以
+明确：当前主要瓶颈不是 L0 prepare、Aeron publish，也不是 deadline 到期后的 worker
+调度；deadline wait 只解释 request 级增量的一部分，主要新增成本在 request 进入 L0
+之前的 client route/producer 阶段（common-core route、owner/channel 选择或 L0
+submit 前的调度）。
+
+因此暂不急于跑 `delay=0`：它最多只能验证约 `75us` 的 deadline 组成，不能解释已经
+确认的约 `216us` submit->L0 增量。下一步应继续把 `submit->L0` 拆成 route 完成、
+owner channel ready/选择和 `vemb_v16_cli_l0_submit_with_identity()` 调用前后的时间点；
+若需要最终做控制实验，再用 delay=0 验证 deadline 部分是否消失。
+
+### 2026-08-26 route 与 L0 submit 细分统计
+
+为继续拆分 `submit->L0`，client request 现在记录以下时间点：
+
+```text
+submit_ns
+  -> route_start_ns       cluster_core_prepare() 前
+  -> route_done_ns        cluster_core_prepare() 后
+  -> l0_submit_start_ns   channel/owner submit-path 选择完成后
+  -> l0_submit_end_ns     vemb_v16_cli_l0_submit_with_identity() 返回后
+```
+
+输出中的四个 request 级平均值分别是：
+
+* `submit_to_route_start_avg_ns`：request 在进入 route loop 前的 client/poll 排队；
+* `route_duration_avg_ns`：common-core `cluster_core_prepare` 本身；
+* `route_to_l0_start_avg_ns`：channel ready、owner session 状态检查和 submit-path 选择；
+* `l0_submit_duration_avg_ns`：L0 hash/group 查找、leader/follower 聚合和 entry 入队。
+
+这些值与 `submit_to_l0_avg_ns` 使用相同的 request 采样口径，但只对最终进入 v2
+L0 batch 的请求计数。因而它们可以直接比较 old/steady 的增量，判断 `submit->L0`
+增加究竟来自 client 调度、common-core route、owner/channel 路径，还是 L0 submit
+函数自身；不能用不同采样粒度的 leader deadline 统计替代这组 request 统计。
+
+### 2026-08-26 route/deadline 细分复测
+
+运行 `ub_active_2node_20260826_170848`，场景为 `cc_nc`，保持 delay `10us`、
+64 threads x 4 clients、pipeline `32`、dim `300`。old/steady 两个 key 范围均为
+10,000 个 key，四阶段 correctness 全部通过：
+
+| 阶段 | QPS | p50 (ms) | p99 (ms) |
+| --- | ---: | ---: | ---: |
+| old | 13,453,159 | 0.383 | 0.663 |
+| steady | 11,329,376 | 0.415 | 0.735 |
+| old after steady | 13,226,658 | 0.375 | 0.655 |
+| steady read | 11,329,376 | 0.415 | 0.735 |
+
+对各 worker 的 `owner_transport` request 样本按样本数加权后，old -> steady 的
+关键平均值如下（单位 ns）：
+
+| 阶段 | old | steady | 增量 |
+| --- | ---: | ---: | ---: |
+| submit -> route_start | 295,524 | 633,824 | +338,300 |
+| route duration | 99 | 104 | +5 |
+| route_done -> l0_start | 75,276 | 211,054 | +135,778 |
+| L0 submit duration | 483 | 502 | +19 |
+| submit -> L0 | 371,410 | 845,514 | +474,104 |
+| L0 -> observed deadline due | 101,493 | 285,767 | +184,274 |
+| deadline_set -> observed due | 63,702 | 156,284 | +92,582 |
+| deadline_target -> observed due | 53,702 | 146,284 | +92,582 |
+| observed due -> flush enter | 26 | 29 | +3 |
+| flush enter -> publish | 4,134 | 4,321 | +187 |
+| submit -> publish | 477,062 | 1,135,630 | +658,568 |
+
+本轮可以确认：
+
+1. QPS 差距约 `2.12M`，而 `submit->publish` 增加约 `659us`。
+2. 其中约 `338us` 出现在 request submit 后到下一次 route loop 开始，指向
+   client poll/调度或 request producer 排队；`cluster_core_prepare` 自身只增加约
+   `5ns`。
+3. 另有约 `136us` 出现在 route 完成到 L0 submit 开始，属于 channel/owner
+   submit-path 选择之前的 client 路径；L0 submit 函数自身只增加约 `19ns`。
+4. `deadline_target->observed_due` 从约 `54us` 增至约 `146us`，说明 deadline
+   到期后被 poll 观察的滞后在 steady 增加；但 `observed_due->flush_enter` 仍只有
+   约 `26--29ns`，所以不是到期后 flush worker 没有及时进入。
+5. `deadline_set->L0` 约 `4.5us` 且 old/steady 基本不变，说明 request 在已有
+   deadline 建立后的进入时刻没有显著变化；新增 deadline 成本主要是到期点被观察
+   得更晚，而不是固定的 `10us` 配置本身变长。
+
+因此当前最强结论是：steady 的主要新增成本仍在 client 侧 poll/route 调度链路，
+不是 common-core route 算法或 L0 聚合执行时间；同时该调度变慢也使 deadline due
+观察出现约 `93us` 的额外滞后。`route_done->l0_start` 的统计还覆盖 channel/owner
+状态检查和 submit-path 选择，下一步若要继续闭合边界，应在这段内部增加
+`ensure_owner_channel`、`vemb_v16_owner_session_select_submit_path` 的独立计时。
+
+#### 数据流与耗时对比图
+
+本轮只保留耗时明显增加的链路段（old -> steady）：
+
+```text
+client submit
+    |
+    | submit -> route_start       +338.3 us
+    v
+client poll / route loop
+    |
+    | route_done -> l0_start      +135.8 us
+    v
+channel + owner path
+    |
+    v
+L0 submit / enqueue
+    |
+    | deadline target -> observed  +92.6 us
+    v
+deadline observed
+```
+
+`cluster_core_prepare`、L0 submit、deadline 到期后的 flush、Aeron publish 及响应
+回程在本轮没有明显增加，因此不在图中展开。
+
+### 2026-08-26 route/deadline 二级细分复测
+
+在 `ub_active_2node_20260826_174735` 中继续增加 `ensure_owner_channel`、
+`sdk_owner_v2_enable`、owner submit-path 选择，以及 deadline poll/check 的独立
+计时。测试仍为 `cc_nc`、delay `10us`、64 threads x 4 clients、pipeline `32`，
+correctness 通过。
+
+| request 级阶段 | old | steady | 增量 |
+| --- | ---: | ---: | ---: |
+| submit -> route_start | 312.9 us | 518.4 us | +205.5 us |
+| route -> channel start | 25 ns | 26 ns | 基本不变 |
+| `ensure_owner_channel` duration | 19.2 us | 35.9 us | +16.7 us |
+| channel -> owner path start | 70.0 us | 120.9 us | +50.9 us |
+| `sdk_owner_v2_enable` duration | 69.9 us | 120.8 us | +50.9 us |
+| owner path select duration | 29 ns | 31 ns | 基本不变 |
+| owner path -> L0 start | 25 ns | 26 ns | 基本不变 |
+| L0 submit duration | 431 ns | 455 ns | 基本不变 |
+| L0 -> observed deadline due | 118.9 us | 189.3 us | +70.4 us |
+| deadline target -> observed due | 65.7 us | 102.1 us | +36.4 us |
+
+deadline 检查自身的采样结果为：
+
+| deadline 检查阶段 | old | steady |
+| --- | ---: | ---: |
+| owner poll enter -> check start | 46 ns | 53 ns |
+| check duration | 54 ns | 63 ns |
+
+因此 `deadline target -> observed` 的主要部分不在 deadline 判断代码，而在
+理论到期后等待下一次 owner poll/check。`deadline_target_to_check` 只在采样 poll
+上记录，样本数约 `900`，其中包含长尾毫秒级等待，不能与 request 级
+`deadline_target_to_due` 直接按平均值相减；但两项检查内部统计均为几十纳秒，
+已经足以确认新增成本来自 check 之前的 client 调度/轮询等待。
+
+route 侧则可以进一步确认：`route_done -> l0_start` 的 steady 增量主要来自
+`sdk_owner_v2_enable`，而 `vemb_v16_owner_session_select_submit_path` 和 L0
+submit 本身没有变慢。下一步优化应优先检查 V2 enable 的状态路径和重复调用，
+并在保持状态机语义的前提下评估按 owner/poll 缓存 ready 结果；deadline 侧应优化
+owner poll 的调度公平性或减少 poll 前的 slot 工作量。
+
+
+### 2026-08-26 submit/slot poll 与 deadline target 二级边界复测
+
+为闭合上一节的两个未拆分区间，SDK/runner 新增以下 request 级边界：
+
+```text
+submit -> drive_sessions_start
+drive_sessions_start -> slot_poll_start
+slot_poll_start -> route_start
+l0_enqueue -> deadline_target
+deadline_target -> poll_check
+```
+
+在无 flamegraph/bpftrace 干扰的 `ub_active_2node_20260826_182428`、`cc_nc`、
+delay `10us`、64 threads x 4 clients、pipeline `32`、dim `300` 回归中，四个阶段
+均 correctness pass：old `13,207,288` QPS，steady `11,286,226` QPS，old after
+steady `12,559,876` QPS，steady reread `11,286,226` QPS。下表是各 worker 最终
+`owner_transport` 累计样本按 samples 加权的 request 统计，单位为 us：
+
+| 阶段 | old | steady | old after steady | steady reread |
+| --- | ---: | ---: | ---: | ---: |
+| submit -> drive_sessions_start | 5.8 | 6.2 | 7.4 | 6.1 |
+| drive_sessions_start -> slot_poll_start | 674.0 | 1,353.7 | 787.5 | 1,348.4 |
+| slot_poll_start -> route_start | 6.3 | 6.1 | 5.9 | 6.1 |
+| submit -> route_start | 686.1 | 1,366.0 | 800.7 | 1,360.7 |
+| L0 enqueue -> deadline target | 68.2 | 197.2 | 177.6 | 197.2 |
+| L0 -> observed deadline due | 135.4 | 342.4 | 383.7 | 342.4 |
+
+这组数据把 `submit->route_start` 的主要增量定位到
+`drive_sessions_start -> slot_poll_start`：steady 比 old 增加约 `680us`，而
+`submit->drive_sessions_start` 和 `slot_poll_start->route_start` 都只有约 `0--1us`
+变化。因此当前更具体的边界是 runner 的 slot 顺序/前序 slot poll 工作造成的
+client 调度排队，不是 `cluster_core_prepare()` 自身。
+
+`l0_enqueue->deadline_target` 在 steady 比 old 增加约 `129us`，解释了
+`L0->observed due` 增量的一部分。新增 `deadline_target->poll_check` 仅在原有
+sampled poll 与 request sample 同时命中时计数，old/steady 样本分别约 `116/102`，
+均值约 `26.4ms/64.9ms`，它代表 poll 等待长尾而不是全量 request 平均值；因此不能
+与全量 request 的 `deadline_target->due` 直接相减。它仍确认 deadline target 之后
+的额外等待发生在下一次 poll/check 之前，几十纳秒的 check 代码不是瓶颈。
+
+本轮结论：`submit->route_start` 的剩余成本主要来自 slot poll 排队；
+`L0->observed due` 的 request 级可比较部分主要是 `l0_enqueue->deadline_target`，
+而 target 到 poll/check 的低频样本显示了调度长尾。后续应分别优化 slot 调度公平性、
+owner poll 触发/唤醒和 deadline 采样覆盖率，不能把低样本 target->poll_check 均值
+当作稳态平均延迟。
+
+#### 当前 client 主要增加耗时总结
+
+综合前述几轮 route、deadline 和 slot 级实验，当前 client 侧已经确认的主要增加点为：
+
+1. **slot poll 到达前的 client 调度/排队**：
+   `drive_sessions_start -> slot_poll_start` 是最大增量，old 约 `674us`、steady
+   约 `1,354us`，增加约 `680us`。这里的“slot poll / client 调度”表示同一边界
+   的综合成本，尚不能拆分前序 slot poll 工作、slot 顺序排队和 OS 线程调度各自的比例；
+   不能表述为 slot poll 内部执行本身变慢。
+2. **route 完成后的 owner/channel 状态处理**：上一轮细分中，
+   `ensure_owner_channel` 增加约 `16.7us`，`sdk_owner_v2_enable` 增加约 `50.9us`，
+   是 `route_done -> l0_start` 增量的主要来源；owner path select 没有明显增加。
+3. **L0 入队后的 deadline 建立等待**：`l0_enqueue -> deadline_target` 从约 `68us`
+   增至约 `197us`，增加约 `129us`，是 `L0 -> observed due` 增量的重要组成部分。
+4. **deadline target 后的 poll 等待长尾**：低频 `deadline_target -> poll_check`
+   样本显示毫秒级等待，说明额外时间主要在等待下一次 client poll；deadline check
+   本身仍只有几十纳秒。该指标样本量较小，不能当作全量 request 平均值。
+
+目前基本没有明显增加的部分包括 `cluster_core_prepare()`、
+`slot_poll_start -> route_start`、owner path select、L0 submit/聚合、deadline check、
+`deadline due -> flush` 和 flush -> Aeron publish。因此现阶段 client 优化重点应放在
+slot 调度公平性、owner/channel/V2 enable 状态处理，以及 owner poll 的触发/唤醒，
+而不是路由算法或 L0 聚合代码。
+
 
 ### UB 扩容期间问题定位、修复与 TCP 对照（2026-08-23）
 
@@ -128,7 +1390,7 @@ topology refresh 和 imported NC 映射证据仍未补齐。
      `VEMB_V16_STATUS_ERR`。
    - 证据：[`clients/c/vemb_v16_cluster_core.c:144`](../clients/c/vemb_v16_cluster_core.c:144)、
      [`clients/c/vemb_v16_client_sdk.c:1904`](../clients/c/vemb_v16_client_sdk.c:1904)、
-     [`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447`](../benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447)。
+     [`scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447`](../scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh:447)。
      during 原始日志中可见 `MOVED ... from_owner=0 to_owner=1` 与
      `prepared=2 ... attempts=8 ... active_count=1 endpoint_count=2`。
 
@@ -230,7 +1492,7 @@ transport 共享的公共路由状态机；同时仍应修正服务端 topology 
 
 ### 历史短测与当前状态
 
-脚本：`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`
+脚本：`scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh`
 结果目录：`benchmark/results/scaleout/ub_scaleout_20260820_155951/`
 参数：`PREFILL_KEYS=10000`、`VNODE_COUNT=100`、`PIO=7`、`SNW=7`、
 `t=64`、`c=4`、`pipeline=32`。
@@ -246,10 +1508,14 @@ attach 配置不一致；统一重建和修正配置后 prefill 与 baseline 已
 
 ### 当前剩余验证缺口
 
-1. 当前 root 硬件环境下，imported `dev5..dev8/dev13..dev16` 直接以普通
-   `O_RDWR` 打开也成功，尚未触发 `O_SYNC` fallback。因此代码路径已具备
-   fallback，但 imported path 是否实际获得 NC mmap 属性仍未被实机证明；需要
-   结合驱动权限/映射属性日志确认，或由设备层提供可观测的 NC 验证。
+1. 2026-08-24 的 `ub_cc_nc_visibility_ut` 已用新的 scratch offset 验证第二组
+   `dev9..dev12 -> dev13..dev16`，以及反向四组映射；八个方向均为
+   `O_RDWR/CC` local writer 到 `O_RDWR|O_SYNC/NC` imported reader，并在
+   `attempt=0` 返回 `VISIBLE`。在同一轮对两台机器上的 imported `dev5..dev8` 和
+   `dev13..dev16` 逐一强制普通 `O_RDWR(CC)` 时驱动均返回 `EPERM`，说明 imported
+   path 必须保留 O_SYNC fallback，不能把 imported path 当作普通 CC mapping。仍
+   缺少的是设备级属性查询，不能仅凭 `mmap` 成功证明所有 imported 设备的 NC 属性
+   完全一致。
 2. 阶段 8 仍需补齐 attach/close/re-attach 资源泄漏、连续 topology refresh、
    retry/peer-view/ring/warm-read 失败分类，以及 TCP/UB 同 workload 可比性能报告。
 
@@ -622,6 +1888,9 @@ load/store 的 acquire/release 语义：
 这里的 `devN` 是实际设备编号，例如 `dev4` 表示
 `/dev/obmm_shmdev4`。在每台机器上访问 `dev5..dev8` 与 `dev13..dev16`
 都必须使用 NC mmap；这与 UB 的 acquire/release load/store 顺序语义不同。
+2026-08-24 的最小 UT 已证明第二组四对设备在 64B line 粒度双向可见；但按相同
+角色平移后的 4KiB frame/ack 复用在第 2 代停止推进，说明 line 映射通过不等价于
+多 cacheline response frame 的连续 descriptor/ack 可见性已经通过。
 配置文件不再携带 `cache_policy` 字段，warm region 与 remote meta 可以共用各自 owner 的
 warm backing，但必须使用不同 mmap offset（warm 为 `0`，meta 默认从
 `268435456` 开始）。同机 CLI 的 warm read 使用 local CC；跨机 warm import
@@ -1699,7 +2968,7 @@ vemb_v16_peer_view_transport_ut、SDK static 和 vemb_v16_bench 均已在本地�
 目的：把已有 migration protocol 与公共 core、UB transport 接入同一条
 `baseline -> during_scaleout -> after` 实验流程。
 
-- [x] 新建 `benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`，使用仓库内
+- [x] 新建 `scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh`，使用仓库内
   VEMB-aware common core，不使用 TCP-only origin memtier 代替 UB 数据面。
 - [x] baseline：仅 owner 111 active，CLI@111 使用 direct-local UB；bootstrap 和
   初始 topology 只包含 owner0，确认 prefill 与 baseline read 成功。
@@ -1726,15 +2995,16 @@ owner1 动态 refresh/ATTACH 和 old-key correctness；
 代码提交：
 工作区状态：UB 资源映射只携带路径和角色；所有 UB open+mmap 统一先尝试
 `O_RDWR`，在 `EPERM/EACCES` 时以 `O_RDWR|O_SYNC` 重试。manifest 不再要求
-`cache_policy`，同机路径保持 CC；imported dev5..8/dev13..16 的 NC 访问尚未
-通过当前 root 硬件的实际映射属性得到证明。
+`cache_policy`，同机路径保持 CC；`ub_cc_nc_visibility_ut` 已证明
+`dev1..dev4/dev5..dev8` 和 `dev9..dev12/dev13..dev16` 的 CC writer 到 NC
+import reader 可见，但设备级 mmap 属性仍没有独立查询接口。
 脚本与部署参数：`scripts/hpc_redis_scaleout_throughput.sh` 与
 `scripts/vemb_v16_expand_ub_memory_2node.sh` 已接入路径/offset 配置；不再生成或
 读取 `cache_policy`。reset 只写本机拥有的 UB backing 和 NC 发送环，不重置 peer
 CC view。
 baseline/during/after 结果目录：111/112 `benchmark/results/scaleout/nc_cc_scaleout_20260817_1720/`（TCP control/data workload，用于验证 server-side migration/UB-RPC，不是本阶段 UB client cluster 验收）。baseline=9.75M ops/s，during=10.08M ops/s，after=10.03M ops/s。
 迁移 epoch 与 fence 记录：candidate=1786958553，full-active=1786958554；`scaleout_all_sources_done=1`、两个 owner 的 full-active publish 均成功。
-P7 runner：`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`。它从 Mac
+P7 runner：`scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh`。它从 Mac
 仅经 `NODE0_SSH_HOST:NODE0_SSH_PORT` 和 `NODE1_SSH_HOST:NODE1_SSH_PORT` 管理两台
 机器，默认分别为 `43.154.145.18:8111`、`43.154.145.18:8112`；topology、server
 control、AERON ATTACH 与 peer-view 一律继续使用 `192.168.90.111/112`。server-side
