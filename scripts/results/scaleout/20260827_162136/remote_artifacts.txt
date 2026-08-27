@@ -1,0 +1,13 @@
+# Remote artifacts for run_id=20260827_162136 (logs are not copied locally)
+node0=root@43.154.145.18:8111:/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136
+node1=root@43.154.145.18:8112:/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136
+node0_server_log=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/server_node0.log
+node1_server_log=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/server_node1.log
+coordinator_log=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/coord.out
+coordinator_error=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/coord.err
+prefill_log=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/prefill.log
+raw_baseline=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/raw/scaleout_baseline.txt
+raw_during=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/raw/scaleout_during.txt
+raw_after_old_keys=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/raw/scaleout_after_old_keys.txt
+raw_after_prefill=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/raw/scaleout_after_prefill.txt
+raw_after=/root/gqs/codespace/UnifiedBus/hpc-redis/benchmark/results/scaleout/20260827_162136/raw/scaleout_after.txt
