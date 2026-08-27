@@ -327,6 +327,8 @@ static int common_core_prepare_slot(common_core_slot *slot)
     if (!common_core_pure_read(worker->cfg))
         return 0;
     if (worker->use_handle_session) {
+        if (vemb_v16_client_prepare_active_owner_channels(slot->client) != 0)
+            return -1;
         vemb_v16_client_handle_session_options_t options = {
             .max_batch_delay_us = worker->cfg->vemb_v16_batch_max_delay_us,
         };

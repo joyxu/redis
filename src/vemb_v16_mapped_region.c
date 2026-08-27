@@ -17,17 +17,39 @@ static uint64_t page_align_down(uint64_t value) {
     return value & ~page_mask;
 }
 
-static int open_ub_with_fallback(const char *path, int *used_sync) {
-    int fd = open(path, O_RDWR);
+int vemb_v16_open_ub_with_fallback(const char *path,
+                                   int open_flags,
+                                   int *used_sync) {
+    int requested_sync = (open_flags & O_SYNC) != 0;
+    int fd = open(path, open_flags);
     if (fd >= 0) {
-        *used_sync = 0;
+        *used_sync = requested_sync;
         return fd;
     }
-    if (errno != EPERM && errno != EACCES)
+    int open_errno = errno;
+    if (requested_sync ||
+        (open_errno != EPERM && open_errno != EACCES))
         return -1;
-    fd = open(path, O_RDWR | O_SYNC);
-    if (fd >= 0)
+
+    serverLog(LL_WARNING,
+              "vemb_v16 UB open O_RDWR permission denied, retrying O_SYNC: path=%s errno=%d (%s)",
+              path,
+              open_errno,
+              strerror(open_errno));
+    fd = open(path, open_flags | O_SYNC);
+    if (fd >= 0) {
         *used_sync = 1;
+        return fd;
+    }
+
+    int sync_open_errno = errno;
+    if (sync_open_errno == EPERM || sync_open_errno == EACCES) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 UB open O_SYNC fallback permission denied: path=%s errno=%d (%s)",
+                  path,
+                  sync_open_errno,
+                  strerror(sync_open_errno));
+    }
     return fd;
 }
 
@@ -38,16 +60,49 @@ static void *map_ub_with_fallback(const char *path, int *fd,
                          MAP_SHARED, *fd, (off_t)offset);
     if (mapping != MAP_FAILED)
         return mapping;
-    if (errno != EPERM && errno != EACCES)
+    int mmap_errno = errno;
+    if (mmap_errno != EPERM && mmap_errno != EACCES)
         return MAP_FAILED;
+
+    serverLog(LL_WARNING,
+              "vemb_v16 UB mmap permission denied, retrying O_SYNC: path=%s fd=%d bytes=%zu offset=%llu errno=%d (%s)",
+              path,
+              *fd,
+              bytes,
+              (unsigned long long)offset,
+              mmap_errno,
+              strerror(mmap_errno));
 
     close(*fd);
     *fd = open(path, O_RDWR | O_SYNC);
-    if (*fd < 0)
+    if (*fd < 0) {
+        int sync_open_errno = errno;
+        if (sync_open_errno == EPERM || sync_open_errno == EACCES) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 UB mmap O_SYNC fallback open permission denied: path=%s errno=%d (%s)",
+                      path,
+                      sync_open_errno,
+                      strerror(sync_open_errno));
+        }
         return MAP_FAILED;
+    }
     *used_sync = 1;
-    return mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                MAP_SHARED, *fd, (off_t)offset);
+    mapping = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, *fd, (off_t)offset);
+    if (mapping == MAP_FAILED) {
+        int sync_mmap_errno = errno;
+        if (sync_mmap_errno == EPERM || sync_mmap_errno == EACCES) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 UB mmap O_SYNC fallback permission denied: path=%s fd=%d bytes=%zu offset=%llu errno=%d (%s)",
+                      path,
+                      *fd,
+                      bytes,
+                      (unsigned long long)offset,
+                      sync_mmap_errno,
+                      strerror(sync_mmap_errno));
+        }
+    }
+    return mapping;
 }
 
 static int open_or_attach_local_shm(vemb_v16_mapped_region_t *region,
@@ -158,7 +213,8 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         if (open_or_attach_local_shm(region, path, required_size, &created) != 0)
             return -1;
     } else {
-        region->fd = open_ub_with_fallback(path, &used_sync);
+        region->fd = vemb_v16_open_ub_with_fallback(path, O_RDWR,
+                                                    &used_sync);
         if (region->fd < 0) {
             serverLog(LL_WARNING,
                       "vemb_v16 mapped region ub open failed: path=%s access_mode=%u request_size=%zu offset=%llu error=%s",

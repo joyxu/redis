@@ -280,15 +280,18 @@ struct vemb_v16_client {
     uint32_t bootstrap_seed_count;
     uint32_t next_topology_seed;
     uint64_t topology_fetch_attempts;
+    uint64_t topology_snapshot_id;
     sdk_bootstrap_seed_t bootstrap_seeds[VEMB_V16_SDK_MAX_ENDPOINTS];
 
     /* Shared routing, retry and logical-completion state. It deliberately
      * does not own any transport channel or mapping. */
     vemb_v16_cluster_core_t cluster;
 
-    /* Owner-keyed channels, opened lazily by ensure_owner_channel(). */
+    /* Owner-keyed channels. Stable snapshot reuse is handled by the hot path;
+     * new owners and new snapshots use the slow setup path. */
     sdk_backend_t   owner_channels[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     uint8_t         owner_channel_inited[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+    uint64_t owner_channel_snapshot_id[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
 
     /* MOVED override: once any key returns MOVED with target_owner=X, the
      * cached active ring is permanently stale for this client's lifetime
@@ -951,6 +954,9 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
                     topology_changed);
         }
         vemb_v16_cluster_core_publish_topology(&client->cluster, &topology);
+        client->topology_snapshot_id++;
+        if (client->topology_snapshot_id == 0)
+            client->topology_snapshot_id++;
         int migration_prepare = (topology.flags &
             VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED) != 0;
         for (uint32_t owner = 0;
@@ -1316,6 +1322,7 @@ static void sdk_owner_channel_close(vemb_v16_client_t *client,
     sdk_owner_v2_stop(client, owner_id);
     sdk_backend_close(&client->owner_channels[owner_id]);
     client->owner_channel_inited[owner_id] = 0;
+    client->owner_channel_snapshot_id[owner_id] = 0;
     vemb_v16_cluster_core_owner_channel_closed(&client->cluster, owner_id);
 }
 
@@ -1369,15 +1376,28 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
     return 1;
 }
 
-/* Lazy-open a data channel to the given owner_id using endpoint info from
- * the cached topology. Returns 0 on success (channel ready in
- * owner_channels[owner_id]), -1 on failure. Idempotent: if channel already
- * open, returns 0 without re-opening.
- *
- * Its channel identity lives in cluster core. The client startup contract has
- * already fixed one data transport for every owner; a topology refresh may
- * move an endpoint but cannot change its transport. */
-static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
+/* Stable channel reuse is the normal request-path contract. A successful
+ * topology snapshot has already validated the endpoint and resource state;
+ * endpoint lookup, resource probing and reattach remain in the slow path. */
+static int sdk_owner_channel_fast_ready(const vemb_v16_client_t *client,
+                                        uint32_t owner_id)
+{
+    assert(owner_id < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS);
+    if (!client->owner_channel_inited[owner_id] ||
+        !vemb_v16_cluster_core_owner_channel_ready(&client->cluster,
+                                                   owner_id) ||
+        client->owner_channel_snapshot_id[owner_id] == 0 ||
+        client->owner_channel_snapshot_id[owner_id] !=
+            client->topology_snapshot_id)
+        return 0;
+    return sdk_backend_ready(&client->owner_channels[owner_id]);
+}
+
+/* Open or repair a data channel using endpoint information from the cached
+ * topology. The caller enters here only for a new owner, new snapshot, or a
+ * resource/channel state transition. */
+static int ensure_owner_channel_slow(vemb_v16_client_t *client,
+                                     uint32_t owner_id)
 {
     assert(owner_id < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS);
 
@@ -1404,8 +1424,11 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
                                                    owner_id) &&
         sdk_backend_matches_endpoint(b, ep, transport)) {
         if (b->resource_checked_topology_epoch ==
-            topology->current_topology_epoch)
+            topology->current_topology_epoch) {
+            client->owner_channel_snapshot_id[owner_id] =
+                client->topology_snapshot_id;
             return 0;
+        }
         vemb_v16_transport_resource_state_t resource_state =
             sdk_backend_check_resource(b);
         if (resource_state == VEMB_V16_TRANSPORT_RESOURCE_FAILED)
@@ -1413,6 +1436,8 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
         if (resource_state == VEMB_V16_TRANSPORT_RESOURCE_CURRENT) {
             b->resource_checked_topology_epoch =
                 topology->current_topology_epoch;
+            client->owner_channel_snapshot_id[owner_id] =
+                client->topology_snapshot_id;
             return 0;
         }
         /* The caller's owner-group completion loop has already drained all
@@ -1502,6 +1527,13 @@ static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
         (topology->flags & VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED) !=
             0);
     return 0;
+}
+
+static int ensure_owner_channel(vemb_v16_client_t *client, uint32_t owner_id)
+{
+    if (sdk_owner_channel_fast_ready(client, owner_id))
+        return 0;
+    return ensure_owner_channel_slow(client, owner_id);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4214,6 +4246,24 @@ int vemb_v16_client_stats(vemb_v16_client_t *c, vemb_v16_stats_t *out_stats)
 int vemb_v16_client_topology_refresh(vemb_v16_client_t *client)
 {
     return fetch_topology_via_bootstrap_seeds(client);
+}
+
+int vemb_v16_client_prepare_active_owner_channels(vemb_v16_client_t *client)
+{
+    if (client->transport_type != VEMB_V16_TRANSPORT_AERON ||
+        !client->ub_peer_view_ready ||
+        !vemb_v16_cluster_core_topology_ready(&client->cluster))
+        return -1;
+
+    const vemb_v16_client_topology_t *topology =
+        vemb_v16_cluster_core_topology(&client->cluster);
+    for (uint32_t i = 0; i < topology->active_ring.owner_count; i++) {
+        uint32_t owner_id = topology->active_ring.owners[i];
+        if (ensure_owner_channel(client, owner_id) != 0 ||
+            !sdk_owner_v2_enable(client, owner_id))
+            return -1;
+    }
+    return 0;
 }
 
 void vemb_v16_client_set_retry_budget(vemb_v16_client_t *client,

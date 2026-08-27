@@ -137,7 +137,7 @@ batch 大小、测试时长、build policy 和源码 commit，只改变正在测
 | `SSH_USER`, `SSH_PORT` | `root`, 空 | SSH 用户和端口；`SSH_PORT` 为空时不传 `-p`，直接使用 `~/.ssh/config` 中主机别名的端口配置。 |
 | `SERVER_ROOT`, `CLIENT_ROOT` | `/root/szz/codespace/hpc-redis` | 远端源码根目录。 |
 | `FLAMEGRAPH_DIR` | `/root/FlameGraph` | 远端 FlameGraph 工具目录。 |
-| `SERVER_MANIFEST` | `/tmp/vemb_perf_warm_111.yaml` | server warm-region manifest。 |
+| `SERVER_MANIFEST` | `$SERVER_ROOT/examples/vemb_perf_warm_111.yaml` | server warm-region manifest；默认使用仓库内的 4 GiB `/dev/obmm_shmdev4` 配置。 |
 | `PORT`, `SERVER_IP` | `6395`, `192.168.90.111` | Redis control endpoint。 |
 | `SERVER_REQUEST_UB_PATH`, `SERVER_RESPONSE_UB_PATH`, `SERVER_WARM_UB_PATH` | `/dev/obmm_shmdev3`, `/dev/obmm_shmdev6`, `/dev/obmm_shmdev4` | server request/response/warm UB 设备。 |
 | `CLIENT_REQUEST_UB_PATH`, `CLIENT_RESPONSE_UB_PATH`, `CLIENT_WARM_UB_PATH` | `/dev/obmm_shmdev7`, `/dev/obmm_shmdev2`, `/dev/obmm_shmdev8` | client request/response/warm UB 设备。 |

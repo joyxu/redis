@@ -21,6 +21,13 @@ typedef struct vemb_v16_mapped_region {
     char path[256];
 } vemb_v16_mapped_region_t;
 
+/* Open a UB device with the current hardware compatibility rule. The caller
+ * supplies either O_RDWR or O_RDWR|O_SYNC; only an O_RDWR permission failure
+ * triggers the O_SYNC retry. */
+int vemb_v16_open_ub_with_fallback(const char *path,
+                                   int open_flags,
+                                   int *used_sync);
+
 int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 uint32_t backend_type,
                                 uint32_t cache_policy,
