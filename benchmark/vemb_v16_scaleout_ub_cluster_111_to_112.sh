@@ -586,7 +586,7 @@ ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if 
 # A successful coordinator publish is only the control-plane half of the
 # protocol.  The source must accept local-done ACK and complete source GC
 # before its global migration gate is allowed to clear.
-ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if grep -q 'scaleout auto local done notified' '$NODE0_LOG' && grep -q 'scaleout auto done' '$NODE0_LOG'; then exit 0; fi; sleep 1; done; echo 'source did not reach local-done notified and done' >&2; grep -E 'scaleout auto|local done|migration_active|batch rejected|ATTACH rejected' '$NODE0_LOG' >&2 || true; exit 1"
+ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if grep -q '^scaleout_all_sources_done=1$' '$COORD_OUT'; then exit 0; fi; sleep 1; done; echo 'coordinator did not confirm all sources done' >&2; tail -5 '$COORD_OUT' >&2 || true; exit 1"
 T1=$(date +%s)
 SCALEOUT_WALL=$((T1 - T0))
 REMAIN=$((BG_TIME_SCALEOUT - SCALEOUT_WALL))

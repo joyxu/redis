@@ -125,6 +125,32 @@ int vemb_v16_client_vsim(vemb_v16_client_t *client,
                          float *out_score);
 
 /*
+ * VSIM_KEY_KEY — compute cosine similarity between the two stored vectors
+ * for (set_name, elem1) and (set_name, elem2), server-side.
+ * On success, *out_score receives the similarity score.
+ * Returns 0 on success, 1 if either key not found, -1 on error.
+ */
+int vemb_v16_client_vsim_key_key(vemb_v16_client_t *client,
+                                 const char *set_name,
+                                 const char *elem1,
+                                 const char *elem2,
+                                 uint32_t dim,
+                                 float *out_score);
+
+/*
+ * Pipelined VSIM_KEY_KEY — batch of server-side 2-key cosine similarity
+ * operations with up to max_inflight requests in flight per owner group.
+ * out_scores[count] receives the scores (0.0f sentinel for not-found).
+ */
+int vemb_v16_client_vsim_key_key_pipeline(vemb_v16_client_t *client,
+                                          const char **set_names,
+                                          const char **elem1_names,
+                                          const char **elem2_names,
+                                          uint32_t count,
+                                          float *out_scores,
+                                          uint32_t max_inflight);
+
+/*
  * VREM — remove a vector by (set_name, elem_name).
  * Idempotent: returns 0 whether the key existed or not. Returns -1 on error.
  */
@@ -158,6 +184,7 @@ typedef struct vemb_v16_pipeline_resp {
     uint32_t bytes;
     uint32_t dim;
     uint32_t region_id;
+    float    score;       /* VSIM / VSIM_KEY_KEY 服务端计算结果 */
 } vemb_v16_pipeline_resp_t;
 
 /* Response classification — used by sync retry engine and async callers. */
@@ -295,6 +322,15 @@ vemb_v16_client_handle_session_t *vemb_v16_client_handle_session_create(
 int vemb_v16_client_handle_session_submit(
     vemb_v16_client_handle_session_t *session, const char *set_name,
     const char *elem_name, uint64_t caller_cookie);
+
+/*
+ * VSIM_KEY_KEY on the async handle-session path: server-side 2-key cosine.
+ * Completion (with response->score) is delivered by poll()/close() like a
+ * handle read. Rides the v1 channel (the v2 batch protocol is handle-only).
+ */
+int vemb_v16_client_handle_session_submit_vsim_key_key(
+    vemb_v16_client_handle_session_t *session, const char *set_name,
+    const char *elem1, const char *elem2, uint64_t caller_cookie);
 
 /* Publish all currently eligible L0 groups. It never waits for a response. */
 int vemb_v16_client_handle_session_flush(

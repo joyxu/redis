@@ -46,13 +46,15 @@ void vemb_v16_aeron_set_transport(const std::string &mode,
 extern "C" {
 #include "vemb_v16_protocol.h"
 #include "vemb_v16_client_sdk.h"
+#include "vemb_v16_vector_gen.h"
 #include "monotonic.h"
 }
 
 enum {
     COMMON_CORE_SET_CMD_IDX = 0,
     COMMON_CORE_GET_CMD_IDX = 2,
-    COMMON_CORE_SYNC_BATCH_MAX = 32,
+    /* sync-op 每次批量: 摊薄每批提交/轮询开销; 每组 inflight 仍受 pipeline 限制 */
+    COMMON_CORE_SYNC_BATCH_MAX = 128,
 };
 
 struct common_core_worker;
@@ -86,6 +88,7 @@ struct common_core_worker {
     unsigned long long unmatched;
     unsigned long set_ratio_count;
     unsigned long get_ratio_count;
+    uint64_t key2_rng;
     bool use_handle_session;
     bool setup_failed;
     run_stats *stats;
@@ -118,17 +121,22 @@ static int common_core_obj_iter_type(const benchmark_config *cfg,
     return OBJECT_GENERATOR_KEY_GET_ITER;
 }
 
-static void common_core_fill_vector(float *vector, uint32_t dim,
-                                    uint32_t global_id)
+/* key2: 同 key1 前缀 + [key_min,key_max] 随机编号 (LCG 与 protocol.cpp TCP 路径一致) */
+static void common_core_next_key2(common_core_worker *w,
+                                  const std::string &k1,
+                                  char *out, size_t out_cap)
 {
-    uint32_t state = global_id * 2654435761u + 12345u;
-    for (uint32_t i = 0; i < dim; i++) {
-        state = state * 1103515245u + 12345u;
-        uint32_t bits = (state >> 9) | 0x40000000u;
-        float value;
-        memcpy(&value, &bits, sizeof(value));
-        vector[i] = value * 0.001f;
-    }
+    size_t prefix_len = k1.size();
+    while (prefix_len > 0 && k1[prefix_len - 1] >= '0' &&
+           k1[prefix_len - 1] <= '9')
+        prefix_len--;
+    w->key2_rng = w->key2_rng * 6364136223846793005ULL +
+                  1442695040888963407ULL;
+    unsigned long long range =
+        w->cfg->key_maximum - w->cfg->key_minimum + 1;
+    snprintf(out, out_cap, "%.*s%llu", (int)prefix_len, k1.c_str(),
+             (unsigned long long)(w->cfg->key_minimum +
+                                  (w->key2_rng % range)));
 }
 
 static std::string common_core_next_key(common_core_worker *worker,
@@ -143,6 +151,8 @@ static std::string common_core_next_key(common_core_worker *worker,
 
 static uint8_t common_core_next_op(common_core_worker *worker)
 {
+    if (worker->cfg->vemb_v16_vsim_key_key)
+        return VEMB_V16_OP_VSIM_KEY_KEY;
     if (worker->cfg->vemb_v16_vsim)
         return VEMB_V16_OP_VSIM_INLINE;
     if (worker->cfg->vemb_v16_vrem)
@@ -170,9 +180,18 @@ static uint8_t common_core_next_op(common_core_worker *worker)
     return VEMB_V16_OP_VEMB_HANDLE;
 }
 
+/* key-key 走 async handle session (v1) 的条件:
+ * 不依赖 L1 cache / 未禁用 batch (与 pure read 的 session 条件对齐) */
+static bool common_core_key_key_session(const benchmark_config *cfg)
+{
+    return cfg->vemb_v16_vsim_key_key &&
+        cfg->vemb_v16_l1_entries == 0 && !cfg->vemb_v16_batch_disable;
+}
+
 static bool common_core_pure_read(const benchmark_config *cfg)
 {
-    return !cfg->vemb_v16_vsim && !cfg->vemb_v16_vrem &&
+    return !cfg->vemb_v16_vsim && !cfg->vemb_v16_vsim_key_key &&
+        !cfg->vemb_v16_vrem &&
         cfg->ratio.a == 0 && cfg->ratio.b > 0;
 }
 
@@ -246,7 +265,10 @@ static void common_core_handle_completion(
     common_core_pending pending = it->second;
     slot->pending.erase(it);
     bool materialized = false;
-    if (response->status == 0) {
+    if (slot->worker->cfg->vemb_v16_vsim_key_key) {
+        /* key-key 返回 score, 无向量物化 */
+        materialized = response->status == 0;
+    } else if (response->status == 0) {
         float vector[VEMB_V16_MAX_DIM];
         materialized = vemb_v16_client_read_vector(
             slot->client, response->offset, response->bytes, vector,
@@ -324,7 +346,8 @@ static int common_core_prepare_slot(common_core_slot *slot)
     vemb_v16_client_set_retry_budget(
         slot->client, worker->cfg->vemb_v16_topology_retry_limit);
 
-    if (!common_core_pure_read(worker->cfg))
+    if (!common_core_pure_read(worker->cfg) &&
+        !common_core_key_key_session(worker->cfg))
         return 0;
     if (worker->use_handle_session) {
         vemb_v16_client_handle_session_options_t options = {
@@ -407,11 +430,23 @@ static void common_core_run_async_reads(common_core_worker *worker,
                 gettimeofday(&pending.sent_time, NULL);
                 pending.bytes_tx = (uint32_t)key.size() + 24u;
                 uint64_t cookie = next_cookie++;
-                int rc = worker->use_handle_session ?
-                    vemb_v16_client_handle_session_submit(
-                        it->handle_session, NULL, key.c_str(), cookie) :
-                    vemb_v16_client_vector_session_submit(
+                int rc;
+                if (worker->cfg->vemb_v16_vsim_key_key &&
+                    it->handle_session) {
+                    char key2_buf[VEMB_V16_MAX_KEY_LEN];
+                    common_core_next_key2(worker, key, key2_buf,
+                                          sizeof(key2_buf));
+                    pending.bytes_tx += strlen(key2_buf);
+                    rc = vemb_v16_client_handle_session_submit_vsim_key_key(
+                        it->handle_session, NULL, key.c_str(), key2_buf,
+                        cookie);
+                } else if (worker->use_handle_session) {
+                    rc = vemb_v16_client_handle_session_submit(
+                        it->handle_session, NULL, key.c_str(), cookie);
+                } else {
+                    rc = vemb_v16_client_vector_session_submit(
                         it->vector_session, NULL, key.c_str(), cookie);
+                }
                 worker->issued++;
                 if (rc != 0) {
                     common_core_account_read(worker, pending, -1, 0, false);
@@ -462,7 +497,7 @@ static void common_core_run_vadd_batch(common_core_worker *worker,
         gettimeofday(&pending[i].sent_time, NULL);
         pending[i].bytes_tx = (uint32_t)keys.back().size() + 24u +
             worker->cfg->vemb_v16_dim * sizeof(float);
-        common_core_fill_vector(
+        vemb_v16_fill_vector(
             &vectors[(size_t)i * worker->cfg->vemb_v16_dim],
             worker->cfg->vemb_v16_dim, (uint32_t)(worker->issued + i));
     }
@@ -479,6 +514,58 @@ static void common_core_run_vadd_batch(common_core_worker *worker,
     worker->issued += count;
 }
 
+static void common_core_run_key_key_batch(common_core_worker *worker,
+                                          common_core_slot *slot,
+                                          uint32_t count)
+{
+    std::vector<std::string> keys1;
+    std::vector<std::string> keys2;
+    std::vector<const char *> sets(count, NULL);
+    std::vector<const char *> elems1;
+    std::vector<const char *> elems2;
+    std::vector<float> scores(count, 0.0f);
+    std::vector<common_core_pending> pending(count);
+    keys1.reserve(count);
+    keys2.reserve(count);
+    elems1.reserve(count);
+    elems2.reserve(count);
+
+    /* key1 走 memtier key-pattern; key2 同前缀 + [key_min,key_max] 随机
+     * (LCG 与 protocol.cpp TCP 路径一致) */
+    const benchmark_config *cfg = worker->cfg;
+    unsigned long long range = cfg->key_maximum - cfg->key_minimum + 1;
+    for (uint32_t i = 0; i < count; i++) {
+        keys1.push_back(common_core_next_key(worker, false));
+        const std::string &k1 = keys1.back();
+        size_t prefix_len = k1.size();
+        while (prefix_len > 0 && k1[prefix_len - 1] >= '0' &&
+               k1[prefix_len - 1] <= '9')
+            prefix_len--;
+        worker->key2_rng = worker->key2_rng * 6364136223846793005ULL +
+                           1442695040888963407ULL;
+        char key2_buf[VEMB_V16_MAX_KEY_LEN];
+        snprintf(key2_buf, sizeof(key2_buf), "%.*s%llu",
+                 (int)prefix_len, k1.c_str(),
+                 (unsigned long long)(cfg->key_minimum +
+                                      (worker->key2_rng % range)));
+        keys2.push_back(key2_buf);
+        gettimeofday(&pending[i].sent_time, NULL);
+        pending[i].bytes_tx = (uint32_t)(k1.size() + keys2.back().size()) + 24u;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        elems1.push_back(keys1[i].c_str());
+        elems2.push_back(keys2[i].c_str());
+    }
+
+    int rc = vemb_v16_client_vsim_key_key_pipeline(
+        slot->client, sets.data(), elems1.data(), elems2.data(),
+        count, scores.data(),
+        std::min<uint32_t>(count, worker->cfg->pipeline));
+    for (uint32_t i = 0; i < count; i++)
+        common_core_account_read(worker, pending[i], rc, 0, rc == 0);
+    worker->issued += count;
+}
+
 static void common_core_run_sync_op(common_core_worker *worker,
                                     common_core_slot *slot, uint8_t op)
 {
@@ -488,6 +575,15 @@ static void common_core_run_sync_op(common_core_worker *worker,
             count = (uint32_t)std::min<unsigned long long>(
                 count, worker->budget - worker->issued);
         common_core_run_vadd_batch(worker, slot, count);
+        return;
+    }
+
+    if (op == VEMB_V16_OP_VSIM_KEY_KEY) {
+        uint32_t count = COMMON_CORE_SYNC_BATCH_MAX;
+        if (worker->budget != 0)
+            count = (uint32_t)std::min<unsigned long long>(
+                count, worker->budget - worker->issued);
+        common_core_run_key_key_batch(worker, slot, count);
         return;
     }
 
@@ -504,7 +600,7 @@ static void common_core_run_sync_op(common_core_worker *worker,
     } else if (op == VEMB_V16_OP_VSIM_INLINE) {
         std::vector<float> query(worker->cfg->vemb_v16_dim);
         float score = 0.0f;
-        common_core_fill_vector(query.data(), worker->cfg->vemb_v16_dim,
+        vemb_v16_fill_vector(query.data(), worker->cfg->vemb_v16_dim,
                                 (uint32_t)worker->issued);
         rc = vemb_v16_client_vsim(slot->client, NULL, key.c_str(),
                                   query.data(), worker->cfg->vemb_v16_dim,
@@ -555,7 +651,8 @@ static void *common_core_worker_main(void *arg)
     uint64_t deadline_ns = getMonotonicNs() +
         (uint64_t)worker->cfg->test_time * 1000000000ull;
     if (!worker->setup_failed) {
-        if (common_core_pure_read(worker->cfg))
+        if (common_core_pure_read(worker->cfg) ||
+            common_core_key_key_session(worker->cfg))
             common_core_run_async_reads(worker, deadline_ns);
         else
             common_core_run_sync_ops(worker, deadline_ns);
@@ -660,7 +757,8 @@ run_stats vemb_v16_aeron_run(benchmark_config *cfg, object_generator *obj_gen)
         exit(1);
     }
     monotonicInit();
-    const bool use_handle_session = common_core_pure_read(cfg) &&
+    const bool use_handle_session = (common_core_pure_read(cfg) ||
+                                     common_core_key_key_session(cfg)) &&
         cfg->vemb_v16_l1_entries == 0 && !cfg->vemb_v16_batch_disable;
     fprintf(stderr,
             "[common-core] runner start: mode=%s seeds=%zu t=%u c=%u pipeline=%u "
@@ -696,6 +794,7 @@ run_stats vemb_v16_aeron_run(benchmark_config *cfg, object_generator *obj_gen)
         worker->unmatched = 0;
         worker->set_ratio_count = 0;
         worker->get_ratio_count = 0;
+        worker->key2_rng = 42 + i;
         worker->use_handle_session = use_handle_session;
         worker->setup_failed = false;
         worker->stats = new run_stats(cfg);

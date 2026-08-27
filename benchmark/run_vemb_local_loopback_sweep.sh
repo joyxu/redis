@@ -4,7 +4,7 @@
 # run_vemb_local_loopback_sweep.sh
 # 单实例本地回环 VEMB/VSIM/VADD/VREM 吞吐/延迟 sweep
 #   —— 同一 OP 下, baseline redis 与 hpc-redis 各跑一遍对比
-#   —— 17 档 (t,c,pipeline) 配置矩阵, 一次出 34 行 TSV 直接填评测报告表格
+#   —— 9 档 (t,c,pipeline) 配置矩阵, 一次出 34 行 TSV 直接填评测报告表格
 #
 # 用法:
 #   OP_TYPE=VEMB bash benchmark/run_vemb_local_loopback_sweep.sh   # 默认 VEMB
@@ -14,7 +14,7 @@
 #   TEST_TIME=3 OP_TYPE=VSIM bash ...                              # smoke 快验
 #   SERVERS_ONLY="baseline" OP_TYPE=VEMB bash ...                  # 只跑 baseline
 #
-# 17 档配置矩阵 (默认):
+# 9 档配置矩阵 (默认):
 #   - pipeline=1/4/8/16/32 (t=1 c=1)        5 档
 #   - t 翻倍到 64 (c=1 p=32)                6 档
 #   - c 递增到 64 (t=64 p=32)               6 档
@@ -83,13 +83,14 @@ CLIENT_CPUSET=${CLIENT_CPUSET:-96-191}
 NUMA_NODE_SERVER=${NUMA_NODE_SERVER:-0}
 NUMA_NODE_CLIENT=${NUMA_NODE_CLIENT:-1}
 
-# === 17 档配置矩阵 (并行数组 TS/CS/PS) ===
+# === 9 档配置矩阵 (并行数组 TS/CS/PS) ===
 # 默认完整跑; 可用 TS/CS/PS 环境变量覆盖 (空格分隔, 三数组等长)
 #   smoke: TS="1" CS="1" PS="1" bash ... (1 档)
 #   自定义: TS="1 64" CS="1 4" PS="1 32" bash ... (2 档)
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
+PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )

@@ -12,6 +12,7 @@
 #include "../../src/vemb_v16_batch_ring.h"
 #include "../../src/redisassert.h"
 #include "../../src/vemb_v16_util.h"
+#include "../../src/cpu_relax.h"
 /* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
  * public SDK header — so C++ consumers stay clean. */
 #include "../../src/vemb_v16_client_ring.h"
@@ -28,6 +29,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <sched.h>
 
 #ifdef USE_ARM_SVE
 #include <arm_sve.h>
@@ -97,6 +99,16 @@ typedef struct sdk_ub_channel {
     uint32_t pending_count;
     uint32_t pending_cap;
 } sdk_ub_channel_t;
+
+/* sdk_ub_poll 快路径自旋窗口 (ns), VEMB_V16_UB_POLL_SPIN_US 可调 (默认 300us);
+ * 覆盖典型 server 批处理 RTT (cluster key-key ~250us), 避免每批落进 1ms poll
+ * 睡眠。实测 300us 已到吞吐平台 (~540K ops/s), 更长窗口无收益 */
+static uint64_t ub_poll_spin_ns = 300000;
+__attribute__((constructor)) static void ub_poll_spin_init(void) {
+    const char *s = getenv("VEMB_V16_UB_POLL_SPIN_US");
+    if (s && *s)
+        ub_poll_spin_ns = (uint64_t)strtoull(s, NULL, 10) * 1000ull;
+}
 
 static int sdk_tcp_open_owner_channel(
     vemb_v16_data_channel_t *channel,
@@ -1525,10 +1537,13 @@ typedef struct sdk_handle_session_request {
     uint32_t l0_entry_id;
     uint32_t l0_generation;
     uint16_t key_len;
+    uint16_t key2_len;          /* VSIM_KEY_KEY 第二 key (仅 v1 路径) */
+    uint8_t op;                 /* v1 提交的 op (默认 VEMB_HANDLE) */
     uint8_t state;
     uint8_t l0_leader;
     uint8_t force_v1;
     char key[VEMB_V16_MAX_KEY_LEN];
+    char key2[VEMB_V16_MAX_KEY_LEN];
 } sdk_handle_session_request_t;
 
 struct vemb_v16_client_handle_session {
@@ -1573,6 +1588,7 @@ static int sdk_handle_session_finish(
         .bytes = response->vector_bytes,
         .dim = response->dim ? response->dim : session->client->dim,
         .region_id = response->region_id,
+        .score = response->score,
     };
     uint64_t caller_cookie = request->caller_cookie;
     if (response->status == VEMB_V16_STATUS_OK &&
@@ -1607,18 +1623,6 @@ static int sdk_handle_session_apply_response(
     if (action == VEMB_V16_CLUSTER_RESPONSE_FINAL)
         return sdk_handle_session_finish(session, request_id, response, cb,
                                          priv);
-
-    if (request->operation.operation_id <= 8 ||
-        request->operation.operation_id % 1024 == 0) {
-        fprintf(stderr,
-                "[sdk] handle requeue op=%llu request=%u status=%u action=%u "
-                "old_owner=%u epoch=%llu attempts=%u\n",
-                (unsigned long long)request->operation.operation_id,
-                request_id, response->status, action,
-                request->operation.target_owner,
-                (unsigned long long)request->operation.topology_epoch,
-                request->operation.attempts);
-    }
 
     request->state = SDK_HANDLE_SESSION_REQUEST_ROUTE;
     request->l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY;
@@ -1708,7 +1712,7 @@ static int sdk_handle_session_submit_v1(
     sdk_handle_session_request_t *request = &session->requests[request_id];
     sdk_backend_t *backend = &session->client->owner_channels[route->owner_id];
     vemb_v16_req_t wire_request = {
-        .op = VEMB_V16_OP_VEMB_HANDLE,
+        .op = request->op ? request->op : VEMB_V16_OP_VEMB_HANDLE,
         .flags = route->request_flags,
         .req_id = session->client->req_id++,
         .channel_id = backend->channel_id,
@@ -1719,6 +1723,12 @@ static int sdk_handle_session_submit_v1(
         .vector_bytes = session->client->dim * sizeof(float),
     };
     memcpy(wire_request.key, request->key, request->key_len);
+    if (request->key2_len) {
+        wire_request.key2_len = request->key2_len;
+        memcpy(wire_request.key2, request->key2, request->key2_len);
+        wire_request.key2_hash =
+            vemb_v16_xxh3_64_str(request->key2, request->key2_len);
+    }
     vemb_v16_transport_submission_t submission = {
         .operation_id = request->operation.operation_id,
         .wire_req_id = wire_request.req_id,
@@ -1891,24 +1901,6 @@ static uint32_t sdk_handle_session_route_requests(
         vemb_v16_cluster_prepare_result_t prepared =
             vemb_v16_cluster_core_prepare(&session->client->cluster,
                                           &request->operation, &route);
-        if (request->operation.operation_id <= 8 ||
-            request->operation.operation_id % 1024 == 0) {
-            const vemb_v16_client_topology_t *topology =
-                vemb_v16_cluster_core_topology(&session->client->cluster);
-            fprintf(stderr,
-                    "[sdk] handle route op=%llu request=%u prepared=%u "
-                    "owner=%u epoch=%llu attempts=%u force_v1=%u "
-                    "topology_epoch=%llu active_count=%u endpoint_count=%u\n",
-                    (unsigned long long)request->operation.operation_id,
-                    i, prepared, prepared == VEMB_V16_CLUSTER_PREPARE_READY ?
-                        route.owner_id : UINT32_MAX,
-                    prepared == VEMB_V16_CLUSTER_PREPARE_READY ?
-                        (unsigned long long)route.topology_epoch : 0ull,
-                    request->operation.attempts, request->force_v1,
-                    (unsigned long long)topology->current_topology_epoch,
-                    topology->active_ring.owner_count,
-                    topology->endpoint_count);
-        }
         if (prepared == VEMB_V16_CLUSTER_PREPARE_NEEDS_TOPOLOGY) {
             session->topology_refresh_pending = 1;
             return callbacks;
@@ -1920,14 +1912,6 @@ static uint32_t sdk_handle_session_route_requests(
             continue;
         }
         int channel_rc = ensure_owner_channel(session->client, route.owner_id);
-        if (request->operation.operation_id <= 8 ||
-            request->operation.operation_id % 1024 == 0) {
-            fprintf(stderr,
-                    "[sdk] handle route decision op=%llu owner=%u "
-                    "channel_rc=%d\n",
-                    (unsigned long long)request->operation.operation_id,
-                    route.owner_id, channel_rc);
-        }
         if (channel_rc != 0) {
             vemb_v16_resp_t error = sdk_handle_session_error_response();
             callbacks += sdk_handle_session_finish(session, i, &error, cb,
@@ -2228,10 +2212,55 @@ int vemb_v16_client_handle_session_submit(
     *request = (sdk_handle_session_request_t){
         .caller_cookie = caller_cookie,
         .key_len = (uint16_t)key_len,
+        .op = VEMB_V16_OP_VEMB_HANDLE,
         .state = SDK_HANDLE_SESSION_REQUEST_ROUTE,
         .l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY,
     };
     memcpy(request->key, key, key_len);
+    vemb_v16_cluster_operation_init(
+        &session->client->cluster, &request->operation,
+        vemb_v16_xxh3_64_str(request->key, request->key_len));
+    session->active_requests++;
+    return 0;
+}
+
+int vemb_v16_client_handle_session_submit_vsim_key_key(
+    vemb_v16_client_handle_session_t *session, const char *set_name,
+    const char *elem1, const char *elem2, uint64_t caller_cookie)
+{
+    RETURN_IF(session->closing ||
+              session->active_requests == SDK_HANDLE_SESSION_MAX_PENDING,
+              -1);
+    uint32_t request_id = SDK_HANDLE_SESSION_NO_ENTRY;
+    for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
+        if (session->requests[i].state == SDK_HANDLE_SESSION_REQUEST_FREE) {
+            request_id = i;
+            break;
+        }
+    }
+    assert(request_id != SDK_HANDLE_SESSION_NO_ENTRY);
+
+    char key1[VEMB_V16_MAX_KEY_LEN];
+    char key2[VEMB_V16_MAX_KEY_LEN];
+    uint32_t key_len, key2_len;
+    if (vemb_v16_build_combined_key(key1, sizeof(key1), set_name, elem1,
+                                    &key_len) != 0 ||
+        vemb_v16_build_combined_key(key2, sizeof(key2), set_name, elem2,
+                                    &key2_len) != 0)
+        return -1;
+    sdk_handle_session_request_t *request = &session->requests[request_id];
+    *request = (sdk_handle_session_request_t){
+        .caller_cookie = caller_cookie,
+        .key_len = (uint16_t)key_len,
+        .key2_len = (uint16_t)key2_len,
+        .op = VEMB_V16_OP_VSIM_KEY_KEY,
+        /* key-key 不走 L0/v2 batch (该协议仅承载 handle 读), 强制 v1 */
+        .force_v1 = 1,
+        .state = SDK_HANDLE_SESSION_REQUEST_ROUTE,
+        .l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY,
+    };
+    memcpy(request->key, key1, key_len);
+    memcpy(request->key2, key2, key2_len);
     vemb_v16_cluster_operation_init(
         &session->client->cluster, &request->operation,
         vemb_v16_xxh3_64_str(request->key, request->key_len));
@@ -3007,6 +3036,7 @@ static int client_execute_with_redirect(
         vemb_v16_client_t *client,
         uint8_t  op_type,
         const char *key, uint32_t key_len,
+        const char *key2, uint32_t key2_len,
         const float *payload, uint32_t dim,
         vemb_v16_resp_t *out_resp,
         uint8_t *out_inline, uint32_t out_inline_cap,
@@ -3061,12 +3091,20 @@ static int client_execute_with_redirect(
         req.key_hash = operation.key_hash;
         req.topology_epoch = route.topology_epoch;
         req.dim = dim;
+        if (key2_len > 0) {
+            req.key2_len = key2_len;
+            memcpy(req.key2, key2, key2_len);
+            req.key2_hash = vemb_v16_xxh3_64_str(key2, key2_len);
+        }
 
         switch (op_type) {
         case VEMB_V16_OP_VADD:
         case VEMB_V16_OP_VSIM_INLINE:
             req.vector_bytes = dim * sizeof(float);
             memcpy(req.vector, payload, req.vector_bytes);
+            break;
+        case VEMB_V16_OP_VSIM_KEY_KEY:
+            req.vector_bytes = dim * sizeof(float);
             break;
         case VEMB_V16_OP_VEMB_HANDLE:
         case VEMB_V16_OP_VEMB_INLINE:
@@ -3165,6 +3203,7 @@ static void pipeline_build_req(vemb_v16_req_t *req,
                                uint64_t topology_epoch,
                                uint32_t dim,
                                const char *key, uint32_t key_len,
+                               const char *key2, uint32_t key2_len,
                                const float *payload,
                                uint8_t ask_redirect_flag)
 {
@@ -3178,12 +3217,20 @@ static void pipeline_build_req(vemb_v16_req_t *req,
     req->key_hash = vemb_v16_xxh3_64_str(req->key, key_len);
     req->topology_epoch = topology_epoch;
     req->dim = dim;
+    if (key2_len > 0) {
+        req->key2_len = key2_len;
+        memcpy(req->key2, key2, key2_len);
+        req->key2_hash = vemb_v16_xxh3_64_str(key2, key2_len);
+    }
 
     switch (op_type) {
     case VEMB_V16_OP_VADD:
     case VEMB_V16_OP_VSIM_INLINE:
         req->vector_bytes = dim * sizeof(float);
         memcpy(req->vector, payload, req->vector_bytes);
+        break;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        req->vector_bytes = dim * sizeof(float);
         break;
     case VEMB_V16_OP_VEMB_HANDLE:
     case VEMB_V16_OP_VEMB_INLINE:
@@ -3412,6 +3459,7 @@ static int client_pipeline_execute_with_redirect(
         vemb_v16_client_t *client,
         uint8_t  op_type,
         const char **keys, const uint32_t *key_lens,
+        const char **keys2, const uint32_t *key2_lens,
         const float **payloads,        /* vectors for VADD/VSIM, NULL otherwise */
         uint32_t count,
         uint8_t  *out_entry_status,    /* [count], PIPE_ENTRY_* */
@@ -3548,6 +3596,8 @@ static int client_pipeline_execute_with_redirect(
                                        topology_epochs[src_idx],
                                        client->dim,
                                        keys[src_idx], key_lens[src_idx],
+                                       keys2 ? keys2[src_idx] : NULL,
+                                       key2_lens ? key2_lens[src_idx] : 0,
                                        payloads ? payloads[src_idx] : NULL,
                                        request_flags[src_idx]);
                     uint8_t *inline_vector = out_inline_bufs ?
@@ -3659,6 +3709,8 @@ static int client_pipeline_execute_with_redirect(
                                    client->req_id++, ask_target->channel_id,
                                    ask_route.topology_epoch, client->dim,
                                    keys[src_idx], key_lens[src_idx],
+                                   keys2 ? keys2[src_idx] : NULL,
+                                   key2_lens ? key2_lens[src_idx] : 0,
                                    payloads ? payloads[src_idx] : NULL,
                                    ask_route.request_flags);
                 uint8_t *inline_vector = out_inline_bufs ?
@@ -3770,6 +3822,7 @@ int vemb_v16_client_vadd(vemb_v16_client_t *c,
     vemb_v16_resp_t resp;
     if (client_execute_with_redirect(c, VEMB_V16_OP_VADD,
                                      combined, key_len,
+                                     NULL, 0,
                                      vector, dim,
                                      &resp, NULL, 0, NULL) != 0)
         return -1;
@@ -3796,6 +3849,7 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *c,
     vemb_v16_resp_t resp;
     if (client_execute_with_redirect(c, VEMB_V16_OP_VEMB_HANDLE,
                                      combined, key_len,
+                                     NULL, 0,
                                      NULL, c->dim,
                                      &resp, NULL, 0, NULL) != 0)
         return -1;
@@ -3826,6 +3880,7 @@ int vemb_v16_client_vrem(vemb_v16_client_t *c,
     if (client_execute_with_redirect(c, VEMB_V16_OP_VREM,
                                      combined, key_len,
                                      NULL, 0,
+                                     NULL, 0,
                                      &resp, NULL, 0, NULL) != 0)
         return -1;
 
@@ -3855,7 +3910,8 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
     uint32_t inline_bytes = 0;
     uint32_t inline_cap_bytes = out_cap * sizeof(float);
     if (client_execute_with_redirect(
-            c, c->vector_read_op, combined, key_len, NULL, c->dim,
+            c, c->vector_read_op, combined, key_len, NULL, 0,
+            NULL, c->dim,
             &resp, (uint8_t *)out_vector, inline_cap_bytes,
             &inline_bytes) != 0) {
         return -1;
@@ -3907,7 +3963,45 @@ int vemb_v16_client_vsim(vemb_v16_client_t *c,
     vemb_v16_resp_t resp;
     if (client_execute_with_redirect(c, VEMB_V16_OP_VSIM_INLINE,
                                      combined, key_len,
+                                     NULL, 0,
                                      query_vector, dim,
+                                     &resp, NULL, 0, NULL) != 0)
+        return -1;
+
+    if (resp.status == VEMB_V16_STATUS_NOT_FOUND)
+        return 1;
+    if (resp.status != VEMB_V16_STATUS_OK)
+        return -1;
+
+    *out_score = resp.score;
+    return 0;
+}
+
+int vemb_v16_client_vsim_key_key(vemb_v16_client_t *c,
+                                 const char *set_name,
+                                 const char *elem1,
+                                 const char *elem2,
+                                 uint32_t dim,
+                                 float *out_score)
+{
+    assert(out_score != NULL);
+    RETURN_IF(dim != c->dim, -1);
+
+    char combined1[VEMB_V16_MAX_KEY_LEN];
+    char combined2[VEMB_V16_MAX_KEY_LEN];
+    uint32_t key_len, key2_len;
+    if (vemb_v16_build_combined_key(combined1, sizeof(combined1),
+                                    set_name, elem1, &key_len) != 0)
+        return -1;
+    if (vemb_v16_build_combined_key(combined2, sizeof(combined2),
+                                    set_name, elem2, &key2_len) != 0)
+        return -1;
+
+    vemb_v16_resp_t resp;
+    if (client_execute_with_redirect(c, VEMB_V16_OP_VSIM_KEY_KEY,
+                                     combined1, key_len,
+                                     combined2, key2_len,
+                                     NULL, dim,
                                      &resp, NULL, 0, NULL) != 0)
         return -1;
 
@@ -3954,6 +4048,7 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
     if (client_pipeline_execute_with_redirect(
             c, VEMB_V16_OP_VADD,
             key_ptrs, key_lens,
+            NULL, NULL,
             payload_ptrs, count,
             status, NULL, max_inflight, NULL) != 0)
         return -1;
@@ -4008,6 +4103,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
     int engine_rc = client_pipeline_execute_with_redirect(
             c, VEMB_V16_OP_VEMB_INLINE,
             key_ptrs, key_lens,
+            NULL, NULL,
             NULL, count,
             status, aux, max_inflight, inline_ptrs);
 
@@ -4068,7 +4164,8 @@ int vemb_v16_client_vemb_handle_pipeline(vemb_v16_client_t *c,
     uint8_t status[count];
     vemb_v16_pipe_entry_aux_t aux[count];
     if (client_pipeline_execute_with_redirect(
-            c, VEMB_V16_OP_VEMB_HANDLE, key_ptrs, key_lens, NULL, count,
+            c, VEMB_V16_OP_VEMB_HANDLE, key_ptrs, key_lens, NULL, NULL,
+            NULL, count,
             status, aux, max_inflight, NULL) != 0) {
         return -1;
     }
@@ -4323,11 +4420,68 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
     if (client_pipeline_execute_with_redirect(
             c, VEMB_V16_OP_VSIM_INLINE,
             key_ptrs, key_lens,
+            NULL, NULL,
             payload_ptrs, count,
             status, aux, max_inflight, NULL) != 0)
         return -1;
 
     /* Translate engine status → out_scores. */
+    for (uint32_t i = 0; i < count; i++) {
+        switch (status[i]) {
+        case PIPE_ENTRY_OK:
+            out_scores[i] = aux[i].score;
+            break;
+        case PIPE_ENTRY_NOT_FOUND:
+            out_scores[i] = 0.0f;  /* sentinel for not-found */
+            break;
+        default:
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int vemb_v16_client_vsim_key_key_pipeline(vemb_v16_client_t *c,
+                                          const char **set_names,
+                                          const char **elem1_names,
+                                          const char **elem2_names,
+                                          uint32_t count,
+                                          float *out_scores,
+                                          uint32_t max_inflight)
+{
+    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    assert(set_names != NULL && elem1_names != NULL && elem2_names != NULL &&
+           out_scores != NULL);
+
+    char combined1[count][VEMB_V16_MAX_KEY_LEN];
+    char combined2[count][VEMB_V16_MAX_KEY_LEN];
+    uint32_t key_lens[count], key2_lens[count];
+    const char *key_ptrs[count];
+    const char *key2_ptrs[count];
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (vemb_v16_build_combined_key(combined1[i], VEMB_V16_MAX_KEY_LEN,
+                                        set_names[i], elem1_names[i],
+                                        &key_lens[i]) != 0)
+            return -1;
+        if (vemb_v16_build_combined_key(combined2[i], VEMB_V16_MAX_KEY_LEN,
+                                        set_names[i], elem2_names[i],
+                                        &key2_lens[i]) != 0)
+            return -1;
+        key_ptrs[i] = combined1[i];
+        key2_ptrs[i] = combined2[i];
+    }
+
+    uint8_t status[count];
+    vemb_v16_pipe_entry_aux_t aux[count];
+    if (client_pipeline_execute_with_redirect(
+            c, VEMB_V16_OP_VSIM_KEY_KEY,
+            key_ptrs, key_lens,
+            key2_ptrs, key2_lens,
+            NULL, count,
+            status, aux, max_inflight, NULL) != 0)
+        return -1;
+
     for (uint32_t i = 0; i < count; i++) {
         switch (status[i]) {
         case PIPE_ENTRY_OK:
@@ -5784,6 +5938,13 @@ static vemb_v16_transport_poll_result_t sdk_ub_poll(
 {
     sdk_ub_channel_t *state = sdk_ub_state(channel);
     uint32_t waited_ms = 0;
+    /* Poll fast-path deadline: busy-spin (cpu_relax) for SPIN_WINDOW_NS
+     * before falling back to 1 ms sleeps. Server batch RTT can reach
+     * several hundred µs (cluster key-key via shard queues + remote
+     * meta); a too-short window silently pays a full 1 ms sleep per
+     * batch. Polite yields proved too coarse, so this is a time-bounded
+     * relax spin. */
+    uint64_t spin_until_ns = 0;
 
     for (;;) {
         vemb_v16_resp_t response;
@@ -5819,8 +5980,20 @@ static vemb_v16_transport_poll_result_t sdk_ub_poll(
             return VEMB_V16_TRANSPORT_POLL_EMPTY;
         }
 
-        /* UB has no readable fd. Yield for one millisecond, then poll the
-         * response ring again; WAIT_FOREVER keeps the same pull contract. */
+        /* UB has no readable fd. Time-bounded cpu_relax spin (default
+         * 600 µs, VEMB_V16_UB_POLL_SPIN_US) covering typical server batch
+         * RTT, then fall back to the 1 ms sleep; WAIT_FOREVER keeps the
+         * same pull contract. */
+        if (waited_ms == 0) {
+            if (spin_until_ns == 0)
+                spin_until_ns = vemb_v16_monotonic_ns() + ub_poll_spin_ns;
+            if (vemb_v16_monotonic_ns() < spin_until_ns) {
+                for (int i = 0; i < 32; i++)
+                    cpu_relax();
+                continue;
+            }
+        }
+
         (void)poll(NULL, 0, 1);
         if (timeout_ms != VEMB_V16_TRANSPORT_WAIT_FOREVER)
             waited_ms++;

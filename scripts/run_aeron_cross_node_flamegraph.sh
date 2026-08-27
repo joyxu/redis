@@ -35,6 +35,24 @@ DIM="${DIM:-300}"
 MAX_VECTORS="${MAX_VECTORS:-131072}"
 NUM_KEYS="${NUM_KEYS:-100000}"
 KEY_PATTERN="${KEY_PATTERN:-R:R}"
+# OP_TYPE: VEMB(默认读) / VSIM_2KEY / VADD / VREM; VADD/VREM 自动切 ratio=1:0 + S:S
+OP_TYPE="${OP_TYPE:-VEMB}"
+WORKLOAD_OP_FLAG=""
+WORKLOAD_RATIO="0:1"
+case "$OP_TYPE" in
+    VEMB) ;;
+    VSIM)      WORKLOAD_OP_FLAG="--vemb-v16-vsim" ;;
+    VSIM_2KEY) WORKLOAD_OP_FLAG="--vemb-v16-vsim-key-key" ;;
+    VADD)      WORKLOAD_RATIO="1:0" ;;
+    VREM)      WORKLOAD_OP_FLAG="--vemb-v16-vrem"; WORKLOAD_RATIO="1:0" ;;
+    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VSIM_2KEY/VADD/VREM (got: $OP_TYPE)" >&2; exit 2 ;;
+esac
+if [ "$OP_TYPE" = "VADD" ] || [ "$OP_TYPE" = "VREM" ]; then
+    if [ "$KEY_PATTERN" != "S:S" ]; then
+        echo "NOTICE: OP_TYPE=$OP_TYPE forces KEY_PATTERN=S:S (was $KEY_PATTERN)" >&2
+        KEY_PATTERN="S:S"
+    fi
+fi
 ZIPF_S="${ZIPF_S:-}"
 RUN_ID="${RUN_ID:-}"
 KEY_PREFIX="${KEY_PREFIX:-item:}"
@@ -541,7 +559,7 @@ client_ssh bash -s -- \
     "$KEY_PREFIX" "$DIM" "$BATCH_REQUEST_SIZE" "$CLIENT_CPU_MASK" \
     "$CLIENT_REQUEST_UB_PATH" "$CLIENT_RESPONSE_UB_PATH" "$CLIENT_WARM_UB_PATH" \
     "$CLIENT_PEER_VIEW_MANIFEST" "$CLIENT_PEER_VIEW_HOST" "$CLIENT_PEER_VIEW_OWNER_ID" \
-    "$AERON_UB_CACHEABLE" <<'REMOTE_PREFILL'
+    "$AERON_UB_CACHEABLE" "$OP_TYPE" <<'REMOTE_PREFILL'
 set -euo pipefail
 
 root=$1
@@ -562,6 +580,7 @@ peer_view_manifest=$4
 peer_view_host=$5
 peer_view_owner_id=$6
 ub_cacheable=$7
+op_type=${17:-VEMB}
 export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
 
 for path in "$request_path" "$response_path" "$warm_path"; do
@@ -579,6 +598,11 @@ done
 
 mkdir -p "$run"
 cd "$root/memtier_benchmark"
+# VADD 本身即写入 (与 TCP cross-node sweep 同语义), 只校验 UB/peer-view 不 prefill
+if [ "$op_type" = "VADD" ]; then
+    echo "OP_TYPE=VADD skip prefill"
+    exit 0
+fi
 taskset -c "$cpu_mask" ./memtier_benchmark \
     --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port" \
     --threads=1 --clients=1 --pipeline="$batch_size" --requests="$keys" \
@@ -702,7 +726,7 @@ client_ssh bash -s -- \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" "$TEST_TIME" \
     "$CLIENT_CPU_MASK" "$FREQ" "$EVENT" "$FLAMEGRAPH_DIR" "$run_label" "$PROFILE" \
     "$CLIENT_PEER_VIEW_MANIFEST" "$CLIENT_PEER_VIEW_HOST" "$CLIENT_PEER_VIEW_OWNER_ID" \
-    "$AERON_UB_CACHEABLE" <<'REMOTE_CLIENT_PERF'
+    "$AERON_UB_CACHEABLE" "$WORKLOAD_OP_FLAG" "$WORKLOAD_RATIO" <<'REMOTE_CLIENT_PERF'
 set -euo pipefail
 
 root=$1
@@ -734,6 +758,8 @@ peer_view_manifest=${23}
 peer_view_host=${24}
 peer_view_owner_id=${25}
 ub_cacheable=${26}
+op_flag=${27:-}
+ratio=${28:-0:1}
 export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
 
 [ "$profile" = 0 ] || [ "$profile" = 1 ] || exit 1
@@ -789,7 +815,10 @@ BEGIN {
     materialized_fail += metric("materialized_fail")
 }
 END {
-    if (!have_totals || !have_cache_summary || !have_rss || leaders <= 0)
+    # leaders>0 only holds for the async session read path; sync ops
+    # (vsim / vsim-key-key / vrem / vadd) report ops but no leaders —
+    # gate on logical_ops instead and guard the fanout divide.
+    if (!have_totals || !have_cache_summary || !have_rss || logical_ops <= 0)
         exit 1
     emit("workload key results", "")
     emit("qps_ops_sec", sprintf("%.6f", qps))
@@ -797,7 +826,7 @@ END {
     emit("p50_ms", sprintf("%.6f", p50_ms))
     emit("p99_ms", sprintf("%.6f", p99_ms))
     emit("logical_ops", sprintf("%.0f", logical_ops))
-    emit("fanout", sprintf("%.6f", (leaders + followers) / leaders))
+    emit("fanout", sprintf("%.6f", leaders > 0 ? (leaders + followers) / leaders : 1.0))
     emit("status_ok", sprintf("%.0f", status_ok))
     emit("status_notfound", sprintf("%.0f", status_notfound))
     emit("status_err", sprintf("%.0f", status_err))
@@ -855,7 +884,7 @@ workload_cmd=(
     /bin/bash -c "$timed_workload_cmd" bash "$cpu_mask" ./memtier_benchmark
     --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port"
     --threads="$threads" --clients="$clients" --pipeline="$pipeline"
-    --ratio=0:1 --key-minimum=1 --key-maximum="$keys"
+    --ratio="$ratio" --key-minimum=1 --key-maximum="$keys"
     --key-pattern="$pattern" --key-prefix="$prefix" --vemb-v16-dim="$dim"
     --vemb-v16-handle --vemb-v16-transport=aeron
     --vemb-v16-ub-peer-view-manifest="$peer_view_manifest"
@@ -863,7 +892,7 @@ workload_cmd=(
     --vemb-v16-ub-peer-view-owner-id="$peer_view_owner_id"
     --vemb-v16-batch-request-size="$batch_size"
     --vemb-v16-batch-max-delay-us="$max_delay_us"
-    --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}"
+    --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}" $op_flag
 )
 if [ "$profile" = 1 ]; then
     perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
@@ -877,10 +906,14 @@ if grep -q 'Connection error' "$run/client.workload.log"; then
     exit 1
 fi
 grep -q '^\[common-core\] all workers joined$' "$run/client.workload.log"
-if grep -Eq 'status_(nf|err)=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' \
-    "$run/client.workload.log"; then
-    echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
-    exit 1
+# status_nf gate 只对读类 op 有效: VREM/VADD 的 S:S 会循环命中已删/已写 key,
+# not-found 是正常业务结果不是数据面故障
+if [ -z "$op_flag" ] || [ "$op_flag" != "--vemb-v16-vrem" ]; then
+    if grep -Eq 'status_(nf|err)=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' \
+        "$run/client.workload.log"; then
+        echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
+        exit 1
+    fi
 fi
 awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/client.workload.log"
@@ -962,14 +995,16 @@ BEGIN {
     materialized_fail += metric("materialized_fail")
 }
 END {
-    if (!have_totals || qps <= 0 || logical_ops <= 0 || leaders <= 0)
+    # leaders>0 only holds for the async session read path; sync ops
+    # (vsim / vsim-key-key / vrem / vadd) report ops but no leaders.
+    if (!have_totals || qps <= 0 || logical_ops <= 0)
         exit 1
     duration_sec = logical_ops / qps
     printf "%-32s\t%20s\n", "metric", "value"
     emit("test_time_sec", test_time)
     emitf("effective_duration_sec", "%.6f", duration_sec)
     emitf("logical_ops", "%.0f", logical_ops)
-    emitf("fanout", "%.6f", (leaders + followers) / leaders)
+    emitf("fanout", "%.6f", leaders > 0 ? (leaders + followers) / leaders : 1.0)
     emitf("qps_ops_sec", "%.6f", qps)
     emitf("hits_sec", "%.6f", hits_sec)
     emitf("misses_sec", "%.6f", misses_sec)

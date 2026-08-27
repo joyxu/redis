@@ -20,7 +20,7 @@
 #   hpc      — memtier --vemb-v16-vsim-key-key, 每 op = 2-key fetch + server cosine
 #
 # 用法:
-#   bash benchmark/run_vsim_2key_2node.sh                           # 完整 17 档
+#   bash benchmark/run_vsim_2key_2node.sh                           # 完整 9 档
 #   TEST_TIME=5 NUM_KEYS=1000 TS="64" CS="4" PS="32" \
 #     bash benchmark/run_vsim_2key_2node.sh                         # smoke
 #   SERVERS_ONLY=baseline bash benchmark/run_vsim_2key_2node.sh     # 只跑 baseline
@@ -62,10 +62,11 @@ HPC_SNW=${HPC_SNW:-2}
 HPC_MANIFEST_0=${HPC_MANIFEST_0:-$HPC_DIR/examples/cluster_vsim_111.yaml}
 HPC_MANIFEST_1=${HPC_MANIFEST_1:-$HPC_DIR/examples/cluster_vsim_112.yaml}
 
-# === 17 档配置矩阵 (跟 run_vemb_local_loopback_sweep.sh 一致) ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵 (跟 run_vemb_local_loopback_sweep.sh 一致) ===
+# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
+PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )

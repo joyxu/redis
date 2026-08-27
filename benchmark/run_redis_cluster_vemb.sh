@@ -2,14 +2,14 @@
 # baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_redis_cluster_vemb.sh
-# 4 节点原生 redis cluster (baseline redis-8.6.3) VEMB 吞吐/延迟 17 档 sweep
+# 4 节点原生 redis cluster (baseline redis-8.6.3) VEMB 吞吐/延迟 9 档 sweep
 #
 # 拓扑: HW01/HW02/HW05/HW04 每节点 1 个 redis 实例, cluster mode
 # 网络: 192.168.1.x (100G mlx5 直连), data port 7000, cluster bus 17000
 # 测试: prefill 多 vset -> memtier --cluster-mode VEMB
 #
 # 用法:
-#   bash benchmark/run_redis_cluster_vemb.sh                      # 默认 17 档
+#   bash benchmark/run_redis_cluster_vemb.sh                      # 默认 9 档
 #   TEST_TIME=10 bash benchmark/run_redis_cluster_vemb.sh         # smoke
 #   TS="64" CS="8" PS="32" bash benchmark/run_redis_cluster_vemb.sh  # 单档
 #   MEMTIER_HOST=HW07 bash benchmark/run_redis_cluster_vemb.sh    # 换客户端
@@ -50,10 +50,11 @@ DIM=${DIM:-300}
 # === CPU 绑核 ===
 CORES_PER_NODE=${CORES_PER_NODE:-96}
 
-# === 17 档配置矩阵 ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵 ===
+# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
+PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -475,7 +476,7 @@ check_cluster
 log "=== STEP 4: prefill ==="
 prefill
 
-log "=== STEP 5: VEMB 17-config sweep ==="
+log "=== STEP 5: VEMB 9-config sweep ==="
 log "  MEMTIER_HOST=$MEMTIER_HOST  NUM_VSETS=$NUM_VSETS  DIM=$DIM"
 printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 

@@ -1,0 +1,49 @@
+# Owner 1 @ 112.
+# dev12 is the sole local warm/meta export; dev10/dev11 are CLI rings.
+local_ub_node_id: 1
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev12
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 65536
+remote_meta_buckets: 131072
+ub_rpc_timeout_ms: 2000
+
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev12
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 12288
+    home_ub_node_id: 1
+    weight: 1
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev7
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 12288
+    home_ub_node_id: 0
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 0
+    provider: ub
+    path: /dev/obmm_shmdev7
+    mmap_offset: 268435456
+    entries: 65536
+    buckets: 131072
+
+ub_rpc_peers:
+  - owner_id: 0
+    provider: ub
+    request_path: /dev/obmm_shmdev9
+    request_mmap_offset: 134217728
+    response_path: /dev/obmm_shmdev8
+    response_mmap_offset: 201326592
+    inbound_request_path: /dev/obmm_shmdev8
+    inbound_request_mmap_offset: 134217728
+    outbound_response_path: /dev/obmm_shmdev9
+    outbound_response_mmap_offset: 201326592

@@ -33,7 +33,9 @@ NSHARDS=${NSHARDS:-1}
 mkdir -p "$OUT_DIR"
 TAG=$([ "$NOQUANT" = 1 ] && echo NOQUANT || echo INT8)
 SUF_SHARD=""; [ "$SCENE" = multi ] && [ "$NSHARDS" != 1 ] && SUF_SHARD="_sh$(printf '%02d' "$SHARD")"
-RDB_NAME="${NUM_KEYS}K_${DIM}D_${TAG}_${SET}_${SCENE}${SUF_SHARD}.rdb"
+# rand 场景不带后缀 (与消费脚本 myset 命名一致), multi 带 _multi_shNN
+SUF_SCENE=""; [ "$SCENE" != rand ] && SUF_SCENE="_${SCENE}"
+RDB_NAME="${NUM_KEYS}K_${DIM}D_${TAG}_${SET}${SUF_SCENE}${SUF_SHARD}.rdb"
 RDB_PATH="$OUT_DIR/$RDB_NAME"
 
 # 已存在则跳过 (FORCE=1 覆盖)
@@ -95,8 +97,7 @@ gen_pipe() {
             for (i=1; i<=n; i++) {
                 printf "VADD %s VALUES %d", set, dim;
                 for (j=0; j<dim; j++) printf " %f", rand()*j*0.001;
-                printf " item:%d%s
-", i, suf;
+                printf " item:%d%s\n", i, suf;
             }
         }'
     fi

@@ -4,7 +4,7 @@
 # 一档失败会触发 cleanup 杀全部 server。用 || true 兜底。
 #
 # ============================================================================
-# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis) - 17 档 sweep 版
+# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis) - 9 档 sweep 版
 #
 # 在 SERVER (HW01) 本地直接执行；跨节点时 ssh CLIENT 启 memtier。
 #
@@ -13,12 +13,12 @@
 # N 个 memtier 并行打，各连各的端口，汇总吞吐
 #
 # 跟 run_vemb_{local_loopback,cross_node}_sweep.sh 对齐:
-#   - 17 档 (t,c,pipeline) 配置矩阵（TS/CS/PS 数组）
+#   - 9 档 (t,c,pipeline) 配置矩阵（TS/CS/PS 数组）
 #   - server 启动参数对齐（--bind 0.0.0.0 / --tcp-backlog 16384 / --appendonly no / --save ''）
 #   - 输出 TSV 列对齐 sweep 脚本（op/server_type/t/c/pipeline/ops_sec/avg/p50/p99/kb_sec/cores/nic_util）
 #
 # 用法 (在 HW01 上执行):
-#   bash run_multi_instance_redis_baseline.sh                                 # 默认 17 档, 跨节点
+#   bash run_multi_instance_redis_baseline.sh                                 # 默认 9 档, 跨节点
 #   TS="64" CS="4" PS="32" bash ...                                          # 单档调试
 #   LOCAL_BENCH=1 RAW=1 DIM=300 bash ...                                     # 本地回环 + RAW
 #   DIM=8 NIC_IFACE=eth4 bash ...                                            # 跨节点 DIM=8
@@ -47,10 +47,11 @@ RAW_SUFFIX=""
 [ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
 NIC_IFACE=${NIC_IFACE:-eth4}
 
-# === 17 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
+# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
+PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )

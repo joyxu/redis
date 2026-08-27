@@ -42,7 +42,9 @@
 #define VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US 100000u
 #define VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS 1000u
 #define VEMB_V16_READ_JOB_POOL_SLOTS 1024u
-#define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
+/* 256 在高并发突发下 (≥64 client-slots × 32 pipeline) 热点 worker 瞬间打满
+ * → alloc 失败直接回 ERR (client status_err ~70%+). 提到与 READ 同量级. */
+#define VEMB_V16_VSIM_JOB_POOL_SLOTS 2048u
 #define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
 #define VEMB_V16_SUPERNODE_IDLE_SPIN_NS 5000ULL
 #define VEMB_V16_SUPERNODE_IDLE_CLOCK_CHECK_ROUNDS 32u
@@ -1363,8 +1365,16 @@ static int prepare_request_job(vemb_v16_channel_t *ch,
         &ch->proxy->proxy_io_workers[proxy_io_worker_id].job_pools[pool_type];
     uint32_t slot_id = 0;
     if (job_pool_alloc_slot(pool, &slot_id) != 0) {
+        /* 池满: 高并发突发时 supernode 正在消费, 短暂自旋等释放
+         * 而不是立刻回 ERR (client 侧表现为 status_err) */
+        for (uint32_t retry = 0; retry < 8; retry++) {
+            cpu_relax();
+            if (job_pool_alloc_slot(pool, &slot_id) == 0)
+                goto alloc_ok;
+        }
         return -1;
     }
+alloc_ok:
     GOTO_IF(fill_job_slot(pool,
                           slot_id,
                           ch,
@@ -2224,9 +2234,12 @@ static void close_channel_locked(vemb_v16_channel_t *ch) {
 }
 
 static void close_channel(vemb_v16_channel_t *ch) {
-    pthread_mutex_lock(&ch->proxy->channel_lifecycle_lock);
+    /* close_channel_locked 末尾的 reset_closed_channel 会把 ch->proxy 清 NULL,
+     * 必须先保存指针再解引用, 否则 unlock 段错误 (NULL + 锁偏移) */
+    vemb_v16_proxy_t *proxy = ch->proxy;
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
     close_channel_locked(ch);
-    pthread_mutex_unlock(&ch->proxy->channel_lifecycle_lock);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
 }
 
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {

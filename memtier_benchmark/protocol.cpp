@@ -18,6 +18,7 @@
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
+#include "vemb_v16_vector_gen.h"
 #endif
 
 #include <stdlib.h>
@@ -1710,7 +1711,10 @@ int vemb_v16_protocol::write_command_set(const char *key, int key_len,
     req.vector_bytes = vector_bytes;
     memcpy(req.key, key, actual_key_len);
     req.key_hash = vemb_v16_xxh3_64_str(req.key, req.key_len);
-    memcpy(req.vector, value, vector_bytes);
+    /* 向量自生成 (与通用 value/32B dummy 解耦, 见 vemb_v16_vector_gen.h):
+     * 任意 dim 无越界, 且与 aeron transport 写入逐字节一致 */
+    vemb_v16_fill_vector(req.vector, m_dim, req.req_id);
+    (void)value; (void)value_len;
 
     size_t payload_len_actual = 0;
     if (vemb_v16_req_encode((uint8_t *)vec[0].iov_base + sizeof(vemb_v16_net_hdr_t),
