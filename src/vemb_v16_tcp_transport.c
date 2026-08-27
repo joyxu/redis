@@ -1181,6 +1181,24 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
         return;
     }
 
+    if (hdr.type == VEMB_V16_NET_DIAGNOSTIC_STATS) {
+        if (hdr.payload_len != 0) {
+            close(fd);
+            return;
+        }
+        vemb_v16_diagnostic_stats_t stats;
+        vemb_v16_proxy_get_diagnostic_stats(proxy, &stats);
+        vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_DIAGNOSTIC_STATS,
+                                 0,
+                                 0,
+                                 0,
+                                 &stats,
+                                 sizeof(stats));
+        close(fd);
+        return;
+    }
+
     if (hdr.type == VEMB_V16_NET_CLOSE_CHANNEL) {
         if (hdr.payload_len != 0) {
             close(fd);

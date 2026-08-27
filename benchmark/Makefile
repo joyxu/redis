@@ -163,6 +163,9 @@ vemb_v16_cli_local_completion_ut: vemb_v16_cli_local_completion_ut.cpp ../memtie
 	$(CXX) -O2 -Wall -Wextra -std=gnu++11 -I../memtier_benchmark -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/build/libvemb_v16_client.a -lpthread -lm
 	./$@
 
+vemb_v16_warm_copy_latency_ut: vemb_v16_warm_copy_latency_ut.c ../clients/c/vemb_v16_client_sdk.h ../clients/c/build/libvemb_v16_client.a
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/build/libvemb_v16_client.a -lpthread -lm
+
 vemb_v16_cli_l1_materialization_ut: vemb_v16_cli_l1_materialization_ut.c ../clients/c/vemb_v16_aeron_batch_client.c ../clients/c/vemb_v16_cli_l0.c ../clients/c/vemb_v16_cli_l1.c ../clients/c/vemb_v16_client_sdk.c ../clients/c/vemb_v16_cluster_core.c ../clients/c/vemb_v16_owner_session.c ../clients/c/vemb_v16_ub_peer_view.c ../src/redisassert.c
 	$(CC) -O2 -Wall -Wextra -std=gnu11 -DVEMB_V16_CLIENT_SDK -I../clients/c -I../clients/c/internal -I../src -o $@ $< ../clients/c/vemb_v16_cli_l0.c ../clients/c/vemb_v16_cli_l1.c ../clients/c/vemb_v16_client_sdk.c ../clients/c/vemb_v16_cluster_core.c ../clients/c/vemb_v16_owner_session.c ../clients/c/vemb_v16_ub_peer_view.c ../src/vemb_v16_net.c ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/monotonic.c ../src/redisassert.c -lpthread -lm
 	./$@

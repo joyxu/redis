@@ -114,6 +114,13 @@ uint32_t vemb_v16_cli_l0_pending_frame_bytes(
 int vemb_v16_cli_l0_publish_batch(vemb_v16_cli_l0_t *l0,
                                    const vemb_v16_cli_l0_batch_draft_t *draft,
                                    uint64_t batch_id);
+void vemb_v16_cli_l0_set_batch_publish_ns(vemb_v16_cli_l0_t *l0,
+                                           uint32_t channel_index,
+                                           uint64_t batch_id,
+                                           uint64_t publish_ns);
+uint64_t vemb_v16_cli_l0_get_batch_publish_ns(
+    vemb_v16_cli_l0_t *l0, uint32_t channel_index,
+    uint64_t batch_id);
 
 /* Resolve one response item to a live group. Returns 1 once, 0 for a
  * duplicate item, and -1 for stale/unknown identity. */

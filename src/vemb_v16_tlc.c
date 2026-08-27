@@ -219,8 +219,7 @@ static void make_handle(vemb_v16_tlc_t *tlc,
 }
 
 static void tlc_counter_add(atomic_uint_fast64_t *counter, uint64_t value) {
-    (void)counter;
-    (void)value;
+    atomic_fetch_add_explicit(counter, value, memory_order_relaxed);
 }
 
 static uint64_t tlc_counter_load(atomic_uint_fast64_t *counter) {
@@ -255,6 +254,10 @@ static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->remote_meta_repair_enqueue, 0);
     atomic_init(&tlc->remote_meta_repair_ok, 0);
     atomic_init(&tlc->remote_meta_repair_drop, 0);
+    atomic_init(&tlc->handle_lookup_miss, 0);
+    atomic_init(&tlc->handle_lookup_miss_not_found, 0);
+    atomic_init(&tlc->handle_lookup_miss_moved, 0);
+    atomic_init(&tlc->handle_lookup_miss_stale, 0);
 }
 
 int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
@@ -2148,4 +2151,29 @@ void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
     stats->remote_meta_repair_enqueue = tlc_counter_load(&tlc->remote_meta_repair_enqueue);
     stats->remote_meta_repair_ok = tlc_counter_load(&tlc->remote_meta_repair_ok);
     stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);
+}
+
+void vemb_v16_tlc_note_handle_lookup_miss(vemb_v16_tlc_t *tlc,
+                                          uint8_t status) {
+    tlc_counter_add(&tlc->handle_lookup_miss, 1);
+    if (status == VEMB_V16_STATUS_MOVED)
+        tlc_counter_add(&tlc->handle_lookup_miss_moved, 1);
+    else if (status == VEMB_V16_STATUS_STALE_TOPOLOGY)
+        tlc_counter_add(&tlc->handle_lookup_miss_stale, 1);
+    else if (status == VEMB_V16_STATUS_NOT_FOUND)
+        tlc_counter_add(&tlc->handle_lookup_miss_not_found, 1);
+}
+
+void vemb_v16_tlc_get_lookup_diagnostic_stats(
+    vemb_v16_tlc_t *tlc,
+    vemb_v16_tlc_lookup_diagnostic_stats_t *stats) {
+    *stats = (vemb_v16_tlc_lookup_diagnostic_stats_t){
+        .handle_lookup_miss = tlc_counter_load(&tlc->handle_lookup_miss),
+        .handle_lookup_miss_not_found = tlc_counter_load(
+            &tlc->handle_lookup_miss_not_found),
+        .handle_lookup_miss_moved = tlc_counter_load(
+            &tlc->handle_lookup_miss_moved),
+        .handle_lookup_miss_stale = tlc_counter_load(
+            &tlc->handle_lookup_miss_stale),
+    };
 }
