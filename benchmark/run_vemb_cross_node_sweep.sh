@@ -80,10 +80,10 @@ BASELINE_SERVER_CPUSET=${BASELINE_SERVER_CPUSET:-31-38}
 HPC_SERVER_CPUSET=${HPC_SERVER_CPUSET:-41-48}
 
 # === 9 档配置矩阵 (跟本地脚本一致) ===
-# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
-TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
-CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
-PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )

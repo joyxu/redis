@@ -8,7 +8,7 @@
 # 在本地 Mac 执行（管理面走外网转发口，数据面走 111/112 内网）:
 #   REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis \
 #     bash benchmark/vemb_v16_aeron_cluster_tput.sh
-# 默认 9 档矩阵 (1,1,1)...(64,64,32); 单档: SWEEP=0 TS=64 CS=4 PS=32 TEST_TIME=30
+# 默认 7 档矩阵 (1,1,1)...(64,16,32); 单档: SWEEP=0 TS=64 CS=4 PS=32 TEST_TIME=30
 # OP_TYPE=VSIM_2KEY 跑双 key 余弦对比 (报告 3.2.7 HPC Aeron)
 set -euo pipefail
 
@@ -46,6 +46,8 @@ NODE0_AERON_REQUEST_PATH="${NODE0_AERON_REQUEST_PATH:-/dev/obmm_shmdev1}"
 NODE0_AERON_RESPONSE_PATH="${NODE0_AERON_RESPONSE_PATH:-/dev/obmm_shmdev2}"
 NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev10}"
 NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev11}"
+# CLI@111 侧看到的 owner1 响应环窗口 (dev11@112 == dev15@111, 实测镜像关系)
+NODE1_AERON_RESPONSE_CLIENT_PATH="${NODE1_AERON_RESPONSE_CLIENT_PATH:-/dev/obmm_shmdev15}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 LOCAL_RESULT_DIR="${LOCAL_RESULT_DIR:-$ROOT_DIR/benchmark/results/aeron_cluster/$RUN_ID}"
@@ -113,7 +115,7 @@ if [ "$USE_EXTERNAL_UB_CONFIG" = "1" ]; then
                [ -f "$ROOT_DIR/examples/vemb_v16_ub_cluster_111_to_112_${n}${DIM_SUFFIX}.yaml" ] ||                    die "missing dim manifest: vemb_v16_ub_cluster_111_to_112_${n}${DIM_SUFFIX}.yaml"
            done ;;
     esac
-    ssh_run "$NODE0_HOST" "cp '$UB_CONFIG_DIR/vemb_v16_ub_cluster_111_to_112_node0${DIM_SUFFIX}.yaml' '$NODE0_MANIFEST' && cp '$UB_CONFIG_DIR/vemb_v16_ub_cluster_111_to_112_node0_peer_map.yaml' '$NODE0_PEER_MAP'"
+    ssh_run "$NODE0_HOST" "cp '$UB_CONFIG_DIR/vemb_v16_ub_cluster_111_to_112_node0${DIM_SUFFIX}.yaml' '$NODE0_MANIFEST' && cp '$UB_CONFIG_DIR/vemb_v16_ub_cluster_111_to_112_node0_peer_map${DIM_SUFFIX}.yaml' '$NODE0_PEER_MAP'"
     ssh_run "$NODE1_HOST" "cp '$UB_CONFIG_DIR/vemb_v16_ub_cluster_111_to_112_node1${DIM_SUFFIX}.yaml' '$NODE1_MANIFEST'"
 else
     die "fallback manifest generation not supported; keep USE_EXTERNAL_UB_CONFIG=1"
@@ -179,7 +181,12 @@ peer_views:
     client_path: $NODE0_AERON_RESPONSE_PATH
     map_from_start: true
 YAML
-sed -n '/^  - client_host: 111$/,\$p' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
+# owner1 response 条目重写: examples yaml 编码的是 scaleout 布局 (server resp
+# 在 dev15@112), 本脚本 rings 落在 dev10/dev11@112, provider 需为 ATTACH 广播值
+# ($NODE1_AERON_RESPONSE_PATH), client 需为 111 侧同窗口视图 dev15。
+sed -n '/^  - client_host: 111$/,\$p' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' \
+  | sed -e 's|^    provider_path: /dev/obmm_shmdev15$|    provider_path: $NODE1_AERON_RESPONSE_PATH|' \
+        -e 's|^    client_path: /dev/obmm_shmdev11$|    client_path: $NODE1_AERON_RESPONSE_CLIENT_PATH|' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
 
 # ── P3: start servers ──────────────────────────────────────────────────────
 start_server() {
@@ -212,18 +219,18 @@ PREFILL_OUT="$REMOTE_RESULT_DIR/prefill.out"
 ssh_run "$NODE0_HOST" "cd '$REMOTE_DIR' && numactl --membind=1 taskset -c 96-191 '$MEMTIER' --protocol=vemb_v16 --vemb-v16-dim='$DIM' --vemb-v16-handle --vemb-v16-transport=aeron --vemb-v16-ub-peer-view-manifest='$CLIENT_PEER_MANIFEST' --vemb-v16-ub-peer-view-client-host=111 --vemb-v16-ub-peer-view-owner-id=1 --vemb-v16-endpoints='$NODE0_HOST:$SERVER_PORT,$NODE1_HOST:$SERVER_PORT' --threads=1 --clients=1 --pipeline=32 --requests='$NUM_KEYS' --ratio=1:0 --key-pattern=S:S --key-prefix=item: --key-minimum=1 --key-maximum='$NUM_KEYS' >'$PREFILL_OUT' 2>&1"
 ssh_run "$NODE0_HOST" "grep -q '^Totals' '$PREFILL_OUT' && ! grep -Eq 'status_(nf|err)=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' '$PREFILL_OUT'" || die "prefill failed correctness checks: $PREFILL_OUT"
 
-# ── P6: bench (9 档矩阵 × OP_TYPE) ─────────────────────────────────────────
-# 9 档精简矩阵 (与 TCP sweep 脚本一致); SWEEP=0 时用单档 (TS/CS/PS, 默认取
-# MEMTIER_T/MEMTIER_C/PIPELINE 兼容旧用法); SWEEP=1 (默认) 忽略单值跑 9 档,
+# ── P6: bench (7 档矩阵 × OP_TYPE) ─────────────────────────────────────────
+# 7 档精简矩阵 (与 TCP sweep 脚本一致); SWEEP=0 时用单档 (TS/CS/PS, 默认取
+# MEMTIER_T/MEMTIER_C/PIPELINE 兼容旧用法); SWEEP=1 (默认) 忽略单值跑 7 档,
 # 除非显式传了多值 TS/CS/PS (空格分隔, 三数组等长)。
 TS=( ${TS:-} )
 CS=( ${CS:-} )
 PS=( ${PS:-} )
 SWEEP=${SWEEP:-1}
 if [ "$SWEEP" = "1" ] && [ "${#TS[@]}" -le 1 ] && [ "${#CS[@]}" -le 1 ] && [ "${#PS[@]}" -le 1 ]; then
-    TS=( 1  1  4 16 64 64 64 32 64)
-    CS=( 1  1  1  1  1  4 16 32 64)
-    PS=( 1 32 32 32 32 32 32 32 32)
+    TS=( 1  1  4 16 64 64 64)
+    CS=( 1  1  1  1  1  4 16)
+    PS=( 1 32 32 32 32 32 32)
 fi
 [ "${#TS[@]}" -ge 1 ] || TS=( ${MEMTIER_T:-64} )
 [ "${#CS[@]}" -ge 1 ] || CS=( ${MEMTIER_C:-4} )

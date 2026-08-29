@@ -12,6 +12,9 @@ warm_regions:
     provider: ub
     path: /dev/obmm_shmdev4
     mmap_offset: 0
+    # Keep at 1GiB: warm layout stride ≈ 2×value_size, so the reset mmap is
+    # ~2×bytes; 7GiB (dim300 sizing) maps ~14GiB on shmdev4 and exceeds the
+    # device capacity, failing server startup.
     bytes: 1073741824
     value_size: 32
     home_ub_node_id: 0

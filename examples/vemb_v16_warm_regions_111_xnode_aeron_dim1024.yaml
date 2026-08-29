@@ -12,7 +12,7 @@ warm_regions:
     provider: ub
     path: /dev/obmm_shmdev4
     mmap_offset: 0
-    bytes: 4294967296
+    bytes: 7516192768
     value_size: 4096
     home_ub_node_id: 0
     weight: 1

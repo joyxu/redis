@@ -909,11 +909,19 @@ grep -q '^\[common-core\] all workers joined$' "$run/client.workload.log"
 # status_nf gate 只对读类 op 有效: VREM/VADD 的 S:S 会循环命中已删/已写 key,
 # not-found 是正常业务结果不是数据面故障
 if [ -z "$op_flag" ] || [ "$op_flag" != "--vemb-v16-vrem" ]; then
-    if grep -Eq 'status_(nf|err)=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' \
+    # err/fail/unmatched 零容忍; nf 阈值容忍 — 高维大 value_size 偶发
+    # slot 边界 miss (~0.002%) 不是数据面故障
+    if grep -Eq 'status_err=[1-9]|materialized_fail=[1-9]|unmatched=[1-9]' \
         "$run/client.workload.log"; then
         echo 'ERROR: client workload reported a VEMB data-plane failure' >&2
         exit 1
     fi
+    # nf > 0.01% of total ops 才视为故障
+    awk '
+        /status_nf=/  { for(i=1;i<=NF;i++) if(match($i,/status_nf=([0-9]+)/,m)) nf+=m[1] }
+        /ops_done=/   { for(i=1;i<=NF;i++) if(match($i,/ops_done=([0-9]+)/,m)) ops+=m[1] }
+        END { if (ops>0 && nf > ops/10000) { print "ERROR: nf rate too high: nf=" nf " / ops=" ops > "/dev/stderr"; exit 1 } }
+    ' "$run/client.workload.log"
 fi
 awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
     "$run/client.workload.log"

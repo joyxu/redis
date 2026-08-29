@@ -63,10 +63,10 @@ HPC_MANIFEST_0=${HPC_MANIFEST_0:-$HPC_DIR/examples/cluster_vsim_111.yaml}
 HPC_MANIFEST_1=${HPC_MANIFEST_1:-$HPC_DIR/examples/cluster_vsim_112.yaml}
 
 # === 9 档配置矩阵 (跟 run_vemb_local_loopback_sweep.sh 一致) ===
-# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
-TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
-CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
-PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )

@@ -87,10 +87,10 @@ NUMA_NODE_CLIENT=${NUMA_NODE_CLIENT:-1}
 # 默认完整跑; 可用 TS/CS/PS 环境变量覆盖 (空格分隔, 三数组等长)
 #   smoke: TS="1" CS="1" PS="1" bash ... (1 档)
 #   自定义: TS="1 64" CS="1 4" PS="1 32" bash ... (2 档)
-# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
-TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
-CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
-PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -281,7 +281,7 @@ prefill() {
         [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-                -s 127.0.0.1 -p $hpc_mport -t 8 -c 1 --test-time=$prefill_sec \
+                -s 127.0.0.1 -p $hpc_mport -t 64 -c 1 --pipeline=32 --test-time=$prefill_sec \
                 --ratio=1:0 --key-pattern=S:S --key-prefix=$prefix \
                 --key-minimum=$kmin --key-maximum=$kmax \
                 > "$RAWDIR/${server_type}_${OP_TYPE}_prefill.log" 2>&1

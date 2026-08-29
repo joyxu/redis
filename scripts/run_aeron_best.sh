@@ -135,10 +135,10 @@ SERVER_MASK=${SERVER_MASK:-"0-47"}
 CLIENT_MASK=${CLIENT_MASK:-"96-191"}
 
 # === 配置矩阵 ===
-# 9 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
-TS_DEFAULT=( 1  1  4 16 64 64 64 32 64)
-CS_DEFAULT=( 1  1  1  1  1  4 16 32 64)
-PS_DEFAULT=( 1 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PIPELINE:-${PS_DEFAULT[*]}} )

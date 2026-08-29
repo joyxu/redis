@@ -35,19 +35,19 @@ SERVERS_ONLY=baseline OP_TYPE=VREM      bash benchmark/run_vemb_local_loopback_s
 hpc TCP【HW01 执行】（4 条）：
 
 ```bash
-SERVERS_ONLY=hpc OP_TYPE=VEMB      bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VADD      bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VREM      bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB      bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VADD      bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VREM      bash benchmark/run_vemb_local_loopback_sweep.sh
 ```
 
 hpc Aeron【HW01 执行，RUN_LOCAL=1】（4 条；VADD 免 prefill，非 VEMB 每档重启 server + prefill）：
 
 ```bash
-RUN_LOCAL=1 TEST_TIME=20 OP_TYPE=VEMB      bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 TEST_TIME=20 OP_TYPE=VSIM_2KEY bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 TEST_TIME=20 OP_TYPE=VADD      bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 TEST_TIME=20 OP_TYPE=VREM      bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VEMB      bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VSIM_2KEY bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VADD      bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VREM      bash scripts/run_aeron_best.sh
 ```
 
 产物 TSV：TCP/baseline 在 `benchmark/results/<op小写>_loopback_sweep/<时间戳>/summary.tsv`；Aeron 在 `perf/aeron_sweep/<run-id>/summary.tsv`。
@@ -65,17 +65,17 @@ SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD
 hpc TCP【HW01 执行】：
 
 ```bash
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
 ```
 
 hpc Aeron【HW01 执行，RUN_LOCAL=1】：
 
 ```bash
-RUN_LOCAL=1 DIM=1024 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 DIM=2048 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 DIM=3072 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 DIM=1024 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 DIM=2048 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=2:2 DIM=3072 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash scripts/run_aeron_best.sh
 ```
 
 ### 1.3 跨节点 VEMB / VSIM_2KEY
@@ -90,18 +90,18 @@ SERVERS_ONLY=baseline OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_cross_node_sweep
 hpc TCP【HW01 执行，脚本 ssh 到 HW02 起 memtier】：
 
 ```bash
-SERVERS_ONLY=hpc OP_TYPE=VEMB bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VSIM_2KEY bash benchmark/run_vemb_cross_node_sweep.sh
 ```
 
-hpc Aeron【本地 Mac 执行】（单次单档、外层 9 档循环）：
+hpc Aeron【本地 Mac 执行】（单次单档、外层 7 档循环）：
 
 ```bash
-TS_l=( 1  1  4 16 64 64 64 32 64); CS_l=( 1  1  1  1  1  4 16 32 64); PS_l=( 1 32 32 32 32 32 32 32 32)
+TS_l=( 1  1  4 16 64 64 64); CS_l=( 1  1  1  1  1  4 16); PS_l=( 1 32 32 32 32 32 32)
 for OP in VEMB VSIM_2KEY; do
-    for i in $(seq 0 8); do
+    for i in $(seq 0 6); do
         OP_TYPE=$OP THREADS=${TS_l[$i]} CLIENTS=${CS_l[$i]} PIPELINE=${PS_l[$i]} \
-        PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 \
+        PROFILE=0 TEST_TIME=30 PIO=2 SNW=2 \
         SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
         CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
         SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
@@ -125,17 +125,17 @@ SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD
 hpc TCP【HW01 执行】：
 
 ```bash
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=2 HPC_SNW=2 OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_cross_node_sweep.sh
 ```
 
 hpc Aeron【本地 Mac 执行】：
 
 ```bash
-OP_TYPE=VEMB DIM=1024 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim1024.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
-OP_TYPE=VEMB DIM=2048 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim2048.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
-OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim3072.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+OP_TYPE=VEMB DIM=1024 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=2 SNW=2 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim1024.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+OP_TYPE=VEMB DIM=2048 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=2 SNW=2 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim2048.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=2 SNW=2 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim3072.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
 ```
 
 ---
@@ -158,9 +158,9 @@ LOCAL_BENCH=1 RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=300 bash run_multi_instanc
 ```bash
 # hpc TCP 17:17【HW01 执行】
 SERVERS_ONLY=hpc OP_TYPE=VEMB HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 DIM=300 TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
-# hpc Aeron 17:17【本地 Mac 执行】（9 档循环）
-TS_l=( 1  1  4 16 64 64 64 32 64); CS_l=( 1  1  1  1  1  4 16 32 64); PS_l=( 1 32 32 32 32 32 32 32 32)
-for i in $(seq 0 8); do
+# hpc Aeron 17:17【本地 Mac 执行】（7 档循环）
+TS_l=( 1  1  4 16 64 64 64); CS_l=( 1  1  1  1  1  4 16); PS_l=( 1 32 32 32 32 32 32)
+for i in $(seq 0 6); do
     THREADS=${TS_l[$i]} CLIENTS=${CS_l[$i]} PIPELINE=${PS_l[$i]} \
     PROFILE=0 TEST_TIME=30 PIO=17 SNW=17 \
     SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
@@ -177,9 +177,9 @@ RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=300 NIC_IFACE=eth4 bash run_multi_instan
 ```bash
 # hpc TCP 17:17【HW01 执行】（脚本自动切 dim8 manifest）
 SERVERS_ONLY=hpc OP_TYPE=VEMB HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 DIM=8 TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
-# hpc Aeron 17:17【本地 Mac 执行】（9 档循环）
-TS_l=( 1  1  4 16 64 64 64 32 64); CS_l=( 1  1  1  1  1  4 16 32 64); PS_l=( 1 32 32 32 32 32 32 32 32)
-for i in $(seq 0 8); do
+# hpc Aeron 17:17【本地 Mac 执行】（7 档循环）
+TS_l=( 1  1  4 16 64 64 64); CS_l=( 1  1  1  1  1  4 16); PS_l=( 1 32 32 32 32 32 32)
+for i in $(seq 0 6); do
     DIM=8 THREADS=${TS_l[$i]} CLIENTS=${CS_l[$i]} PIPELINE=${PS_l[$i]} \
     PROFILE=0 TEST_TIME=30 PIO=17 SNW=17 \
     SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
@@ -194,35 +194,35 @@ RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=8 NIC_IFACE=eth4 bash run_multi_instance
 ### 2.4 本地回环 64x1x32 高维（DIM=1024/2048/3072）【全部 HW01 执行】
 
 ```bash
-# baseline
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-# hpc TCP【HW01 执行】
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_local_loopback_sweep.sh
-# hpc Aeron【RUN_LOCAL=1】
-RUN_LOCAL=1 DIM=1024 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 DIM=2048 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash scripts/run_aeron_best.sh
-RUN_LOCAL=1 DIM=3072 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash scripts/run_aeron_best.sh
+# baseline 12 实例【HW01 执行】
+LOCAL_BENCH=1 RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=1024 bash run_multi_instance_redis_baseline.sh
+LOCAL_BENCH=1 RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=2048 bash run_multi_instance_redis_baseline.sh
+LOCAL_BENCH=1 RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=3072 bash run_multi_instance_redis_baseline.sh
+# hpc TCP 17:17【HW01 执行】
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml TEST_TIME=30 bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml TEST_TIME=30 bash benchmark/run_vemb_local_loopback_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml TEST_TIME=30 bash benchmark/run_vemb_local_loopback_sweep.sh
+# hpc Aeron 17:17【HW01 执行，RUN_LOCAL=1】
+RUN_LOCAL=1 WORKERS=17:17 SERVER_MASK=0-47 DIM=1024 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=17:17 SERVER_MASK=0-47 DIM=2048 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash scripts/run_aeron_best.sh
+RUN_LOCAL=1 WORKERS=17:17 SERVER_MASK=0-47 DIM=3072 TS=64 CS=1 PIPELINE=32 TEST_TIME=30 MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash scripts/run_aeron_best.sh
 ```
 
 ### 2.5 跨节点 64x1x32 高维（DIM=1024/2048/3072）【块内注释标注执行位置】
 
 ```bash
-# baseline【HW01 执行】
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=baseline OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-# hpc TCP
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-SERVERS_ONLY=hpc OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml bash benchmark/run_vemb_cross_node_sweep.sh
-# hpc Aeron【本地 Mac 执行】
-OP_TYPE=VEMB DIM=1024 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim1024.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
-OP_TYPE=VEMB DIM=2048 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim2048.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
-OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=21 SNW=21 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim3072.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+# baseline 12 实例【HW01 执行】
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=1024 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=2048 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=3072 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+# hpc TCP 17:17【HW01 执行】
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
+SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=3072 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim3072.yaml TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
+# hpc Aeron 17:17【本地 Mac 执行】
+OP_TYPE=VEMB DIM=1024 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=17 SNW=17 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim1024.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+OP_TYPE=VEMB DIM=2048 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=17 SNW=17 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim2048.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
+OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PIO=17 SNW=17 SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron_dim3072.yaml bash scripts/run_aeron_cross_node_flamegraph.sh
 ```
 
 ---
@@ -234,10 +234,10 @@ OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PI
 ```bash
 # 原生 redis cluster 4 节点【HW01 执行】⚠️ HW05 失联，待恢复
 bash benchmark/run_redis_cluster_vemb.sh
-# hpc TCP 双机 cluster【HW01 执行】
-bash run_cluster_2node_sweep.sh
+# hpc TCP 双机 cluster【HW01 执行】（默认 HPC_PIO=4 HPC_SNW=4）
+HPC_PIO=4 HPC_SNW=4 bash run_cluster_2node_sweep.sh
 # hpc Aeron 双机 cluster【本地 Mac 执行】（默认 9 档）
-TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
 ```
 
 产物：`benchmark/results/cluster_2node_sweep/<时间戳>/summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`、原生 `benchmark/results/cluster_vemb/...`。三方案对比表（原生/TCP/Aeron ops/sec/core）由三个 TSV 汇总。
@@ -250,13 +250,13 @@ DIM=1024 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=2048 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=3072 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 # hpc TCP cluster【HW01 执行】
-DIM=1024 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
-DIM=2048 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
-DIM=3072 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+HPC_PIO=4 HPC_SNW=4 DIM=1024 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+HPC_PIO=4 HPC_SNW=4 DIM=2048 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+HPC_PIO=4 HPC_SNW=4 DIM=3072 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
 # hpc Aeron cluster【本地 Mac 执行】（单档）
-DIM=1024 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
-DIM=2048 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
-DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+DIM=1024 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+DIM=2048 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
 ```
 
 ---
@@ -264,10 +264,10 @@ DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_clu
 ## 4. 3.2.4 扩容场景下 VEMB 性能【块内注释标注执行位置】
 
 ```bash
-# hpc TCP 扩容【HW01 执行】(脚本需内网直连 192.168.1.x:22, Mac 只走 frp 转发口不可达)
-bash scripts/hpc_redis_scaleout_throughput.sh
+# hpc TCP 扩容【HW01 执行】(脚本需内网直连 192.168.1.x:22, Mac 只走 frp 转发口不可达；默认 PIO=21 SNW=21)
+PIO=21 SNW=21 bash scripts/hpc_redis_scaleout_throughput.sh
 # hpc Aeron 扩容【本地 Mac 执行】
-REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis bash benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh
+REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis PIO=21 SNW=21 bash benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh
 # 原生 redis cluster 扩容【HW01 执行】⚠️ HW05 失联，待恢复
 N_INIT=3 N_FINAL=4 RAW=1 TEST_TIME=60 CLIENTS=200 THREADS=16 IO_THREADS=4 VECTORS_PER_VSET=6250 bash benchmark/run_redis_cluster_scaleout_vemb.sh
 ```
@@ -279,12 +279,12 @@ N_INIT=3 N_FINAL=4 RAW=1 TEST_TIME=60 CLIENTS=200 THREADS=16 IO_THREADS=4 VECTOR
 ## 5. 3.2.5 混合读与写/删【HW01 执行】
 
 ```bash
-bash benchmark/hpc_redis_mixed_workload.sh
+PIO=21 SNW=21 bash benchmark/hpc_redis_mixed_workload.sh
 ```
 
 （报告此节无 Aeron 行）
 
-## 6. 3.2.6 本地远端 UB 7:1 拓扑读吞吐对比【HW01 执行】
+## 6. 3.2.6 本地远端 UB 7:1 拓扑读吞吐对比【HW01 执行】（脚本内置 server pio=21 snw=21，TCP/aeron 场景同参）
 
 ```bash
 bash bench_aeron_3scenarios.sh pure_local_100k tcp   100000 30
@@ -297,9 +297,9 @@ bash bench_aeron_3scenarios.sh small_7to1_100k aeron 100000 30
 
 ```bash
 # baseline + hpc TCP【HW01 执行】（一次跑出两组）
-TEST_TIME=30 NUM_KEYS=100000 bash benchmark/run_vsim_2key_2node.sh
+HPC_PIO=2 HPC_SNW=2 TEST_TIME=30 NUM_KEYS=100000 bash benchmark/run_vsim_2key_2node.sh
 # HPC Aeron【本地 Mac 执行】（双 owner cluster 拓扑 + vsim-key-key，默认 9 档）
-OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 PIO=2 SNW=2 bash benchmark/vemb_v16_aeron_cluster_tput.sh
 ```
 
 产物：`benchmark/results/vsim_2key/.../summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`。

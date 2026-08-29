@@ -1620,9 +1620,10 @@ static int ensure_owner_channel_slow(vemb_v16_client_t *client,
         /* leave channel unopened; caller will handle submit failure */
         fprintf(stderr,
                 "[sdk] owner channel open failed owner=%u endpoint=%s:%u "
-                "transport=%s\n",
+                "transport=%s errno=%d(%s)\n",
                 owner_id, ep->host, ep->tcp_port,
-                transport == &sdk_ub_data_transport_ops ? "aeron" : "tcp");
+                transport == &sdk_ub_data_transport_ops ? "aeron" : "tcp",
+                errno, strerror(errno));
         return -1;
     }
     client->owner_channel_inited[owner_id] = 1;
@@ -1713,6 +1714,9 @@ struct vemb_v16_client_handle_session {
         deadlines[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     sdk_handle_session_request_t requests[SDK_HANDLE_SESSION_MAX_PENDING];
     uint32_t active_requests;
+    /* per-owner 在途 batch 数: publish 时 +1, consume response 时 -1.
+     * 为 0 时跳过 v2_poll 避免无效 NC ring 读 (owner=1 ~50-100us/次) */
+    uint32_t v2_batches_outstanding[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     uint8_t topology_refresh_pending;
     uint8_t closing;
 };
@@ -2124,6 +2128,7 @@ static int sdk_handle_session_flush_owner(
             continue;
         }
 
+        session->v2_batches_outstanding[owner_id]++; /* publish 前先计入, 失败再回退 */
         uint64_t batch_id = sdk_handle_session_next_batch_id(v2);
         uint64_t publish_start_ns = sample_flush ?
             vemb_v16_monotonic_ns() : 0;
@@ -2142,10 +2147,12 @@ static int sdk_handle_session_flush_owner(
                 stats->v2_publish_ns_max = publish_ns_duration;
         }
         if (publish_rc == RING_ERR_FULL) {
+            session->v2_batches_outstanding[owner_id]--; /* publish 失败, 回退 */
             sdk_owner_stats(session->client, owner_id)->v2_publish_ring_full++;
             return 0;
         }
         if (publish_rc != RING_OK) {
+            session->v2_batches_outstanding[owner_id]--; /* publish 失败, 回退 */
             sdk_owner_stats(session->client, owner_id)->v2_publish_errors++;
             if (!allow_v1_fallback)
                 return -1;
@@ -2155,6 +2162,7 @@ static int sdk_handle_session_flush_owner(
             sdk_handle_session_deadline_after_progress(session, owner_id);
             continue;
         }
+
         uint64_t publish_ns = vemb_v16_monotonic_ns();
 #if VEMB_V16_SDK_TRACE
         if (batch_id <= 8 || batch_id % 1024 == 0) {
@@ -2570,6 +2578,9 @@ static uint32_t sdk_handle_session_poll_v2(
     sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
     if (!v2->channel || !v2->l0)
         return 0;
+    /* 无在途 batch: response ring 不可能有新数据, 跳过 NC 读 */
+    if (session->v2_batches_outstanding[owner_id] == 0)
+        return 0;
 
     uint32_t callbacks = 0;
     for (;;) {
@@ -2598,6 +2609,10 @@ static uint32_t sdk_handle_session_poll_v2(
                 publish_to_response_poll_ns;
             stats->v2_response_wait_ns_sum += publish_to_response_poll_ns;
         }
+
+        /* 消费了一个 batch response, 在途计数递减 */
+        if (session->v2_batches_outstanding[owner_id] > 0)
+            session->v2_batches_outstanding[owner_id]--;
 
         vemb_v16_owner_session_identity_t identity;
         uint32_t expected_count = vemb_v16_cli_l0_batch_item_count(
@@ -5456,7 +5471,12 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
  *  Aeron transport (TCP control + UB-backed SPSC ring)
  * ===================================================================== */
 
-#define VEMB_V16_AERON_CONTROL_TIMEOUT_MS 5000u
+/* Control-plane (ATTACH handshake) timeout. Server handles ATTACH on its
+ * main event loop serially; under mass parallel setup (hundreds of
+ * concurrent handshakes) queueing can exceed a 5s budget and the client
+ * aborts while the server logs nothing. Align with the TCP transport
+ * default (10s) used by sdk_tcp_open_owner_channel. */
+#define VEMB_V16_AERON_CONTROL_TIMEOUT_MS 10000u
 
 struct vemb_v16_aeron_channel {
     vemb_v16_channel_desc_t    desc;

@@ -5,7 +5,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: /dev/obmm_shmdev3
-remote_meta_mmap_offset: 268435456
+remote_meta_mmap_offset: 4831838208
 remote_meta_entries: 65536
 remote_meta_buckets: 131072
 ub_rpc_timeout_ms: 2000

@@ -1,0 +1,34 @@
+# Owner 0 peer map for owner 1 after scaleout.
+expected_local_owner_id: 0
+attach_now: true
+ub_rpc_timeout_ms: 2000
+
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev16
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 4096
+    home_ub_node_id: 1
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev16
+    mmap_offset: 4831838208
+    entries: 65536
+    buckets: 131072
+
+ub_rpc_peers:
+  - owner_id: 1
+    provider: ub
+    request_path: /dev/obmm_shmdev4
+    request_mmap_offset: 134217728
+    response_path: /dev/obmm_shmdev13
+    response_mmap_offset: 201326592
+    inbound_request_path: /dev/obmm_shmdev13
+    inbound_request_mmap_offset: 134217728
+    outbound_response_path: /dev/obmm_shmdev4
+    outbound_response_mmap_offset: 201326592

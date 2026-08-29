@@ -1,0 +1,36 @@
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 1
+warm_regions:
+  - region_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev2
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 8192
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 2
+    provider: ub
+    path: /dev/obmm_shmdev4
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 8192
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 3
+    provider: ub
+    path: /dev/obmm_shmdev5
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 8192
+    home_ub_node_id: 1
+    weight: 1
+  - region_id: 4
+    provider: ub
+    path: /dev/obmm_shmdev6
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 8192
+    home_ub_node_id: 1
+    weight: 1
