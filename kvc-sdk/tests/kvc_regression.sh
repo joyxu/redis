@@ -13,6 +13,12 @@
 
 set -u
 TAG=${1:-run}
+
+# 环境前提（本轮调试定位的两个坑，防复发）:
+#  1) TE TCP one-shot 连接 → 默认端口池耗尽（~530MB 写入量）→ tcp_tw_reuse
+#  2) master 默认 KV 租约 10s → runtime>10s 的 read_perf 出 miss → TTL 调大
+sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.ip_local_port_range=10240 65535" >/dev/null 2>&1 || true
 LOG=/tmp/kvc_regress_${TAG}.log
 MCB=/tmp/mc_build
 PYROOT=/opt/mc_py
@@ -45,9 +51,9 @@ start_cluster() { # $1=kvc|anon  $2=tag
   PYTHONPATH=$PYROOT nohup python3 -m mooncake.http_metadata_server --port 8080 > /tmp/meta.log 2>&1 &
   sleep 1
   if [ "$1" = kvc ]; then
-    KVC_MASTER_BLOCK_SIZE=4096 nohup $MCB/mooncake-store/src/mooncake_master -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
+    KVC_MASTER_BLOCK_SIZE=4096 nohup $MCB/mooncake-store/src/mooncake_master -default_kv_lease_ttl=600000 -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
   else
-    nohup $MCB/mooncake-store/src/mooncake_master -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
+    nohup $MCB/mooncake-store/src/mooncake_master -default_kv_lease_ttl=600000 -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
   fi
   sleep 2
   if [ "$1" = kvc ]; then

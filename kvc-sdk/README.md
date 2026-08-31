@@ -70,8 +70,34 @@ tests/         headers_check（P0 验收）
 
 - 一个 region 一个 block_size（= 目标模型 KV page，如 glm5 MLA 7MB）；
   混合层组模型用多 region 分 size class。
-- **远端读的 Gate**：cachable/SNP import —— 当前 noncacheable import 实测
-  读仅 67MB/s（逐 cache line 往返），必须重建 cachable import 后远端读路径才成立。
-  （实测脚本：`Mooncake/benchmarks/storage_benchmark_v1/ub_shmdev_bench.py`）
+- 远端访问必须 nc/O_SYNC 映射 + 流水拷贝（`kvc_copy_remote`，glibc memcpy
+  在 nc 内存上不流水，单线程差 30 倍）；decoder_flag 必须 0x63（见 core/ub/README）。
+- **测试环境前提**（否则数据失真）：
+  - `sysctl tcp_tw_reuse=1` + 宽端口范围 —— TE TCP one-shot 连接在默认
+    sysctl 下有端口压力，会同时压低 TE 基线并诱发传输异常；
+  - master `-default_kv_lease_ttl` 按测试时长调大（默认 10s）。
 - 内存序契约：写端 release 翻 READY、读端 acquire 查状态（SNP 可见性顺序），
   详见 kvc_common.h。
+
+## 实测基线（store_kv_bench, 4KB block, 同机, sysctl 校准后）
+
+| 配置 | MiB/s | p50 | vs TE |
+|---|---:|---:|---|
+| TE（原生） | 109 | 0.85 ms | 1× |
+| + 直读 | 850 | 0.14 ms | 7.8× |
+| + 直读+位置缓存 | 1391 | 0.084 ms | 12.8× |
+
+跨节点（HW02→HW01, nc 直读）：447 MiB/s / p50 0.28ms。
+注：早前 91×/143× 的基线是端口压力下的失真 TE（9.9 MiB/s），上表为修复后口径。
+跨节点直读存在 2 次未定位间歇性内容不符（均发生在端口压力窗口内，修复后
+13+ 次同模式不复现），默认 env 关闭，详见 core/ub/README。
+
+## 测量口径说明（重要，防误读）
+
+- store_kv_bench 的 MiB/s = 应用侧有效字节（kv/s × value_size），非线速。
+- 同机直读 1416 MiB/s 的工作集仅 8MB（L3 常驻）——反映的是"移除传输栈"
+  加 L3 命中，不代表 DRAM 带宽。
+- SDK 层单线程物理上限（tools/kvc_rw_bw 实测，512MB 工作集 >L3，
+  全量逐字节校验 bad=0）：直读 1731 MB/s / 直写 8452 MB/s。
+- 143× 的对比基线是"TE-TCP 回环 + python 单车道"部署形态；对标 Mooncake
+  生产形态（RDMA + C++）比值会显著缩小。正确表述：移除了传输栈开销。
