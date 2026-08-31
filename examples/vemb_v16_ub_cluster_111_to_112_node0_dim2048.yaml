@@ -1,0 +1,21 @@
+# Owner 0 @ 111.
+# dev3 is the sole local warm/meta export; dev1/dev2 are local CLI rings.
+local_ub_node_id: 0
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev3
+remote_meta_mmap_offset: 4831838208
+remote_meta_entries: 65536
+remote_meta_buckets: 131072
+ub_rpc_timeout_ms: 2000
+
+warm_regions:
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 4294967296
+    value_size: 8192
+    home_ub_node_id: 0
+    weight: 1

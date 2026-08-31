@@ -63,6 +63,13 @@ typedef enum vemb_v16_tlc_lookup_source {
     VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC = 3,
 } vemb_v16_tlc_lookup_source_t;
 
+typedef struct vemb_v16_tlc_lookup_diagnostic_stats {
+    uint64_t handle_lookup_miss;
+    uint64_t handle_lookup_miss_not_found;
+    uint64_t handle_lookup_miss_moved;
+    uint64_t handle_lookup_miss_stale;
+} vemb_v16_tlc_lookup_diagnostic_stats_t;
+
 typedef struct vemb_v16_tlc_warm_region {
     uint32_t region_id;
     uint32_t backend_type;
@@ -164,6 +171,10 @@ struct vemb_v16_tlc {
     atomic_uint_fast64_t remote_meta_repair_enqueue;
     atomic_uint_fast64_t remote_meta_repair_ok;
     atomic_uint_fast64_t remote_meta_repair_drop;
+    atomic_uint_fast64_t handle_lookup_miss;
+    atomic_uint_fast64_t handle_lookup_miss_not_found;
+    atomic_uint_fast64_t handle_lookup_miss_moved;
+    atomic_uint_fast64_t handle_lookup_miss_stale;
 };
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
@@ -289,5 +300,10 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
                              uint32_t *vector_bytes);
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats);
+void vemb_v16_tlc_note_handle_lookup_miss(vemb_v16_tlc_t *tlc,
+                                          uint8_t status);
+void vemb_v16_tlc_get_lookup_diagnostic_stats(
+    vemb_v16_tlc_t *tlc,
+    vemb_v16_tlc_lookup_diagnostic_stats_t *stats);
 
 #endif

@@ -42,7 +42,9 @@
 #define VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US 100000u
 #define VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS 1000u
 #define VEMB_V16_READ_JOB_POOL_SLOTS 1024u
-#define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
+/* 256 在高并发突发下 (≥64 client-slots × 32 pipeline) 热点 worker 瞬间打满
+ * → alloc 失败直接回 ERR (client status_err ~70%+). 提到与 READ 同量级. */
+#define VEMB_V16_VSIM_JOB_POOL_SLOTS 2048u
 #define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
 #define VEMB_V16_SUPERNODE_IDLE_SPIN_NS 5000ULL
 #define VEMB_V16_SUPERNODE_IDLE_CLOCK_CHECK_ROUNDS 32u
@@ -1363,8 +1365,16 @@ static int prepare_request_job(vemb_v16_channel_t *ch,
         &ch->proxy->proxy_io_workers[proxy_io_worker_id].job_pools[pool_type];
     uint32_t slot_id = 0;
     if (job_pool_alloc_slot(pool, &slot_id) != 0) {
+        /* 池满: 高并发突发时 supernode 正在消费, 短暂自旋等释放
+         * 而不是立刻回 ERR (client 侧表现为 status_err) */
+        for (uint32_t retry = 0; retry < 8; retry++) {
+            cpu_relax();
+            if (job_pool_alloc_slot(pool, &slot_id) == 0)
+                goto alloc_ok;
+        }
         return -1;
     }
+alloc_ok:
     GOTO_IF(fill_job_slot(pool,
                           slot_id,
                           ch,
@@ -2224,9 +2234,12 @@ static void close_channel_locked(vemb_v16_channel_t *ch) {
 }
 
 static void close_channel(vemb_v16_channel_t *ch) {
-    pthread_mutex_lock(&ch->proxy->channel_lifecycle_lock);
+    /* close_channel_locked 末尾的 reset_closed_channel 会把 ch->proxy 清 NULL,
+     * 必须先保存指针再解引用, 否则 unlock 段错误 (NULL + 锁偏移) */
+    vemb_v16_proxy_t *proxy = ch->proxy;
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
     close_channel_locked(ch);
-    pthread_mutex_unlock(&ch->proxy->channel_lifecycle_lock);
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
 }
 
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
@@ -4516,6 +4529,7 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
                 vemb_v16_aeron_available(&proxy->job_shard_queues[i].ring);
         }
     }
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -4528,4 +4542,99 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
             stats->completion_ring_depth += vemb_v16_aeron_available(&ch->completion_ring);
         }
     }
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
+}
+
+void vemb_v16_proxy_get_diagnostic_stats(
+        vemb_v16_proxy_t *proxy, vemb_v16_diagnostic_stats_t *stats) {
+    assert(proxy != NULL);
+    assert(stats != NULL);
+    *stats = (vemb_v16_diagnostic_stats_t){
+        .version = VEMB_V16_DIAGNOSTIC_STATS_VERSION,
+        .bytes = sizeof(*stats),
+    };
+
+    tlc_core_stats_t core_stats;
+    tlc_core_get_stats(proxy_storage(proxy)->tlc->core, &core_stats);
+    stats->lookup_cache_hit = core_stats.lookup_cache_hit;
+    stats->lookup_cache_miss = core_stats.lookup_cache_miss;
+    stats->warm_local_hit = core_stats.lookup_warm_local_hit;
+    stats->warm_imported_hit = core_stats.lookup_warm_imported_hit;
+    stats->cold_promote = core_stats.lookup_cold_promote;
+    stats->lookup_final_miss = core_stats.lookup_final_miss;
+
+    vemb_v16_tlc_lookup_diagnostic_stats_t handle_stats;
+    vemb_v16_tlc_get_lookup_diagnostic_stats(proxy_storage(proxy)->tlc,
+                                             &handle_stats);
+    stats->handle_lookup_miss = handle_stats.handle_lookup_miss;
+    stats->handle_lookup_miss_not_found =
+        handle_stats.handle_lookup_miss_not_found;
+    stats->handle_lookup_miss_moved = handle_stats.handle_lookup_miss_moved;
+    stats->handle_lookup_miss_stale = handle_stats.handle_lookup_miss_stale;
+
+    tlc_core_region_stats_t regions[TLC_CORE_MAX_TOTAL_WARM_REGIONS];
+    uint32_t region_count = tlc_core_get_region_stats(
+        proxy_storage(proxy)->tlc->core, regions,
+        TLC_CORE_MAX_TOTAL_WARM_REGIONS);
+    if (region_count > VEMB_V16_DIAGNOSTIC_MAX_REGIONS)
+        region_count = VEMB_V16_DIAGNOSTIC_MAX_REGIONS;
+    stats->region_count = region_count;
+    for (uint32_t i = 0; i < region_count; i++) {
+        stats->regions[i] = (vemb_v16_diagnostic_region_stats_t){
+            .region_id = regions[i].region_id,
+            .region_index = i,
+            .is_local = regions[i].is_local,
+            .lookup_hits = regions[i].lookup_hits,
+            .cold_promotes = regions[i].cold_promotes,
+        };
+    }
+
+    pthread_mutex_lock(&proxy->channel_lifecycle_lock);
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        vemb_v16_channel_t *ch = &proxy->channels[i];
+        uint64_t channel_id = atomic_load_explicit(
+            &ch->slot_channel_id, memory_order_acquire);
+        if (channel_id == 0)
+            continue;
+        if (stats->channel_count < VEMB_V16_DIAGNOSTIC_MAX_CHANNELS) {
+            uint32_t out_index = stats->channel_count++;
+            uint_fast32_t proxy_io_state = atomic_load_explicit(
+                &ch->proxy_io_state, memory_order_acquire);
+            uint_fast32_t supernode_state = atomic_load_explicit(
+                &ch->supernode_state, memory_order_acquire);
+            vemb_v16_diagnostic_channel_stats_t *out =
+                &stats->channels[out_index];
+            *out = (vemb_v16_diagnostic_channel_stats_t){
+                .channel_id = channel_id,
+                .index = i,
+                .transport_type = ch->transport_type,
+                .proxy_io_worker_id = ch->proxy_io_worker_id,
+                .supernode_worker_id = ch->supernode_worker_id,
+                .active = atomic_load_explicit(&ch->active,
+                                               memory_order_acquire) != 0,
+                .proxy_io_closing =
+                    (proxy_io_state & VEMB_V16_PROXY_IO_STATE_CLOSING) != 0,
+                .supernode_closing =
+                    (supernode_state & VEMB_V16_SUPERNODE_STATE_CLOSING) != 0,
+                .request_ring_depth = ch->request_ring
+                    ? vemb_v16_client_available(ch->request_ring) : 0,
+                .response_ring_depth = ch->response_ring
+                    ? vemb_v16_client_available(ch->response_ring) : 0,
+                .completion_ring_depth = vemb_v16_aeron_available(
+                    &ch->completion_ring),
+            };
+        } else {
+            stats->channel_stats_truncated = 1;
+        }
+        if (atomic_load_explicit(&ch->active, memory_order_acquire))
+            stats->active_channel_count++;
+        if ((atomic_load_explicit(&ch->proxy_io_state,
+                                  memory_order_acquire) &
+             VEMB_V16_PROXY_IO_STATE_CLOSING) != 0 ||
+            (atomic_load_explicit(&ch->supernode_state,
+                                  memory_order_acquire) &
+             VEMB_V16_SUPERNODE_STATE_CLOSING) != 0)
+            stats->closing_channel_count++;
+    }
+    pthread_mutex_unlock(&proxy->channel_lifecycle_lock);
 }

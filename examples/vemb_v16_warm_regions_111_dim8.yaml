@@ -6,7 +6,7 @@ warm_regions:
     provider: ub
     path: /dev/obmm_shmdev2
     mmap_offset: 0
-    bytes: 1073741824
+    bytes: 1073741824  # ~2x stride mmap must fit shmdev2 capacity; see xnode dim8 note
     value_size: 32
     home_ub_node_id: 0
     weight: 1

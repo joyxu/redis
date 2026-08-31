@@ -334,6 +334,32 @@ int main(int argc, char **argv) {
               (unsigned long long)stats.ub_lookup_rpc_error,
               (unsigned long long)stats.ub_lookup_rpc_handle,
               (unsigned long long)stats.ub_lookup_rpc_snapshot);
+    vemb_v16_diagnostic_stats_t diagnostic;
+    vemb_v16_proxy_get_diagnostic_stats(g_proxy, &diagnostic);
+    serverLog(LL_NOTICE,
+              "vemb_v16 diagnostic: cache_hit=%llu cache_miss=%llu warm_local_hit=%llu warm_imported_hit=%llu cold_promote=%llu final_miss=%llu handle_miss=%llu handle_not_found=%llu handle_moved=%llu handle_stale=%llu regions=%u",
+              (unsigned long long)diagnostic.lookup_cache_hit,
+              (unsigned long long)diagnostic.lookup_cache_miss,
+              (unsigned long long)diagnostic.warm_local_hit,
+              (unsigned long long)diagnostic.warm_imported_hit,
+              (unsigned long long)diagnostic.cold_promote,
+              (unsigned long long)diagnostic.lookup_final_miss,
+              (unsigned long long)diagnostic.handle_lookup_miss,
+              (unsigned long long)diagnostic.handle_lookup_miss_not_found,
+              (unsigned long long)diagnostic.handle_lookup_miss_moved,
+              (unsigned long long)diagnostic.handle_lookup_miss_stale,
+              diagnostic.region_count);
+    for (uint32_t i = 0; i < diagnostic.region_count; i++) {
+        const vemb_v16_diagnostic_region_stats_t *region =
+            &diagnostic.regions[i];
+        serverLog(LL_NOTICE,
+                  "vemb_v16 diagnostic region: index=%u id=%u local=%u lookup_hits=%llu cold_promotes=%llu",
+                  region->region_index,
+                  region->region_id,
+                  region->is_local,
+                  (unsigned long long)region->lookup_hits,
+                  (unsigned long long)region->cold_promotes);
+    }
 cleanup:
     if (g_proxy) {
         vemb_v16_proxy_destroy(g_proxy);

@@ -59,6 +59,7 @@ typedef struct vemb_v16_cli_l0_key_slab {
 
 typedef struct vemb_v16_cli_l0_batch_record {
     uint64_t batch_id;
+    uint64_t publish_ns;
     vemb_v16_owner_session_identity_t identity;
     uint64_t completed[(VEMB_V16_BATCH_REQUEST_SIZE_MAX + 63u) / 64u];
     uint32_t channel_index;
@@ -477,6 +478,24 @@ int vemb_v16_cli_l0_publish_batch(vemb_v16_cli_l0_t *l0,
         record->generations[i] = entry->generation;
     }
     return 0;
+}
+
+void vemb_v16_cli_l0_set_batch_publish_ns(vemb_v16_cli_l0_t *l0,
+                                           uint32_t channel_index,
+                                           uint64_t batch_id,
+                                           uint64_t publish_ns) {
+    vemb_v16_cli_l0_batch_record_t *record =
+        vemb_v16_cli_l0_batch_record_find(l0, channel_index, batch_id);
+    assert(record != NULL);
+    record->publish_ns = publish_ns;
+}
+
+uint64_t vemb_v16_cli_l0_get_batch_publish_ns(
+    vemb_v16_cli_l0_t *l0, uint32_t channel_index,
+    uint64_t batch_id) {
+    vemb_v16_cli_l0_batch_record_t *record =
+        vemb_v16_cli_l0_batch_record_find(l0, channel_index, batch_id);
+    return record ? record->publish_ns : 0;
 }
 
 int vemb_v16_cli_l0_peek_response(vemb_v16_cli_l0_t *l0,

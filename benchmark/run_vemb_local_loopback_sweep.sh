@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_vemb_local_loopback_sweep.sh
 # 单实例本地回环 VEMB/VSIM/VADD/VREM 吞吐/延迟 sweep
 #   —— 同一 OP 下, baseline redis 与 hpc-redis 各跑一遍对比
-#   —— 17 档 (t,c,pipeline) 配置矩阵, 一次出 34 行 TSV 直接填评测报告表格
+#   —— 9 档 (t,c,pipeline) 配置矩阵, 一次出 34 行 TSV 直接填评测报告表格
 #
 # 用法:
 #   OP_TYPE=VEMB bash benchmark/run_vemb_local_loopback_sweep.sh   # 默认 VEMB
@@ -13,7 +14,7 @@
 #   TEST_TIME=3 OP_TYPE=VSIM bash ...                              # smoke 快验
 #   SERVERS_ONLY="baseline" OP_TYPE=VEMB bash ...                  # 只跑 baseline
 #
-# 17 档配置矩阵 (默认):
+# 9 档配置矩阵 (默认):
 #   - pipeline=1/4/8/16/32 (t=1 c=1)        5 档
 #   - t 翻倍到 64 (c=1 p=32)                6 档
 #   - c 递增到 64 (t=64 p=32)               6 档
@@ -71,6 +72,9 @@ BASELINE_IO_THREADS=${BASELINE_IO_THREADS:-4}
 HPC_PIO=${HPC_PIO:-2}
 HPC_SNW=${HPC_SNW:-2}
 MANIFEST=${MANIFEST:-$HPC_DIR/examples/vemb_v16_warm_regions_111.yaml}
+# baseline 免 prefill: 兼容 RDB 存在则加载 (auto), 不存在走 prefill; 0=强制 prefill
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$HPC_DIR/benchmark/baseline_rdb}
 
 # === CPU 绑核 ===
 BASELINE_SERVER_CPUSET=${BASELINE_SERVER_CPUSET:-31-38}
@@ -79,13 +83,14 @@ CLIENT_CPUSET=${CLIENT_CPUSET:-96-191}
 NUMA_NODE_SERVER=${NUMA_NODE_SERVER:-0}
 NUMA_NODE_CLIENT=${NUMA_NODE_CLIENT:-1}
 
-# === 17 档配置矩阵 (并行数组 TS/CS/PS) ===
+# === 9 档配置矩阵 (并行数组 TS/CS/PS) ===
 # 默认完整跑; 可用 TS/CS/PS 环境变量覆盖 (空格分隔, 三数组等长)
 #   smoke: TS="1" CS="1" PS="1" bash ... (1 档)
 #   自定义: TS="1 64" CS="1 4" PS="1 32" bash ... (2 档)
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -153,17 +158,45 @@ wait_port(){
 }
 
 # ----------------------------------------------------------------------------
+# 返回兼容 RDB 路径 (不存在返回空)。VADD 是纯写测试, 永不加载。
+baseline_rdb_path() {
+    [ "$BASELINE_RDB" = "0" ] && return 1
+    [ "$OP_TYPE" = "VADD" ] && return 1
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    local f="$RDB_DIR/${NUM_KEYS}K_${DIM}D_${tag}_myset.rdb"
+    [ -f "$f" ] || return 1
+    echo "$f"
+}
+
 start_baseline() {
     log "启动 baseline redis-server (io-threads=$BASELINE_IO_THREADS)..."
+    local rdb
+    rdb=$(baseline_rdb_path || true)
+    local dir_args=(--dir $DATA_DIR)
+    if [ -n "$rdb" ]; then
+        # --dir 指向 RDB 所在目录 (只读 444, --save '' 保证不回写)
+        dir_args=(--dir "$(dirname "$rdb")" --dbfilename "$(basename "$rdb")")
+        log "  加载预填充 RDB: $rdb (跳过 prefill)"
+    fi
     taskset -c $BASELINE_SERVER_CPUSET \
         $REDIS_DIR/src/redis-server \
             --port $PORT --bind 127.0.0.1 --protected-mode no \
             --tcp-backlog 16384 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --appendonly no --save '' \
-            --dir $DATA_DIR --logfile $DATA_DIR/baseline.log \
+            "${dir_args[@]}" --logfile $DATA_DIR/baseline.log \
             --daemonize yes
     wait_port $PORT || { log "FAIL: baseline server"; exit 1; }
+    if [ -n "$rdb" ]; then
+        # 就绪判据: VCARD 为数字 (PING 在 LOADING 期间也有回复, 不可用)
+        local v=""
+        for _ in $(seq 1 300); do
+            v=$($REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT VCARD myset 2>/dev/null | grep -E '^[0-9]+$') && break
+            sleep 0.1
+        done
+        [ "$v" = "$NUM_KEYS" ] || { log "FAIL: RDB 加载校验 VCARD=$v != $NUM_KEYS ($rdb)"; exit 1; }
+        log "  RDB 加载完成: VCARD=$v"
+    fi
     sleep 1  # let server fully stabilize before prefill
 }
 
@@ -189,7 +222,7 @@ start_hpc() {
             --vemb-v16-reset-warm-regions yes \
             $tcp_args \
             --appendonly no --save '' \
-            --dir $DATA_DIR --logfile $DATA_DIR/hpc.log \
+            --dir $DATA_DIR --logfile $DATA_DIR/hpc.log --loglevel warning \
             --daemonize yes
     wait_port $PORT || { log "FAIL: hpc server"; exit 1; }
     sleep 1  # let server fully stabilize before prefill
@@ -231,6 +264,11 @@ prefill() {
 
     local prefix kmin kmax
     read prefix kmin kmax < <(op_key_range)
+    # baseline 已由 RDB 预填充 → 跳过 (FLUSHDB 也跳过, 否则清掉刚加载的数据)
+    if [ "$server_type" = "baseline" ] && [ -n "$(baseline_rdb_path || true)" ]; then
+        log "[$server_type] OP_TYPE=$OP_TYPE 使用 RDB 预填充, 跳过 prefill"
+        return 0
+    fi
     log "[$server_type] OP_TYPE=$OP_TYPE prefill key=$prefix[$kmin..$kmax] (DIM=$DIM)..."
     $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT FLUSHDB >/dev/null 2>&1
 
@@ -243,7 +281,7 @@ prefill() {
         [ "${HPC_TCP_PORT:-0}" -gt 0 ] && hpc_mport=$HPC_TCP_PORT
         taskset -c $CLIENT_CPUSET \
             $HPC_MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-                -s 127.0.0.1 -p $hpc_mport -t 8 -c 1 --test-time=$prefill_sec \
+                -s 127.0.0.1 -p $hpc_mport -t 64 -c 1 --pipeline=32 --test-time=$prefill_sec \
                 --ratio=1:0 --key-pattern=S:S --key-prefix=$prefix \
                 --key-minimum=$kmin --key-maximum=$kmax \
                 > "$RAWDIR/${server_type}_${OP_TYPE}_prefill.log" 2>&1
@@ -254,7 +292,7 @@ prefill() {
             for (i=1; i<=n; i++) {
                 printf "VADD myset VALUES %d", dim;
                 for (j=0; j<dim; j++) printf " %f", rand()*j*0.001;
-                printf " item:%d\n", i;
+                printf " item:%d%s\n", i, (ENVIRON["BASELINE_NOQUANT"]=="0" ? "" : " NOQUANT");
             }
         }' | $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $PORT --pipe >/dev/null 2>&1
     fi
@@ -350,13 +388,14 @@ run_one_config() {
     local c_hi=$(awk -v d=$((ja_hi - jb_hi)) -v s=$elapsed_ns 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local rss=$(snapshot_rss $PORT)
 
-    # memtier Totals 行字段位置 (按 NF 自动判: NF>=9 带 Hits/Misses / NF>=7 普通)
+    # memtier Totals 行字段位置 (按 NF 自动判: NF>=11 新vemb格式 / NF>=9 带Hits/Misses / NF>=7 普通)
     local totals ops avg p50 p99 kb
     totals=$(grep "^Totals" "$raw" | tail -1)
     read ops avg p50 p99 kb < <(
         echo "$totals" | awk '{
-            if (NF>=9)      printf "%s %s %s %s %s", $2,$5,$6,$7,$9
-            else if (NF>=7) printf "%s %s %s %s %s", $2,$3,$4,$5,$7
+            if (NF>=11)      printf "%s %s %s %s %s", $2,$7,$8,$9,$11
+            else if (NF>=9)  printf "%s %s %s %s %s", $2,$5,$6,$7,$9
+            else if (NF>=7)  printf "%s %s %s %s %s", $2,$3,$4,$5,$7
             else            printf "0 NA NA NA NA"
         }'
     )

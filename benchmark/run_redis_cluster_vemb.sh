@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_redis_cluster_vemb.sh
-# 4 节点原生 redis cluster (baseline redis-8.6.3) VEMB 吞吐/延迟 17 档 sweep
+# 4 节点原生 redis cluster (baseline redis-8.6.3) VEMB 吞吐/延迟 9 档 sweep
 #
 # 拓扑: HW01/HW02/HW05/HW04 每节点 1 个 redis 实例, cluster mode
 # 网络: 192.168.1.x (100G mlx5 直连), data port 7000, cluster bus 17000
 # 测试: prefill 多 vset -> memtier --cluster-mode VEMB
 #
 # 用法:
-#   bash benchmark/run_redis_cluster_vemb.sh                      # 默认 17 档
+#   bash benchmark/run_redis_cluster_vemb.sh                      # 默认 9 档
 #   TEST_TIME=10 bash benchmark/run_redis_cluster_vemb.sh         # smoke
 #   TS="64" CS="8" PS="32" bash benchmark/run_redis_cluster_vemb.sh  # 单档
 #   MEMTIER_HOST=HW07 bash benchmark/run_redis_cluster_vemb.sh    # 换客户端
@@ -39,16 +40,21 @@ REPLICAS=${REPLICAS:-0}
 
 # === 数据规模 ===
 NUM_VSETS=${NUM_VSETS:-16}
+# baseline 免 prefill: 每 master 实例一份 RDB (slot 布局由 --cluster create 决定,
+# 生成时捕获, 布局变化需 FORCE 重新生成); 0=强制 prefill
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/benchmark/baseline_rdb}
 VECTORS_PER_VSET=${VECTORS_PER_VSET:-6250}
 DIM=${DIM:-300}
 
 # === CPU 绑核 ===
 CORES_PER_NODE=${CORES_PER_NODE:-96}
 
-# === 17 档配置矩阵 ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵 ===
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -115,14 +121,33 @@ cleanup_all() {
 # ----------------------------------------------------------------------------
 start_node() {
     local i=$1 ip=${IPS[$i]}
+    # RDB 预放置: 若本节点承载 master (按 .layout 顺序), 把对应 rdb 拷到各 inst 目录
+    local base; base=$(cluster_rdb_base 2>/dev/null)
+    if [ "$BASELINE_RDB" != "0" ] && [ -f "${base}.layout" ]; then
+        local idx=0 m mip
+        while IFS= read -r m; do
+            mip=${m%%:*}
+            if [ "$mip" = "$ip" ] && [ -f "${base}_m${idx}.rdb" ]; then
+                ssh -n $SSH_OPTS "${NODES[$i]}" "mkdir -p $DATA_DIR/inst0" >/dev/null 2>&1
+                ssh $SSH_OPTS "${NODES[$i]}" "cat > $DATA_DIR/inst0/prefill.rdb" < "${base}_m${idx}.rdb" 2>/dev/null
+                log "  ${NODES[$i]}: 预放置 RDB m$idx ($(stat -c%s ${base}_m${idx}.rdb)B)"
+                break  # 每节点 1 实例默认; 多实例时 slot 布局也变, 不支持
+            fi
+            idx=$((idx+1))
+        done <<< "$(cat ${base}.layout)"
+    fi
     local cores_per_inst=$((CORES_PER_NODE / INSTANCES_PER_NODE))
     for ((j=0; j<INSTANCES_PER_NODE; j++)); do
         local port=$((PORT + j))
+        # 该实例目录有预放置 rdb 则加载
+        local RDB_FLAG=" --dbfilename prefill.rdb"
+        ssh -n $SSH_OPTS "${NODES[$i]}" "test -f $DATA_DIR/inst$j/prefill.rdb" >/dev/null 2>&1 || RDB_FLAG=""
+        [ -n "$RDB_FLAG" ] && log "    ${NODES[$i]} inst$j: 将加载 prefill.rdb"
         local c0=$((j * cores_per_inst))
         local c1=$(((j + 1) * cores_per_inst - 1))
         local ddir="$DATA_DIR/inst${j}"
         log "  ${NODES[$i]} inst$j: port=$port cores=$c0-$c1 dir=$ddir"
-        ssh_node $i "mkdir -p $ddir && cd $REDIS_DIR && \
+        local start_cmd="mkdir -p $ddir && cd $REDIS_DIR && \
             numactl --membind=0 taskset -c $c0-$c1 \
             ./src/redis-server \
                 --port $port --bind 0.0.0.0 --protected-mode no \
@@ -133,7 +158,11 @@ start_node() {
                 --io-threads $IO_THREADS --io-threads-do-reads yes \
                 --appendonly no --save '' \
                 --dir $ddir --logfile $ddir/redis.log \
-                --daemonize yes" >/dev/null
+                --daemonize yes ${RDB_FLAG}"
+        local src_out
+        src_out=$(ssh_node $i "$start_cmd")
+        local src_rc=$?
+        log "    start rc=$src_rc out=$(echo "$src_out" | head -c 100)"
     done
 }
 
@@ -146,6 +175,28 @@ wait_port() {
 }
 
 # ----------------------------------------------------------------------------
+# 给节点补齐 [from,to] 的 slot。RDB 预加载的 key 会触发 auto-claim (busy),
+# busy 的正是 key 所在 slot 且已在正确节点, 只补缺失的空 slot。
+# 注意: redis-cli 收到 ERR 回复时 exit code 仍为 0, 必须判输出内容。
+fill_node_slots() {
+    local ip=$1 from=$2 to=$3 try mine_id missing out
+    for try in 1 2 3 4 5; do
+        out=$($REDIS_DIR/src/redis-cli -h $ip -p $PORT CLUSTER ADDSLOTS $(seq $from $to) 2>&1)
+        [ "$out" = "OK" ] && return 0
+        mine_id=$($REDIS_DIR/src/redis-cli -h $ip -p $PORT CLUSTER MYID 2>/dev/null)
+        [ -z "$mine_id" ] && { sleep 1; continue; }
+        missing=$($REDIS_DIR/src/redis-cli -h $ip -p $PORT CLUSTER NODES 2>/dev/null | awk -v me="$mine_id" -v f="$from" -v t="$to" '
+            $1==me { for(i=9;i<=NF;i++){ if($i ~ /-/) { split($i,a,"-"); for(s=a[1];s<=a[2];s++) have[s]=1 } else have[$i+0]=1 } }
+            END { for(s=f;s<=t;s++) if(!(s in have)) print s }')
+        [ -z "$missing" ] && return 0
+        out=$($REDIS_DIR/src/redis-cli -h $ip -p $PORT CLUSTER ADDSLOTS $missing 2>&1)
+        [ "$out" = "OK" ] && return 0
+        sleep 1
+    done
+    log "WARN: fill_node_slots $ip [$from,$to] 未完全成功"
+    return 1
+}
+
 create_cluster() {
     local ntotal=$((NNODES * INSTANCES_PER_NODE))
     local nmasters=$((ntotal / (REPLICAS + 1)))
@@ -156,8 +207,30 @@ create_cluster() {
             endpoints="$endpoints ${IPS[$i]}:$((PORT + j))"
         done
     done
-    echo yes | $REDIS_DIR/src/redis-cli --cluster create $endpoints --cluster-replicas $REPLICAS 2>&1 \
-        | grep -E "Slots|Master|Replica|slots:|OK|All|coverage|agree|Can't|err" | head -60
+    # 空 cluster (无 RDB 预加载) 走原生 --cluster create
+    if [ ! -f "$DATA_DIR/inst0/prefill.rdb" ]; then
+        echo yes | $REDIS_DIR/src/redis-cli --cluster create $endpoints --cluster-replicas $REPLICAS 2>&1 \
+            | grep -E "Slots|Master|Replica|slots:|OK|All|coverage|agree|Can't|err" | head -60
+        return $?
+    fi
+    # RDB 预加载模式: --cluster create 拒绝非空节点 (ERR Node is not empty),
+    # 改用 MEET + 均分 ADDSLOTS (fill 补差, 见 fill_node_slots)
+    local n_per=$((16384 / nmasters)) m=0 first_ip=${IPS[0]} first_port=$PORT
+    $REDIS_DIR/src/redis-cli -h $first_ip -p $first_port CLUSTER MEET ${IPS[1]} $PORT >/dev/null 2>&1
+    [ $NNODES -gt 2 ] && $REDIS_DIR/src/redis-cli -h $first_ip -p $first_port CLUSTER MEET ${IPS[2]} $PORT >/dev/null 2>&1
+    [ $NNODES -gt 3 ] && $REDIS_DIR/src/redis-cli -h $first_ip -p $first_port CLUSTER MEET ${IPS[3]} $PORT >/dev/null 2>&1
+    sleep 3
+    local k=0
+    for ((i=0; i<NNODES; i++)); do
+        for ((j=0; j<INSTANCES_PER_NODE; j++)); do
+            [ $k -ge $nmasters ] && break
+            local f=$((k * n_per)) t=$(( (k+1) * n_per - 1 ))
+            [ $k -eq $((nmasters-1)) ] && t=16383
+            fill_node_slots ${IPS[$i]} $f $t
+            k=$((k+1))
+        done
+    done
+    sleep 2
 }
 
 check_cluster() {
@@ -172,8 +245,74 @@ check_cluster() {
 }
 
 # ----------------------------------------------------------------------------
+rdb_tag() { [ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT; }
+
+# master 实例列表 (ip:port), 与 --cluster create 的分配一致时才能复用 RDB
+# 生成时把当时的 master 顺序写入 .layout, 加载时校验一致
+cluster_rdb_base() { echo "$RDB_DIR/${NUM_VSETS}V${VECTORS_PER_VSET}_${DIM}D_$(rdb_tag)_rc"; }
+
+# master ip:port 列表 (排序稳定), 从 CLUSTER NODES 解析 (无 replicas 时全 master;
+# 有 replicas 时取 role==master 的行)
+cluster_masters_list() {
+    $REDIS_DIR/src/redis-cli -h ${IPS[0]} -p $PORT CLUSTER NODES 2>/dev/null \
+        | awk '$3 ~ /master/ {sub(/@.*/, "", $2); print $2}' | sort
+}
+
+# prefill 成功后捕获: 逐 master SAVE → <base>_mN.rdb + .layout(各master的vset归属)
+capture_cluster_rdb() {
+    [ "$BASELINE_RDB" = "0" ] && return 0
+    local base; base=$(cluster_rdb_base)
+    mkdir -p "$RDB_DIR"
+    local masters
+    masters=$(cluster_masters_list)
+    [ -z "$masters" ] && return 0
+    printf '%s\n' "$masters" > "${base}.layout"
+    local idx=0 m ip port
+    while IFS= read -r m; do
+        ip=${m%%:*}; port=${m##*:}
+        local node=HW01
+        for ((i=0; i<NNODES; i++)); do [[ "${IPS[$i]}" == "$ip" ]] && node=${NODES[$i]}; done
+        $REDIS_DIR/src/redis-cli -h $ip -p $port SAVE >/dev/null 2>&1
+        # dump.rdb 落在该实例 --dir; port 对应 inst$((port-PORT)) 目录
+        local inst=$((port - PORT))
+        local d="$DATA_DIR/inst${inst}/dump.rdb"
+        # 注意: ssh 必须 -n (否则吃掉 while 的 stdin, 循环只跑一轮)
+        ssh -n $SSH_OPTS "$node" "[ -f $d ]" >/dev/null 2>&1 || continue
+        ssh -n $SSH_OPTS "$node" "cat $d" > "${base}_m${idx}.rdb" && chmod 444 "${base}_m${idx}.rdb"
+        ssh -n $SSH_OPTS "$node" "rm -f $d" 2>/dev/null
+        log "    [rdb] m$idx ← $node:$port ($d)"
+        idx=$((idx+1))
+    done <<< "$masters"
+    log "  [rdb] 捕获 $idx masters → ${base}_m*.rdb"
+}
+
+# 兼容 RDB 是否存在且布局匹配
+cluster_rdb_ready() {
+    [ "$BASELINE_RDB" = "0" ] && return 1
+    local base; base=$(cluster_rdb_base)
+    [ -f "${base}.layout" ] || return 1
+    local masters
+    masters=$(cluster_masters_list)
+    [ "$masters" != "$(cat ${base}.layout)" ] && return 1
+    local idx=0
+    while IFS= read -r _; do
+        [ -f "${base}_m${idx}.rdb" ] || return 1
+        idx=$((idx+1))
+    done <<< "$(cat ${base}.layout)"
+    return 0
+}
+
 prefill() {
     local v0=$KEY_OFFSET v1=$((KEY_OFFSET + NUM_VSETS - 1))
+    # RDB 已在各 master 就位 → 校验一个样本 vset 后跳过
+    if cluster_rdb_ready; then
+        local card=$($REDIS_DIR/src/redis-cli -c -h ${IPS[0]} -p $PORT VCARD vset$v0 2>/dev/null)
+        if [ "$card" = "$VECTORS_PER_VSET" ]; then
+            log "prefill skipped: using pre-loaded RDBs (vset$v0 VCARD=$card)"
+            return 0
+        fi
+        log "WARN: RDB VCARD=$card != $VECTORS_PER_VSET, 回退 prefill"
+    fi
     log "prefill: vset$v0..vset$v1 ($NUM_VSETS vsets) x $VECTORS_PER_VSET vectors (dim=$DIM)..."
     $REDIS_DIR/src/redis-cli -c -h ${IPS[0]} -p $PORT FLUSHALL >/dev/null 2>&1
     awk -v off=$KEY_OFFSET -v m=$NUM_VSETS -v k=$VECTORS_PER_VSET -v dim=$DIM 'BEGIN{
@@ -183,7 +322,7 @@ prefill() {
             for (e=0; e<k; e++) {
                 printf "VADD vset%d VALUES %d", v, dim;
                 for (j=0; j<dim; j++) printf " %f", rand()*0.001;
-                printf " elem%d\n", e;
+                printf " elem%d%s\n", e, (ENVIRON["BASELINE_NOQUANT"]=="0" ? "" : " NOQUANT");
             }
         }
     }' | $REDIS_DIR/src/redis-cli -c -h ${IPS[0]} -p $PORT >/dev/null 2>&1
@@ -192,6 +331,7 @@ prefill() {
         printf "  vset%d VCARD=%s\n" "$v" \
             "$($REDIS_DIR/src/redis-cli -c -h ${IPS[0]} -p $PORT VCARD vset$v 2>/dev/null)"
     done
+    capture_cluster_rdb
 }
 
 # ----------------------------------------------------------------------------
@@ -336,7 +476,7 @@ check_cluster
 log "=== STEP 4: prefill ==="
 prefill
 
-log "=== STEP 5: VEMB 17-config sweep ==="
+log "=== STEP 5: VEMB 9-config sweep ==="
 log "  MEMTIER_HOST=$MEMTIER_HOST  NUM_VSETS=$NUM_VSETS  DIM=$DIM"
 printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp999_ms\tkb_sec\tcores\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"
 

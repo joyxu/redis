@@ -472,7 +472,7 @@ fi
 start_server() {
     local node="$1" manifest="$2" logfile="$3" pid_file="$4"
     local request_path="$5" response_path="$6"
-    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$request_path' --vemb-v16-aeron-response-ub-path '$response_path' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel notice"
+    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$request_path' --vemb-v16-aeron-response-ub-path '$response_path' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel warning"
 }
 
 wait_server_ready() {
@@ -593,7 +593,7 @@ ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if 
 # A successful coordinator publish is only the control-plane half of the
 # protocol.  The source must accept local-done ACK and complete source GC
 # before its global migration gate is allowed to clear.
-ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if grep -q 'scaleout auto local done notified' '$NODE0_LOG' && grep -q 'scaleout auto done' '$NODE0_LOG'; then exit 0; fi; sleep 1; done; echo 'source did not reach local-done notified and done' >&2; grep -E 'scaleout auto|local done|migration_active|batch rejected|ATTACH rejected' '$NODE0_LOG' >&2 || true; exit 1"
+ssh_run "$NODE0_HOST" "for _ in \$(seq 1 $((COORD_WAIT_MS / 1000 + 10))); do if grep -q '^scaleout_all_sources_done=1$' '$COORD_OUT'; then exit 0; fi; sleep 1; done; echo 'coordinator did not confirm all sources done' >&2; tail -5 '$COORD_OUT' >&2 || true; exit 1"
 T1=$(date +%s)
 SCALEOUT_WALL=$((T1 - T0))
 REMAIN=$((BG_TIME_SCALEOUT - SCALEOUT_WALL))

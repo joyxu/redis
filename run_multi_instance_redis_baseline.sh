@@ -1,9 +1,10 @@
 #!/bin/bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # 注意：不能用 set -e —— vanilla redis VEMB 高并发偶发 connection reset，
 # 一档失败会触发 cleanup 杀全部 server。用 || true 兜底。
 #
 # ============================================================================
-# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis) - 17 档 sweep 版
+# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis) - 9 档 sweep 版
 #
 # 在 SERVER (HW01) 本地直接执行；跨节点时 ssh CLIENT 启 memtier。
 #
@@ -12,12 +13,12 @@
 # N 个 memtier 并行打，各连各的端口，汇总吞吐
 #
 # 跟 run_vemb_{local_loopback,cross_node}_sweep.sh 对齐:
-#   - 17 档 (t,c,pipeline) 配置矩阵（TS/CS/PS 数组）
+#   - 9 档 (t,c,pipeline) 配置矩阵（TS/CS/PS 数组）
 #   - server 启动参数对齐（--bind 0.0.0.0 / --tcp-backlog 16384 / --appendonly no / --save ''）
 #   - 输出 TSV 列对齐 sweep 脚本（op/server_type/t/c/pipeline/ops_sec/avg/p50/p99/kb_sec/cores/nic_util）
 #
 # 用法 (在 HW01 上执行):
-#   bash run_multi_instance_redis_baseline.sh                                 # 默认 17 档, 跨节点
+#   bash run_multi_instance_redis_baseline.sh                                 # 默认 9 档, 跨节点
 #   TS="64" CS="4" PS="32" bash ...                                          # 单档调试
 #   LOCAL_BENCH=1 RAW=1 DIM=300 bash ...                                     # 本地回环 + RAW
 #   DIM=8 NIC_IFACE=eth4 bash ...                                            # 跨节点 DIM=8
@@ -36,6 +37,9 @@ LOCAL_BENCH=${LOCAL_BENCH:-0}
 NUM_INSTANCES=${NUM_INSTANCES:-12}
 IO_THREADS=${IO_THREADS:-4}
 DIM=${DIM:-300}
+# baseline 免 prefill: 兼容分片 RDB 存在则加载; 0=强制 prefill
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/benchmark/baseline_rdb}
 NUM_KEYS=${NUM_KEYS:-100000}
 TEST_TIME=${TEST_TIME:-30}
 RAW=${RAW:-0}
@@ -43,10 +47,11 @@ RAW_SUFFIX=""
 [ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
 NIC_IFACE=${NIC_IFACE:-eth4}
 
-# === 17 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -127,14 +132,29 @@ inst_var() {
 start_instance() {
     local iid=$1; inst_var $iid
     rm -rf "$INST_DATA_DIR" && mkdir -p "$INST_DATA_DIR"
+    local rdb
+    rdb=$(instance_rdb_path "$1" || true)
+    local dir_args=(--dir "$INST_DATA_DIR")
+    if [ -n "$rdb" ]; then
+        dir_args=(--dir "$(dirname "$rdb")" --dbfilename "$(basename "$rdb")")
+        log "    inst $1: 加载分片 RDB $rdb"
+    fi
     numactl --membind=0 taskset -c $INST_CORE_START-$INST_CORE_END \
         $CODE_DIR/src/redis-server \
             --port $INST_PORT --bind 0.0.0.0 --protected-mode no \
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
             --io-threads $IO_THREADS --io-threads-do-reads yes \
             --appendonly no --save '' \
-            --dir "$INST_DATA_DIR" --logfile "$INST_LOG" \
+            "${dir_args[@]}" --logfile "$INST_LOG" \
             --daemonize yes --pidfile "${INST_DATA_DIR}/redis.pid"
+}
+
+# 实例 iid 的兼容分片 RDB (12 分片按 inst_var 同款切分); 不存在返回空
+instance_rdb_path() {
+    [ "${BASELINE_RDB:-auto}" = "0" ] && return 1
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    printf '%s\n' "$RDB_DIR/${NUM_KEYS}K_${DIM}D_${tag}_myvectors_multi_sh$(printf '%02d' "$1").rdb"
+    [ -f "$RDB_DIR/${NUM_KEYS}K_${DIM}D_${tag}_myvectors_multi_sh$(printf '%02d' "$1").rdb" ] || return 1
 }
 
 stop_instance() {
@@ -150,12 +170,27 @@ prefill_instance() {
     local iid=$1; inst_var $iid
     local vec300=$(seq -s " " 1 $DIM | sed "s/[0-9]*/0.1/g")
     local expected=$((INST_KEY_MAX - INST_KEY_MIN + 1))
+    local rdb
+    rdb=$(instance_rdb_path "$iid" || true)
+    if [ -n "$rdb" ]; then
+        # 等分片加载完成 (VCARD 数字) 并校验
+        local v=""
+        for _ in $(seq 1 300); do
+            v=$($CODE_DIR/src/redis-cli -p $INST_PORT VCARD myvectors 2>/dev/null | grep -E '^[0-9]+$') && break
+            sleep 0.1
+        done
+        if [ "$v" = "$expected" ]; then
+            log "    inst $iid: RDB 加载完成 card=$v, 跳过 prefill"
+            return 0
+        fi
+        log "    inst $iid: RDB 校验不符 (card=${v:-NA} != $expected), 回退 prefill"
+    fi
     for attempt in 1 2 3 4 5; do
         $CODE_DIR/src/redis-cli -p $INST_PORT DEL myvectors >/dev/null 2>&1
         sleep 0.2
         {
             for i in $(seq $INST_KEY_MIN $INST_KEY_MAX); do
-                echo "VADD myvectors VALUES $DIM $vec300 item:$i"
+                echo "VADD myvectors VALUES $DIM $vec300 item:$i$( [ "${BASELINE_NOQUANT:-1}" != 0 ] && echo " NOQUANT" )"
             done
         } | $CODE_DIR/src/redis-cli -p $INST_PORT --pipe >/dev/null 2>&1
         local card=$($CODE_DIR/src/redis-cli -p $INST_PORT VCARD myvectors 2>/dev/null)
@@ -252,11 +287,11 @@ run_one_config() {
     jb_si=$(snapshot_si)
     log "  launching $NUM_INSTANCES parallel memtier (per-inst: -t $t -c $c --pipeline=$p)"
     declare -a REMOTE_OUTS
-    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-        inst_var $i
-        local remote_out="/tmp/multi_inst_${TIMESTAMP}_t${t}_c${c}_p${p}_inst${i}.log"
-        REMOTE_OUTS[$i]=$remote_out
-        if [ "$LOCAL_BENCH" = "1" ]; then
+    if [ "$LOCAL_BENCH" = "1" ]; then
+        for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+            inst_var $i
+            local remote_out="/tmp/multi_inst_${TIMESTAMP}_t${t}_c${c}_p${p}_inst${i}.log"
+            REMOTE_OUTS[$i]=$remote_out
             taskset -c $CLIENT_CPU_SPEC \
                 $MEMTIER_DIR/memtier_benchmark \
                     -h "$bench_host" -p "$INST_PORT" \
@@ -267,20 +302,19 @@ run_one_config() {
                     --key-prefix=item: \
                     --key-minimum="$INST_KEY_MIN" --key-maximum="$INST_KEY_MAX" \
                     > "$remote_out" 2>&1 &
-        else
-            ssh "$CLIENT" "taskset -c $CLIENT_CPU_SPEC \
-                $MEMTIER_DIR/memtier_benchmark \
-                    -h '$bench_host' -p '$INST_PORT' \
-                    --hide-histogram --test-time='$TEST_TIME' --select-db=0 \
-                    -c '$c' -t '$t' --pipeline='$p' \
-                    --command='VEMB myvectors __key__${RAW_SUFFIX}' \
-                    --command-key-pattern=R \
-                    --key-prefix='item:' \
-                    --key-minimum='$INST_KEY_MIN' --key-maximum='$INST_KEY_MAX' \
-                    > '$remote_out' 2>&1" &
-        fi
-    done
-    wait
+        done
+        wait
+    else
+        local remote_cmd="set +e; "
+        for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+            inst_var $i
+            local remote_out="/tmp/multi_inst_${TIMESTAMP}_t${t}_c${c}_p${p}_inst${i}.log"
+            REMOTE_OUTS[$i]=$remote_out
+            remote_cmd+="taskset -c $CLIENT_CPU_SPEC $MEMTIER_DIR/memtier_benchmark -h '$bench_host' -p '$INST_PORT' --hide-histogram --test-time='$TEST_TIME' --select-db=0 -c '$c' -t '$t' --pipeline='$p' --command='VEMB myvectors __key__${RAW_SUFFIX}' --command-key-pattern=R --key-prefix='item:' --key-minimum='$INST_KEY_MIN' --key-maximum='$INST_KEY_MAX' > '$remote_out' 2>&1 & "
+        done
+        remote_cmd+="wait"
+        ssh "$CLIENT" "$remote_cmd"
+    fi
 
     # softirq delta + server rss (VmRSS KB, 所有实例求和)
     # core 分母 = 纳秒实测窗口 (与脚本13对齐; 此处先算, 下方 si 与 per-instance 都用)

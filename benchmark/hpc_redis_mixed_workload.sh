@@ -69,7 +69,7 @@ start_server() {
         --vemb-v16-warm-regions-manifest "$MANIFEST" \
         --vemb-v16-reset-warm-regions yes \
         --vemb-v16-proxy-io-threads $PIO --vemb-v16-supernode-workers $SNW \
-        --daemonize yes --pidfile $PIDFILE --logfile "$logfile" --loglevel notice \
+        --daemonize yes --pidfile $PIDFILE --logfile "$logfile" --loglevel warning \
         >/dev/null 2>&1
     wait_port || { echo "FAIL: server did not listen (see $logfile)"; return 1; }
     SERVER_PID=$(cat "$PIDFILE" 2>/dev/null)
@@ -118,7 +118,7 @@ run_mixed() {
         -s 127.0.0.1 -p $PORT -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE \
         --ratio=$ratio --key-pattern=$key_pat $extra_flags \
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$num_keys \
-        --test-time=$TEST_TIME >"$raw" 2>&1
+        --test-time=$TEST_TIME --hide-histogram >"$raw" 2>&1
 
     read j1_ut j1_st < <(get_cpu_jiffies "$SERVER_PID")
     J1_NS=$(date +%s%N)
@@ -135,10 +135,12 @@ run_mixed() {
 
     local tot; tot=$(grep '^Totals' "$raw" | tail -1)
     local ops hits p50 p99
+    # Totals 双格式: 旧9列 ops hits misses avg p50 p99 p999 kb;
+    # 新11列(vemb统一传输后) ops hits misses 0 0 avg p50 p99 p999 kb
     ops=$(echo "$tot" | awk '{print $2}')
     hits=$(echo "$tot" | awk '{print $3}')
-    p50=$(echo "$tot" | awk '{print $6}')
-    p99=$(echo "$tot" | awk '{print $7}')
+    p50=$(echo "$tot" | awk '{if (NF>=11) print $8; else print $6}')
+    p99=$(echo "$tot" | awk '{if (NF>=11) print $9; else print $7}')
     [ -z "$ops" ] && ops=0
     [ -z "$hits" ] && hits=0
 

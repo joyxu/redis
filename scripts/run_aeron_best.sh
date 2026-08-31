@@ -13,6 +13,8 @@
 #
 # 可调参数（环境变量）：
 #   TEST_TIME     bench 持续秒数         (默认 60)
+#   OP_TYPE       VEMB(默认)/VSIM_2KEY/VADD/VREM (aeron runner 支持全部 op flag;
+#                 非 VEMB 每档重启 server + prefill, 与 TCP loopback sweep 同语义)
 #   TS CS         client -t / -c         (默认 64 / 4；可传空格分隔矩阵)
 #   PIPELINE      每 channel in-flight   (默认 32；可传空格分隔矩阵)
 #   NUM_KEYS      prefill key 数         (默认 100000)
@@ -44,6 +46,21 @@ REMOTE_CHILD=${AERON_BEST_REMOTE_CHILD:-0}
 REDIS=$HPC/src/redis-server
 MEMTIER=$HPC/memtier_benchmark/memtier_benchmark
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
+
+# OP_TYPE: VEMB(默认读) / VSIM_2KEY / VADD / VREM (与 TCP loopback sweep 脚本同语义:
+# VADD 免 prefill; 非 VEMB 每档重启 server 保证干净起点)
+OP_TYPE=${OP_TYPE:-VEMB}
+OP_FLAG=""
+RATIO_ARG="--ratio=0:1"
+KP_ARG="R:R"
+case "$OP_TYPE" in
+    VEMB) ;;
+    VSIM)      OP_FLAG="--vemb-v16-vsim" ;;
+    VSIM_2KEY) OP_FLAG="--vemb-v16-vsim-key-key" ;;
+    VADD)      RATIO_ARG="--ratio=1:0"; KP_ARG="S:S" ;;
+    VREM)      OP_FLAG="--vemb-v16-vrem"; RATIO_ARG="--ratio=1:0"; KP_ARG="S:S" ;;
+    *) echo "ERROR: OP_TYPE must be one of VEMB/VSIM/VSIM_2KEY/VADD/VREM (got: $OP_TYPE)" >&2; exit 2 ;;
+esac
 
 PORT=${PORT:-6395}
 SERVER_HOST=${SERVER_HOST:-127.0.0.1}
@@ -118,9 +135,10 @@ SERVER_MASK=${SERVER_MASK:-"0-47"}
 CLIENT_MASK=${CLIENT_MASK:-"96-191"}
 
 # === 配置矩阵 ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PIPELINE:-${PS_DEFAULT[*]}} )
@@ -288,10 +306,13 @@ validate_profile() {
         echo "ERROR: FLAME_DURATION must be positive" >&2
         exit 2
     }
-    [ "$FLAME_DURATION" -lt "$TEST_TIME" ] || {
-        echo "ERROR: FLAME_DURATION must be less than TEST_TIME" >&2
-        exit 2
-    }
+    # FLAME_DURATION 仅在 PROFILE=1 时有意义, PROFILE=0 不校验
+    if [ "$PROFILE" = 1 ]; then
+        [ "$FLAME_DURATION" -lt "$TEST_TIME" ] || {
+            echo "ERROR: FLAME_DURATION must be less than TEST_TIME" >&2
+            exit 2
+        }
+    fi
     if [ "$PROFILE" = 1 ]; then
         [ "$ROLE" = both ] || {
             echo "ERROR: PROFILE=1 requires ROLE=both" >&2
@@ -483,7 +504,7 @@ cleanup() {
         [ -n "$p" ] && { kill "$p" 2>/dev/null; sleep 0.3; kill -9 "$p" 2>/dev/null; }
     fi
     pkill -9 -f "redis-server.*:$PORT " 2>/dev/null || true
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$SERVER_LOG"
 }
 
 # ============================================================================
@@ -511,8 +532,8 @@ if [ "$NUM_KEYS" -gt "$MAX_VECTORS" ]; then
 fi
 
 # ── 启动 server ──
-if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
-    echo "=== start server: mask=$SERVER_MASK pio=$PIO snw=$SNW ==="
+start_local_server() {
+    echo "=== start server: mask=$SERVER_MASK pio=$PIO snw=$SNW op=$OP_TYPE ==="
     taskset -c "$SERVER_MASK" $REDIS \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
@@ -541,6 +562,38 @@ if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
     fi
     echo "server up: pid=$(cat $PIDFILE) control=tcp tcp=$SERVER_HOST:$PORT"
     sleep 1
+}
+
+run_prefill() {
+    # VADD 本身即写入, 只清库不 prefill
+    if [ "$OP_TYPE" = "VADD" ]; then
+        echo "=== OP_TYPE=VADD skip prefill (FLUSHDB) ==="
+        $HPC/src/redis-cli -h 127.0.0.1 -p $PORT FLUSHDB >/dev/null 2>&1 || true
+        return 0
+    fi
+    echo ""
+    echo "=== prefill: $NUM_KEYS keys, dim=$DIM server=$SERVER_HOST:$PORT ==="
+    if ! taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
+        "${VEMB_MODE_ARGS[@]}" \
+        "${VEMB_BATCH_ARGS[@]}" \
+        "${VEMB_ENDPOINT_ARGS[@]}" \
+        "${VEMB_PEER_VIEW_ARGS[@]}" \
+        --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
+        -t 1 -c 1 -n $NUM_KEYS --pipeline=32 \
+        --ratio=1:0 --key-pattern=S:S \
+        --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
+        > "$RAWDIR/prefill.log" 2>&1; then
+        echo "FAIL: Aeron prefill failed"
+        tail -80 "$RAWDIR/prefill.log" 2>/dev/null
+        exit 1
+    fi
+    PREFILL_TOTALS=$(grep "^Totals" "$RAWDIR/prefill.log" | tail -1)
+    PREFILL_OPS=$(echo "$PREFILL_TOTALS" | awk '{print $2}')
+    log "prefill done: ${PREFILL_OPS:-N/A} sets/sec"
+}
+
+if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
+    start_local_server
 fi
 
 if [ "$ROLE" = "server" ]; then
@@ -557,25 +610,7 @@ fi
 SRV_PID=$(cat "$PIDFILE" 2>/dev/null)
 
 # ── prefill ──
-echo ""
-echo "=== prefill: $NUM_KEYS keys, dim=$DIM server=$SERVER_HOST:$PORT ==="
-if ! taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport="$AERON_TRANSPORT" \
-    "${VEMB_MODE_ARGS[@]}" \
-    "${VEMB_BATCH_ARGS[@]}" \
-    "${VEMB_ENDPOINT_ARGS[@]}" \
-    "${VEMB_PEER_VIEW_ARGS[@]}" \
-    --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
-    -t 1 -c 1 -n $NUM_KEYS --pipeline=32 \
-    --ratio=1:0 --key-pattern=S:S \
-    --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
-    > "$RAWDIR/prefill.log" 2>&1; then
-    echo "FAIL: Aeron prefill failed"
-    tail -80 "$RAWDIR/prefill.log" 2>/dev/null
-    exit 1
-fi
-PREFILL_TOTALS=$(grep "^Totals" "$RAWDIR/prefill.log" | tail -1)
-PREFILL_OPS=$(echo "$PREFILL_TOTALS" | awk '{print $2}')
-log "prefill done: ${PREFILL_OPS:-N/A} sets/sec"
+run_prefill
 
 if [ "$PROFILE" = 1 ]; then
     start_server_perf
@@ -591,6 +626,15 @@ printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tp9
 for ((idx=0; idx<NCONFIGS; idx++)); do
     t=${TS[$idx]}; c=${CS[$idx]}; p=${PS[$idx]}
     log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
+
+    # 非 VEMB op 修改数据 (VSIM_2KEY 只读可不重启; VADD/VREM 改数据), 统一按 TCP loopback
+    # 语义每档重启 server + prefill 保证干净起点; 第 0 档沿用循环前已起的 server
+    if [ "$OP_TYPE" != "VEMB" ] && [ "$idx" -gt 0 ]; then
+        cleanup
+        sleep 0.5
+        start_local_server
+        run_prefill
+    fi
 
     SRV_PID=$(cat $PIDFILE 2>/dev/null)
     J0_UT=0 J0_ST=0
@@ -609,9 +653,9 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
         "${VEMB_PEER_VIEW_ARGS[@]}"
         --vemb-v16-dim "$DIM" -s "$SERVER_HOST" -p "$PORT"
         -t "$t" -c "$c" --pipeline="$p"
-        --ratio=0:1 --key-pattern=R:R
+        $OP_FLAG $RATIO_ARG --key-pattern=$KP_ARG
         --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
-        --test-time="$TEST_TIME"
+        --test-time="$TEST_TIME" --hide-histogram
     )
     workload_log="$RAWDIR/t${t}_c${c}_p${p}.log"
 
@@ -703,7 +747,8 @@ for ((idx=0; idx<NCONFIGS; idx++)); do
     )
     OPS_PER_CORE=$(awk -v o="$ops" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0||o==0) print "NA"; else printf "%.0f", o/c }')
 
-    printf "VEMB\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s_local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$OP_TYPE" \
         "$AERON_TRANSPORT" \
         "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$p999" "$kb" "$CPU_CORES" "$OPS_PER_CORE" \
         "$CORE_UT" "$CORE_ST" "$C_SI" "$RSS_KB" >> "$TSV"

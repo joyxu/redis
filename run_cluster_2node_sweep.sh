@@ -7,7 +7,7 @@
 #   SAR 同时采集两台 server 网卡利用率
 #
 # 用法 (在 HW01 上执行):
-#   bash run_cluster_2node_sweep.sh                          # 默认 17 档 DIM=300
+#   bash run_cluster_2node_sweep.sh                          # 默认 9 档 DIM=300
 #   DIM=300 TEST_TIME=10 bash run_cluster_2node_sweep.sh       # smoke
 #   TS="64" CS="8" PS="32" bash run_cluster_2node_sweep.sh   # 单档
 #   CLIENT=HW07 bash run_cluster_2node_sweep.sh              # 换客户端
@@ -29,8 +29,13 @@ CLIENT_TASKSET="taskset -c $CLIENT_CPUSET"
 
 # === 路径 (SERVER 本地) ===
 HPC_DIR=${HPC_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}
-HW01_MANIFEST=${HW01_MANIFEST:-$HPC_DIR/examples/cluster_111.yaml}
-HW02_MANIFEST=${HW02_MANIFEST:-$HPC_DIR/examples/cluster_112.yaml}
+# 高维 (DIM!=300) 默认使用对应 dim 变体 manifest (value_size=dim*4, 4GB region)
+DIM_MANIFEST_SUFFIX=""
+if [ "${DIM:-300}" != "300" ]; then
+    DIM_MANIFEST_SUFFIX="_dim${DIM}"
+fi
+HW01_MANIFEST=${HW01_MANIFEST:-$HPC_DIR/examples/cluster_111${DIM_MANIFEST_SUFFIX}.yaml}
+HW02_MANIFEST=${HW02_MANIFEST:-$HPC_DIR/examples/cluster_112${DIM_MANIFEST_SUFFIX}.yaml}
 MEMTIER=${MEMTIER:-$HPC_DIR/memtier_benchmark/memtier_benchmark}
 DATA_DIR=${DATA_DIR:-/tmp/redis-cluster-sweep}
 
@@ -44,10 +49,11 @@ HPC_PIO=${HPC_PIO:-4}
 HPC_SNW=${HPC_SNW:-4}
 BASELINE_IO_THREADS=${BASELINE_IO_THREADS:-4}
 
-# === 17 档配置矩阵 ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵 ===
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -114,6 +120,7 @@ start_server_hw01() {
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
+            --vemb-v16-tcp-host $HW01_IP \
             --vemb-v16-dim $DIM \
             --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
@@ -141,6 +148,7 @@ start_server_hw02() {
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
+            --vemb-v16-tcp-host $HW02_IP \
             --vemb-v16-dim $DIM \
             --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
@@ -281,12 +289,14 @@ run_one_config() {
     local nfields=$(echo "$totals" | awk '{print NF}')
     local ops=0 avg_lat=0 p50=0 p99=0 kb=0
     if [ -n "$totals" ]; then
-        if [ "$nfields" -ge 9 ]; then
+        if [ "$nfields" -ge 11 ]; then
+            # memtier Totals: 1=Totals 2=Ops/sec 3=Hits 4=Misses 5=MOVED 6=ASK
+            #                 7=Avg 8=p50 9=p99 10=p99.9 11=KB/sec
             ops=$(echo "$totals" | awk '{print $2}')
-            avg_lat=$(echo "$totals" | awk '{print $5}')
-            p50=$(echo "$totals" | awk '{print $6}')
-            p99=$(echo "$totals" | awk '{print $7}')
-            kb=$(echo "$totals" | awk '{print $9}')
+            avg_lat=$(echo "$totals" | awk '{print $7}')
+            p50=$(echo "$totals" | awk '{print $8}')
+            p99=$(echo "$totals" | awk '{print $9}')
+            kb=$(echo "$totals" | awk '{print $11}')
         elif [ "$nfields" -ge 7 ]; then
             ops=$(echo "$totals" | awk '{print $2}')
             avg_lat=$(echo "$totals" | awk '{print $3}')

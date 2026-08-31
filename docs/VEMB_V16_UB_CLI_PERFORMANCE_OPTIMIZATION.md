@@ -97,13 +97,25 @@ callback 增量是真实的 client completion 路径增量，但 `read_vector` �
 为验证集群场景下一个 session 的 pipeline 被两个 owner 分摊后容易形成小 batch，
 在 `threads=64`、`clients=1`、`delay=10us`、`cc_nc` 下逐步提高 read pipeline。
 `server --vemb-v16-batch-request-size` 与 CLI batch size 随脚本的 `PIPELINE` 一起调整；
-steady write 阶段仍使用脚本固定的 pipeline=32。三轮测试均 correctness pass：
+steady write 阶段仍使用脚本固定的 pipeline=32。原三轮 delay=10us 测试均 correctness pass；
+新增的 delay=0 控制实验也 correctness pass：
 
 | read pipeline | old-key QPS | old-key after steady QPS | steady-key QPS | steady p50/p99 |
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 14,066,514 | 14,456,820 | 12,868,981 | 0.103/0.231 ms |
 | 64 | 15,947,158 | 15,832,934 | 14,239,397 | 0.167/0.399 ms |
 | 80 | 16,234,975 | 16,276,764 | 14,539,727 | 0.199/0.487 ms |
+| 80 (delay=0) | 16,318,820 | 16,381,232 | 14,530,011 | 0.199/0.479 ms |
+
+新增的 `pipeline=80、BATCH_MAX_DELAY_US=0` 控制实验来自
+`ub_active_2node_20260826_223534`；其余主要参数保持为 `threads=64`、`clients=1`、
+`cc_nc`、`SLOT_SCHED=fixed`，server/client batch size 均为 80。该行的 prefill 和
+steady write 仍使用脚本固定的 pipeline=32，表中读阶段使用 pipeline=80。
+
+与 delay=10us 的 pipeline=80 对照相比，old-key、old-key after steady 和 steady-key
+QPS 变化分别约为 `+0.52%`、`+0.64%` 和 `-0.07%`，steady p99 从 `0.487ms` 变为
+`0.479ms`。单轮结果不能证明存在收益，但至少表明关闭 10us deadline 没有改变当前
+吞吐等级；该控制实验应与原三轮 delay=10us 数据分开解读。
 
 pipeline=64 相比 pipeline=32 将 old/steady 的绝对 QPS 分别提高约 13.4% 和 10.7%；
 pipeline=80 继续提高到约 16.23M/14.54M。owner batch 统计也显示 batch 从 pipeline=32

@@ -1,0 +1,12 @@
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 1
+warm_regions:
+  - region_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev2
+    mmap_offset: 0
+    bytes: 7516192768
+    value_size: 12288
+    home_ub_node_id: 0
+    weight: 1

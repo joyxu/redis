@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# baseline 存储默认 NOQUANT(fp32, VEMB RAW 返回 f32 与 hpc 响应对齐); BASELINE_NOQUANT=0 恢复 int8 量化
 # ============================================================================
 # run_vsim_2key_2node.sh
 # 2-node VSIM_2KEY: Redis Cluster (baseline) vs hpc-redis 吞吐/延迟 对比
@@ -19,7 +20,7 @@
 #   hpc      — memtier --vemb-v16-vsim-key-key, 每 op = 2-key fetch + server cosine
 #
 # 用法:
-#   bash benchmark/run_vsim_2key_2node.sh                           # 完整 17 档
+#   bash benchmark/run_vsim_2key_2node.sh                           # 完整 9 档
 #   TEST_TIME=5 NUM_KEYS=1000 TS="64" CS="4" PS="32" \
 #     bash benchmark/run_vsim_2key_2node.sh                         # smoke
 #   SERVERS_ONLY=baseline bash benchmark/run_vsim_2key_2node.sh     # 只跑 baseline
@@ -35,6 +36,10 @@ NODE1_SSH=${NODE1_SSH:-HW02}
 REDIS_DIR=${REDIS_DIR:-/root/gqs/codespace/redis-8.6.3}
 HPC_DIR=${HPC_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}
 BASELINE_MEMTIER=${BASELINE_MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin/memtier_benchmark}
+# baseline 免 prefill: 每 node 一份 RDB (slot 布局固定 0-8191/8192-16383)
+# 首轮 prefill 后自动捕获 (SAVE 落盘), 之后直接加载; 0=强制 prefill 不捕获
+BASELINE_RDB=${BASELINE_RDB:-auto}
+RDB_DIR=${RDB_DIR:-$HPC_DIR/benchmark/baseline_rdb}
 HPC_MEMTIER=${HPC_MEMTIER:-$HPC_DIR/memtier_benchmark/memtier_benchmark}
 
 # === 端口 ===
@@ -57,10 +62,11 @@ HPC_SNW=${HPC_SNW:-2}
 HPC_MANIFEST_0=${HPC_MANIFEST_0:-$HPC_DIR/examples/cluster_vsim_111.yaml}
 HPC_MANIFEST_1=${HPC_MANIFEST_1:-$HPC_DIR/examples/cluster_vsim_112.yaml}
 
-# === 17 档配置矩阵 (跟 run_vemb_local_loopback_sweep.sh 一致) ===
-TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
-CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
-PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+# === 9 档配置矩阵 (跟 run_vemb_local_loopback_sweep.sh 一致) ===
+# 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)
+TS_DEFAULT=( 1  1  4 16 64 64 64)
+CS_DEFAULT=( 1  1  1  1  1  4 16)
+PS_DEFAULT=( 1 32 32 32 32 32 32)
 TS=( ${TS:-${TS_DEFAULT[*]}} )
 CS=( ${CS:-${CS_DEFAULT[*]}} )
 PS=( ${PS:-${PS_DEFAULT[*]}} )
@@ -139,9 +145,87 @@ wait_port_1() {
 #   node1: 1 instance  (7000=main)
 #   3 masters total → quorum satisfied
 # ============================================================================
+# 兼容 RDB 路径 (node 侧); 不存在返回空
+vsim_rdb_path() {
+    [ "$BASELINE_RDB" = "0" ] && return 1
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    local f="$RDB_DIR/${NUM_KEYS}K_${DIM}D_${tag}_vsim2key_n$1.rdb"
+    [ -f "$f" ] || return 1
+    echo "$f"
+}
+
+# prefill 后捕获: 每 data-node SAVE → 统一存 RDB_DIR + DBSIZE meta
+capture_vsim_rdb() {
+    [ "$BASELINE_RDB" = "0" ] && return 0
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    local base="${NUM_KEYS}K_${DIM}D_${tag}_vsim2key"
+    # node0 主实例
+    local d0
+    d0=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" DBSIZE 2>/dev/null)
+    $REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" SAVE >/dev/null 2>&1
+    mv /tmp/redis-cluster-baseline/dump.rdb "$RDB_DIR/${base}_n0.rdb" 2>/dev/null && chmod 444 "$RDB_DIR/${base}_n0.rdb" && echo "$d0" > "$RDB_DIR/${base}_n0.size"
+    # node1
+    local d1
+    d1=$(ssh $SSH_OPTS "$NODE1_SSH" "$REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $BASELINE_PORT DBSIZE 2>/dev/null; $REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $BASELINE_PORT SAVE >/dev/null 2>&1; echo done" 2>/dev/null | head -1)
+    ssh $SSH_OPTS "$NODE1_SSH" "cat /tmp/redis-cluster-baseline/dump.rdb" > "$RDB_DIR/${base}_n1.rdb" 2>/dev/null && chmod 444 "$RDB_DIR/${base}_n1.rdb" && echo "$d1" > "$RDB_DIR/${base}_n1.size"
+    log "  [rdb] 捕获完成: ${base}_n0.rdb($d0 keys) ${base}_n1.rdb($d1 keys)"
+}
+
+# RDB 就绪校验 (cluster ok 后): DBSIZE 与捕获时一致
+check_vsim_rdb_loaded() {
+    local tag=$([ "${BASELINE_NOQUANT:-1}" = "0" ] && echo INT8 || echo NOQUANT)
+    local base="${NUM_KEYS}K_${DIM}D_${tag}_vsim2key"
+    local want0=$(cat "$RDB_DIR/${base}_n0.size" 2>/dev/null)
+    local want1=$(cat "$RDB_DIR/${base}_n1.size" 2>/dev/null)
+    [ -z "$want0" ] && return 0
+    local d0 d1
+    d0=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" DBSIZE 2>/dev/null)
+    d1=$(ssh $SSH_OPTS "$NODE1_SSH" "$REDIS_DIR/src/redis-cli -h 127.0.0.1 -p $BASELINE_PORT DBSIZE 2>/dev/null" 2>/dev/null)
+    if [ "$d0" = "$want0" ] && [ "$d1" = "$want1" ]; then
+        log "  [rdb] 校验 OK: n0=$d0 n1=$d1"; return 0
+    fi
+    log "  [rdb] 校验不符: n0=$d0/$want0 n1=$d1/$want1"; return 1
+}
+
+# 给 (host:BASELINE_PORT) 补齐 [from,to] 的 slot。RDB 预加载的 key 会触发 redis
+# auto-claim (busy), busy 的正是 key 所在 slot 且已在正确节点, 只需补缺失的空 slot。
+fill_cluster_slots() {
+    local host=$1 from=$2 to=$3 try mine_id missing rc
+    for try in 1 2 3 4 5; do
+        # 注意: redis-cli 收到 ERR 回复时 exit code 仍是 0, 必须判输出内容
+        local out
+        out=$($REDIS_DIR/src/redis-cli -h "$host" -p "$BASELINE_PORT" CLUSTER ADDSLOTS $(seq $from $to) 2>&1)
+        [ "$out" = "OK" ] && return 0
+        log "    fill[$host] try=$try addslots: $(echo "$out" | head -c 60)"
+        mine_id=$($REDIS_DIR/src/redis-cli -h "$host" -p "$BASELINE_PORT" CLUSTER MYID 2>/dev/null)
+        [ -z "$mine_id" ] && { sleep 1; continue; }
+        missing=$($REDIS_DIR/src/redis-cli -h "$host" -p "$BASELINE_PORT" CLUSTER NODES 2>/dev/null | awk -v me="$mine_id" -v f="$from" -v t="$to" '
+            $1==me { for(i=9;i<=NF;i++){ if($i ~ /-/) { split($i,a,"-"); for(s=a[1];s<=a[2];s++) have[s]=1 } else have[$i+0]=1 } }
+            END { for(s=f;s<=t;s++) if(!(s in have)) print s }')
+        log "    fill[$host] missing_count=$(echo $missing | wc -w)"
+        log "    fill_cluster_slots $host try=$try missing=$(echo $missing | wc -w) slots"
+        [ -z "$missing" ] && return 0
+        local out2
+        out2=$($REDIS_DIR/src/redis-cli -h "$host" -p "$BASELINE_PORT" CLUSTER ADDSLOTS $missing 2>&1)
+        [ "$out2" = "OK" ] && return 0
+        log "    fill[$host] try=$try addslots-missing: $(echo "$out2" | head -c 60)"
+        sleep 1
+    done
+    log "WARN: fill_cluster_slots $host [$from,$to] 未完全成功"
+    return 1
+}
+
 start_baseline_0() {
     log "  [node0] start baseline redis-server main port=$BASELINE_PORT"
     mkdir -p /tmp/redis-cluster-baseline
+    rm -f /tmp/redis-cluster-baseline/nodes-*.conf /tmp/redis-cluster-baseline/dump.rdb  # 防跨 run 残留
+    local rdb0
+    rdb0=$(vsim_rdb_path 0 || true)
+    local dir_args=(--dir /tmp/redis-cluster-baseline)
+    if [ -n "$rdb0" ]; then
+        dir_args=(--dir "$(dirname "$rdb0")" --dbfilename "$(basename "$rdb0")")
+        log "  [node0] 加载预填充 RDB: $rdb0"
+    fi
     taskset -c 0-47 \
         $REDIS_DIR/src/redis-server \
             --port $BASELINE_PORT --bind 0.0.0.0 --protected-mode no \
@@ -150,7 +234,7 @@ start_baseline_0() {
             --cluster-node-timeout 10000 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --appendonly no --save '' \
-            --dir /tmp/redis-cluster-baseline \
+            "${dir_args[@]}" \
             --logfile /tmp/redis-cluster-baseline/redis-$BASELINE_PORT.log \
             --daemonize yes
 
@@ -170,8 +254,19 @@ start_baseline_0() {
 
 start_baseline_1() {
     log "  [node1] start baseline redis-server port=$BASELINE_PORT"
+    local rdb1
+    rdb1=$(vsim_rdb_path 1 || true)
+    local remote_dir="/tmp/redis-cluster-baseline"
+    local remote_dbargs=""
+    if [ -n "$rdb1" ]; then
+        # 把 rdb 复制到 node1 固定路径, quorum 不在 node1 不受影响
+        scp -q "$rdb1" "$NODE1_SSH:/tmp/vsim2key_n1.rdb" 2>/dev/null
+        remote_dir="/tmp"
+        remote_dbargs="--dbfilename vsim2key_n1.rdb"
+        log "  [node1] 加载预填充 RDB: $rdb1"
+    fi
     ssh $SSH_OPTS "$NODE1_SSH" "
-        mkdir -p /tmp/redis-cluster-baseline && \
+        mkdir -p /tmp/redis-cluster-baseline && rm -f /tmp/redis-cluster-baseline/nodes-*.conf /tmp/redis-cluster-baseline/dump.rdb && \
         taskset -c 0-95 \
         $REDIS_DIR/src/redis-server \
             --port $BASELINE_PORT --bind 0.0.0.0 --protected-mode no \
@@ -180,7 +275,7 @@ start_baseline_1() {
             --cluster-node-timeout 10000 \
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --appendonly no --save '' \
-            --dir /tmp/redis-cluster-baseline \
+            --dir $remote_dir $remote_dbargs \
             --logfile /tmp/redis-cluster-baseline/redis-$BASELINE_PORT.log \
             --daemonize yes
     " 2>/dev/null
@@ -214,20 +309,25 @@ run_baseline() {
     wait_port_1 "$BASELINE_PORT" || { log "FAIL: node1:$BASELINE_PORT not up"; exit 1; }
     log "all 3 baseline instances up"
 
-    # --- 4. Create cluster: MEET all 3, ADDSLOTS to 2 ---
+    # --- 4. Create cluster: MEET all 3, then fill slots ---
+    # RDB 预加载的 key 会触发 redis auto-claim 抢占 key 所在 slot, 整段 ADDSLOTS
+    # 会因 "already busy" 原子失败。fill_cluster_slots 先整段尝试, 失败则解析
+    # CLUSTER NODES 求差集只补缺失的空 slot (busy 的已在正确节点, 无需处理)。
     log "creating 3-master cluster (2 with slots + 1 quorum-only)..."
     $REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" \
         CLUSTER MEET "$NODE1_HOST" "$BASELINE_PORT" 2>/dev/null
     $REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" \
         CLUSTER MEET "$NODE0_HOST" "$BASELINE_QUORUM_PORT" 2>/dev/null
     sleep 3
-
-    $REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" CLUSTER ADDSLOTS $(seq 0 8191) 2>/dev/null
-    $REDIS_DIR/src/redis-cli -h "$NODE1_HOST" -p "$BASELINE_PORT" CLUSTER ADDSLOTS $(seq 8192 16383) 2>/dev/null
+    fill_cluster_slots "$NODE0_HOST" 0 8191
+    fill_cluster_slots "$NODE1_HOST" 8192 16383
     sleep 2
 
     # --- 5. Wait cluster_state=ok (not just slots_ok) ---
-    log "waiting for cluster_state=ok..."
+    local sa0 ds0
+    sa0=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" CLUSTER INFO 2>/dev/null | awk -F: '/cluster_slots_assigned/{gsub(/[[:space:]]/,"",$2);print $2}')
+    ds0=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" DBSIZE 2>/dev/null)
+    log "waiting for cluster_state=ok... [slots_assigned=${sa0:-NA} dbsize0=${ds0:-NA}]"
     local cstate="fail" max_wait=60
     for ((w=0; w<max_wait; w++)); do
         cstate=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" CLUSTER INFO 2>/dev/null \
@@ -242,6 +342,18 @@ run_baseline() {
     log "cluster_state=ok after ${w}s"
 
     # --- 6. Prefill ({item:X as implicit hash-tag key, single elem0 per key) ---
+    # RDB 已加载 → 跳过 prefill 数据灌入 (FLUSHALL 也跳过), 但不能 return:
+    # 本函数后续还有 DBSIZE 校验与 bench, return 会整个跳过 baseline 压测
+    local rdb_prefilled=0
+    if [ -n "$(vsim_rdb_path 0 || true)" ] && [ -n "$(vsim_rdb_path 1 || true)" ]; then
+        if check_vsim_rdb_loaded; then
+            log "prefill skipped: using pre-loaded RDBs"
+            rdb_prefilled=1
+        else
+            log "WARN: RDB 校验失败, 回退 prefill"
+        fi
+    fi
+    if [ "$rdb_prefilled" = "0" ]; then
     log "prefilling $NUM_KEYS elements with hash-tag distribution..."
     $REDIS_DIR/src/redis-cli -c -h "$NODE0_HOST" -p "$BASELINE_PORT" FLUSHALL >/dev/null 2>&1
 
@@ -251,7 +363,7 @@ run_baseline() {
         for (i=1; i<=n; i++) {
             printf "VADD {item:%d VALUES %d", i, dim;
             for (j=0; j<dim; j++) printf " %.5f", rand()*j*0.001;
-            printf " elem0\n";
+            printf " elem0%s\n", (ENVIRON["BASELINE_NOQUANT"]=="0" ? "" : " NOQUANT");
         }
     }' | $REDIS_DIR/src/redis-cli -c -h "$NODE0_HOST" -p "$BASELINE_PORT" \
         > /dev/null 2>&1
@@ -263,10 +375,15 @@ run_baseline() {
     dbsize0=$($REDIS_DIR/src/redis-cli -h "$NODE0_HOST" -p "$BASELINE_PORT" DBSIZE 2>/dev/null)
     dbsize1=$($REDIS_DIR/src/redis-cli -h "$NODE1_HOST" -p "$BASELINE_PORT" DBSIZE 2>/dev/null)
     log "  DBSIZE: node0=$dbsize0  node1=$dbsize1"
+    # prefill 成功 → 捕获 RDB 供下次使用
+    if [ "${dbsize0:-0}" -gt 0 ] || [ "${dbsize1:-0}" -gt 0 ]; then
+        capture_vsim_rdb
+    fi
     if [ "${dbsize0:-0}" -eq 0 ] && [ "${dbsize1:-0}" -eq 0 ]; then
         log "FAIL: both nodes have 0 keys after prefill"
         exit 1
     fi
+    fi  # end rdb_prefilled=0
 
     # --- 8. Benchmark (17 configs, no restart — VSIM_2KEY is read-only) ---
     log "benchmark: $NCONFIGS configs, TEST_TIME=${TEST_TIME}s"
@@ -310,8 +427,9 @@ run_baseline() {
         totals=$(grep "^Totals" "$raw" | tr -d '\r' | tail -1)
         read ops avg p50 p99 kb < <(
             echo "$totals" | awk '{
-                if (NF>=9)      printf "%s %s %s %s %s", $2,$5,$6,$7,$9
-                else if (NF>=7) printf "%s %s %s %s %s", $2,$3,$4,$5,$7
+                if (NF>=11)      printf "%s %s %s %s %s", $2,$7,$8,$9,$11
+                else if (NF>=9)  printf "%s %s %s %s %s", $2,$5,$6,$7,$9
+                else if (NF>=7)  printf "%s %s %s %s %s", $2,$3,$4,$5,$7
                 else            printf "0 NA NA NA NA"
             }'
         )
@@ -467,8 +585,9 @@ run_hpc() {
         totals=$(grep "^Totals" "$raw" | tr -d '\r' | tail -1)
         read ops avg p50 p99 kb < <(
             echo "$totals" | awk '{
-                if (NF>=9)      printf "%s %s %s %s %s", $2,$5,$6,$7,$9
-                else if (NF>=7) printf "%s %s %s %s %s", $2,$3,$4,$5,$7
+                if (NF>=11)      printf "%s %s %s %s %s", $2,$7,$8,$9,$11
+                else if (NF>=9)  printf "%s %s %s %s %s", $2,$5,$6,$7,$9
+                else if (NF>=7)  printf "%s %s %s %s %s", $2,$3,$4,$5,$7
                 else            printf "0 NA NA NA NA"
             }'
         )

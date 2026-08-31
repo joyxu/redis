@@ -23,6 +23,7 @@
      (loc).local_slot != TLC_CORE_INVALID_SLOT)
 #define IS_INVALID_LOCATION(loc) (!IS_VALID_LOCATION(loc))
 #define TLC_CORE_MAX_WARM_REGIONS 128u
+#define TLC_CORE_MAX_TOTAL_WARM_REGIONS (TLC_CORE_MAX_WARM_REGIONS * 2u)
 
 typedef struct tlc_warm_location {
     uint32_t region_id;
@@ -111,6 +112,8 @@ typedef struct tlc_core_region_stats {
     uint32_t full;
     uint32_t capacity_slots;
     uint32_t used_slots;
+    uint64_t lookup_hits;
+    uint64_t cold_promotes;
 } tlc_core_region_stats_t;
 
 typedef struct tlc_core_stats {
@@ -127,6 +130,12 @@ typedef struct tlc_core_stats {
     uint64_t warm_stale_handle_reject;
     uint64_t remote_meta_stale;
     uint64_t warm_region_hash_local_pct;
+    uint64_t lookup_cache_hit;
+    uint64_t lookup_cache_miss;
+    uint64_t lookup_warm_local_hit;
+    uint64_t lookup_warm_imported_hit;
+    uint64_t lookup_cold_promote;
+    uint64_t lookup_final_miss;
 } tlc_core_stats_t;
 
 typedef struct tlc_core_config {
