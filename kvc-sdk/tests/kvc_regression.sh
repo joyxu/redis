@@ -19,6 +19,10 @@ TAG=${1:-run}
 #  2) master 默认 KV 租约 10s → runtime>10s 的 read_perf 出 miss → TTL 调大
 sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
 sysctl -w "net.ipv4.ip_local_port_range=10240 65535" >/dev/null 2>&1 || true
+
+# TE 基线推到最强: 连接池 + 16 lane（公平对比; 实测 TE 108.5 -> 273.5 MiB/s）
+export MC_TCP_ENABLE_CONNECTION_POOL=1
+export MC_TCP_LANES_PER_PEER=16
 LOG=/tmp/kvc_regress_${TAG}.log
 MCB=/tmp/mc_build
 PYROOT=/opt/mc_py
