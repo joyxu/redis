@@ -44,7 +44,11 @@ start_cluster() { # $1=kvc|anon  $2=tag
   sleep 2
   PYTHONPATH=$PYROOT nohup python3 -m mooncake.http_metadata_server --port 8080 > /tmp/meta.log 2>&1 &
   sleep 1
-  nohup $MCB/mooncake-store/src/mooncake_master -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
+  if [ "$1" = kvc ]; then
+    KVC_MASTER_BLOCK_SIZE=4096 nohup $MCB/mooncake-store/src/mooncake_master -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
+  else
+    nohup $MCB/mooncake-store/src/mooncake_master -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
+  fi
   sleep 2
   if [ "$1" = kvc ]; then
     KVC_SEGMENT_DEVICE=/dev/obmm_shmdev1 KVC_REGION_ID=1 KVC_BLOCK_SIZE=4096 \
