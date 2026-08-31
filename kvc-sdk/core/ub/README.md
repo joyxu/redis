@@ -34,3 +34,18 @@ region 物理层：shmdev 的 open/mmap/close + O_SYNC fallback。
 - 远端 nc 映射的读性能：单线程 memcpy ≈ 67MB/s（逐 cache line 往返）；
   跨节点读优化方向是多线程并行（每线程独立 load 流水），不是改 flag。
 - 本地 shmdev（cached）：读 15GB/s / 写 25GB/s，与文件 mmap 无差异。
+
+## ⚠️ 已知间歇性问题（P2b 期间发现，未定位）
+
+现象：跨节点直读（nc 映射）在特定时序下 verify 16/16 内容不符（两次复现，
+均在"read_perf 大流量 nc 读之后紧跟 verify_write"的场景），随后同组合连续
+8 次通过。已排除：写路径（probe 本地数据正确）、位置缓存（verify_write
+中每 key 仅读一次，缓存全程 miss）。
+
+怀疑方向：nc 读与段 owner（daemon）cache 脏行的 snoop 竞态窗口 —— 与
+"decoder_flag 必须 0x63"同族的底层一致性问题，需平台侧确认。
+
+处置：跨节点直读保持 env 门控默认关闭（KVC_DIRECT_READ 不设即走 TE，
+TE 路径始终正确）；同机直读不受影响（本地 cache 一致性由 CPU 保证，
+多次 verify 全过）。后续调试抓手：给直读加内容 checksum 双检选项、
+复现时 dump 不匹配字节与 slot 元数据。
