@@ -1,0 +1,3 @@
+[submodule "Mooncake"]
+	path = Mooncake
+	url = git@github.com:qs-ftw/Mooncake.git
