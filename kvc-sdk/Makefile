@@ -56,7 +56,7 @@ build/libkvc_client.so: $(CLIENT_SRC:.c=.o)
 	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
 # --- 工具 ------------------------------------------------------------------
-tools: build/kvc_smoke build/kvc_probe build/kvc_rw_bw
+tools: build/kvc_smoke build/kvc_probe
 
 build/kvc_smoke: tests/kvc_smoke.c build/libkvc_client.a
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/kvc_smoke.c build/libkvc_client.a $(LDLIBS)
@@ -64,8 +64,6 @@ build/kvc_smoke: tests/kvc_smoke.c build/libkvc_client.a
 build/kvc_probe: tests/kvc_probe.c build/libkvc_server.a
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/kvc_probe.c build/libkvc_server.a $(LDLIBS)
 
-build/kvc_rw_bw: tests/kvc_rw_bw.c build/libkvc_client.a
-	$(CC) $(CFLAGS) -Iinclude -o $@ tests/kvc_rw_bw.c build/libkvc_client.a $(LDLIBS)
 
 clean:
 	rm -rf build *.o core/layout/*.o core/ub/*.o server/*.o client/*.o

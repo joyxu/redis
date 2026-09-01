@@ -162,6 +162,15 @@ int kvc_region_stats(const kvc_region_t *region, kvc_region_stats_t *out);
 int kvc_region_publish_base(kvc_region_t *region);
 uint64_t kvc_region_owner_base(const kvc_region_t *region);
 
+/* P0.5: region 状态探测（不做完整 open，只读 header 判定）。
+ * 返回 KVC_PROBE_INITIALIZED(0)=已初始化且几何一致
+ *       KVC_PROBE_UNINITIALIZED(1)=无 magic, CREATE 安全
+ *       KVC_PROBE_CONFLICT(-1)=已初始化但几何/身份冲突, CREATE 会摧毁数据 */
+#define KVC_PROBE_INITIALIZED   0
+#define KVC_PROBE_UNINITIALIZED 1
+#define KVC_PROBE_CONFLICT     -1
+int kvc_region_probe(const kvc_region_config_t *cfg);
+
 #ifdef __cplusplus
 }
 #endif

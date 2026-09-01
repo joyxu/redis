@@ -81,27 +81,41 @@ fi
 
 echo "--- 3. Remove→invalidate 联动（短租约 master）---"
 restart_cluster 2000
-inv_before=$(taskset -c 0-15 $SDK/build/kvc_probe /dev/obmm_shmdev1 $RB 4096 1 2>/dev/null | grep -oE "INVALID=[0-9]+" | grep -oE "[0-9]+")
+inv_before=$(python3 -c "
+import mmap,os,struct
+fd=os.open('/dev/obmm_shmdev1',os.O_RDWR);m=mmap.mmap(fd,$RB,mmap.MAP_SHARED,mmap.PROT_READ)
+print(sum(1 for i in range(struct.unpack_from('<I',m,16)[0]) if struct.unpack_from('<I',m,56+i*24)[0]==3));m.close()")
 KVC_FLIP_DEVICE=/dev/obmm_shmdev1 KVC_FLIP_REGION=1 KVC_FLIP_BLOCK=4096 KVC_FLIP_BYTES=$RB \
 KVC_DIRECT_READ=1 KVC_POS_CACHE=1 KVC_SDK_LIB=$SDK/build/libkvc_server.so \
 PYTHONPATH=/opt/mc_py LD_LIBRARY_PATH=/opt/mc_py/mooncake:/tmp/mc_build/mooncake-common \
 python3 - <<EOF 2>/dev/null
 from mooncake.store import MooncakeDistributedStore
-import time
+import time, mmap, os, struct as st
+RBv = $RB
+def count_states():
+    m = mmap.mmap(os.open("/dev/obmm_shmdev1", os.O_RDWR), RBv, mmap.MAP_SHARED, mmap.PROT_READ)
+    cap = st.unpack_from("<I", m, 16)[0]
+    r = sum(1 for i in range(cap) if st.unpack_from("<I", m, 56+i*24)[0] == 2)
+    v = sum(1 for i in range(cap) if st.unpack_from("<I", m, 56+i*24)[0] == 3)
+    m.close()
+    return r, v
 s = MooncakeDistributedStore()
 s.setup("127.0.0.1:50094", "http://127.0.0.1:8080/metadata", 0, 32*1024*1024, "tcp", "", "127.0.0.1:50051")
 for i in range(4):
     assert s.put("cgr%03d" % i, b"\x63" * 4096) == 0
 for i in range(4):
     assert len(s.get("cgr%03d" % i)) == 4096
+r1, v1 = count_states()
 time.sleep(3)   # 等读租约过 2s TTL
 for i in range(4):
     assert s.remove("cgr%03d" % i) == 0
-print("REMOVE_OK")
+r2, v2 = count_states()
+open("/tmp/gate_inv_delta", "w").write(str(v2 - v1))
+open("/tmp/gate_rdy_delta", "w").write(str(r1 - r2))
 EOF
-inv_after=$(taskset -c 0-15 $SDK/build/kvc_probe /dev/obmm_shmdev1 $RB 4096 1 2>/dev/null | grep -oE "INVALID=[0-9]+" | grep -oE "[0-9]+")
-delta=$((inv_after - inv_before))
-[ "$delta" = "4" ] && ok "remove invalidation (INVALID +$delta)" || bad "remove invalidation (INVALID +$delta, expect 4)"
+delta=$(cat /tmp/gate_inv_delta 2>/dev/null || echo 0)
+rdelta=$(cat /tmp/gate_rdy_delta 2>/dev/null || echo 0)
+[ "$delta" = "4" ] && [ "$rdelta" = "4" ] && ok "remove invalidation (INVALID +$delta, READY -$rdelta)" || bad "remove invalidation (INVALID +$delta, READY -$rdelta, expect +4/-4)"
 
 echo "--- 4. daemon 重启 slot 持久性 ---"
 restart_cluster 600000

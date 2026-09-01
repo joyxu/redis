@@ -14,11 +14,15 @@ int kvc_layout_solve(uint64_t region_bytes, uint32_t block_size,
         return -1;
 
     uint32_t align = block_size < 4096u ? block_size : 4096u;
-    uint64_t cap = region_bytes /
-                   (KVC_LAYOUT_SLOT_META_SIZE + (uint64_t)block_size);
+    /* 单调收敛: cap 从上界开始(数据区从 header 后对齐即开始),
+     * 每轮 meta_end 增大 → data_off 增大 → cap 减小, 不动点即解。
+     * 上轮 bug: 初值低估 meta → data_off 落在 slot 表中间 → 数据覆盖元数据。 */
+    uint64_t cap = (region_bytes -
+                    ((KVC_LAYOUT_HEADER_SIZE + align - 1) / align * align)) /
+                   block_size;
     uint64_t data_off = 0;
 
-    for (int iter = 0; iter < 2; iter++) {
+    for (int iter = 0; iter < 64; iter++) {
         uint64_t meta_end =
             KVC_LAYOUT_HEADER_SIZE + cap * KVC_LAYOUT_SLOT_META_SIZE;
         data_off = (meta_end + align - 1) / align * align;
@@ -30,6 +34,10 @@ int kvc_layout_solve(uint64_t region_bytes, uint32_t block_size,
         cap = cap2;
     }
     if (cap == 0 || cap > 0xffffffffu)
+        return -1;
+    /* 终验: 数据区绝不可与 slot 表重叠（防再次回归） */
+    if (data_off < KVC_LAYOUT_HEADER_SIZE +
+                       (uint64_t)cap * KVC_LAYOUT_SLOT_META_SIZE)
         return -1;
 
     *capacity_out = (uint32_t)cap;
@@ -60,6 +68,17 @@ int kvc_layout_init(void *base, uint64_t region_bytes, uint32_t region_id,
     memset((char *)base + KVC_LAYOUT_HEADER_SIZE, 0,
            (uint64_t)capacity * KVC_LAYOUT_SLOT_META_SIZE);
     return 0;
+}
+
+int kvc_layout_probe(const void *base, uint64_t region_bytes,
+                     uint32_t region_id, uint32_t block_size) {
+    if (!base)
+        return -1;
+    if (kvc_layout_header_ro(base)->magic != KVC_LAYOUT_MAGIC)
+        return 1;
+    return kvc_layout_validate(base, region_bytes, region_id, block_size) == 0
+               ? 0
+               : -1;
 }
 
 int kvc_layout_validate(const void *base, uint64_t region_bytes,

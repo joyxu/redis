@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "kvc/kvc_client.h"
+#include "../core/layout/kvc_layout.h"
 #include "kvc/kvc_server.h"
 
 static int failures = 0;
@@ -59,6 +60,9 @@ int main(int argc, char **argv)
     kvc_region_meta_t meta;
     CHECK(kvc_region_meta(r, &meta) == KVC_OK && meta.capacity_slots > 0,
           "meta: capacity>0");
+    CHECK(meta.data_off >= KVC_LAYOUT_HEADER_SIZE +
+              (uint64_t)meta.capacity_slots * KVC_LAYOUT_SLOT_META_SIZE,
+          "LAYOUT: data_off >= slot table end (no overlap)");
     printf("       capacity=%u data_off=%llu data_bytes=%llu\n",
            meta.capacity_slots, (unsigned long long)meta.data_off,
            (unsigned long long)meta.data_bytes);
@@ -128,6 +132,8 @@ int main(int argc, char **argv)
     CHECK(kvc_slot_invalidate(r, slot) == KVC_OK, "invalidate");
     CHECK(kvc_read_handle(&h, set, out) == KVC_ESTALE,
           "read after invalidate -> ESTALE");
+    CHECK(kvc_slot_mark_writing(r, slot, 42) == KVC_OK,
+          "re-mark_writing after invalidate (master restart reuse)");
     CHECK(kvc_slot_allocator_free(alloc, slot) == KVC_OK, "allocator free");
 
     /* 6. 非 CREATE 重开校验（仅共享设备有意义：匿名重开是全新零内存，

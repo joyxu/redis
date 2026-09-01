@@ -6,6 +6,7 @@
 #include "kvc_region_internal.h"
 #include "kvc_ub.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -206,10 +207,17 @@ int kvc_slot_mark_writing(kvc_region_t *region, uint32_t slot_idx,
         return KVC_EINVAL;
     kvc_layout_slot_t *s = kvc_layout_slot(region->base, slot_idx);
 
+    /* master 重启位图清零后重新分配持久 region 的 slot 时, 可能残留 INVALID
+     * (旧对象已删)——视为可复用。仅 READY 不可直接覆写(读者可能正在读)。 */
     uint32_t expected = KVC_SLOT_FREE;
+    if (__atomic_compare_exchange_n(&s->state, &expected, KVC_SLOT_WRITING,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        goto acquired;
+    expected = KVC_SLOT_INVALID;
     if (!__atomic_compare_exchange_n(&s->state, &expected, KVC_SLOT_WRITING,
                                      0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return KVC_ESTALE;
+acquired:;
 
     s->owner_gen++;   /* 仅 WRITING 持有者触碰其余字段，普通写即可 */
     s->key_hash = key_hash;
@@ -236,6 +244,8 @@ int kvc_slot_invalidate(kvc_region_t *region, uint32_t slot_idx)
 {
     if (!region || slot_idx >= region->capacity_slots)
         return KVC_EINVAL;
+    if (getenv("KVC_DEBUG_INVALIDATE"))
+        fprintf(stderr, "[kvc] invalidate slot=%u\n", slot_idx);
     kvc_layout_slot_t *s = kvc_layout_slot(region->base, slot_idx);
     uint32_t st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
     if (st == KVC_SLOT_FREE)
@@ -362,6 +372,24 @@ int kvc_region_stats(const kvc_region_t *region, kvc_region_stats_t *out)
             out->max_write_seq = s->write_seq;
     }
     return KVC_OK;
+}
+
+int kvc_region_probe(const kvc_region_config_t *cfg)
+{
+    if (cfg_check(cfg) != KVC_OK)
+        return KVC_PROBE_CONFLICT;
+    void *base = kvc_map_memory(cfg->provider == KVC_PROVIDER_DEVICE
+                                    ? cfg->device_path
+                                    : NULL,
+                                cfg->mmap_offset, cfg->bytes, cfg->flags);
+    if (!base)
+        return KVC_PROBE_CONFLICT;
+    int rc = kvc_layout_probe(base, cfg->bytes, cfg->region_id,
+                              cfg->block_size);
+    kvc_unmap_memory(base, cfg->bytes);
+    return rc == 0   ? KVC_PROBE_INITIALIZED
+           : rc == 1 ? KVC_PROBE_UNINITIALIZED
+                     : KVC_PROBE_CONFLICT;
 }
 
 int kvc_region_publish_base(kvc_region_t *region)

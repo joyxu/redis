@@ -55,6 +55,13 @@ int kvc_layout_init(void *base, uint64_t region_bytes, uint32_t region_id,
 int kvc_layout_validate(const void *base, uint64_t region_bytes,
                         uint32_t region_id, uint32_t block_size);
 
+/* 区分"未初始化（可安全 CREATE）"与"已初始化但几何冲突（必须拒绝）"。
+ * 返回: 0 = 已初始化且一致（validate 会通过）
+ *       1 = 未初始化（header 无 magic，CREATE 安全）
+ *      -1 = 已初始化但几何/身份冲突（CREATE 会摧毁数据，禁止） */
+int kvc_layout_probe(const void *base, uint64_t region_bytes,
+                     uint32_t region_id, uint32_t block_size);
+
 /* 内联访问器（base 为 region 映射基址） */
 static inline kvc_layout_header_t *kvc_layout_header(void *base)
 {
