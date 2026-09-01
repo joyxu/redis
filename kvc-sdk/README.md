@@ -101,3 +101,23 @@ tests/         headers_check（P0 验收）
   全量逐字节校验 bad=0）：直读 1731 MB/s / 直写 8452 MB/s。
 - 143× 的对比基线是"TE-TCP 回环 + python 单车道"部署形态；对标 Mooncake
   生产形态（RDMA + C++）比值会显著缩小。正确表述：移除了传输栈开销。
+
+## 耦合开发工作流（hpc-redis ⇄ Mooncake submodule）
+
+Mooncake 以 submodule 钉在个人 fork（qs-ftw/Mooncake）。两侧改动常耦合
+（SDK 接口变 → 适配层必须同步变），规程：
+
+```bash
+# 一次性准备
+git clone --recurse-submodules <hpc-redis>     # 新克隆自动拉配套 Mooncake
+git submodule update --init                    # 已有克隆补拉
+
+# 日常耦合修改（顺序不能反）
+1. cd Mooncake && 改 && git commit && git push origin feature/kvc-adapter
+2. cd .. && 改 hpc-redis && git add Mooncake <改动文件>   # 记录新指针
+3. git commit   # 该 commit 自此永远指向配套的 Mooncake 版本
+```
+
+检出任意历史 hpc-redis commit 后 `git submodule update` 即得到当时
+兼容的 Mooncake（不多不少）。注：指针是 commit SHA 不是分支名，
+回溯到 submodule 注册（beea9a3）之前的 commit 无 Mooncake 钉扎。
