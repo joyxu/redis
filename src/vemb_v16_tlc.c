@@ -697,8 +697,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
         .value_size = tlc->value_size,
         .warm_capacity = max_vectors,
         .hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY,
-        .cold_max_segments = TLC_CORE_DEFAULT_COLD_MAX_SEGMENTS,
-        .cold_segment_records = TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS,
         .warm_regions = core_regions,
         .warm_region_count = warm_region_count,
         .local_region_weight = local_region_weight,
@@ -750,6 +748,39 @@ int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
                           runtime_count + 1u,
                           memory_order_release);
     return 0;
+}
+
+int vemb_v16_tlc_enable_cold(vemb_v16_tlc_t *tlc,
+                             const tlc_cold_config_t *cold_config) {
+    RETURN_IF(!tlc || !cold_config, -1);
+    return tlc_core_enable_cold(tlc->core, cold_config);
+}
+
+int vemb_v16_tlc_recover_cold(vemb_v16_tlc_t *tlc) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_recover_cold(tlc->core);
+}
+
+int vemb_v16_tlc_publish_checkpoint(vemb_v16_tlc_t *tlc,
+                                    uint64_t generation,
+                                    uint64_t term,
+                                    tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!tlc || generation == 0 || !result, -1);
+    return tlc_core_publish_checkpoint(tlc->core,
+                                       generation,
+                                       term,
+                                       result);
+}
+
+int vemb_v16_tlc_compact(vemb_v16_tlc_t *tlc,
+                         uint64_t checkpoint_floor_seq,
+                         uint64_t ha_safe_point_seq,
+                         uint32_t checkpoint_retention_count) {
+    RETURN_IF(!tlc || checkpoint_retention_count == 0, -1);
+    return tlc_core_compact(tlc->core,
+                            checkpoint_floor_seq,
+                            ha_safe_point_seq,
+                            checkpoint_retention_count);
 }
 
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {

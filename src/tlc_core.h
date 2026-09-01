@@ -3,16 +3,12 @@
 
 #include "vemb_v16_warm_region_layout.h"
 #include "vemb_v16_protocol.h"
+#include "tlc_cold.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define TLC_CORE_DEFAULT_HOT_CAPACITY 65536u
-#define TLC_CORE_DEFAULT_COLD_MAX_SEGMENTS 64u
-#define TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS 4096u
-#ifndef TLC_CORE_ENABLE_COLD_LAYER
-#define TLC_CORE_ENABLE_COLD_LAYER 0
-#endif
 #ifndef TLC_CORE_ALLOW_LRU_EVICTION
 #define TLC_CORE_ALLOW_LRU_EVICTION 0
 #endif
@@ -142,8 +138,6 @@ typedef struct tlc_core_config {
     uint32_t value_size;
     uint32_t warm_capacity;
     uint32_t hot_capacity;
-    uint32_t cold_max_segments;
-    uint32_t cold_segment_records;
     const tlc_core_warm_region_config_t *warm_regions;
     uint32_t warm_region_count;
     uint32_t local_region_weight;
@@ -153,6 +147,19 @@ typedef struct tlc_core tlc_core_t;
 
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config);
 void tlc_core_destroy(tlc_core_t *core);
+/* Must be called once, before concurrent writes begin; resolver_arg remains live. */
+int tlc_core_enable_cold(tlc_core_t *core,
+                         const tlc_cold_config_t *cold_config);
+int tlc_core_recover_cold(tlc_core_t *core);
+/* Preconditions: v16 boundary validated generation and output shape. */
+int tlc_core_publish_checkpoint(tlc_core_t *core,
+                                uint64_t generation,
+                                uint64_t term,
+                                tlc_cold_checkpoint_result_t *result);
+int tlc_core_compact(tlc_core_t *core,
+                     uint64_t checkpoint_floor_seq,
+                     uint64_t ha_safe_point_seq,
+                     uint32_t checkpoint_retention_count);
 int tlc_core_source_fence_active(const tlc_core_t *core);
 int tlc_core_attach_warm_region(tlc_core_t *core,
                                 const tlc_core_warm_region_config_t *region,
@@ -200,6 +207,7 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
                                uint64_t key_hash,
                                uint64_t topology_epoch,
                                tlc_core_key_migration_info_t *info);
+/* Legacy explicit durable PUT; requires persistent COLD to be enabled. */
 int tlc_core_cold_append(tlc_core_t *core,
                          const char *key,
                          uint32_t key_len,

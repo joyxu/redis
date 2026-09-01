@@ -204,7 +204,7 @@ CLI -> Proxy -> SuperNode/TLC -> Node primary 写入协调逻辑
                     +---------------------+---------------------+
                     |                                           |
                     v                                           v
-        本地 durable 路径                    异步复制路径
+        本地 durable 路径                       异步复制路径
                |                                  |
                v                                  v
   local flush coordinator                 replication cursor
@@ -307,6 +307,12 @@ Primary 和 Follower 都运行完整的本地 COLD 管线。区别只在于入�
 
 每个组件都按 `hpc_node_id` 隔离状态。一个 HPC-Redis Node 的 COLD 队列或 checkpoint
 失败，不得锁住其他 HPC-Redis Node 的备份和在线请求。
+
+恢复失败的可用性边界：单节点部署没有替代副本时，该 HPC-Redis Node 必须保持不可用；
+双副本 HA 部署由 LVS/HA 接入层将请求切换到另一个健康的 HPC-Redis Node。故障节点
+在 `FENCED` 状态下尝试使用本地 COLD 或另一副本重新恢复/同步，恢复成功并重新加入
+路由前不得接收业务请求。容错粒度是 HPC-Redis Node，而不是 key-shard 或 metadata
+shard。
 
 ### 2.2 AOF 与 RDB 的职责和组合
 
@@ -451,6 +457,10 @@ RDB checkpoint 是每个 key-shard 在各自捕获序号上的完整状态。由
 key-shard 不在同一个全局时刻完成捕获，这种 Checkpoint 称为 `fuzzy checkpoint`：
 它不是事务级的全局瞬时快照，但每个 key-shard 都有明确的状态边界，并且可以
 通过 AOF 增量恢复到一致状态。
+
+当前 `tlc_core` 实现将 key-shard checkpoint 分区直接落到 metadata shard：
+`key_meta_shard_for_hash(key_hash)` 同时决定 metadata、AOF event 和 checkpoint
+分区。metadata shard 数量当前由编译期参数决定；这里的分区不是 HPC-Redis Node。
 
 `checkpoint_seq` 表示 generation 的保守全局边界；generation 另外保存每个
 key-shard 的 `captured_seq`。下文的 `checkpoint_seq_of(g)` 只是 generation

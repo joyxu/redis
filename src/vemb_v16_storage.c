@@ -41,6 +41,29 @@ static void strip_comment(char *s) {
     }
 }
 
+static int storage_enable_configured_cold(vemb_v16_storage_ctx_t *storage) {
+    const char *directory = getenv("HPC_REDIS_COLD_DIR");
+    if (!directory || !*directory)
+        return 0;
+    tlc_cold_config_t config = {
+        .directory = directory,
+        .segment_bytes = UINT64_C(64) * 1024 * 1024,
+        .queue_capacity = 131072,
+        .group_max_entries = 64,
+        .group_max_delay_us = 1000,
+    };
+    if (vemb_v16_tlc_enable_cold(storage->tlc, &config) != 0) {
+        serverLog(LL_WARNING,
+                  "failed to enable COLD persistence: directory=%s",
+                  directory);
+        return -1;
+    }
+    serverLog(LL_NOTICE,
+              "COLD persistence enabled: directory=%s",
+              directory);
+    return 0;
+}
+
 static int parse_u32_value(const char *s, uint32_t *out) {
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
@@ -1916,6 +1939,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                   storage->warm_region_count);
         goto err;
     }
+    if (storage_enable_configured_cold(storage) != 0)
+        goto err;
     vemb_v16_tlc_set_remote_meta_view(storage->tlc,
                                       &storage->remote_meta_view,
                                       VEMB_V16_REMOTE_META_DEFAULT_RETRIES);

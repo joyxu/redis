@@ -183,6 +183,19 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight);
+/* Enable local COLD persistence before this Node accepts writes. */
+int vemb_v16_tlc_enable_cold(vemb_v16_tlc_t *tlc,
+                             const tlc_cold_config_t *cold_config);
+/* Replay durable COLD events into WARM after a failed publish. */
+int vemb_v16_tlc_recover_cold(vemb_v16_tlc_t *tlc);
+int vemb_v16_tlc_publish_checkpoint(vemb_v16_tlc_t *tlc,
+                                    uint64_t generation,
+                                    uint64_t term,
+                                    tlc_cold_checkpoint_result_t *result);
+int vemb_v16_tlc_compact(vemb_v16_tlc_t *tlc,
+                         uint64_t checkpoint_floor_seq,
+                         uint64_t ha_safe_point_seq,
+                         uint32_t checkpoint_retention_count);
 int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
                                     const vemb_v16_tlc_warm_region_t *warm_region);
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc);

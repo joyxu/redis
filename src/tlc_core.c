@@ -15,14 +15,6 @@
 #include <string.h>
 
 #define TLC_CORE_HOT_PROBES 4u
-/*
- * The warm/cold hash tables stay intentionally sparse, but realistic bench
- * keysets can still create 10+ entry linear-probe runs. A slightly larger
- * probe window avoids spilling valid warm keys into the cold path and later
- * surfacing them as false NOT_FOUND responses.
- */
-#define TLC_CORE_COLD_PROBES 16u
-#define TLC_CORE_INVALID_OFFSET UINT64_MAX
 #define TLC_CORE_WARM_WAYS 8u
 #define TLC_CORE_WARM_PLACE_RETRIES 3u
 #define TLC_CORE_WARM_BUSY_RETRIES 1024u
@@ -161,44 +153,13 @@ typedef struct tlc_core_warm_layer {
     atomic_uint_fast64_t misses;
 } tlc_core_warm_layer_t;
 
-typedef struct tlc_core_cold_record {
-    /* TODO: evaluate using uint64_t key_hash as the canonical key, matching three_layer_cache_ub. */
-    uint64_t key_hash;
-    uint64_t offset;
-    uint32_t key_len;
-    uint32_t value_size;
-    char key[VEMB_V16_MAX_KEY_LEN];
-} tlc_core_cold_record_t;
-
-typedef struct tlc_core_cold_segment {
-    tlc_core_cold_record_t *records;
-    uint8_t *values;
-    uint64_t base_offset;
-    size_t count;
-    size_t capacity;
-} tlc_core_cold_segment_t;
-
-typedef struct tlc_core_cold_layer {
-    tlc_core_cold_segment_t *segments;
-    atomic_int num_segments;
-    atomic_uint_fast64_t next_offset;
-    atomic_uint_fast64_t *offset_index;
-    uint32_t offset_index_size;
-    uint32_t oi_mask;
-    uint32_t max_segments;
-    size_t segment_capacity;
-    state_bitmap_t locks;
-    atomic_uint_fast64_t hits;
-    atomic_uint_fast64_t misses;
-} tlc_core_cold_layer_t;
-
 struct tlc_core {
     uint32_t value_size;
     uint32_t warm_capacity;
     tlc_core_hold_layer_t hold;
     tlc_core_location_cache_t location_cache;
     tlc_core_warm_layer_t warm;
-    tlc_core_cold_layer_t cold;
+    tlc_cold_t *persistent_cold;
     atomic_uint_fast64_t warm_alloc_local;
     atomic_uint_fast64_t warm_alloc_remote;
     atomic_uint_fast64_t warm_alloc_fallback;
@@ -234,6 +195,26 @@ static const tlc_warm_location_t tlc_invalid_location = {
     .offset = UINT64_MAX,
     .owner_generation = 0,
 };
+
+typedef struct tlc_core_checkpoint_entry {
+    uint64_t key_hash;
+    uint64_t key_version;
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint32_t migration_state;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t tombstone;
+    uint32_t shard_id;
+    uint32_t key_len;
+    uint32_t value_len;
+} tlc_core_checkpoint_entry_t;
+
+typedef struct tlc_core_checkpoint_state {
+    uint8_t *data;
+    size_t length;
+    size_t capacity;
+} tlc_core_checkpoint_state_t;
 
 static void tlc_core_log_put_failure(
         const char *reason,
@@ -1738,257 +1719,6 @@ static int warm_put(tlc_core_t *core,
     return -1;
 }
 
-#if TLC_CORE_ENABLE_COLD_LAYER
-static int cold_alloc_segment(tlc_core_t *core, uint32_t seg_id) {
-    tlc_core_cold_layer_t *cold = &core->cold;
-    RETURN_IF(seg_id >= cold->max_segments, -1);
-    tlc_core_cold_segment_t *seg = &cold->segments[seg_id];
-    RETURN_IF(seg->records && seg->values, 0);
-    seg->capacity = cold->segment_capacity;
-    seg->base_offset = (uint64_t)seg_id * cold->segment_capacity;
-    seg->records = zcalloc(sizeof(*seg->records) * seg->capacity);
-    seg->values = zcalloc((size_t)core->value_size * seg->capacity);
-    RETURN_IF(!seg->records || !seg->values, -1);
-    return 0;
-}
-#endif
-
-static int cold_init(tlc_core_t *core,
-                     uint32_t max_segments,
-                     uint32_t segment_records) {
-    tlc_core_cold_layer_t *cold = &core->cold;
-    cold->max_segments = max_segments ?
-        max_segments : TLC_CORE_DEFAULT_COLD_MAX_SEGMENTS;
-    cold->segment_capacity = segment_records;
-    if (cold->segment_capacity == 0 ||
-        cold->segment_capacity > TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS) {
-        cold->segment_capacity = TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS;
-    }
-    atomic_init(&cold->num_segments, 0);
-    atomic_init(&cold->next_offset, 0);
-    atomic_init(&cold->hits, 0);
-    atomic_init(&cold->misses, 0);
-#if !TLC_CORE_ENABLE_COLD_LAYER
-    (void)core;
-    return 0;
-#else
-    cold->segments =
-        zcalloc(sizeof(*cold->segments) * cold->max_segments);
-    RETURN_IF(!cold->segments, -1);
-    cold->offset_index_size =
-        vemb_v16_pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
-    if (cold->offset_index_size < 1024)
-        cold->offset_index_size = 1024;
-    cold->oi_mask = cold->offset_index_size - 1u;
-    cold->offset_index =
-        zcalloc(sizeof(*cold->offset_index) * cold->offset_index_size);
-    RETURN_IF(!cold->offset_index, -1);
-    for (uint32_t i = 0; i < cold->offset_index_size; i++)
-        atomic_init(&cold->offset_index[i], TLC_CORE_INVALID_OFFSET);
-    atomic_store_explicit(&cold->num_segments, 1, memory_order_relaxed);
-    int locks_rc = bitmap_init(&cold->locks, cold->max_segments);
-    RETURN_IF(locks_rc != 0, -1);
-    return cold_alloc_segment(core, 0);
-#endif
-}
-
-#if TLC_CORE_ENABLE_COLD_LAYER
-static tlc_core_cold_record_t *cold_record_by_offset(tlc_core_t *core,
-                                                     uint64_t offset,
-                                                     const uint8_t **value) {
-    tlc_core_cold_layer_t *cold = &core->cold;
-    uint32_t seg_id = (uint32_t)(offset / cold->segment_capacity);
-    size_t local = (size_t)(offset % cold->segment_capacity);
-    RETURN_IF(seg_id >= cold->max_segments, NULL);
-    tlc_core_cold_segment_t *seg = &cold->segments[seg_id];
-    RETURN_IF(!seg->records || !seg->values || local >= seg->count, NULL);
-    if (value)
-        *value = seg->values + local * core->value_size;
-    return &seg->records[local];
-}
-
-static int cold_offset_matches(tlc_core_t *core,
-                               uint64_t offset,
-                               const char *key,
-                               uint32_t key_len,
-                               uint64_t key_hash) {
-    const uint8_t *value = NULL;
-    tlc_core_cold_record_t *record =
-        cold_record_by_offset(core, offset, &value);
-    (void)value;
-    return record &&
-           key_matches(key_hash, key, key_len,
-                       record->key_hash, record->key, record->key_len);
-}
-#endif
-
-#if TLC_CORE_ENABLE_COLD_LAYER
-static void cold_index_store(tlc_core_t *core,
-                             const char *key,
-                             uint32_t key_len,
-                             uint64_t key_hash,
-                             uint64_t offset) {
-    tlc_core_cold_layer_t *cold = &core->cold;
-    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
-    for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
-        uint32_t pos = (slot + i) & cold->oi_mask;
-        uint64_t cur =
-            atomic_load_explicit(&cold->offset_index[pos],
-                                 memory_order_acquire);
-        if (cur == TLC_CORE_INVALID_OFFSET ||
-            cold_offset_matches(core, cur, key, key_len, key_hash)) {
-            atomic_store_explicit(&cold->offset_index[pos],
-                                  offset,
-                                  memory_order_release);
-            return;
-        }
-    }
-    atomic_store_explicit(&cold->offset_index[slot],
-                          offset,
-                          memory_order_release);
-}
-#endif
-
-#if TLC_CORE_ENABLE_COLD_LAYER
-static uint64_t cold_index_find_locked(tlc_core_t *core,
-                                       const char *key,
-                                       uint32_t key_len,
-                                       uint64_t key_hash) {
-    tlc_core_cold_layer_t *cold = &core->cold;
-    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
-    for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
-        uint32_t pos = (slot + i) & cold->oi_mask;
-        uint64_t offset =
-            atomic_load_explicit(&cold->offset_index[pos],
-                                 memory_order_acquire);
-        if (offset == TLC_CORE_INVALID_OFFSET)
-            break;
-        if (cold_offset_matches(core, offset, key, key_len, key_hash))
-            return offset;
-    }
-    return TLC_CORE_INVALID_OFFSET;
-}
-#endif
-
-static int cold_append(tlc_core_t *core,
-                       const char *key,
-                       uint32_t key_len,
-                       uint64_t key_hash,
-                       const void *value,
-                       uint32_t value_size) {
-#if !TLC_CORE_ENABLE_COLD_LAYER
-    (void)core;
-    (void)key;
-    (void)key_len;
-    (void)key_hash;
-    (void)value;
-    (void)value_size;
-    return 0;
-#else
-    tlc_core_cold_layer_t *cold = &core->cold;
-    bitmap_lock_blocking(&cold->locks, 0);
-    uint64_t existing_offset =
-        cold_index_find_locked(core, key, key_len, key_hash);
-    if (existing_offset != TLC_CORE_INVALID_OFFSET) {
-        const uint8_t *ignored = NULL;
-        tlc_core_cold_record_t *existing =
-            cold_record_by_offset(core, existing_offset, &ignored);
-        if (existing) {
-            existing->key_hash = key_hash;
-            existing->offset = existing_offset;
-            existing->key_len = key_len;
-            existing->value_size = value_size;
-            memcpy(existing->key, key, key_len);
-            uint32_t seg_id =
-                (uint32_t)(existing_offset / cold->segment_capacity);
-            size_t local =
-                (size_t)(existing_offset % cold->segment_capacity);
-            memcpy(cold->segments[seg_id].values +
-                       local * core->value_size,
-                   value,
-                   value_size);
-            bitmap_unlock(&cold->locks, 0);
-            return 0;
-        }
-    }
-
-    uint64_t offset =
-        atomic_load_explicit(&cold->next_offset, memory_order_relaxed);
-    uint32_t seg_id = (uint32_t)(offset / cold->segment_capacity);
-    size_t local = (size_t)(offset % cold->segment_capacity);
-    if (seg_id >= cold->max_segments ||
-        cold_alloc_segment(core, seg_id) != 0) {
-        bitmap_unlock(&cold->locks, 0);
-        return -1;
-    }
-    int current_segments =
-        atomic_load_explicit(&cold->num_segments, memory_order_relaxed);
-    if ((int)seg_id >= current_segments) {
-        atomic_store_explicit(&cold->num_segments, (int)seg_id + 1,
-                              memory_order_relaxed);
-    }
-    tlc_core_cold_segment_t *seg = &cold->segments[seg_id];
-    tlc_core_cold_record_t *record = &seg->records[local];
-    record->key_hash = key_hash;
-    record->offset = offset;
-    record->key_len = key_len;
-    record->value_size = value_size;
-    memcpy(record->key, key, key_len);
-    memcpy(seg->values + local * core->value_size, value, value_size);
-    if (local >= seg->count)
-        seg->count = local + 1;
-    cold_index_store(core, key, key_len, key_hash, offset);
-    atomic_store_explicit(&cold->next_offset, offset + 1,
-                          memory_order_release);
-    bitmap_unlock(&cold->locks, 0);
-    return 0;
-#endif
-}
-
-static int cold_lookup(tlc_core_t *core,
-                       const char *key,
-                       uint32_t key_len,
-                       uint64_t key_hash,
-                       const uint8_t **value,
-                       uint32_t *value_size) {
-#if !TLC_CORE_ENABLE_COLD_LAYER
-    (void)core;
-    (void)key;
-    (void)key_len;
-    (void)key_hash;
-    (void)value;
-    (void)value_size;
-    return -1;
-#else
-    tlc_core_cold_layer_t *cold = &core->cold;
-    bitmap_lock_blocking(&cold->locks, 0);
-    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
-    for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
-        uint32_t pos = (slot + i) & cold->oi_mask;
-        uint64_t offset =
-            atomic_load_explicit(&cold->offset_index[pos],
-                                 memory_order_acquire);
-        if (offset == TLC_CORE_INVALID_OFFSET)
-            break;
-        const uint8_t *cold_value = NULL;
-        tlc_core_cold_record_t *record =
-            cold_record_by_offset(core, offset, &cold_value);
-        if (record &&
-            key_matches(key_hash, key, key_len,
-                        record->key_hash, record->key, record->key_len)) {
-            *value = cold_value;
-            *value_size = record->value_size;
-            atomic_fetch_add_explicit(&cold->hits, 1, memory_order_relaxed);
-            bitmap_unlock(&cold->locks, 0);
-            return 0;
-        }
-    }
-    atomic_fetch_add_explicit(&cold->misses, 1, memory_order_relaxed);
-    bitmap_unlock(&cold->locks, 0);
-    return -1;
-#endif
-}
-
 int tlc_core_copy_warm_location_value(tlc_core_t *core,
                                       uint64_t key_hash,
                                       const tlc_warm_location_t *location,
@@ -2074,9 +1804,6 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     if (hot_init(core, config->hot_capacity) != 0 ||
         location_cache_init(core, config->hot_capacity) != 0 ||
         warm_init(core, config) != 0 ||
-        cold_init(core,
-                  config->cold_max_segments,
-                  config->cold_segment_records) != 0 ||
         key_meta_init(core) != 0) {
         tlc_core_destroy(core);
         return -1;
@@ -2084,6 +1811,27 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
 
     *out = core;
     return 0;
+}
+
+int tlc_core_enable_cold(tlc_core_t *core,
+                         const tlc_cold_config_t *cold_config) {
+    RETURN_IF(!core || !cold_config || core->persistent_cold, -1);
+    int rc = tlc_cold_open(&core->persistent_cold, cold_config);
+    if (rc != 0) {
+        serverLog(LL_WARNING,
+                  "tlc_core COLD open failed: directory=%s",
+                  cold_config->directory);
+        return rc;
+    }
+    rc = tlc_core_recover_cold(core);
+    if (rc != 0) {
+        serverLog(LL_WARNING,
+                  "failed to recover WARM from COLD AOF: directory=%s",
+                  cold_config->directory);
+        tlc_cold_close(core->persistent_cold);
+        core->persistent_cold = NULL;
+    }
+    return rc;
 }
 
 int tlc_core_attach_warm_region(tlc_core_t *core,
@@ -2123,8 +1871,9 @@ int tlc_core_attach_warm_region(tlc_core_t *core,
 
 void tlc_core_destroy(tlc_core_t *core) {
     RETURN_IF(!core);
+    if (core->persistent_cold)
+        tlc_cold_close(core->persistent_cold);
     bitmap_destroy(&core->warm.locks);
-    bitmap_destroy(&core->cold.locks);
     if (core->hold.table) zfree(core->hold.table);
     location_cache_destroy(core);
     if (core->warm.entries) zfree(core->warm.entries);
@@ -2138,16 +1887,6 @@ void tlc_core_destroy(tlc_core_t *core) {
         zfree(core->key_meta_shards);
     }
     bitmap_destroy(&core->key_meta_locks);
-    if (core->cold.segments) {
-        for (uint32_t i = 0; i < core->cold.max_segments; i++) {
-            if (core->cold.segments[i].records)
-                zfree(core->cold.segments[i].records);
-            if (core->cold.segments[i].values)
-                zfree(core->cold.segments[i].values);
-        }
-    }
-    if (core->cold.segments) zfree(core->cold.segments);
-    if (core->cold.offset_index) zfree(core->cold.offset_index);
     zfree(core);
 }
 
@@ -2187,22 +1926,9 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
         goto found;
     }
 
-    const uint8_t *cold_value = NULL;
-    uint32_t cold_value_size = 0;
-    int cold_rc = cold_lookup(core, key, key_len, key_hash,
-                              &cold_value, &cold_value_size);
-    if (cold_rc != 0) {
-        atomic_fetch_add_explicit(&core->lookup_final_miss, 1,
-                                  memory_order_relaxed);
-        return -1;
-    }
-    RETURN_IF(cold_value_size != core->value_size, -1);
-    int warm_rc = warm_put(core, key, key_len, key_hash,
-                           cold_value, cold_value_size, location);
-    RETURN_IF(warm_rc != 0, -1);
-    atomic_fetch_add_explicit(&core->lookup_cold_promote, 1,
+    atomic_fetch_add_explicit(&core->lookup_final_miss, 1,
                               memory_order_relaxed);
-    note_lookup_location(core, location, 1);
+    return -1;
 
 found:
     location_cache_put(core, key, key_len, key_hash, location);
@@ -2291,6 +2017,394 @@ static void key_meta_commit_location_locked(tlc_core_t *core,
         location_cache_put(core, key, key_len, key_hash, location);
 }
 
+static int tlc_core_persist_event_locked(tlc_core_t *core,
+                                         const tlc_core_key_meta_entry_t *key_meta,
+                                         const char *key,
+                                         uint32_t key_len,
+                                         uint64_t key_hash,
+                                         uint32_t op,
+                                         const void *value,
+                                         uint32_t value_size,
+                                         uint64_t topology_epoch) {
+    if (!core->persistent_cold)
+        return 0;
+    uint64_t version = key_meta ? key_meta->key_version : 0;
+    if (version == UINT64_MAX)
+        return -1;
+    tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
+    tlc_cold_event_input_t event = {
+        .term = topology_epoch,
+        .op = op,
+        .meta_shard_id = shard->lock_id,
+        .version = version + 1,
+        .key = key,
+        .key_len = key_len,
+        .value = value,
+        .value_len = value_size,
+    };
+    return tlc_cold_submit(core->persistent_cold,
+                           &event,
+                           TLC_COLD_ACK_ACCEPTED,
+                           NULL);
+}
+
+static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
+                                  uint64_t seq,
+                                  void *arg) {
+    tlc_core_t *core = arg;
+    uint64_t key_hash = vemb_v16_xxh3_64(event->key, event->key_len);
+    tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
+    if (shard->lock_id != event->meta_shard_id) {
+        serverLog(LL_WARNING,
+                  "COLD recovery key-shard mismatch: seq=%llu key_hash=%llu event_shard=%u resolved_shard=%u",
+                  (unsigned long long)seq,
+                  (unsigned long long)key_hash,
+                  event->meta_shard_id,
+                  shard->lock_id);
+        return -1;
+    }
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
+    tlc_core_key_meta_entry_t *meta = key_meta_find_locked(
+        core, event->key, event->key_len, key_hash, 0);
+    if (meta && event->term < meta->topology_epoch) {
+        uint64_t current_term = meta->topology_epoch;
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        serverLog(LL_WARNING,
+                  "COLD recovery stale term rejected: seq=%llu key_hash=%llu event_term=%llu current_term=%llu",
+                  (unsigned long long)seq,
+                  (unsigned long long)key_hash,
+                  (unsigned long long)event->term,
+                  (unsigned long long)current_term);
+        return -1;
+    }
+    if (meta && meta->key_version >= event->version) {
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        return 0;
+    }
+    if (event->op == TLC_COLD_OP_DEL) {
+        if (!meta)
+            meta = key_meta_find_locked(core, event->key, event->key_len,
+                                        key_hash, 1);
+        if (!meta) {
+            bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+            serverLog(LL_WARNING,
+                      "COLD recovery metadata allocation failed: seq=%llu key_hash=%llu",
+                      (unsigned long long)seq,
+                      (unsigned long long)key_hash);
+            return -1;
+        }
+        meta->key_version = event->version;
+        if (event->term > meta->topology_epoch)
+            meta->topology_epoch = event->term;
+        key_meta_set_tombstone_locked(core, meta, 1);
+        meta->location = tlc_invalid_location;
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        return 0;
+    }
+    tlc_warm_location_t location = tlc_invalid_location;
+    if (event->value_len != core->value_size ||
+        warm_put(core, event->key, event->key_len, key_hash,
+                 event->value, event->value_len, &location) != 0) {
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        serverLog(LL_WARNING,
+                  "COLD recovery WARM publish failed: seq=%llu key_hash=%llu value_size=%u expected=%u",
+                  (unsigned long long)seq,
+                  (unsigned long long)key_hash,
+                  event->value_len,
+                  core->value_size);
+        return -1;
+    }
+    if (!meta)
+        meta = key_meta_find_locked(core, event->key, event->key_len,
+                                    key_hash, 1);
+    if (!meta) {
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        serverLog(LL_WARNING,
+                  "COLD recovery metadata publish failed: seq=%llu key_hash=%llu",
+                  (unsigned long long)seq,
+                  (unsigned long long)key_hash);
+        return -1;
+    }
+    meta->key_version = event->version;
+    if (event->term > meta->topology_epoch)
+        meta->topology_epoch = event->term;
+    key_meta_set_tombstone_locked(core, meta, 0);
+    meta->location = location;
+    location_cache_put(core, event->key, event->key_len, key_hash, &location);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+    return 0;
+}
+
+typedef struct tlc_core_checkpoint_recovery {
+    tlc_core_t *core;
+    uint64_t *captured_seq;
+} tlc_core_checkpoint_recovery_t;
+
+static int tlc_core_load_checkpoint_shard(uint32_t meta_shard_id,
+                                          uint64_t captured_seq,
+                                          const void *state_data,
+                                          uint32_t state_len,
+                                          void *arg) {
+    tlc_core_checkpoint_recovery_t *recovery = arg;
+    tlc_core_t *core = recovery->core;
+    recovery->captured_seq[meta_shard_id] = captured_seq;
+    tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[meta_shard_id];
+    const uint8_t *cursor = state_len ? state_data : (const uint8_t *)"";
+    const uint8_t *end = cursor + state_len;
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
+    while (cursor < end) {
+        if ((size_t)(end - cursor) < sizeof(tlc_core_checkpoint_entry_t))
+            goto failed;
+        tlc_core_checkpoint_entry_t entry;
+        memcpy(&entry, cursor, sizeof(entry));
+        cursor += sizeof(entry);
+        if (entry.key_len == 0 || entry.key_len > VEMB_V16_MAX_KEY_LEN ||
+            entry.value_len > core->value_size ||
+            (entry.tombstone && entry.value_len != 0) ||
+            (size_t)(end - cursor) < entry.key_len + entry.value_len)
+            goto failed;
+        const char *key = (const char *)cursor;
+        const uint8_t *value = cursor + entry.key_len;
+        uint64_t key_hash = vemb_v16_xxh3_64(key, entry.key_len);
+        if (key_hash != entry.key_hash ||
+            key_meta_shard_for_hash(core, key_hash) != shard)
+            goto failed;
+        tlc_core_key_meta_entry_t *meta = key_meta_find_locked(
+            core, key, entry.key_len, key_hash, 1);
+        if (!meta)
+            goto failed;
+        meta->key_version = entry.key_version;
+        meta->topology_epoch = entry.topology_epoch;
+        meta->owner_epoch = entry.owner_epoch;
+        meta->migration_state = entry.migration_state;
+        meta->source_owner = entry.source_owner;
+        meta->target_owner = entry.target_owner;
+        meta->shard_id = entry.shard_id;
+        key_meta_set_tombstone_locked(core, meta, entry.tombstone != 0);
+        if (entry.tombstone) {
+            meta->location = tlc_invalid_location;
+        } else {
+            tlc_warm_location_t location = tlc_invalid_location;
+            if (entry.value_len != core->value_size ||
+                warm_put(core, key, entry.key_len, key_hash,
+                         value, entry.value_len, &location) != 0)
+                goto failed;
+            meta->location = location;
+            location_cache_put(core, key, entry.key_len, key_hash, &location);
+        }
+        cursor += entry.key_len + entry.value_len;
+    }
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+    return 0;
+failed:
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+    serverLog(LL_WARNING,
+              "COLD checkpoint state decode failed: meta_shard_id=%u captured_seq=%llu",
+              meta_shard_id, (unsigned long long)captured_seq);
+    return -1;
+}
+
+int tlc_core_recover_cold(tlc_core_t *core) {
+    RETURN_IF(!core || !core->persistent_cold, -1);
+    uint32_t meta_shard_count = core->key_meta_shard_count;
+    uint64_t *captured_seq = zcalloc_num(meta_shard_count,
+                                          sizeof(*captured_seq));
+    if (!captured_seq)
+        return -1;
+    tlc_cold_checkpoint_result_t checkpoint;
+    int checkpoint_valid = tlc_cold_validate_checkpoint(
+        core->persistent_cold, 0, meta_shard_count, NULL) == 0;
+    if (!checkpoint_valid) {
+        zfree(captured_seq);
+        return tlc_cold_replay(core->persistent_cold,
+                               tlc_core_recover_event,
+                               core);
+    }
+    tlc_core_checkpoint_recovery_t recovery = {
+        .core = core,
+        .captured_seq = captured_seq,
+    };
+    int checkpoint_rc = tlc_cold_load_checkpoint(
+        core->persistent_cold, meta_shard_count,
+        tlc_core_load_checkpoint_shard, &recovery, &checkpoint);
+    if (checkpoint_rc != 0) {
+        zfree(captured_seq);
+        return -1;
+    }
+    int rc = tlc_cold_replay_after(core->persistent_cold,
+                                   captured_seq,
+                                   meta_shard_count,
+                                   tlc_core_recover_event,
+                                   core);
+    zfree(captured_seq);
+    return rc;
+}
+
+static int checkpoint_state_append(tlc_core_checkpoint_state_t *state,
+                                   const void *data,
+                                   size_t length) {
+    if (length > SIZE_MAX - state->length)
+        return -1;
+    size_t required = state->length + length;
+    if (required > state->capacity) {
+        size_t capacity = state->capacity ? state->capacity : 4096;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2)
+                capacity = required;
+            else
+                capacity *= 2;
+        }
+        uint8_t *next = zmalloc(capacity);
+        if (!next)
+            return -1;
+        if (state->length)
+            memcpy(next, state->data, state->length);
+        zfree(state->data);
+        state->data = next;
+        state->capacity = capacity;
+    }
+    if (length)
+        memcpy(state->data + state->length, data, length);
+    state->length = required;
+    return 0;
+}
+
+int tlc_core_publish_checkpoint(tlc_core_t *core,
+                                uint64_t generation,
+                                uint64_t term,
+                                tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!core || !core->persistent_cold, -1);
+    uint32_t meta_shard_count = core->key_meta_shard_count;
+    tlc_core_checkpoint_state_t *states = zcalloc_num(
+        meta_shard_count, sizeof(*states));
+    tlc_cold_checkpoint_record_t *records = zcalloc_num(
+        meta_shard_count, sizeof(*records));
+    uint64_t *captured_seq = zmalloc(sizeof(*captured_seq) * meta_shard_count);
+    if (!states || !records || !captured_seq) {
+        serverLog(LL_WARNING,
+                  "TLC checkpoint allocation failed: generation=%llu meta_shards=%u",
+                  (unsigned long long)generation, meta_shard_count);
+        zfree(states);
+        zfree(records);
+        zfree(captured_seq);
+        return -1;
+    }
+    for (uint32_t i = 0; i < meta_shard_count; i++)
+        captured_seq[i] = UINT64_MAX;
+
+    int rc = 0;
+    for (uint32_t shard_index = 0;
+         shard_index < core->key_meta_shard_count && rc == 0;
+         shard_index++) {
+        tlc_core_key_meta_shard_t *meta_shard =
+            &core->key_meta_shards[shard_index];
+        bitmap_lock_blocking(&core->key_meta_locks, meta_shard->lock_id);
+        for (uint32_t slot = 0; slot < meta_shard->capacity; slot++) {
+            tlc_core_key_meta_entry_t *meta = &meta_shard->entries[slot];
+            if (!meta->occupied)
+                continue;
+            uint32_t value_len = meta->tombstone ? 0 : core->value_size;
+            uint8_t *value = NULL;
+            if (value_len) {
+                value = zmalloc(value_len);
+                if (!value || tlc_core_copy_warm_location_value(
+                        core, meta->key_hash, &meta->location,
+                        value, value_len, TLC_CORE_WARM_BUSY_RETRIES) != 0) {
+                    serverLog(LL_WARNING,
+                              "TLC checkpoint WARM value capture failed: key_hash=%llu meta_shard_id=%u",
+                              (unsigned long long)meta->key_hash,
+                              shard_index);
+                    zfree(value);
+                    rc = -1;
+                    break;
+                }
+            }
+            tlc_core_checkpoint_entry_t entry = {
+                .key_hash = meta->key_hash,
+                .key_version = meta->key_version,
+                .topology_epoch = meta->topology_epoch,
+                .owner_epoch = meta->owner_epoch,
+                .migration_state = meta->migration_state,
+                .source_owner = meta->source_owner,
+                .target_owner = meta->target_owner,
+                .tombstone = meta->tombstone,
+                .shard_id = meta->shard_id,
+                .key_len = meta->key_len,
+                .value_len = value_len,
+            };
+            if (checkpoint_state_append(&states[shard_index],
+                                        &entry, sizeof(entry)) != 0 ||
+                checkpoint_state_append(&states[shard_index],
+                                        meta->key, meta->key_len) != 0 ||
+                checkpoint_state_append(&states[shard_index],
+                                        value, value_len) != 0) {
+                serverLog(LL_WARNING,
+                          "TLC checkpoint state append failed: key_hash=%llu meta_shard_id=%u",
+                          (unsigned long long)meta->key_hash,
+                          shard_index);
+                zfree(value);
+                rc = -1;
+                break;
+            }
+            zfree(value);
+        }
+        tlc_cold_progress_t progress;
+        if (tlc_cold_get_progress(core->persistent_cold, &progress) != 0)
+            rc = -1;
+        bitmap_unlock(&core->key_meta_locks, meta_shard->lock_id);
+        if (rc != 0)
+            break;
+        captured_seq[shard_index] = progress.durable_seq;
+    }
+    if (rc == 0) {
+        tlc_cold_progress_t progress;
+        if (tlc_cold_get_progress(core->persistent_cold, &progress) != 0) {
+            rc = -1;
+        }
+        if (rc == 0) {
+            for (uint32_t meta_shard_id = 0;
+                 meta_shard_id < meta_shard_count; meta_shard_id++) {
+                if (captured_seq[meta_shard_id] == UINT64_MAX)
+                    captured_seq[meta_shard_id] = progress.durable_seq;
+                if (states[meta_shard_id].length > UINT32_MAX) {
+                    serverLog(LL_WARNING,
+                              "TLC checkpoint state exceeds format limit: meta_shard_id=%u length=%zu",
+                              meta_shard_id, states[meta_shard_id].length);
+                    rc = -1;
+                }
+                records[meta_shard_id].meta_shard_id = meta_shard_id;
+                records[meta_shard_id].captured_seq = captured_seq[meta_shard_id];
+                records[meta_shard_id].state = states[meta_shard_id].data;
+                records[meta_shard_id].state_len =
+                    (uint32_t)states[meta_shard_id].length;
+            }
+        }
+        if (rc == 0)
+            rc = tlc_cold_publish_checkpoint(core->persistent_cold,
+                                             generation, term,
+                                             meta_shard_count,
+                                             records, meta_shard_count,
+                                             result);
+    }
+    for (uint32_t i = 0; i < meta_shard_count; i++)
+        zfree(states[i].data);
+    zfree(records);
+    zfree(states);
+    zfree(captured_seq);
+    return rc;
+}
+
+int tlc_core_compact(tlc_core_t *core,
+                     uint64_t checkpoint_floor_seq,
+                     uint64_t ha_safe_point_seq,
+                     uint32_t checkpoint_retention_count) {
+    RETURN_IF(!core || !core->persistent_cold, -1);
+    return tlc_cold_compact(core->persistent_cold,
+                            checkpoint_floor_seq,
+                            ha_safe_point_seq,
+                            checkpoint_retention_count);
+}
+
 int tlc_core_put_location_epoch(tlc_core_t *core,
                                 const char *key,
                                 uint32_t key_len,
@@ -2329,13 +2443,24 @@ int tlc_core_put_location_epoch(tlc_core_t *core,
         failure_reason = "key_meta_full";
         goto rollback;
     }
-    int cold_rc = cold_append(core, key, key_len, key_hash, value, value_size);
-    if (cold_rc != 0) {
-        failure_reason = "cold_append_failed";
+    if (tlc_core_persist_event_locked(core,
+                                      key_meta,
+                                      key,
+                                      key_len,
+                                      key_hash,
+                                      TLC_COLD_OP_PUT,
+                                      value,
+                                      value_size,
+                                      topology_epoch) != 0) {
+        serverLog(LL_WARNING,
+                  "tlc_core COLD PUT append submit failed: key_hash=%llu key_len=%u topology_epoch=%llu",
+                  (unsigned long long)key_hash,
+                  key_len,
+                  (unsigned long long)topology_epoch);
+        failure_reason = "cold_persist_failed";
         failure_meta = key_meta;
         goto rollback;
     }
-
     if (key_meta && !key_meta->tombstone &&
         IS_VALID_LOCATION(key_meta->location) &&
         warm_overwrite_location(core,
@@ -2357,21 +2482,25 @@ int tlc_core_put_location_epoch(tlc_core_t *core,
         goto commit;
     }
 
-#if !TLC_CORE_ENABLE_COLD_LAYER
-    failure_reason = "warm_put_failed_cold_disabled";
+    if (core->persistent_cold) {
+        serverLog(LL_WARNING,
+                  "tlc_core WARM publish failed after COLD accepted PUT; AOF entry retained for retry: key_hash=%llu key_len=%u",
+                  (unsigned long long)key_hash,
+                  key_len);
+    }
+
+    failure_reason = "warm_put_failed";
     failure_meta = key_meta;
     goto rollback;
-#else
-    atomic_fetch_add_explicit(&core->warm_alloc_cold_spill, 1,
-                              memory_order_relaxed);
-    *location = tlc_invalid_location;
-    key_meta = key_meta_find_locked(core, key, key_len, key_hash, 1);
-    update_location_cache = 0;
-    goto commit;
-#endif
 
 commit:
     if (!key_meta) {
+        if (core->persistent_cold) {
+            serverLog(LL_WARNING,
+                      "tlc_core WARM metadata publish failed after COLD accepted PUT; AOF entry retained: key_hash=%llu key_len=%u",
+                      (unsigned long long)key_hash,
+                      key_len);
+        }
         failure_reason = update_location_cache ?
             "key_meta_create_after_warm_failed update_location_cache=1" :
             "key_meta_create_after_spill_failed update_location_cache=0";
@@ -2428,6 +2557,24 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
         return -1;
     }
 
+    if (tlc_core_persist_event_locked(core,
+                                      key_meta,
+                                      key,
+                                      key_len,
+                                      key_hash,
+                                      TLC_COLD_OP_DEL,
+                                      NULL,
+                                      0,
+                                      topology_epoch) != 0) {
+        serverLog(LL_WARNING,
+                  "tlc_core COLD DEL append submit failed: key_hash=%llu key_len=%u topology_epoch=%llu",
+                  (unsigned long long)key_hash,
+                  key_len,
+                  (unsigned long long)topology_epoch);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        return -1;
+    }
+
     key_meta->key_version++;
     if (topology_epoch > key_meta->topology_epoch)
         key_meta->topology_epoch = topology_epoch;
@@ -2443,10 +2590,25 @@ int tlc_core_cold_append(tlc_core_t *core,
                          uint32_t key_len,
                          uint64_t key_hash,
                          const void *value,
-                         uint32_t value_size) {
+    uint32_t value_size) {
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!core || !valid_key || value_size != core->value_size, -1);
-    return cold_append(core, key, key_len, key_hash, value, value_size);
+    RETURN_IF(!core->persistent_cold, -1);
+    tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
+    tlc_cold_event_input_t event = {
+        .term = 0,
+        .op = TLC_COLD_OP_PUT,
+        .meta_shard_id = shard->lock_id,
+        .version = 1,
+        .key = key,
+        .key_len = key_len,
+        .value = value,
+        .value_len = value_size,
+    };
+    return tlc_cold_submit(core->persistent_cold,
+                           &event,
+                           TLC_COLD_ACK_ACCEPTED,
+                           NULL);
 }
 
 int tlc_core_get_migration_info(tlc_core_t *core,
@@ -2998,13 +3160,7 @@ int tlc_core_apply_migration(tlc_core_t *core,
 
     tlc_warm_location_t new_location = tlc_invalid_location;
     if (!snapshot->tombstone) {
-        if (cold_append(core,
-                        snapshot->key,
-                        snapshot->key_len,
-                        snapshot->key_hash,
-                        value,
-                        value_size) != 0 ||
-            warm_put(core,
+        if (warm_put(core,
                      snapshot->key,
                      snapshot->key_len,
                      snapshot->key_hash,

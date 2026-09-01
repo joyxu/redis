@@ -3,9 +3,12 @@
 #include "../src/monotonic.h"
 #include "../src/vemb_v16_remote_meta.h"
 #include "../src/vemb_v16_ub_rpc.h"
+#include "../src/zmalloc.h"
 
 #include <assert.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +25,401 @@ static void make_key(char *buf, size_t len, uint32_t id) {
     snprintf(buf, len, "item:%u", id);
 }
 #endif
+
+typedef struct fuzzy_checkpoint_writer_arg {
+    vemb_v16_tlc_t *tlc;
+    uint32_t worker_id;
+    uint32_t count;
+    atomic_int *failures;
+} fuzzy_checkpoint_writer_arg_t;
+
+static void *fuzzy_checkpoint_writer(void *opaque) {
+    fuzzy_checkpoint_writer_arg_t *arg = opaque;
+    for (uint32_t i = 0; i < arg->count; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "fuzzy:%u:%u", arg->worker_id, i);
+        float value[2] = {(float)arg->worker_id, (float)i};
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+        vemb_v16_vector_handle_t handle;
+        uint32_t warm_slot = TLC_CORE_INVALID_SLOT;
+        if (vemb_v16_tlc_put_with_epoch(arg->tlc, key, strlen(key), key_hash,
+                                        value, sizeof(value), 1, &handle,
+                                        &warm_slot) != 0)
+            atomic_fetch_add_explicit(arg->failures, 1, memory_order_relaxed);
+        if (i == arg->count / 2)
+            usleep(10000);
+        if ((i & 7u) == 0)
+            sched_yield();
+    }
+    return NULL;
+}
+
+static void init_fuzzy_slot_meta(vemb_v16_warm_slot_meta_t *slot_meta,
+                                 uint32_t count,
+                                 uint32_t region_id) {
+    for (uint32_t i = 0; i < count; i++) {
+        atomic_init(&slot_meta[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slot_meta[i].owner_generation, 0);
+        atomic_init(&slot_meta[i].write_seq, 0);
+        atomic_init(&slot_meta[i].last_access_ns, 0);
+        atomic_init(&slot_meta[i].clock_bit, 0);
+        atomic_init(&slot_meta[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+        slot_meta[i].region_id = region_id;
+        slot_meta[i].local_slot = i;
+    }
+}
+
+static void test_fuzzy_checkpoint_concurrent_writes(void) {
+    enum { SLOT_COUNT = 4096, WORKER_COUNT = 4, WRITES_PER_WORKER = 128 };
+    float *region = zmalloc(SLOT_COUNT * 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *slot_meta = zcalloc_num(
+        SLOT_COUNT, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, SLOT_COUNT, 910);
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 910,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = SLOT_COUNT * 2 * sizeof(float),
+        .value_size = 2 * sizeof(float),
+        .slot_meta = slot_meta,
+    };
+    char directory[] = "/tmp/tlc-fuzzy-checkpoint-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    tlc_cold_config_t cold_config = {
+        .directory = directory,
+        .segment_bytes = 4096,
+        .queue_capacity = 32,
+        .group_max_entries = 16,
+        .group_max_delay_us = 1000,
+    };
+    vemb_v16_tlc_t *tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
+    pthread_t threads[WORKER_COUNT];
+    fuzzy_checkpoint_writer_arg_t args[WORKER_COUNT];
+    atomic_int failures;
+    atomic_init(&failures, 0);
+    for (uint32_t i = 0; i < WORKER_COUNT; i++) {
+        args[i] = (fuzzy_checkpoint_writer_arg_t){
+            .tlc = tlc, .worker_id = i, .count = WRITES_PER_WORKER,
+            .failures = &failures};
+        assert(pthread_create(&threads[i], NULL, fuzzy_checkpoint_writer,
+                              &args[i]) == 0);
+    }
+    usleep(1000);
+    tlc_cold_checkpoint_result_t checkpoint_result;
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+                                           &checkpoint_result) == 0);
+    for (uint32_t i = 0; i < WORKER_COUNT; i++)
+        assert(pthread_join(threads[i], NULL) == 0);
+    assert(atomic_load_explicit(&failures, memory_order_acquire) == 0);
+    vemb_v16_tlc_destroy(tlc);
+
+    vemb_v16_warm_slot_meta_t *recovered_slot_meta = zcalloc_num(
+        SLOT_COUNT, sizeof(*recovered_slot_meta));
+    float *recovered_region = zmalloc(SLOT_COUNT * 2 * sizeof(float));
+    assert(recovered_slot_meta != NULL && recovered_region != NULL);
+    init_fuzzy_slot_meta(recovered_slot_meta, SLOT_COUNT, 911);
+    vemb_v16_tlc_warm_region_t recovered_warm = warm;
+    recovered_warm.region_id = 911;
+    recovered_warm.mapped_addr = recovered_region;
+    recovered_warm.slot_meta = recovered_slot_meta;
+    vemb_v16_tlc_t *recovered = NULL;
+    assert(vemb_v16_tlc_create(&recovered, 2, SLOT_COUNT,
+                               &recovered_warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
+    for (uint32_t worker = 0; worker < WORKER_COUNT; worker++) {
+        for (uint32_t i = 0; i < WRITES_PER_WORKER; i++) {
+            char key[64];
+            snprintf(key, sizeof(key), "fuzzy:%u:%u", worker, i);
+            uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+            tlc_core_key_migration_info_t info;
+            assert(tlc_core_get_migration_info(recovered->core, key,
+                                               strlen(key), key_hash,
+                                               &info) == 0);
+            assert(info.key_version == 1);
+            float expected[2] = {(float)worker, (float)i};
+            float stored[2] = {0};
+            assert(tlc_core_copy_warm_location_value(
+                       recovered->core, key_hash, &info.location, stored,
+                       sizeof(stored), 1024) == 0);
+            assert(memcmp(stored, expected, sizeof(expected)) == 0);
+        }
+    }
+    vemb_v16_tlc_destroy(recovered);
+    zfree(recovered_region);
+    zfree(recovered_slot_meta);
+    zfree(region);
+    zfree(slot_meta);
+    printf("fuzzy checkpoint concurrent writes: PASS\n");
+}
+
+static void assert_recovered_value(vemb_v16_tlc_t *tlc,
+                                   const char *key,
+                                   const float expected[2]) {
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    tlc_core_key_migration_info_t info;
+    assert(tlc_core_get_migration_info(tlc->core, key, strlen(key), key_hash,
+                                       &info) == 0);
+    float actual[2] = {0};
+    assert(tlc_core_copy_warm_location_value(tlc->core, key_hash,
+                                             &info.location, actual,
+                                             sizeof(actual), 1024) == 0);
+    assert(memcmp(actual, expected, sizeof(actual)) == 0);
+}
+
+static void test_checkpoint_aof_full_recovery_consistency(void) {
+    enum { SLOT_COUNT = 32 };
+    float *region = zmalloc(SLOT_COUNT * 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *slot_meta = zcalloc_num(
+        SLOT_COUNT, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, SLOT_COUNT, 920);
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 920,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = SLOT_COUNT * 2 * sizeof(float),
+        .value_size = 2 * sizeof(float),
+        .slot_meta = slot_meta,
+    };
+    char directory[] = "/tmp/tlc-full-recovery-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    tlc_cold_config_t cold_config = {
+        .directory = directory,
+        .segment_bytes = 512,
+        .queue_capacity = 8,
+        .group_max_entries = 4,
+        .group_max_delay_us = 1000,
+    };
+    vemb_v16_tlc_t *tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
+    const char *keys[] = {"recover:keep", "recover:update", "recover:delete"};
+    const float initial[][2] = {{1, 2}, {3, 4}, {5, 6}};
+    for (size_t i = 0; i < 3; i++) {
+        uint64_t key_hash = vemb_v16_xxh3_64_str(keys[i], strlen(keys[i]));
+        vemb_v16_vector_handle_t handle;
+        uint32_t warm_slot;
+        assert(vemb_v16_tlc_put_with_epoch(tlc, keys[i], strlen(keys[i]),
+                                           key_hash, initial[i],
+                                           sizeof(initial[i]), 1, &handle,
+                                           &warm_slot) == 0);
+    }
+    tlc_cold_checkpoint_result_t checkpoint_result;
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+                                           &checkpoint_result) == 0);
+
+    const float updated[] = {30, 40};
+    uint64_t update_hash = vemb_v16_xxh3_64_str(keys[1], strlen(keys[1]));
+    vemb_v16_vector_handle_t handle;
+    uint32_t warm_slot;
+    assert(vemb_v16_tlc_put_with_epoch(tlc, keys[1], strlen(keys[1]),
+                                       update_hash, updated, sizeof(updated),
+                                       2, &handle, &warm_slot) == 0);
+    uint64_t delete_hash = vemb_v16_xxh3_64_str(keys[2], strlen(keys[2]));
+    assert(tlc_core_delete_with_epoch(tlc->core, keys[2], strlen(keys[2]),
+                                      delete_hash, 2, NULL) == 0);
+    const char new_key[] = "recover:new";
+    const float new_value[] = {70, 80};
+    uint64_t new_hash = vemb_v16_xxh3_64_str(new_key, sizeof(new_key) - 1);
+    assert(vemb_v16_tlc_put_with_epoch(tlc, new_key, sizeof(new_key) - 1,
+                                       new_hash, new_value, sizeof(new_value),
+                                       1, &handle, &warm_slot) == 0);
+    vemb_v16_tlc_destroy(tlc);
+
+    float *recovered_region = zmalloc(SLOT_COUNT * 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *recovered_slot_meta = zcalloc_num(
+        SLOT_COUNT, sizeof(*recovered_slot_meta));
+    assert(recovered_region != NULL && recovered_slot_meta != NULL);
+    init_fuzzy_slot_meta(recovered_slot_meta, SLOT_COUNT, 921);
+    warm.region_id = 921;
+    warm.mapped_addr = recovered_region;
+    warm.slot_meta = recovered_slot_meta;
+    vemb_v16_tlc_t *recovered = NULL;
+    assert(vemb_v16_tlc_create(&recovered, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
+    assert_recovered_value(recovered, keys[0], initial[0]);
+    assert_recovered_value(recovered, keys[1], updated);
+    assert_recovered_value(recovered, new_key, new_value);
+    tlc_core_key_migration_info_t deleted_info;
+    assert(tlc_core_get_migration_info(recovered->core, keys[2], strlen(keys[2]),
+                                       delete_hash, &deleted_info) == 0);
+    assert(deleted_info.tombstone != 0);
+    assert(IS_INVALID_LOCATION(deleted_info.location));
+    vemb_v16_tlc_destroy(recovered);
+    zfree(recovered_region);
+    zfree(recovered_slot_meta);
+    zfree(region);
+    zfree(slot_meta);
+    printf("checkpoint + AOF full recovery consistency: PASS\n");
+}
+
+static void test_single_node_recovery_failure_blocks_startup(void) {
+    enum { SLOT_COUNT = 4 };
+    char directory[] = "/tmp/tlc-single-node-recovery-fail-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    tlc_cold_config_t cold_config = {
+        .directory = directory, .segment_bytes = 4096, .queue_capacity = 2,
+        .group_max_entries = 1, .group_max_delay_us = 1000};
+    tlc_cold_t *cold = NULL;
+    assert(tlc_cold_open(&cold, &cold_config) == 0);
+    const char key[] = "single-node-failure-key";
+    const char value[] = "single-node-failure-value";
+    tlc_cold_event_input_t event = {
+        .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
+        .key = key, .key_len = sizeof(key) - 1, .value = value,
+        .value_len = sizeof(value) - 1};
+    assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
+    tlc_cold_close(cold);
+    char path[4096];
+    assert(snprintf(path, sizeof(path), "%s/aof-%020d.log", directory, 0) <
+           (int)sizeof(path));
+    int fd = open(path, O_RDWR);
+    assert(fd >= 0);
+    uint8_t corrupt = 0;
+    assert(read(fd, &corrupt, sizeof(corrupt)) == (ssize_t)sizeof(corrupt));
+    corrupt ^= 0xff;
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    assert(write(fd, &corrupt, sizeof(corrupt)) == (ssize_t)sizeof(corrupt));
+    assert(close(fd) == 0);
+
+    float *region = zmalloc(SLOT_COUNT * 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *slot_meta = zcalloc_num(
+        SLOT_COUNT, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, SLOT_COUNT, 930);
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 930, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .weight = 1, .mapped_addr = region,
+        .region_bytes = SLOT_COUNT * 2 * sizeof(float),
+        .value_size = 2 * sizeof(float), .slot_meta = slot_meta};
+    vemb_v16_tlc_t *tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
+    vemb_v16_tlc_destroy(tlc);
+    zfree(region);
+    zfree(slot_meta);
+    printf("single-node recovery failure blocks startup: PASS\n");
+}
+
+static void test_recovery_strict_term_and_state_boundaries(void) {
+    const uint32_t value_size = 2 * sizeof(float);
+    const char *key = "strict-term-key";
+    const float first_value[] = {1, 2};
+    const float stale_value[] = {3, 4};
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    char directory[] = "/tmp/tlc-strict-term-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    tlc_cold_config_t cold_config = {
+        .directory = directory, .segment_bytes = 512, .queue_capacity = 4,
+        .group_max_entries = 2, .group_max_delay_us = 1000};
+
+    float *region = zmalloc(4 * value_size);
+    vemb_v16_warm_slot_meta_t *slot_meta = zcalloc_num(
+        4, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, 4, 940);
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 940, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .weight = 1, .mapped_addr = region,
+        .region_bytes = 4 * value_size, .value_size = value_size,
+        .slot_meta = slot_meta};
+    vemb_v16_tlc_t *tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
+    vemb_v16_vector_handle_t handle;
+    uint32_t warm_slot;
+    assert(vemb_v16_tlc_put_with_epoch(
+               tlc, key, strlen(key), key_hash, first_value, value_size, 2,
+               &handle, &warm_slot) == 0);
+    tlc_cold_checkpoint_result_t checkpoint_result;
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 2,
+                                           &checkpoint_result) == 0);
+    vemb_v16_tlc_destroy(tlc);
+    zfree(region);
+    zfree(slot_meta);
+
+    tlc_cold_t *cold = NULL;
+    assert(tlc_cold_open(&cold, &cold_config) == 0);
+    tlc_cold_event_input_t stale_event = {
+        .term = 1,
+        .op = TLC_COLD_OP_PUT,
+        .meta_shard_id = (uint32_t)(vemb_v16_mix32_u64(key_hash) & 255u),
+        .version = 2,
+        .key = key,
+        .key_len = (uint32_t)strlen(key),
+        .value = stale_value,
+        .value_len = value_size};
+    assert(tlc_cold_submit(cold, &stale_event, TLC_COLD_ACK_DURABLE, NULL) ==
+           0);
+    tlc_cold_close(cold);
+
+    region = zmalloc(4 * value_size);
+    slot_meta = zcalloc_num(4, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, 4, 941);
+    warm.region_id = 941;
+    warm.mapped_addr = region;
+    warm.slot_meta = slot_meta;
+    tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
+    vemb_v16_tlc_destroy(tlc);
+    zfree(region);
+    zfree(slot_meta);
+    printf("strict recovery term boundary: PASS\n");
+
+    char state_directory[] = "/tmp/tlc-strict-state-XXXXXX";
+    assert(mkdtemp(state_directory) != NULL);
+    cold_config.directory = state_directory;
+    region = zmalloc(4 * value_size);
+    slot_meta = zcalloc_num(4, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, 4, 942);
+    warm.region_id = 942;
+    warm.mapped_addr = region;
+    warm.slot_meta = slot_meta;
+    tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
+    const char *key2 = "strict-state-key-2";
+    const float second_value[] = {5, 6};
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
+    assert(vemb_v16_tlc_put_with_epoch(
+               tlc, key, strlen(key), key_hash, first_value, value_size, 1,
+               &handle, &warm_slot) == 0);
+    assert(vemb_v16_tlc_put_with_epoch(
+               tlc, key2, strlen(key2), key2_hash, second_value, value_size, 1,
+               &handle, &warm_slot) == 0);
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+                                           &checkpoint_result) == 0);
+    vemb_v16_tlc_destroy(tlc);
+    zfree(region);
+    zfree(slot_meta);
+
+    region = zmalloc(value_size);
+    slot_meta = zcalloc_num(1, sizeof(*slot_meta));
+    assert(region != NULL && slot_meta != NULL);
+    init_fuzzy_slot_meta(slot_meta, 1, 943);
+    warm.region_id = 943;
+    warm.mapped_addr = region;
+    warm.region_bytes = value_size;
+    warm.slot_meta = slot_meta;
+    tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
+    assert(vemb_v16_tlc_recover_cold(tlc) != 0);
+    vemb_v16_tlc_destroy(tlc);
+    zfree(region);
+    zfree(slot_meta);
+    printf("checkpoint state load failure boundary: PASS\n");
+}
 
 static void init_test_allocator(vemb_v16_warm_region_header_t *allocator,
                                 uint32_t region_id,
@@ -147,6 +545,92 @@ static int tlc_ut_create(vemb_v16_tlc_t **out,
                                warm_regions,
                                warm_region_count,
                                local_region_weight);
+}
+
+static void test_persistent_cold_write_order(void) {
+    float region[2] = {0};
+    vemb_v16_warm_slot_meta_t slot_meta = {0};
+    atomic_init(&slot_meta.state, VEMB_V16_WARM_SLOT_FREE);
+    atomic_init(&slot_meta.owner_generation, 0);
+    atomic_init(&slot_meta.write_seq, 0);
+    atomic_init(&slot_meta.last_access_ns, 0);
+    atomic_init(&slot_meta.clock_bit, 0);
+    atomic_init(&slot_meta.cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+    slot_meta.region_id = 700;
+    slot_meta.local_slot = 0;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 700,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = sizeof(region),
+        .slot_meta = &slot_meta,
+    };
+    char directory[] = "/tmp/tlc-m2-cold-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    tlc_cold_config_t cold_config = {
+        .directory = directory,
+        .segment_bytes = 1024,
+        .queue_capacity = 2,
+        .group_max_entries = 2,
+        .group_max_delay_us = 1000,
+    };
+    vemb_v16_tlc_t *tlc = NULL;
+    assert(vemb_v16_tlc_create(&tlc, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
+    const char key[] = "m2-key";
+    float value[2] = {1.0f, 2.0f};
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, sizeof(key) - 1);
+    vemb_v16_vector_handle_t handle;
+    uint32_t warm_slot = TLC_CORE_INVALID_SLOT;
+    assert(vemb_v16_tlc_put_with_epoch(tlc,
+                                       key,
+                                       sizeof(key) - 1,
+                                       key_hash,
+                                       value,
+                                       sizeof(value),
+                                       1,
+                                       &handle,
+                                       &warm_slot) == 0);
+    tlc_cold_checkpoint_result_t checkpoint_result;
+    assert(vemb_v16_tlc_publish_checkpoint(tlc,
+                                           1,
+                                           1,
+                                           &checkpoint_result) == 0);
+    assert(checkpoint_result.generation == 1);
+    /* ACK_ACCEPTED does not wait for the background fsync; a checkpoint
+     * captured immediately after the write may therefore start at seq 0. */
+    assert(checkpoint_result.checkpoint_seq <= 1);
+    assert(tlc_core_delete_with_epoch(tlc->core,
+                                      key,
+                                      sizeof(key) - 1,
+                                      key_hash,
+                                      1,
+                                      NULL) == 0);
+    vemb_v16_tlc_destroy(tlc);
+
+    tlc_cold_t *cold = NULL;
+    assert(tlc_cold_open(&cold, &cold_config) == 0);
+    tlc_cold_progress_t progress;
+    assert(tlc_cold_get_progress(cold, &progress) == 0);
+    assert(progress.appended_seq == 2);
+    assert(progress.durable_seq == 2);
+    tlc_cold_close(cold);
+
+    vemb_v16_tlc_t *recovered = NULL;
+    assert(vemb_v16_tlc_create(&recovered, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
+    tlc_core_key_migration_info_t info;
+    assert(tlc_core_get_migration_info(recovered->core,
+                                       key,
+                                       sizeof(key) - 1,
+                                       key_hash,
+                                       &info) == 0);
+    assert(info.key_version == 2);
+    assert(info.tombstone == 1);
+    vemb_v16_tlc_destroy(recovered);
 }
 
 static int tlc_ut_attach_warm_region(vemb_v16_tlc_t *tlc,
@@ -432,8 +916,6 @@ static void test_disabled_cold_append_is_noop(void) {
         .value_size = sizeof(vector),
         .warm_capacity = max_vectors,
         .hot_capacity = 4,
-        .cold_max_segments = 1,
-        .cold_segment_records = 2,
         .warm_regions = &warm,
         .warm_region_count = 1,
         .local_region_weight = 1,
@@ -454,7 +936,7 @@ static void test_disabled_cold_append_is_noop(void) {
                                 (uint32_t)strlen(key),
                                 key_hash,
                                 vector,
-                                sizeof(vector)) == 0);
+                                sizeof(vector)) != 0);
     assert(tlc_core_get_warm_location(core,
                                       key,
                                       (uint32_t)strlen(key),
@@ -485,8 +967,6 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
         .value_size = sizeof(vector),
         .warm_capacity = max_vectors,
         .hot_capacity = 4,
-        .cold_max_segments = 1,
-        .cold_segment_records = 2,
         .warm_regions = &warm,
         .warm_region_count = 1,
         .local_region_weight = 1,
@@ -3441,6 +3921,11 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
 int main(void) {
     monotonicInit();
 
+    test_persistent_cold_write_order();
+    test_fuzzy_checkpoint_concurrent_writes();
+    test_checkpoint_aof_full_recovery_consistency();
+    test_single_node_recovery_failure_blocks_startup();
+    test_recovery_strict_term_and_state_boundaries();
     test_put_get_handle();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();
