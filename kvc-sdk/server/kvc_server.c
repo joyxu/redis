@@ -411,3 +411,87 @@ uint64_t kvc_region_owner_base(const kvc_region_t *region)
     const kvc_layout_header_t *h = kvc_layout_header_ro(region->base);
     return __atomic_load_n(&h->owner_base, __ATOMIC_ACQUIRE);
 }
+
+/* ---------------------------------------------------------------------------
+ * owner 拓扑身份（T0-1）
+ * ------------------------------------------------------------------------- */
+uint64_t kvc_identity_hash(const char *identity)
+{
+    if (!identity)
+        return 0;
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 offset basis */
+    for (const unsigned char *p = (const unsigned char *)identity; *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;             /* FNV-1a 64 prime */
+    }
+    return h ? h : 1;                      /* 0 保留为"未发布" */
+}
+
+int kvc_region_publish_identity(kvc_region_t *region, const char *owner_identity)
+{
+    if (!region || !owner_identity)
+        return KVC_EINVAL;
+    kvc_layout_header_t *h = kvc_layout_header(region->base);
+    uint64_t id = kvc_identity_hash(owner_identity);
+    uint32_t next = __atomic_load_n(&h->owner_epoch, __ATOMIC_ACQUIRE) + 1;
+    h->owner_host_id = id;   /* 平写；epoch release 之后才对读者可见 */
+    __atomic_store_n(&h->owner_epoch, next, __ATOMIC_RELEASE);
+    return KVC_OK;
+}
+
+int kvc_region_owner_info(const kvc_region_t *region, uint64_t *host_id,
+                          uint32_t *epoch)
+{
+    if (!region || !host_id || !epoch)
+        return KVC_EINVAL;
+    const kvc_layout_header_t *h = kvc_layout_header_ro(region->base);
+    *epoch = __atomic_load_n(&h->owner_epoch, __ATOMIC_ACQUIRE);
+    *host_id = h->owner_host_id;   /* epoch acquire 之后的平读已有序 */
+    return KVC_OK;
+}
+
+uint32_t kvc_region_owner_epoch(const kvc_region_t *region)
+{
+    if (!region)
+        return 0;
+    return __atomic_load_n(&kvc_layout_header_ro(region->base)->owner_epoch,
+                           __ATOMIC_ACQUIRE);
+}
+
+int kvc_region_probe_identity(const char *device_path, uint64_t mmap_offset,
+                              uint32_t flags, kvc_region_meta_t *geo_out,
+                              uint64_t *host_id, uint32_t *epoch_out)
+{
+    if (!device_path || !geo_out || !host_id || !epoch_out)
+        return KVC_EINVAL;
+
+    void *base = kvc_map_memory(device_path, mmap_offset, 4096, flags);
+    if (!base)
+        return KVC_ENODEV;
+    const kvc_layout_header_t *h = kvc_layout_header_ro(base);
+    int rc = KVC_OK;
+    if (h->magic != KVC_LAYOUT_MAGIC || h->version != KVC_LAYOUT_VERSION) {
+        rc = KVC_ENOENT;
+        goto out;
+    }
+    uint32_t capacity;
+    uint64_t data_off;
+    if (kvc_layout_solve(h->region_bytes, h->block_size, &capacity,
+                         &data_off) != 0 ||
+        capacity != h->capacity_slots || data_off != h->data_off) {
+        rc = KVC_ESTALE;   /* header 自身几何不自洽（写坏/接错） */
+        goto out;
+    }
+    geo_out->region_id = h->region_id;
+    geo_out->block_size = h->block_size;
+    geo_out->capacity_slots = h->capacity_slots;
+    geo_out->data_off = h->data_off;
+    geo_out->data_bytes = (uint64_t)h->capacity_slots * h->block_size;
+    *epoch_out = __atomic_load_n(&h->owner_epoch, __ATOMIC_ACQUIRE);
+    *host_id = h->owner_host_id;
+out:
+    kvc_unmap_memory(base, 4096);
+    return rc;
+}
+
+uint32_t kvc_api_version(void) { return KVC_ABI_VERSION; }

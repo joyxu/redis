@@ -1,4 +1,5 @@
 /* kvc_ub.c — shmdev mmap（O_SYNC fallback 实测路径）+ 匿名映射 */
+#include <stdlib.h>
 #include "kvc_ub.h"
 #include "kvc/kvc_common.h"
 
@@ -21,10 +22,16 @@ void *kvc_map_memory(const char *path, uint64_t offset, uint64_t bytes,
 
     int fd = -1;
     int last_errno = 0;
+    /* ④定位实验: KVC_FORCE_O_SYNC=1 时 owner/读者两侧强制 O_SYNC 映射
+     * （排除双映射属性不一致假设）。确认后回退或转为正式配置。 */
     int open_flags[2] = {O_RDWR, O_RDWR | O_SYNC};
     int nflags = 1;
     if (flags & KVC_REGION_O_SYNC_FALLBACK)
         nflags = 2;
+    if (getenv("KVC_FORCE_O_SYNC") != NULL) {
+        open_flags[0] = O_RDWR | O_SYNC;
+        open_flags[1] = O_RDWR;
+    }
 
     for (int i = 0; i < nflags; i++) {
         fd = open(path, open_flags[i]);

@@ -221,6 +221,59 @@ int main(int argc, char **argv)
     kvc_region_set_destroy(set3);
     kvc_slot_allocator_destroy(a3);
 
+    /* ============ T0-1 用例（拓扑身份，重新建 region） ============ */
+    printf("--- T0-1 identity ---\n");
+    kvc_region_config_t cfg4 = cfg;
+    cfg4.flags |= KVC_REGION_CREATE;
+    kvc_region_t *r4 = kvc_region_open_local(&cfg4);
+    CHECK(r4 != NULL, "T0-1: fresh region");
+
+    uint64_t hid = 0;
+    uint32_t ep = 0;
+    CHECK(kvc_region_owner_info(r4, &hid, &ep) == KVC_OK && hid == 0 && ep == 0,
+          "pre-publish: host_id=0 epoch=0");
+    CHECK(kvc_identity_hash("hw01|/dev/obmm_shmdev1") !=
+              kvc_identity_hash("hw02|/dev/obmm_shmdev1"),
+          "identity_hash discriminates hosts");
+    CHECK(kvc_identity_hash("hw01|/dev/obmm_shmdev1") ==
+              kvc_identity_hash("hw01|/dev/obmm_shmdev1"),
+          "identity_hash stable");
+    CHECK(kvc_identity_hash("hw01|/dev/obmm_shmdev1") !=
+              kvc_identity_hash("hw01|/dev/obmm_shmdev5"),
+          "identity_hash discriminates devices");
+
+    CHECK(kvc_region_publish_identity(r4, "hw01|/dev/obmm_shmdev1") == KVC_OK,
+          "publish_identity");
+    CHECK(kvc_region_owner_info(r4, &hid, &ep) == KVC_OK &&
+              hid == kvc_identity_hash("hw01|/dev/obmm_shmdev1") && ep == 1,
+          "post-publish: host_id + epoch=1");
+    CHECK(kvc_region_publish_base(r4) == KVC_OK &&
+              kvc_region_owner_base(r4) ==
+                  (uint64_t)(uintptr_t)kvc_region_data_base(r4),
+          "publish_base roundtrip");
+
+    /* 模拟 owner 重启: 二次发布 → epoch 递增，读者复查可见 */
+    CHECK(kvc_region_publish_identity(r4, "hw01|/dev/obmm_shmdev1") == KVC_OK,
+          "republish (owner restart)");
+    CHECK(kvc_region_owner_epoch(r4) == 2, "owner_epoch observes increment");
+
+    if (cfg.provider == KVC_PROVIDER_DEVICE) {
+        kvc_region_meta_t geo;
+        uint64_t ph = 0;
+        uint32_t pe = 0;
+        int rc = kvc_region_probe_identity(cfg.device_path, 0, cfg.flags &
+                                                   ~KVC_REGION_CREATE, &geo,
+                                           &ph, &pe);
+        CHECK(rc == KVC_OK && ph == hid && pe == 2 &&
+                  geo.block_size == cfg.block_size &&
+                  geo.region_id == cfg.region_id &&
+                  geo.data_bytes == kvc_region_data_bytes(r4),
+              "probe_identity: geometry + identity from header page");
+    } else {
+        printf("  skip probe_identity (anon provider)\n");
+    }
+    kvc_region_close(r4);
+
     printf(failures ? "== SMOKE FAILED (%d) ==\n" : "== SMOKE PASSED ==\n",
            failures);
     return failures ? 1 : 0;

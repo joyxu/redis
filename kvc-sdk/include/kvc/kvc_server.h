@@ -21,6 +21,11 @@ extern "C" {
 
 typedef struct kvc_region kvc_region_t;          /* opaque: 已映射的 region */
 
+/* ABI 版本协商（A6）: 适配层 dlopen 后立即调用，与编译期 KVC_ABI_VERSION
+ * 不符即拒绝使用该 so（几何/身份协议跨版本不兼容，宁拒不错）。 */
+#define KVC_ABI_VERSION 2u
+uint32_t kvc_api_version(void);
+
 /* region 几何元数据（master 构建 allocator 视图 / 对外上报用） */
 typedef struct {
     uint32_t region_id;
@@ -170,6 +175,42 @@ uint64_t kvc_region_owner_base(const kvc_region_t *region);
 #define KVC_PROBE_UNINITIALIZED 1
 #define KVC_PROBE_CONFLICT     -1
 int kvc_region_probe(const kvc_region_config_t *cfg);
+
+/* ---------------------------------------------------------------------------
+ * 5. owner 拓扑身份 — T0-1：防接错设备 + owner 重启检测（R2）
+ *
+ * 期望身份由读者从 master 权威元数据（replica 的 transport_endpoint 提取
+ * host）计算；实际身份由 owner（daemon）启动时发布进 region header。
+ * 两者比对是 shm 自描述对 master 权威的交叉核验，不引入新 RPC。
+ * ------------------------------------------------------------------------- */
+
+/* 身份串（建议 "hostname|device_path"）→ 64 位 FNV-1a hash。
+ * 读者/owner 两侧用同一函数与同一身份串格式。 */
+uint64_t kvc_identity_hash(const char *identity);
+
+/* owner 端发布身份：epoch 递增（release），随后 owner_base/其余字段对
+ * acquire 读到新 epoch 的读者可见。owner 每次启动（daemon 起段后）调用。
+ * 前置条件: region 为本地可写映射（open_local 所得）。 */
+int kvc_region_publish_identity(kvc_region_t *region, const char *owner_identity);
+
+/* 读者端读取 owner 身份快照（一次 acquire 读 epoch + 平读 host_id）。
+ * host_id==0 表示 owner 尚未发布。 */
+int kvc_region_owner_info(const kvc_region_t *region, uint64_t *host_id,
+                          uint32_t *epoch);
+
+/* 轻量 epoch 复查（读者命中路径每读一次，单 acquire load）。
+ * 返回当前 epoch；调用方与缓存值比对，变化 = owner 已重启，须作废
+ * 本地 poscache/owner_base 并重新 lazy_init。 */
+uint32_t kvc_region_owner_epoch(const kvc_region_t *region);
+
+/* 免配置探测：只映射 header 一页，读出 owner 发布的权威几何与身份。
+ * 读者先用它拿到 region_bytes/block_size，再 open_local(validate)——
+ * env 几何仅作断言（不一致即拒绝），不再人肉配置。
+ * 返回 KVC_OK；KVC_ENOENT 表示设备上无 magic（未初始化或接错设备）。 */
+int kvc_region_probe_identity(const char *device_path, uint64_t mmap_offset,
+                              uint32_t flags,
+                              kvc_region_meta_t *geo_out, uint64_t *host_id,
+                              uint32_t *epoch_out);
 
 #ifdef __cplusplus
 }

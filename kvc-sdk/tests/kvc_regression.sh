@@ -85,12 +85,14 @@ VERIFY_ARGS="--nr-objects 16 --batch-size 4 --value-size 4096 --memory-replica-n
 READ_ARGS="--nr-objects 2048 --batch-size 32 --value-size 4096 --memory-replica-num 1 --nof-replica-num 0 --runtime 10"
 
 : > $LOG
-for cfg in anon kvc-off kvc-on kvc-direct; do
+for cfg in anon kvc-off kvc-on kvc-direct kvc-full; do
   case $cfg in
-    anon)        M=anon; FLIPON=0 ;;
-    kvc-off)     M=kvc;  FLIPON=0 ;;
-    kvc-on)      M=kvc;  FLIPON=1; unset KVC_DIRECT_READ ;;
-    kvc-direct)  M=kvc;  FLIPON=1; export KVC_DIRECT_READ=1 ;;
+    anon)        M=anon; FLIPON=0; unset KVC_POS_CACHE ;;
+    kvc-off)     M=kvc;  FLIPON=0; unset KVC_POS_CACHE ;;
+    kvc-on)      M=kvc;  FLIPON=1; unset KVC_DIRECT_READ KVC_POS_CACHE ;;
+    kvc-direct)  M=kvc;  FLIPON=1; export KVC_DIRECT_READ=1; unset KVC_POS_CACHE ;;
+    # 满配: 直读 + 位置缓存（终态目标口径）
+    kvc-full)    M=kvc;  FLIPON=1; export KVC_DIRECT_READ=1 KVC_POS_CACHE=1 ;;
   esac
   echo "########## CONFIG: $cfg ##########" >> $LOG
   start_cluster $M ${cfg}_v; echo "== $cfg verify ==" >> $LOG; bench verify_write ${cfg}v $VERIFY_ARGS

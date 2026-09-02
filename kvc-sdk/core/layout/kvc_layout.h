@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 #define KVC_LAYOUT_MAGIC   0x5243564Bu   /* "KVCR" */
-#define KVC_LAYOUT_VERSION 1u
+#define KVC_LAYOUT_VERSION 2u
 
 /* region header — 64 字节，单 cacheline */
 typedef struct {
@@ -26,9 +26,14 @@ typedef struct {
     uint32_t capacity_slots;
     uint32_t used_hint;      /* 松散计数，仅供观测 */
     uint64_t owner_base;     /* owner 进程的数据区 VA（跨进程 offset 换算用） */
-    uint32_t reserved1;
+    uint32_t owner_epoch;    /* owner 身代：每次 publish_identity 递增（release 写）。
+                              * 读者 acquire 复查此字段可检测 owner 重启（R2）。 */
+    uint32_t pad0;
     uint64_t data_off;
     uint64_t region_bytes;
+    uint64_t owner_host_id;  /* owner 拓扑身份（hostname+device 的 FNV-1a）。
+                              * 读者与 master 元数据（transport_endpoint 提取的
+                              * host）交叉核验，防接错设备。 */
 } kvc_layout_header_t;
 
 /* slot 元数据 — 32 字节，独立于数据行（扫状态不触碰数据） */
@@ -41,6 +46,10 @@ typedef struct {
 
 #define KVC_LAYOUT_HEADER_SIZE ((uint64_t)sizeof(kvc_layout_header_t))
 #define KVC_LAYOUT_SLOT_META_SIZE ((uint64_t)sizeof(kvc_layout_slot_t))
+
+/* header 必须单 cacheline（读者 epoch 复查的廉价性依赖此不变量） */
+_Static_assert(sizeof(kvc_layout_header_t) == 64, "region header must be 64B");
+_Static_assert(sizeof(kvc_layout_slot_t) == 24, "slot meta must be 24B");
 
 /* 解算几何: 给定 region_bytes/block_size，输出 capacity 与 data_off。
  * 返回 0 成功（bytes 至少容纳 header + 1 个 slot），-1 参数非法。 */
