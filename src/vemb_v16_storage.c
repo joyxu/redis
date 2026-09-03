@@ -4512,13 +4512,37 @@ int vemb_v16_storage_migration_mark_cutover_in_shard(
         return -1;
     }
 
-    return tlc_core_mark_cutover(storage->tlc->core,
-                                     key,
-                                     key_len,
-                                     key_hash,
-                                     topology_epoch,
-                                     target_owner,
-                                     info);
+    /*
+     * CUTOVER is a topology-control transition.  Once the target lease is
+     * committed, remove the source value with the same ordinary DEL event
+     * used by client deletes.  The COLD append sink carries this event to the
+     * source Follower; no migration-specific Replica opcode is required.
+     */
+    tlc_core_key_migration_info_t deleted = {0};
+    int delete_ok = current.tombstone ||
+        tlc_core_delete_with_epoch(storage->tlc->core,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   topology_epoch,
+                                   &deleted) == 0;
+    int mark_ok = delete_ok &&
+        tlc_core_mark_cutover(storage->tlc->core,
+                              key,
+                              key_len,
+                              key_hash,
+                              topology_epoch,
+                              target_owner,
+                              info) == 0;
+    if (!mark_ok) {
+        serverLog(LL_WARNING,
+                  "migration cutover source DEL/state transition failed: key_hash=%llu target_owner=%u delete_ok=%d",
+                  (unsigned long long)key_hash,
+                  target_owner,
+                  delete_ok);
+        return -1;
+    }
+    return 0;
 }
 
 int vemb_v16_storage_migration_mark_cutover(
@@ -4902,7 +4926,16 @@ int vemb_v16_storage_migration_range_mark_cutover(
                                                      cutover_topology_epoch,
                                                      target_owner,
                                                      shard_id);
-        int mark_ok = lease_ok &&
+        tlc_core_key_migration_info_t deleted = {0};
+        int delete_ok = lease_ok &&
+            (keys[i].info.tombstone ||
+             tlc_core_delete_with_epoch(storage->tlc->core,
+                                        keys[i].key,
+                                        keys[i].key_len,
+                                        keys[i].key_hash,
+                                        cutover_topology_epoch,
+                                        &deleted) == 0);
+        int mark_ok = delete_ok &&
             tlc_core_mark_cutover(storage->tlc->core,
                                   keys[i].key,
                                   keys[i].key_len,
@@ -4921,6 +4954,10 @@ int vemb_v16_storage_migration_range_mark_cutover(
                           shard_id,
                           (unsigned long long)keys[i].key_hash,
                           lease_ok);
+                serverLog(LL_WARNING,
+                          "vemb_v16 range cutover source DEL/state transition failed: key_hash=%llu delete_ok=%d",
+                          (unsigned long long)keys[i].key_hash,
+                          delete_ok);
             }
             error_count++;
             break;

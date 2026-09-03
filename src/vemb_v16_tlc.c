@@ -763,12 +763,12 @@ int vemb_v16_tlc_recover_cold(vemb_v16_tlc_t *tlc) {
 
 int vemb_v16_tlc_publish_checkpoint(vemb_v16_tlc_t *tlc,
                                     uint64_t generation,
-                                    uint64_t term,
+                                    uint64_t ha_term,
                                     tlc_cold_checkpoint_result_t *result) {
     RETURN_IF(!tlc || generation == 0 || !result, -1);
     return tlc_core_publish_checkpoint(tlc->core,
                                        generation,
-                                       term,
+                                       ha_term,
                                        result);
 }
 

@@ -10,6 +10,8 @@ typedef struct tlc_cold tlc_cold_t;
 enum {
     TLC_COLD_OK = 0,
     TLC_COLD_ERR = -1,
+    TLC_COLD_REPLICA_GAP = -2,
+    TLC_COLD_REPLICA_CONFLICT = -3,
 };
 
 typedef enum tlc_cold_ack_mode {
@@ -23,7 +25,10 @@ typedef enum tlc_cold_op {
 } tlc_cold_op_t;
 
 typedef struct tlc_cold_event_input {
-    uint64_t term;
+    /* Owner fencing term; zero is used by Standalone mode. */
+    uint64_t ha_term;
+    /* Topology/migration epoch associated with this logical event. */
+    uint64_t topology_epoch;
     uint32_t op;
     uint32_t meta_shard_id;
     uint64_t version;
@@ -49,6 +54,20 @@ typedef struct tlc_cold_progress {
     uint64_t segment_offset;
 } tlc_cold_progress_t;
 
+typedef struct tlc_cold_seq_cursor {
+    uint64_t seq;
+    uint64_t segment_id;
+    uint64_t segment_offset;
+} tlc_cold_seq_cursor_t;
+
+typedef enum tlc_cold_replica_batch_status {
+    TLC_COLD_REPLICA_BATCH_APPLIED = 0,
+    TLC_COLD_REPLICA_BATCH_DUPLICATE = 1,
+    TLC_COLD_REPLICA_BATCH_GAP = 2,
+    TLC_COLD_REPLICA_BATCH_CONFLICT = 3,
+    TLC_COLD_REPLICA_BATCH_ERROR = 4,
+} tlc_cold_replica_batch_status_t;
+
 typedef struct tlc_cold_checkpoint_record {
     uint32_t meta_shard_id;
     uint64_t captured_seq;
@@ -58,6 +77,8 @@ typedef struct tlc_cold_checkpoint_record {
 
 typedef struct tlc_cold_checkpoint_result {
     uint64_t generation;
+    /* Owner fencing term captured by the checkpoint generation. */
+    uint64_t ha_term;
     uint64_t checkpoint_seq;
     uint64_t generation_checksum;
 } tlc_cold_checkpoint_result_t;
@@ -85,6 +106,9 @@ typedef enum tlc_cold_io_failpoint {
 typedef int (*tlc_cold_replay_fn)(const tlc_cold_event_input_t *input,
                                   uint64_t seq,
                                   void *arg);
+typedef int (*tlc_cold_append_sink_fn)(const tlc_cold_event_input_t *input,
+                                       uint64_t seq,
+                                       void *arg);
 typedef int (*tlc_cold_checkpoint_load_fn)(uint32_t meta_shard_id,
                                            uint64_t captured_seq,
                                            const void *state,
@@ -109,6 +133,34 @@ int tlc_cold_submit(tlc_cold_t *cold,
 int tlc_cold_get_progress(const tlc_cold_t *cold,
                           tlc_cold_progress_t *progress);
 
+/* Find the nearest retained AOF offset at or before seq. */
+int tlc_cold_get_seq_cursor(tlc_cold_t *cold,
+                            uint64_t seq,
+                            tlc_cold_seq_cursor_t *cursor);
+
+/* Configure the append sink before concurrent submissions begin. */
+int tlc_cold_set_append_sink(tlc_cold_t *cold,
+                             tlc_cold_append_sink_fn sink,
+                             void *arg);
+
+/*
+ * Append a contiguous Leader sequence range to the local Replica AOF.
+ * The input event buffers are copied before this function returns. A new
+ * range is appended with the supplied original seq values and acknowledges
+ * according to ack_mode. An identical already acknowledged range is reported
+ * as DUPLICATE; a different payload for the same seq is CONFLICT. A range
+ * that does not start at the next local seq is reported as GAP. The caller
+ * must serialize this operation with Replica apply/recovery lifecycle changes.
+ */
+int tlc_cold_submit_replica_batch(
+    tlc_cold_t *cold,
+    uint64_t first_seq,
+    const tlc_cold_event_input_t *events,
+    uint32_t event_count,
+    tlc_cold_ack_mode_t ack_mode,
+    tlc_cold_replica_batch_status_t *status,
+    uint64_t *acknowledged_seq);
+
 /*
  * Replay every complete AOF event in sequence order. The callback owns no
  * event buffers; key/value are valid only until it returns. It must not call
@@ -116,6 +168,12 @@ int tlc_cold_get_progress(const tlc_cold_t *cold,
  * previously durable event whose metadata publish failed.
  */
 int tlc_cold_replay(tlc_cold_t *cold, tlc_cold_replay_fn callback, void *arg);
+/* Replay one inclusive contiguous seq range from the AOF. */
+int tlc_cold_replay_range(tlc_cold_t *cold,
+                          uint64_t start_seq,
+                          uint64_t end_seq,
+                          tlc_cold_replay_fn callback,
+                          void *arg);
 int tlc_cold_replay_after(tlc_cold_t *cold,
                           const uint64_t *captured_seq,
                           uint32_t meta_shard_count,
@@ -132,7 +190,7 @@ int tlc_cold_replay_after(tlc_cold_t *cold,
 int tlc_cold_publish_checkpoint(
     tlc_cold_t *cold,
     uint64_t generation,
-    uint64_t term,
+    uint64_t ha_term,
     uint32_t meta_shard_count,
     const tlc_cold_checkpoint_record_t *records,
     uint32_t record_count,
@@ -171,6 +229,39 @@ int tlc_cold_load_checkpoint(tlc_cold_t *cold,
                              tlc_cold_checkpoint_load_fn callback,
                              void *arg,
                              tlc_cold_checkpoint_result_t *result);
+
+/* Clone the active validated checkpoint into an empty fenced Replica COLD. */
+int tlc_cold_clone_checkpoint(tlc_cold_t *source,
+                              tlc_cold_t *target,
+                              uint32_t expected_meta_shard_count,
+                              tlc_cold_checkpoint_result_t *result);
+/*
+ * Export the active validated checkpoint as an owned immutable blob.
+ * Preconditions: cold, blob, blob_bytes and result are non-NULL; the expected
+ * shard count is non-zero. The caller owns the returned blob and must release
+ * it with tlc_cold_free_checkpoint_blob().
+ */
+int tlc_cold_export_checkpoint(tlc_cold_t *cold,
+                               uint32_t expected_meta_shard_count,
+                               void **blob,
+                               size_t *blob_bytes,
+                               tlc_cold_checkpoint_result_t *result);
+/*
+ * Import a validated checkpoint blob into an empty fenced Replica COLD.
+ * Preconditions: cold, blob and result are non-NULL; expected shard count is
+ * non-zero; no AOF submissions or lifecycle changes run concurrently. The
+ * target has no checkpoint manifest and its seq prefix is zero. The blob is
+ * immutable for the duration of the call. Invalid input never replaces an
+ * existing valid generation.
+ */
+int tlc_cold_import_checkpoint(tlc_cold_t *cold,
+                               uint32_t expected_meta_shard_count,
+                               const void *blob,
+                               size_t blob_bytes,
+                               tlc_cold_checkpoint_result_t *result);
+void tlc_cold_free_checkpoint_blob(void *blob);
+/* Seed an empty Replica COLD with the checkpoint's durable prefix. */
+int tlc_cold_set_replica_base_seq(tlc_cold_t *cold, uint64_t base_seq);
 
 /* Compact sealed AOF segments and trim old published generations. */
 int tlc_cold_compact(tlc_cold_t *cold,

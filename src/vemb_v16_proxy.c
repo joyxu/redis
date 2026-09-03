@@ -3901,8 +3901,11 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     free_job_shard_queues(proxy);
     free_job_return_queues(proxy);
     cleanup_proxy_io_job_pools(proxy);
-    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++)
-        close_channel(&proxy->channels[i]);
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        if (atomic_load_explicit(&proxy->channels[i].slot_channel_id,
+                                 memory_order_acquire) != 0)
+            close_channel(&proxy->channels[i]);
+    }
     if (proxy->listen_fd >= 0) close(proxy->listen_fd);
     pthread_mutex_destroy(&proxy->channel_lifecycle_lock);
     pthread_mutex_destroy(&proxy->stats_lock);

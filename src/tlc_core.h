@@ -47,6 +47,14 @@ typedef enum tlc_core_migration_apply_status {
     TLC_CORE_MIGRATION_ERROR = 4,
 } tlc_core_migration_apply_status_t;
 
+typedef enum tlc_core_replica_apply_status {
+    TLC_CORE_REPLICA_APPLY_APPLIED = 0,
+    TLC_CORE_REPLICA_APPLY_DUPLICATE = 1,
+    TLC_CORE_REPLICA_APPLY_GAP = 2,
+    TLC_CORE_REPLICA_APPLY_STALE = 3,
+    TLC_CORE_REPLICA_APPLY_ERROR = 4,
+} tlc_core_replica_apply_status_t;
+
 typedef struct tlc_core_key_migration_info {
     uint64_t key_hash;
     uint64_t key_version;
@@ -144,22 +152,37 @@ typedef struct tlc_core_config {
 } tlc_core_config_t;
 
 typedef struct tlc_core tlc_core_t;
+typedef int (*tlc_core_replica_event_sink_fn)(
+    const tlc_cold_event_input_t *event,
+    uint64_t seq,
+    void *arg);
 
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config);
 void tlc_core_destroy(tlc_core_t *core);
 /* Must be called once, before concurrent writes begin; resolver_arg remains live. */
 int tlc_core_enable_cold(tlc_core_t *core,
                          const tlc_cold_config_t *cold_config);
+/* Configure the Leader event sink before concurrent writes begin. */
+int tlc_core_set_replica_event_sink(tlc_core_t *core,
+                                    tlc_core_replica_event_sink_fn sink,
+                                    void *arg);
+/* Return the borrowed COLD runtime; ownership remains with core. */
+tlc_cold_t *tlc_core_get_cold(tlc_core_t *core);
 int tlc_core_recover_cold(tlc_core_t *core);
 /* Preconditions: v16 boundary validated generation and output shape. */
 int tlc_core_publish_checkpoint(tlc_core_t *core,
                                 uint64_t generation,
-                                uint64_t term,
+                                uint64_t ha_term,
                                 tlc_cold_checkpoint_result_t *result);
 int tlc_core_compact(tlc_core_t *core,
                      uint64_t checkpoint_floor_seq,
                      uint64_t ha_safe_point_seq,
                      uint32_t checkpoint_retention_count);
+/* Resync an empty fenced follower from the leader's active checkpoint and AOF tail. */
+int tlc_core_resync_from(tlc_core_t *leader,
+                         tlc_core_t *follower,
+                         uint64_t boundary_seq,
+                         tlc_cold_checkpoint_result_t *result);
 int tlc_core_source_fence_active(const tlc_core_t *core);
 int tlc_core_attach_warm_region(tlc_core_t *core,
                                 const tlc_core_warm_region_config_t *region,
@@ -207,6 +230,16 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
                                uint64_t key_hash,
                                uint64_t topology_epoch,
                                tlc_core_key_migration_info_t *info);
+/*
+ * Apply one already-normalized event received from the paired Leader.
+ * The ingress boundary validates event operation, key/value shape and seq.
+ * The event is applied only to in-memory HA/WARM state; this API does not
+ * append to local COLD.
+ */
+int tlc_core_apply_replica_event(tlc_core_t *core,
+                                 const tlc_cold_event_input_t *event,
+                                 uint64_t seq,
+                                 tlc_core_replica_apply_status_t *status);
 /* Legacy explicit durable PUT; requires persistent COLD to be enabled. */
 int tlc_core_cold_append(tlc_core_t *core,
                          const char *key,

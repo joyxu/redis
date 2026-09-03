@@ -111,8 +111,9 @@ static void test_fuzzy_checkpoint_concurrent_writes(void) {
     }
     usleep(1000);
     tlc_cold_checkpoint_result_t checkpoint_result;
-    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 0,
                                            &checkpoint_result) == 0);
+    assert(checkpoint_result.ha_term == 0);
     for (uint32_t i = 0; i < WORKER_COUNT; i++)
         assert(pthread_join(threads[i], NULL) == 0);
     assert(atomic_load_explicit(&failures, memory_order_acquire) == 0);
@@ -212,7 +213,7 @@ static void test_checkpoint_aof_full_recovery_consistency(void) {
                                            &warm_slot) == 0);
     }
     tlc_cold_checkpoint_result_t checkpoint_result;
-    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 0,
                                            &checkpoint_result) == 0);
 
     const float updated[] = {30, 40};
@@ -272,7 +273,7 @@ static void test_single_node_recovery_failure_blocks_startup(void) {
     const char key[] = "single-node-failure-key";
     const char value[] = "single-node-failure-value";
     tlc_cold_event_input_t event = {
-        .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
+        .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
         .key = key, .key_len = sizeof(key) - 1, .value = value,
         .value_len = sizeof(value) - 1};
     assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -339,7 +340,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
                tlc, key, strlen(key), key_hash, first_value, value_size, 2,
                &handle, &warm_slot) == 0);
     tlc_cold_checkpoint_result_t checkpoint_result;
-    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 2,
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 0,
                                            &checkpoint_result) == 0);
     vemb_v16_tlc_destroy(tlc);
     zfree(region);
@@ -348,7 +349,8 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
     tlc_cold_t *cold = NULL;
     assert(tlc_cold_open(&cold, &cold_config) == 0);
     tlc_cold_event_input_t stale_event = {
-        .term = 1,
+        .ha_term = 1,
+        .topology_epoch = 1,
         .op = TLC_COLD_OP_PUT,
         .meta_shard_id = (uint32_t)(vemb_v16_mix32_u64(key_hash) & 255u),
         .version = 2,
@@ -397,7 +399,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
     assert(vemb_v16_tlc_put_with_epoch(
                tlc, key2, strlen(key2), key2_hash, second_value, value_size, 1,
                &handle, &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 1,
+    assert(vemb_v16_tlc_publish_checkpoint(tlc, 1, 0,
                                            &checkpoint_result) == 0);
     vemb_v16_tlc_destroy(tlc);
     zfree(region);
@@ -597,7 +599,7 @@ static void test_persistent_cold_write_order(void) {
     tlc_cold_checkpoint_result_t checkpoint_result;
     assert(vemb_v16_tlc_publish_checkpoint(tlc,
                                            1,
-                                           1,
+                                           0,
                                            &checkpoint_result) == 0);
     assert(checkpoint_result.generation == 1);
     /* ACK_ACCEPTED does not wait for the background fsync; a checkpoint

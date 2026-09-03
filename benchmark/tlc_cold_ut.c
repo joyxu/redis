@@ -62,7 +62,8 @@ typedef struct test_cold_frame_header {
     uint32_t magic;
     uint16_t format_version;
     uint16_t header_bytes;
-    uint64_t term;
+    uint64_t ha_term;
+    uint64_t topology_epoch;
     uint64_t seq;
     uint32_t op;
     uint32_t meta_shard_id;
@@ -123,7 +124,7 @@ static void test_strict_aof_seq_gap_rejected(void) {
         int key_len = snprintf(key, sizeof(key), "gap-key-%u", i);
         int value_len = snprintf(value, sizeof(value), "gap-value-%u", i);
         tlc_cold_event_input_t event = {
-            .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
+            .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
             .version = i + 1, .key = key, .key_len = (uint32_t)key_len,
             .value = value, .value_len = (uint32_t)value_len};
         assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -144,7 +145,7 @@ static void test_strict_checkpoint_corruption_rejected(void) {
     const char key[] = "checkpoint-corrupt-key";
     const char value[] = "checkpoint-corrupt-value";
     tlc_cold_event_input_t event = {
-        .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
+        .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
         .key = key, .key_len = sizeof(key) - 1, .value = value,
         .value_len = sizeof(value) - 1};
     assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -204,7 +205,7 @@ static void test_compact_interruption_recovery(
         int key_len = snprintf(key, sizeof(key), "interrupt-key-%u", i);
         int value_len = snprintf(value, sizeof(value), "interrupt-value-%u", i);
         tlc_cold_event_input_t event = {
-            .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
+            .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
             .version = i + 1, .key = key, .key_len = (uint32_t)key_len,
             .value = value, .value_len = (uint32_t)value_len};
         assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -219,7 +220,7 @@ static void test_compact_interruption_recovery(
         int key_len = snprintf(key, sizeof(key), "interrupt-key-%u", i);
         int value_len = snprintf(value, sizeof(value), "interrupt-value-%u", i);
         tlc_cold_event_input_t event = {
-            .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
+            .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0,
             .version = i + 1, .key = key, .key_len = (uint32_t)key_len,
             .value = value, .value_len = (uint32_t)value_len};
         assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -251,7 +252,7 @@ static void test_strict_metadata_shard_mismatch_rejected(void) {
     const char key[] = "shard-mismatch-key";
     const char value[] = "shard-mismatch-value";
     tlc_cold_event_input_t event = {
-        .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 1, .version = 1,
+        .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 1, .version = 1,
         .key = key, .key_len = sizeof(key) - 1, .value = value,
         .value_len = sizeof(value) - 1};
     assert(tlc_cold_submit(cold, &event, TLC_COLD_ACK_DURABLE, NULL) == 0);
@@ -277,7 +278,8 @@ static void test_checkpoint_publish_failure(
     const char key[] = "checkpoint-failure-key";
     const char value[] = "checkpoint-failure-value";
     tlc_cold_event_input_t event = {
-        .term = 1,
+        .ha_term = 1,
+        .topology_epoch = 1,
         .op = TLC_COLD_OP_PUT,
         .meta_shard_id = 0,
         .version = 1,
@@ -317,7 +319,7 @@ static void test_aof_io_failure(tlc_cold_io_failpoint_t failpoint) {
     const char key[] = "io-failure-key";
     const char value[] = "io-failure-value";
     tlc_cold_event_input_t event = {
-        .term = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
+        .ha_term = 1, .topology_epoch = 1, .op = TLC_COLD_OP_PUT, .meta_shard_id = 0, .version = 1,
         .key = key, .key_len = sizeof(key) - 1, .value = value,
         .value_len = sizeof(value) - 1};
     assert(tlc_cold_set_io_failpoint(cold, failpoint) == 0);
@@ -363,7 +365,7 @@ static void *submit_worker(void *opaque) {
         int key_len = snprintf(key, sizeof(key), "worker-%u-key-%u", arg->worker_id, i);
         int value_len = snprintf(value, sizeof(value), "worker-%u-value-%u", arg->worker_id, i);
         tlc_cold_event_input_t event = {
-            .term = 3,
+            .ha_term = 3, .topology_epoch = 3,
             .op = TLC_COLD_OP_PUT,
             .meta_shard_id = arg->worker_id,
             .version = i + 1,
@@ -415,7 +417,7 @@ int main(void) {
     const char value0[] = "value-0";
     uint64_t seq0 = 0;
     tlc_cold_event_input_t put = {
-        .term = 3,
+        .ha_term = 3, .topology_epoch = 3,
         .op = TLC_COLD_OP_PUT,
         .meta_shard_id = 11,
         .version = 1,
@@ -469,11 +471,13 @@ int main(void) {
                                        checkpoint_records, 3,
                                        &checkpoint_result) == 0);
     assert(checkpoint_result.generation == 7);
+    assert(checkpoint_result.ha_term == 3);
     assert(checkpoint_result.checkpoint_seq == 2);
     tlc_cold_checkpoint_result_t validated_checkpoint;
     assert(tlc_cold_validate_checkpoint(cold, 7, 3,
                                         &validated_checkpoint) == 0);
     assert(validated_checkpoint.generation == 7);
+    assert(validated_checkpoint.ha_term == 3);
     assert(validated_checkpoint.checkpoint_seq == 2);
     char checkpoint_path[4096];
     char manifest_path[4096];

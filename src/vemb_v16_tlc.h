@@ -190,7 +190,7 @@ int vemb_v16_tlc_enable_cold(vemb_v16_tlc_t *tlc,
 int vemb_v16_tlc_recover_cold(vemb_v16_tlc_t *tlc);
 int vemb_v16_tlc_publish_checkpoint(vemb_v16_tlc_t *tlc,
                                     uint64_t generation,
-                                    uint64_t term,
+                                    uint64_t ha_term,
                                     tlc_cold_checkpoint_result_t *result);
 int vemb_v16_tlc_compact(vemb_v16_tlc_t *tlc,
                          uint64_t checkpoint_floor_seq,

@@ -6,6 +6,24 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 
 tlc_cold_ut: tlc_cold_ut.c ../src/tlc_cold.c ../src/tlc_cold.h ../src/monotonic.c ../src/monotonic.h ../src/redisassert.c ../src/zmalloc.c ../src/vemb_v16_log.c ../src/localtime.c
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -DTLC_COLD_ENABLE_FAILPOINT -I../src -o $@ tlc_cold_ut.c ../src/tlc_cold.c ../src/monotonic.c ../src/redisassert.c ../src/zmalloc.c ../src/vemb_v16_log.c ../src/localtime.c
+
+tlc_sync_ut: tlc_sync_ut.c ../src/tlc_core.c ../src/tlc_core.h ../src/tlc_cold.c ../src/tlc_cold.h ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_warm_region_layout.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/sve_operation.h ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_sync_ut.c ../src/tlc_core.c ../src/tlc_cold.c ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -lm
+
+tlc_replica_cold_ut: tlc_replica_cold_ut.c ../src/tlc_cold.c ../src/tlc_cold.h ../src/monotonic.c ../src/monotonic.h ../src/redisassert.c ../src/zmalloc.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_replica_cold_ut.c ../src/tlc_cold.c ../src/monotonic.c ../src/redisassert.c ../src/zmalloc.c ../src/vemb_v16_log.c ../src/localtime.c
+
+tlc_ha_replica_ut: tlc_ha_replica_ut.c ../src/tlc_ha_replica.c ../src/tlc_ha_replica.h ../src/tlc_core.c ../src/tlc_core.h ../src/tlc_cold.c ../src/tlc_cold.h ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_warm_region_layout.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/sve_operation.h ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_ha_replica_ut.c ../src/tlc_ha_replica.c ../src/tlc_core.c ../src/tlc_cold.c ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -lm
+
+tlc_ha_replica_process_ut: tlc_ha_replica_process_ut.c ../src/tlc_ha_replica.c ../src/tlc_ha_replica.h ../src/tlc_core.c ../src/tlc_core.h ../src/tlc_cold.c ../src/tlc_cold.h ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_warm_region_layout.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/sve_operation.h ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_ha_replica_process_ut.c ../src/tlc_ha_replica.c ../src/tlc_core.c ../src/tlc_cold.c ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -lm
+
+tlc_ha_replica_ub_node_ut: tlc_ha_replica_ub_node_ut.c ../src/tlc_ha_replica.c ../src/tlc_ha_replica.h ../src/tlc_core.c ../src/tlc_core.h ../src/tlc_cold.c ../src/tlc_cold.h ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_warm_region_layout.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/sve_operation.h ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_ha_replica_ub_node_ut.c ../src/tlc_ha_replica.c ../src/tlc_core.c ../src/tlc_cold.c ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -lm
+
+tlc_resync_ut: tlc_resync_ut.c ../src/tlc_core.c ../src/tlc_core.h ../src/tlc_cold.c ../src/tlc_cold.h ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_warm_region_layout.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/sve_operation.h ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I../src -o $@ tlc_resync_ut.c ../src/tlc_core.c ../src/tlc_cold.c ../src/vemb_v16_warm_region_layout.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -lm
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件

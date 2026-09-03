@@ -33,6 +33,7 @@
 #define SEQLOCK_STATE_STEP UINT64_C(1)
 #define SEQLOCK_VERSION_STEP UINT64_C(2)
 #define SEQLOCK_EMPTY UINT64_C(0)
+#define TLC_CORE_APPLY_EVENT_STALE (-2)
 
 typedef enum tlc_core_entry_state {
     TLC_CORE_ENTRY_EMPTY = 0,
@@ -160,6 +161,12 @@ struct tlc_core {
     tlc_core_location_cache_t location_cache;
     tlc_core_warm_layer_t warm;
     tlc_cold_t *persistent_cold;
+    uint64_t ha_term;
+    tlc_core_replica_event_sink_fn replica_event_sink;
+    void *replica_event_sink_arg;
+    pthread_mutex_t replica_apply_mu;
+    uint32_t replica_apply_mu_init;
+    uint64_t replica_applied_seq;
     atomic_uint_fast64_t warm_alloc_local;
     atomic_uint_fast64_t warm_alloc_remote;
     atomic_uint_fast64_t warm_alloc_fallback;
@@ -186,6 +193,10 @@ struct tlc_core {
     state_bitmap_t key_meta_locks;
     atomic_uint_fast32_t key_meta_count;
 };
+
+static int tlc_core_cold_append_sink(const tlc_cold_event_input_t *event,
+                                     uint64_t seq,
+                                     void *arg);
 
 static const tlc_warm_location_t tlc_invalid_location = {
     .region_id = TLC_CORE_INVALID_REGION_ID,
@@ -1777,6 +1788,11 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     RETURN_IF(!core, -1);
     core->value_size = config->value_size;
     core->warm_capacity = config->warm_capacity;
+    if (pthread_mutex_init(&core->replica_apply_mu, NULL) != 0) {
+        zfree(core);
+        return -1;
+    }
+    core->replica_apply_mu_init = 1;
     atomic_init(&core->warm_alloc_local, 0);
     atomic_init(&core->warm_alloc_remote, 0);
     atomic_init(&core->warm_alloc_fallback, 0);
@@ -1830,8 +1846,34 @@ int tlc_core_enable_cold(tlc_core_t *core,
                   cold_config->directory);
         tlc_cold_close(core->persistent_cold);
         core->persistent_cold = NULL;
+    } else if (core->replica_event_sink) {
+        rc = tlc_cold_set_append_sink(core->persistent_cold,
+                                      tlc_core_cold_append_sink, core);
     }
     return rc;
+}
+
+static int tlc_core_cold_append_sink(const tlc_cold_event_input_t *event,
+                                     uint64_t seq,
+                                     void *arg) {
+    tlc_core_t *core = arg;
+    return core->replica_event_sink(event, seq, core->replica_event_sink_arg);
+}
+
+int tlc_core_set_replica_event_sink(tlc_core_t *core,
+                                    tlc_core_replica_event_sink_fn sink,
+                                    void *arg) {
+    RETURN_IF(!core, -1);
+    core->replica_event_sink = sink;
+    core->replica_event_sink_arg = arg;
+    return core->persistent_cold ?
+        tlc_cold_set_append_sink(core->persistent_cold,
+                                 sink ? tlc_core_cold_append_sink : NULL,
+                                 core) : 0;
+}
+
+tlc_cold_t *tlc_core_get_cold(tlc_core_t *core) {
+    return core ? core->persistent_cold : NULL;
 }
 
 int tlc_core_attach_warm_region(tlc_core_t *core,
@@ -1887,6 +1929,8 @@ void tlc_core_destroy(tlc_core_t *core) {
         zfree(core->key_meta_shards);
     }
     bitmap_destroy(&core->key_meta_locks);
+    if (core->replica_apply_mu_init)
+        pthread_mutex_destroy(&core->replica_apply_mu);
     zfree(core);
 }
 
@@ -2033,7 +2077,8 @@ static int tlc_core_persist_event_locked(tlc_core_t *core,
         return -1;
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     tlc_cold_event_input_t event = {
-        .term = topology_epoch,
+        .ha_term = core->ha_term,
+        .topology_epoch = topology_epoch,
         .op = op,
         .meta_shard_id = shard->lock_id,
         .version = version + 1,
@@ -2042,21 +2087,18 @@ static int tlc_core_persist_event_locked(tlc_core_t *core,
         .value = value,
         .value_len = value_size,
     };
-    return tlc_cold_submit(core->persistent_cold,
-                           &event,
-                           TLC_COLD_ACK_ACCEPTED,
-                           NULL);
+    return tlc_cold_submit(core->persistent_cold, &event,
+                           TLC_COLD_ACK_ACCEPTED, NULL);
 }
 
-static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
-                                  uint64_t seq,
-                                  void *arg) {
-    tlc_core_t *core = arg;
+static int tlc_core_apply_event(tlc_core_t *core,
+                                const tlc_cold_event_input_t *event,
+                                uint64_t seq) {
     uint64_t key_hash = vemb_v16_xxh3_64(event->key, event->key_len);
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     if (shard->lock_id != event->meta_shard_id) {
         serverLog(LL_WARNING,
-                  "COLD recovery key-shard mismatch: seq=%llu key_hash=%llu event_shard=%u resolved_shard=%u",
+                  "COLD event key-shard mismatch: seq=%llu key_hash=%llu event_shard=%u resolved_shard=%u",
                   (unsigned long long)seq,
                   (unsigned long long)key_hash,
                   event->meta_shard_id,
@@ -2066,16 +2108,16 @@ static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
     bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta = key_meta_find_locked(
         core, event->key, event->key_len, key_hash, 0);
-    if (meta && event->term < meta->topology_epoch) {
+    if (meta && event->topology_epoch < meta->topology_epoch) {
         uint64_t current_term = meta->topology_epoch;
         bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         serverLog(LL_WARNING,
-                  "COLD recovery stale term rejected: seq=%llu key_hash=%llu event_term=%llu current_term=%llu",
+                  "COLD event stale topology epoch rejected: seq=%llu key_hash=%llu event_epoch=%llu current_epoch=%llu",
                   (unsigned long long)seq,
                   (unsigned long long)key_hash,
-                  (unsigned long long)event->term,
+                  (unsigned long long)event->topology_epoch,
                   (unsigned long long)current_term);
-        return -1;
+        return TLC_CORE_APPLY_EVENT_STALE;
     }
     if (meta && meta->key_version >= event->version) {
         bitmap_unlock(&core->key_meta_locks, shard->lock_id);
@@ -2088,14 +2130,14 @@ static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
         if (!meta) {
             bitmap_unlock(&core->key_meta_locks, shard->lock_id);
             serverLog(LL_WARNING,
-                      "COLD recovery metadata allocation failed: seq=%llu key_hash=%llu",
+                      "COLD event metadata allocation failed: seq=%llu key_hash=%llu",
                       (unsigned long long)seq,
                       (unsigned long long)key_hash);
             return -1;
         }
         meta->key_version = event->version;
-        if (event->term > meta->topology_epoch)
-            meta->topology_epoch = event->term;
+        if (event->topology_epoch > meta->topology_epoch)
+            meta->topology_epoch = event->topology_epoch;
         key_meta_set_tombstone_locked(core, meta, 1);
         meta->location = tlc_invalid_location;
         bitmap_unlock(&core->key_meta_locks, shard->lock_id);
@@ -2107,7 +2149,7 @@ static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
                  event->value, event->value_len, &location) != 0) {
         bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         serverLog(LL_WARNING,
-                  "COLD recovery WARM publish failed: seq=%llu key_hash=%llu value_size=%u expected=%u",
+                  "COLD event WARM publish failed: seq=%llu key_hash=%llu value_size=%u expected=%u",
                   (unsigned long long)seq,
                   (unsigned long long)key_hash,
                   event->value_len,
@@ -2120,19 +2162,67 @@ static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
     if (!meta) {
         bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         serverLog(LL_WARNING,
-                  "COLD recovery metadata publish failed: seq=%llu key_hash=%llu",
+                      "COLD event metadata publish failed: seq=%llu key_hash=%llu",
                   (unsigned long long)seq,
                   (unsigned long long)key_hash);
         return -1;
     }
     meta->key_version = event->version;
-    if (event->term > meta->topology_epoch)
-        meta->topology_epoch = event->term;
+    if (event->topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = event->topology_epoch;
     key_meta_set_tombstone_locked(core, meta, 0);
     meta->location = location;
     location_cache_put(core, event->key, event->key_len, key_hash, &location);
     bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
+}
+
+static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
+                                  uint64_t seq,
+                                  void *arg) {
+    return tlc_core_apply_event((tlc_core_t *)arg, event, seq);
+}
+
+int tlc_core_apply_replica_event(tlc_core_t *core,
+                                 const tlc_cold_event_input_t *event,
+                                 uint64_t seq,
+                                 tlc_core_replica_apply_status_t *status) {
+    RETURN_IF(!core || !event || !status || seq == 0, -1);
+    int valid_shape = event->key && key_valid(event->key, event->key_len) &&
+        event->meta_shard_id < core->key_meta_shard_count &&
+        event->version != 0 &&
+        ((event->op == TLC_COLD_OP_PUT && event->value &&
+          event->value_len == core->value_size) ||
+         (event->op == TLC_COLD_OP_DEL && !event->value &&
+          event->value_len == 0));
+    if (!valid_shape) {
+        *status = TLC_CORE_REPLICA_APPLY_ERROR;
+        return -1;
+    }
+
+    pthread_mutex_lock(&core->replica_apply_mu);
+    if (seq <= core->replica_applied_seq) {
+        *status = TLC_CORE_REPLICA_APPLY_DUPLICATE;
+        pthread_mutex_unlock(&core->replica_apply_mu);
+        return 0;
+    }
+    if (seq != core->replica_applied_seq + 1) {
+        *status = TLC_CORE_REPLICA_APPLY_GAP;
+        pthread_mutex_unlock(&core->replica_apply_mu);
+        return 0;
+    }
+
+    int rc = tlc_core_apply_event(core, event, seq);
+    if (rc == 0) {
+        core->replica_applied_seq = seq;
+        *status = TLC_CORE_REPLICA_APPLY_APPLIED;
+    } else if (rc == TLC_CORE_APPLY_EVENT_STALE) {
+        *status = TLC_CORE_REPLICA_APPLY_STALE;
+    } else {
+        *status = TLC_CORE_REPLICA_APPLY_ERROR;
+    }
+    pthread_mutex_unlock(&core->replica_apply_mu);
+    return rc == 0 || rc == TLC_CORE_APPLY_EVENT_STALE ? 0 : -1;
 }
 
 typedef struct tlc_core_checkpoint_recovery {
@@ -2271,7 +2361,7 @@ static int checkpoint_state_append(tlc_core_checkpoint_state_t *state,
 
 int tlc_core_publish_checkpoint(tlc_core_t *core,
                                 uint64_t generation,
-                                uint64_t term,
+                                uint64_t ha_term,
                                 tlc_cold_checkpoint_result_t *result) {
     RETURN_IF(!core || !core->persistent_cold, -1);
     uint32_t meta_shard_count = core->key_meta_shard_count;
@@ -2381,7 +2471,7 @@ int tlc_core_publish_checkpoint(tlc_core_t *core,
         }
         if (rc == 0)
             rc = tlc_cold_publish_checkpoint(core->persistent_cold,
-                                             generation, term,
+                                             generation, ha_term,
                                              meta_shard_count,
                                              records, meta_shard_count,
                                              result);
@@ -2403,6 +2493,104 @@ int tlc_core_compact(tlc_core_t *core,
                             checkpoint_floor_seq,
                             ha_safe_point_seq,
                             checkpoint_retention_count);
+}
+
+typedef struct tlc_core_resync_context {
+    tlc_core_t *follower;
+    tlc_cold_t *follower_cold;
+} tlc_core_resync_context_t;
+
+static int tlc_core_resync_replay_event(const tlc_cold_event_input_t *input,
+                                        uint64_t seq,
+                                        void *arg) {
+    tlc_core_resync_context_t *context = arg;
+    tlc_cold_replica_batch_status_t batch_status;
+    uint64_t durable_seq = 0;
+    int rc = tlc_cold_submit_replica_batch(context->follower_cold, seq, input,
+                                            1, TLC_COLD_ACK_DURABLE,
+                                            &batch_status, &durable_seq);
+    if (rc != 0 || (batch_status != TLC_COLD_REPLICA_BATCH_APPLIED &&
+                    batch_status != TLC_COLD_REPLICA_BATCH_DUPLICATE)) {
+        serverLog(LL_WARNING,
+                  "TLC resync tail COLD append failed: seq=%llu rc=%d status=%d",
+                  (unsigned long long)seq, rc, batch_status);
+        return -1;
+    }
+    tlc_core_replica_apply_status_t apply_status =
+        TLC_CORE_REPLICA_APPLY_ERROR;
+    rc = tlc_core_apply_replica_event(context->follower, input, seq,
+                                      &apply_status);
+    if (rc != 0 || (apply_status != TLC_CORE_REPLICA_APPLY_APPLIED &&
+                    apply_status != TLC_CORE_REPLICA_APPLY_DUPLICATE &&
+                    apply_status != TLC_CORE_REPLICA_APPLY_STALE)) {
+        serverLog(LL_WARNING,
+                  "TLC resync tail apply failed: seq=%llu rc=%d status=%d",
+                  (unsigned long long)seq, rc, apply_status);
+        return -1;
+    }
+    return 0;
+}
+
+int tlc_core_resync_from(tlc_core_t *leader,
+                         tlc_core_t *follower,
+                         uint64_t boundary_seq,
+                         tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!leader || !follower || leader == follower ||
+              !leader->persistent_cold || !follower->persistent_cold ||
+              !result, -1);
+    tlc_cold_progress_t leader_progress;
+    if (tlc_cold_get_progress(leader->persistent_cold, &leader_progress) != 0)
+        return -1;
+    uint64_t boundary = boundary_seq ? boundary_seq :
+                                      leader_progress.durable_seq;
+    if (boundary > leader_progress.durable_seq)
+        return -1;
+    uint32_t shard_count = follower->key_meta_shard_count;
+    tlc_cold_checkpoint_result_t checkpoint;
+    if (tlc_cold_validate_checkpoint(leader->persistent_cold, 0, shard_count,
+                                      &checkpoint) != 0) {
+        serverLog(LL_WARNING, "TLC resync rejected: leader checkpoint invalid");
+        return -1;
+    }
+    if (checkpoint.checkpoint_seq > boundary) {
+        serverLog(LL_WARNING,
+                  "TLC resync rejected: checkpoint_seq=%llu boundary=%llu",
+                  (unsigned long long)checkpoint.checkpoint_seq,
+                  (unsigned long long)boundary);
+        return -1;
+    }
+    if (tlc_cold_set_replica_base_seq(follower->persistent_cold,
+                                       checkpoint.checkpoint_seq) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: follower base seq");
+        return -1;
+    }
+    if (tlc_cold_clone_checkpoint(leader->persistent_cold,
+                                   follower->persistent_cold, shard_count,
+                                   result) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: checkpoint clone");
+        return -1;
+    }
+    if (tlc_core_recover_cold(follower) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: follower checkpoint load");
+        return -1;
+    }
+    pthread_mutex_lock(&follower->replica_apply_mu);
+    follower->replica_applied_seq = checkpoint.checkpoint_seq;
+    pthread_mutex_unlock(&follower->replica_apply_mu);
+    if (boundary > checkpoint.checkpoint_seq) {
+        tlc_core_resync_context_t context = {
+            .follower = follower,
+            .follower_cold = follower->persistent_cold,
+        };
+        if (tlc_cold_replay_range(leader->persistent_cold,
+                                  checkpoint.checkpoint_seq + 1, boundary,
+                                  tlc_core_resync_replay_event,
+                                  &context) != 0) {
+            serverLog(LL_WARNING, "TLC resync failed: AOF tail replay");
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int tlc_core_put_location_epoch(tlc_core_t *core,
@@ -2596,7 +2784,8 @@ int tlc_core_cold_append(tlc_core_t *core,
     RETURN_IF(!core->persistent_cold, -1);
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     tlc_cold_event_input_t event = {
-        .term = 0,
+        .ha_term = 0,
+        .topology_epoch = 0,
         .op = TLC_COLD_OP_PUT,
         .meta_shard_id = shard->lock_id,
         .version = 1,
@@ -2605,10 +2794,8 @@ int tlc_core_cold_append(tlc_core_t *core,
         .value = value,
         .value_len = value_size,
     };
-    return tlc_cold_submit(core->persistent_cold,
-                           &event,
-                           TLC_COLD_ACK_ACCEPTED,
-                           NULL);
+    return tlc_cold_submit(core->persistent_cold, &event,
+                           TLC_COLD_ACK_ACCEPTED, NULL);
 }
 
 int tlc_core_get_migration_info(tlc_core_t *core,

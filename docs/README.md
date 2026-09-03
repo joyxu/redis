@@ -13,6 +13,13 @@
 - [VEMB V16 Multi SuperNode TODO](./VEMB_V16_MULTI_SUPERNODE_TODO.md)
 - [VEMB V16 Dim 配置与变更](./VEMB_V16_DIM_CONFIGURATION.md)
 
+## TLC HA
+
+- [TLC HA 数据同步设计](./TLC_HA_DATA_SYNC_DESIGN.md)
+- [TLC HA 数据同步代码落地计划](./TLC_HA_DATA_SYNC_IMPLEMENTATION_PLAN.md)
+- [TLC HA Replica Descriptor Ring 与 Payload Arena 优化设计](./TLC_HA_REPLICA_RING_ARENA_OPTIMIZATION.md)
+- [TLC HA 跨节点 Checkpoint 与 AOF Tail Resync 设计](./TLC_HA_CROSS_NODE_RESYNC_DESIGN.md)
+
 ## UB SVE
 
 - [README: UB SVE 架构与实现说明](./README_UB_SVE.md)
