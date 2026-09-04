@@ -53,6 +53,8 @@ typedef enum tlc_core_replica_apply_status {
     TLC_CORE_REPLICA_APPLY_GAP = 2,
     TLC_CORE_REPLICA_APPLY_STALE = 3,
     TLC_CORE_REPLICA_APPLY_ERROR = 4,
+    /* Event is covered by the per-shard checkpoint; only global seq advances. */
+    TLC_CORE_REPLICA_APPLY_CHECKPOINTED = 5,
 } tlc_core_replica_apply_status_t;
 
 typedef struct tlc_core_key_migration_info {
@@ -168,6 +170,7 @@ int tlc_core_set_replica_event_sink(tlc_core_t *core,
                                     void *arg);
 /* Return the borrowed COLD runtime; ownership remains with core. */
 tlc_cold_t *tlc_core_get_cold(tlc_core_t *core);
+uint32_t tlc_core_meta_shard_count(const tlc_core_t *core);
 int tlc_core_recover_cold(tlc_core_t *core);
 /* Preconditions: v16 boundary validated generation and output shape. */
 int tlc_core_publish_checkpoint(tlc_core_t *core,
@@ -178,7 +181,32 @@ int tlc_core_compact(tlc_core_t *core,
                      uint64_t checkpoint_floor_seq,
                      uint64_t ha_safe_point_seq,
                      uint32_t checkpoint_retention_count);
-/* Resync an empty fenced follower from the leader's active checkpoint and AOF tail. */
+/*
+ * Install one verified checkpoint artifact into this Follower's only runtime.
+ * The caller has stopped all writes, Replica ingress/apply and COLD lifecycle
+ * users. Failure after the reset leaves the runtime fenced and unusable until
+ * a new resync attempt; it never restores the previous generation.
+ */
+int tlc_core_install_resync_checkpoint(
+    tlc_core_t *core,
+    const void *checkpoint_blob,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result);
+/* Same fenced install boundary, consuming one exclusively owned artifact file. */
+int tlc_core_install_resync_checkpoint_file(
+    tlc_core_t *core,
+    int checkpoint_fd,
+    const char *checkpoint_path,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result);
+/*
+ * Resync a fenced follower from the leader's active checkpoint and AOF tail.
+ * The caller has stopped all Follower writes, reads, Replica apply and COLD
+ * lifecycle users, and the Leader checkpoint plus requested tail remain
+ * retained for this call. The Follower is reset in place after the Leader
+ * artifact validates; a failure after reset leaves it fenced and not
+ * recoverable from its old generation.
+ */
 int tlc_core_resync_from(tlc_core_t *leader,
                          tlc_core_t *follower,
                          uint64_t boundary_seq,
@@ -240,6 +268,17 @@ int tlc_core_apply_replica_event(tlc_core_t *core,
                                  const tlc_cold_event_input_t *event,
                                  uint64_t seq,
                                  tlc_core_replica_apply_status_t *status);
+/*
+ * Apply one resync tail event after durable append. Events at or below the
+ * checkpoint boundary for their meta shard advance the global prefix without
+ * changing WARM state. captured_seq has core->key_meta_shard_count entries.
+ */
+int tlc_core_apply_resync_event(tlc_core_t *core,
+                                const tlc_cold_event_input_t *event,
+                                uint64_t seq,
+                                const uint64_t *captured_seq,
+                                uint32_t shard_count,
+                                tlc_core_replica_apply_status_t *status);
 /* Legacy explicit durable PUT; requires persistent COLD to be enabled. */
 int tlc_core_cold_append(tlc_core_t *core,
                          const char *key,

@@ -9,9 +9,13 @@ typedef struct tlc_cold tlc_cold_t;
 /* Return values for all public COLD operations. */
 enum {
     TLC_COLD_OK = 0,
+    /* A replay callback intentionally stopped the current scan. */
+    TLC_COLD_REPLAY_STOP = 1,
     TLC_COLD_ERR = -1,
     TLC_COLD_REPLICA_GAP = -2,
     TLC_COLD_REPLICA_CONFLICT = -3,
+    /* The requested snapshot tail is no longer retained. */
+    TLC_COLD_RESYNC_REQUIRED = -4,
 };
 
 typedef enum tlc_cold_ack_mode {
@@ -45,6 +49,9 @@ typedef struct tlc_cold_config {
     uint32_t queue_capacity;
     uint32_t group_max_entries;
     uint64_t group_max_delay_us;
+    /* Target retained AOF events. The cursor ring is ceil_pow2(1.5x this).
+     * Zero selects the production default. */
+    uint64_t retention_events;
 } tlc_cold_config_t;
 
 typedef struct tlc_cold_progress {
@@ -59,6 +66,13 @@ typedef struct tlc_cold_seq_cursor {
     uint64_t segment_id;
     uint64_t segment_offset;
 } tlc_cold_seq_cursor_t;
+
+typedef struct tlc_cold_retention_window {
+    uint64_t retained_floor_seq;
+    uint64_t appended_seq;
+    uint64_t target_events;
+    uint64_t ring_capacity;
+} tlc_cold_retention_window_t;
 
 typedef enum tlc_cold_replica_batch_status {
     TLC_COLD_REPLICA_BATCH_APPLIED = 0,
@@ -82,6 +96,24 @@ typedef struct tlc_cold_checkpoint_result {
     uint64_t checkpoint_seq;
     uint64_t generation_checksum;
 } tlc_cold_checkpoint_result_t;
+
+/*
+ * Leader-owned immutable resync artifact. The returned blob and captured_seq
+ * belong to this object and are released by tlc_cold_end_resync_snapshot().
+ * A caller must serialize read/end operations for one snapshot.
+ */
+typedef struct tlc_cold_resync_snapshot {
+    void *checkpoint_blob;
+    size_t checkpoint_blob_bytes;
+    uint64_t *captured_seq;
+    uint32_t meta_shard_count;
+    tlc_cold_checkpoint_result_t checkpoint;
+    uint64_t checkpoint_blob_checksum;
+    uint64_t captured_seq_checksum;
+    uint64_t tail_start_seq;
+    uint64_t durable_boundary_seq;
+    uint64_t retention_pin_token;
+} tlc_cold_resync_snapshot_t;
 
 /* One-shot checkpoint publish fault points, available only in test builds. */
 typedef enum tlc_cold_checkpoint_failpoint {
@@ -132,8 +164,15 @@ int tlc_cold_submit(tlc_cold_t *cold,
 /* Returns 0 on success; cold and progress are required. */
 int tlc_cold_get_progress(const tlc_cold_t *cold,
                           tlc_cold_progress_t *progress);
+/* Borrowed configured COLD directory; valid while cold remains alive. */
+const char *tlc_cold_directory(const tlc_cold_t *cold);
+/* Snapshot the retained AOF window for low-frequency retention control. */
+int tlc_cold_get_retention_window(tlc_cold_t *cold,
+                                  tlc_cold_retention_window_t *window);
+/* Seal the current nonempty AOF segment so a later compact can reclaim it. */
+int tlc_cold_seal_segment(tlc_cold_t *cold);
 
-/* Find the nearest retained AOF offset at or before seq. */
+/* Find the exact retained AOF offset for seq. */
 int tlc_cold_get_seq_cursor(tlc_cold_t *cold,
                             uint64_t seq,
                             tlc_cold_seq_cursor_t *cursor);
@@ -164,21 +203,74 @@ int tlc_cold_submit_replica_batch(
 /*
  * Replay every complete AOF event in sequence order. The callback owns no
  * event buffers; key/value are valid only until it returns. It must not call
- * back into this COLD runtime. This is used for WARM recovery and retrying a
- * previously durable event whose metadata publish failed.
+ * back into this COLD runtime. Returning TLC_COLD_REPLAY_STOP ends the scan
+ * without an AOF error; other nonzero returns are propagated. This is used
+ * for WARM recovery and retrying a previously durable event whose metadata
+ * publish failed.
  */
 int tlc_cold_replay(tlc_cold_t *cold, tlc_cold_replay_fn callback, void *arg);
-/* Replay one inclusive contiguous seq range from the AOF. */
+/*
+ * Replay one inclusive contiguous seq range from the AOF. A missing start
+ * record or any discontinuity returns TLC_COLD_RESYNC_REQUIRED.
+ */
 int tlc_cold_replay_range(tlc_cold_t *cold,
                           uint64_t start_seq,
                           uint64_t end_seq,
                           tlc_cold_replay_fn callback,
                           void *arg);
+/*
+ * Replay at most max_events events from an inclusive contiguous seq range.
+ * *next_seq receives the first unread seq on return and *event_count receives
+ * the number of replayed events. A missing start record or any discontinuity
+ * returns TLC_COLD_RESYNC_REQUIRED.
+ */
+int tlc_cold_replay_range_limited(tlc_cold_t *cold,
+                                  uint64_t start_seq,
+                                  uint64_t end_seq,
+                                  uint32_t max_events,
+                                  tlc_cold_replay_fn callback,
+                                  void *arg,
+                                  uint64_t *next_seq,
+                                  uint32_t *event_count);
 int tlc_cold_replay_after(tlc_cold_t *cold,
                           const uint64_t *captured_seq,
                           uint32_t meta_shard_count,
                           tlc_cold_replay_fn callback,
                           void *arg);
+
+/*
+ * Create a Leader snapshot session. It exports an already validated active
+ * checkpoint, fixes durable_boundary_seq, and pins [tail_start_seq, B] from
+ * AOF compaction until tlc_cold_end_resync_snapshot().
+ */
+int tlc_cold_begin_resync_snapshot(
+    tlc_cold_t *cold,
+    uint32_t expected_meta_shard_count,
+    tlc_cold_resync_snapshot_t *snapshot);
+
+/*
+ * Read at most max_events from the pinned inclusive [tail_start_seq, B]
+ * range. *next_seq is the next requested seq and advances on success; it
+ * must initially equal snapshot->tail_start_seq and reaches B + 1 at EOF.
+ * A missing/non-contiguous AOF prefix returns TLC_COLD_RESYNC_REQUIRED.
+ */
+int tlc_cold_read_resync_snapshot(
+    tlc_cold_t *cold,
+    const tlc_cold_resync_snapshot_t *snapshot,
+    uint64_t *next_seq,
+    uint32_t max_events,
+    tlc_cold_replay_fn callback,
+    void *arg,
+    uint32_t *event_count);
+
+/* Release the snapshot blob, captured-seq copy, and its AOF retention pin. */
+void tlc_cold_end_resync_snapshot(
+    tlc_cold_t *cold,
+    tlc_cold_resync_snapshot_t *snapshot);
+/* Extend an active Leader session's retained tail boundary before its next round. */
+int tlc_cold_extend_resync_snapshot(tlc_cold_t *cold,
+                                    tlc_cold_resync_snapshot_t *snapshot,
+                                    uint64_t durable_boundary_seq);
 
 /*
  * Publish one immutable checkpoint generation and atomically update manifest.
@@ -259,7 +351,30 @@ int tlc_cold_import_checkpoint(tlc_cold_t *cold,
                                const void *blob,
                                size_t blob_bytes,
                                tlc_cold_checkpoint_result_t *result);
+/*
+ * Import an immutable complete checkpoint artifact without mapping or copying
+ * the full blob. Preconditions: fd is a readable descriptor for artifact_path,
+ * blob_bytes is its validated exact size, and artifact_path remains exclusively
+ * owned and unchanged until this call returns. The empty fenced target contract
+ * is the same as tlc_cold_import_checkpoint(). On success artifact_path is
+ * atomically moved into this COLD's checkpoint generation.
+ */
+int tlc_cold_import_checkpoint_file(tlc_cold_t *cold,
+                                    uint32_t expected_meta_shard_count,
+                                    int fd,
+                                    const char *artifact_path,
+                                    size_t blob_bytes,
+                                    tlc_cold_checkpoint_result_t *result);
 void tlc_cold_free_checkpoint_blob(void *blob);
+/*
+ * Reset this COLD object in place to an empty fenced runtime. Preconditions:
+ * the caller has stopped all submissions, replay callbacks and lifecycle
+ * users; no request or active resync snapshot can be waiting on this COLD.
+ * Only COLD-owned AOF and
+ * checkpoint files in its configured directory are removed. On failure the
+ * object remains stopped and the caller must keep the Follower fenced.
+ */
+int tlc_cold_reset_fenced(tlc_cold_t *cold);
 /* Seed an empty Replica COLD with the checkpoint's durable prefix. */
 int tlc_cold_set_replica_base_seq(tlc_cold_t *cold, uint64_t base_seq);
 

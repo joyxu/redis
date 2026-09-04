@@ -48,6 +48,7 @@ int main(void) {
         .queue_capacity = 4,
         .group_max_entries = 8,
         .group_max_delay_us = 1000,
+        .retention_events = 2,
     };
 
     const uint8_t value1[4] = {1, 2, 3, 4};
@@ -58,6 +59,9 @@ int main(void) {
     };
     tlc_cold_t *cold = NULL;
     assert(tlc_cold_open(&cold, &config) == 0);
+    tlc_cold_retention_window_t window;
+    assert(tlc_cold_get_retention_window(cold, &window) == 0);
+    assert(window.target_events == 2 && window.ring_capacity == 4);
     tlc_cold_replica_batch_status_t status;
     uint64_t durable_seq = 0;
     assert(tlc_cold_submit_replica_batch(cold, 1, events, 2,
@@ -94,11 +98,23 @@ int main(void) {
     assert(durable_seq == 3);
     assert(tlc_cold_get_progress(cold, &progress) == 0);
     assert(progress.appended_seq == 3 && progress.durable_seq == 3);
+
+    /* A repair batch may overlap records already accepted by the follower
+     * while carrying a new suffix. The prefix must be verified and the
+     * suffix appended instead of being reported as a gap. */
+    tlc_cold_event_input_t mixed[3] = {events[1], event3, events[0]};
+    assert(tlc_cold_submit_replica_batch(cold, 2, mixed, 3,
+                                         TLC_COLD_ACK_DURABLE, &status,
+                                         &durable_seq) == 0);
+    assert(status == TLC_COLD_REPLICA_BATCH_APPLIED);
+    assert(durable_seq == 4);
+    assert(tlc_cold_get_progress(cold, &progress) == 0);
+    assert(progress.appended_seq == 4 && progress.durable_seq == 4);
     tlc_cold_close(cold);
 
     assert(tlc_cold_open(&cold, &config) == 0);
     assert(tlc_cold_get_progress(cold, &progress) == 0);
-    assert(progress.appended_seq == 3 && progress.durable_seq == 3);
+    assert(progress.appended_seq == 4 && progress.durable_seq == 4);
     tlc_cold_event_input_t tail[2] = {events[1], event3};
     assert(tlc_cold_submit_replica_batch(cold, 2, tail, 2,
                                          TLC_COLD_ACK_DURABLE, &status,
@@ -108,14 +124,41 @@ int main(void) {
 
     replay_state_t replay = {0};
     assert(tlc_cold_replay(cold, count_replay_event, &replay) == 0);
-    assert(replay.count == 3 && replay.last_seq == 3);
+    assert(replay.count == 4 && replay.last_seq == 4);
     tlc_cold_seq_cursor_t cursor;
     assert(tlc_cold_get_seq_cursor(cold, 3, &cursor) == 0);
-    assert(cursor.seq == 1);
+    assert(cursor.seq == 3);
     replay = (replay_state_t){0};
     assert(tlc_cold_replay_range(cold, 2, 3, count_replay_event,
                                  &replay) == 0);
     assert(replay.count == 2 && replay.last_seq == 3);
+    replay = (replay_state_t){0};
+    assert(tlc_cold_replay_range(cold, 4, 4, count_replay_event,
+                                 &replay) == 0);
+    assert(replay.count == 1 && replay.last_seq == 4);
+    replay = (replay_state_t){0};
+    assert(tlc_cold_replay_range(cold, 5, 5, count_replay_event,
+                                 &replay) == TLC_COLD_RESYNC_REQUIRED);
+    assert(replay.count == 0);
+
+    tlc_cold_event_input_t overflow[3] = {events[0], events[1], event3};
+    assert(tlc_cold_submit_replica_batch(cold, 4, overflow, 3,
+                                         TLC_COLD_ACK_DURABLE, &status,
+                                         &durable_seq) == 0);
+    assert(status == TLC_COLD_REPLICA_BATCH_APPLIED && durable_seq == 6);
+    assert(tlc_cold_get_retention_window(cold, &window) == 0);
+    assert(window.retained_floor_seq == 1 && window.appended_seq == 6);
+    assert(tlc_cold_get_seq_cursor(cold, 1, &cursor) != 0);
+    assert(tlc_cold_get_seq_cursor(cold, 6, &cursor) == 0);
+    assert(cursor.seq == 6);
+    replay = (replay_state_t){0};
+    assert(tlc_cold_replay_range(cold, 1, 6, count_replay_event,
+                                 &replay) == 0);
+    assert(replay.count == 6 && replay.last_seq == 6);
+    replay = (replay_state_t){0};
+    assert(tlc_cold_replay_range(cold, 3, 6, count_replay_event,
+                                 &replay) == 0);
+    assert(replay.count == 4 && replay.last_seq == 6);
     tlc_cold_close(cold);
     printf("tlc_replica_cold_ut: PASS\n");
     return 0;

@@ -10,6 +10,11 @@
 语义也已经落地。M7 的切主、fencing 和自动角色转换，以及 M4 的完整生产启动流程
 和自动重连仍未完成。
 
+跨节点 checkpoint/AOF tail resync 的最新实现状态以
+`TLC_HA_CROSS_NODE_RESYNC_DESIGN.md` 的 M3-M7 状态总表为准；本文早期阶段描述中
+仍出现“跨节点 blob 搬运待接入”等历史措辞时，均视为已被当前 Replica channel、文件化
+artifact、自动 GAP repair 和 retention->snapshot 闭环实现所替代。
+
 已完成的代码与测试包括：
 
 - 新 COLD/AOF/checkpoint 格式、`ha_term`/`topology_epoch` 分离、单机无副本路径；
@@ -604,8 +609,9 @@ timeout 和恢复重连。`benchmark/tlc_ha_replica_ut` 已覆盖上述 heartbea
 AOF tail 补到固定边界。`tlc_cold_export_checkpoint()` 和
 `tlc_cold_import_checkpoint()` 提供完整 checkpoint 文件 blob 的导出/导入，复用现有
 header、record 和 generation checksum；导入只接受空的 fenced Replica COLD，校验或
-发布失败不会覆盖已有有效 generation。当前 clone/resync 仍在同一进程内编排，实际
-跨节点 blob 搬运待接入 Replica channel 数据面。
+发布失败不会覆盖已有有效 generation。历史版本的 clone/resync 仅在同一进程内编排；
+当前实现已在 Replica channel 增加受校验的 checkpoint 传输流程，并完成文件化 artifact、
+自动 GAP repair 和 retention->snapshot 闭环。
 
 实现 checkpoint + AOF tail：
 
@@ -660,14 +666,14 @@ verify           -> 校验 key/value/version/tombstone 和 progress
 - 该阶段验证的是“持久化恢复 + 手动补发”，不宣称自动 reconnect。
 
 当前真实机脚本已完成固定 COLD 目录传递、首轮复制后的 Leader replay range，以及
-停止后的 Follower AOF recovery 校验；脚本仍明确输出自动 reconnect/failover 和
-跨节点 checkpoint resync 的 `NOT_IMPLEMENTED`。
+停止后的 Follower AOF recovery 校验；跨节点 checkpoint/AOF tail resync 已由 Replica
+channel 接入并在 111/112 脚本中验证，脚本当前仍明确输出自动 reconnect/failover、HA
+control plane 和 lineage transition 的 `TODO`。
 
 #### 真实跨节点 checkpoint + AOF tail resync
 
-当前 `tlc_cold_export_checkpoint()`/`tlc_cold_import_checkpoint()` 只完成同进程
-blob 生命周期，跨节点 resync 还需要在 Replica channel 增加受校验的 checkpoint
-传输流程：
+历史版本的 `tlc_cold_export_checkpoint()`/`tlc_cold_import_checkpoint()` 只完成同进程
+blob 生命周期；当前实现已在 Replica channel 接入受校验的 checkpoint 传输流程：
 
 ```text
 Leader 选择 active checkpoint，固定 durable 边界 B
@@ -692,9 +698,10 @@ Leader 选择 active checkpoint，固定 durable 边界 B
   resync，不能部分发布；
 - resync 完成后必须验证 `durable_seq == B`、`applied_seq == B`，再解除 FENCED。
 
-该流程需要先扩展 `tlc_ha_replica` 的 wire/frame、发送队列和 Follower 状态机，
-再将阶段控制接入真实机脚本；在此之前，`tlc_resync_ut` 继续负责同进程 checkpoint
-边界和损坏 blob 测试，真实 111/112 脚本只验证 UB event/ACK/heartbeat 数据面。
+该流程已扩展 `tlc_ha_replica` 的 wire/frame、发送队列和 Follower 状态机，并接入真实机
+脚本；`tlc_resync_ut` 继续负责同进程 checkpoint 边界和损坏 blob 测试，真实 111/112 脚本
+已覆盖 UB event/ACK/heartbeat、snapshot chunks、install、tail、handoff 及
+retention->snapshot。
 
 ### M7：owner/term、fencing 和 failover
 

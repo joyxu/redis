@@ -51,6 +51,7 @@ static int storage_enable_configured_cold(vemb_v16_storage_ctx_t *storage) {
         .queue_capacity = 131072,
         .group_max_entries = 64,
         .group_max_delay_us = 1000,
+        .retention_events = 1048576,
     };
     if (vemb_v16_tlc_enable_cold(storage->tlc, &config) != 0) {
         serverLog(LL_WARNING,

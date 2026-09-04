@@ -1876,6 +1876,10 @@ tlc_cold_t *tlc_core_get_cold(tlc_core_t *core) {
     return core ? core->persistent_cold : NULL;
 }
 
+uint32_t tlc_core_meta_shard_count(const tlc_core_t *core) {
+    return core ? core->key_meta_shard_count : 0;
+}
+
 int tlc_core_attach_warm_region(tlc_core_t *core,
                                 const tlc_core_warm_region_config_t *region,
                                 uint32_t *region_index) {
@@ -2183,32 +2187,40 @@ static int tlc_core_recover_event(const tlc_cold_event_input_t *event,
     return tlc_core_apply_event((tlc_core_t *)arg, event, seq);
 }
 
-int tlc_core_apply_replica_event(tlc_core_t *core,
-                                 const tlc_cold_event_input_t *event,
-                                 uint64_t seq,
-                                 tlc_core_replica_apply_status_t *status) {
-    RETURN_IF(!core || !event || !status || seq == 0, -1);
-    int valid_shape = event->key && key_valid(event->key, event->key_len) &&
+static int tlc_core_validate_replica_event(const tlc_core_t *core,
+                                           const tlc_cold_event_input_t *event) {
+    int key_shape = event->key && key_valid(event->key, event->key_len);
+    uint64_t key_hash = key_shape ?
+        vemb_v16_xxh3_64(event->key, event->key_len) : 0;
+    int valid_shape = key_shape &&
         event->meta_shard_id < core->key_meta_shard_count &&
+        (vemb_v16_mix32_u64(key_hash) &
+         (core->key_meta_shard_count - 1u)) == event->meta_shard_id &&
         event->version != 0 &&
         ((event->op == TLC_COLD_OP_PUT && event->value &&
           event->value_len == core->value_size) ||
          (event->op == TLC_COLD_OP_DEL && !event->value &&
           event->value_len == 0));
-    if (!valid_shape) {
-        *status = TLC_CORE_REPLICA_APPLY_ERROR;
-        return -1;
-    }
+    return valid_shape ? 0 : -1;
+}
 
-    pthread_mutex_lock(&core->replica_apply_mu);
+static int tlc_core_apply_replica_event_locked(
+        tlc_core_t *core,
+        const tlc_cold_event_input_t *event,
+        uint64_t seq,
+        tlc_core_replica_apply_status_t *status,
+        int skip_warm_apply) {
     if (seq <= core->replica_applied_seq) {
         *status = TLC_CORE_REPLICA_APPLY_DUPLICATE;
-        pthread_mutex_unlock(&core->replica_apply_mu);
         return 0;
     }
     if (seq != core->replica_applied_seq + 1) {
         *status = TLC_CORE_REPLICA_APPLY_GAP;
-        pthread_mutex_unlock(&core->replica_apply_mu);
+        return 0;
+    }
+    if (skip_warm_apply) {
+        core->replica_applied_seq = seq;
+        *status = TLC_CORE_REPLICA_APPLY_CHECKPOINTED;
         return 0;
     }
 
@@ -2221,8 +2233,42 @@ int tlc_core_apply_replica_event(tlc_core_t *core,
     } else {
         *status = TLC_CORE_REPLICA_APPLY_ERROR;
     }
-    pthread_mutex_unlock(&core->replica_apply_mu);
     return rc == 0 || rc == TLC_CORE_APPLY_EVENT_STALE ? 0 : -1;
+}
+
+int tlc_core_apply_replica_event(tlc_core_t *core,
+                                 const tlc_cold_event_input_t *event,
+                                 uint64_t seq,
+                                 tlc_core_replica_apply_status_t *status) {
+    RETURN_IF(!core || !event || !status || seq == 0, -1);
+    if (tlc_core_validate_replica_event(core, event) != 0) {
+        *status = TLC_CORE_REPLICA_APPLY_ERROR;
+        return -1;
+    }
+    pthread_mutex_lock(&core->replica_apply_mu);
+    int rc = tlc_core_apply_replica_event_locked(core, event, seq, status, 0);
+    pthread_mutex_unlock(&core->replica_apply_mu);
+    return rc;
+}
+
+int tlc_core_apply_resync_event(tlc_core_t *core,
+                                const tlc_cold_event_input_t *event,
+                                uint64_t seq,
+                                const uint64_t *captured_seq,
+                                uint32_t shard_count,
+                                tlc_core_replica_apply_status_t *status) {
+    RETURN_IF(!core || !event || !captured_seq || !status || seq == 0 ||
+              shard_count != core->key_meta_shard_count, -1);
+    if (tlc_core_validate_replica_event(core, event) != 0) {
+        *status = TLC_CORE_REPLICA_APPLY_ERROR;
+        return -1;
+    }
+    pthread_mutex_lock(&core->replica_apply_mu);
+    int skip_warm_apply = seq <= captured_seq[event->meta_shard_id];
+    int rc = tlc_core_apply_replica_event_locked(core, event, seq, status,
+                                                 skip_warm_apply);
+    pthread_mutex_unlock(&core->replica_apply_mu);
+    return rc;
 }
 
 typedef struct tlc_core_checkpoint_recovery {
@@ -2498,7 +2544,112 @@ int tlc_core_compact(tlc_core_t *core,
 typedef struct tlc_core_resync_context {
     tlc_core_t *follower;
     tlc_cold_t *follower_cold;
+    uint64_t *captured_seq;
+    uint32_t shard_count;
 } tlc_core_resync_context_t;
+
+static void tlc_core_reset_location_cache(tlc_core_t *core) {
+    tlc_core_location_cache_t *cache = &core->location_cache;
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        tlc_core_location_cache_entry_t *entry = &cache->entries[i];
+        atomic_store_explicit(&entry->seq, SEQLOCK_EMPTY, memory_order_relaxed);
+        atomic_store_explicit(&entry->key_hash, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->key_len, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->region_id, TLC_CORE_INVALID_REGION_ID,
+                              memory_order_relaxed);
+        atomic_store_explicit(&entry->region_index, UINT32_MAX,
+                              memory_order_relaxed);
+        atomic_store_explicit(&entry->local_slot, TLC_CORE_INVALID_SLOT,
+                              memory_order_relaxed);
+        atomic_store_explicit(&entry->bytes, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->offset, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->owner_generation, 0,
+                              memory_order_relaxed);
+        for (uint32_t word = 0; word < TLC_CORE_LOCATION_CACHE_KEY_WORDS;
+             word++)
+            atomic_store_explicit(&entry->key_words[word], 0,
+                                  memory_order_relaxed);
+    }
+}
+
+static void tlc_core_reset_warm_region(
+        tlc_core_warm_region_runtime_t *region) {
+    memset(region->mapped_addr, 0, region->region_bytes);
+    for (uint32_t slot = 0; slot < region->capacity_slots; slot++) {
+        vemb_v16_warm_slot_meta_t *meta = &region->slot_meta[slot];
+        atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_FREE,
+                              memory_order_relaxed);
+        meta->region_id = region->region_id;
+        meta->local_slot = slot;
+        meta->bytes = region->value_size;
+        atomic_store_explicit(&meta->owner_generation, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&meta->write_seq, 0, memory_order_relaxed);
+        meta->key_hash = 0;
+        meta->key_fingerprint = 0;
+        atomic_store_explicit(&meta->last_access_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&meta->clock_bit, 0, memory_order_relaxed);
+        atomic_store_explicit(&meta->cold_state, VEMB_V16_WARM_SLOT_COLD_NONE,
+                              memory_order_relaxed);
+    }
+}
+
+static int tlc_core_reset_fenced_for_resync(tlc_core_t *core) {
+    if (tlc_cold_reset_fenced(core->persistent_cold) != 0)
+        return -1;
+
+    for (uint32_t i = 0; i < core->hold.capacity; i++) {
+        atomic_store_explicit(&core->hold.table[i].key_hash, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&core->hold.table[i].warm_idx, -1,
+                              memory_order_relaxed);
+    }
+    tlc_core_reset_location_cache(core);
+    for (uint32_t i = 0; i < core->warm.hash_capacity; i++)
+        core->warm.hash_table[i] = -1;
+    for (uint32_t i = 0; i < core->warm.capacity; i++) {
+        tlc_core_warm_entry_t *entry = &core->warm.entries[i];
+        entry->key_hash = 0;
+        entry->key_len = 0;
+        entry->value_size = 0;
+        entry->location = tlc_invalid_location;
+        memset(entry->key, 0, sizeof(entry->key));
+        atomic_store_explicit(&entry->access_count, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->state, TLC_CORE_ENTRY_EMPTY,
+                              memory_order_relaxed);
+    }
+    for (uint32_t i = 0; i < core->warm.region_count; i++)
+        tlc_core_reset_warm_region(&core->warm.regions[i]);
+    uint32_t runtime_count = warm_runtime_region_count(&core->warm);
+    for (uint32_t i = 0; i < runtime_count; i++)
+        tlc_core_reset_warm_region(&core->warm.runtime_regions[i]);
+    atomic_store_explicit(&core->warm.count, 0, memory_order_relaxed);
+
+    for (uint32_t i = 0; i < core->key_meta_shard_count; i++) {
+        tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[i];
+        memset(shard->entries, 0, sizeof(*shard->entries) * shard->capacity);
+        shard->count = 0;
+    }
+    atomic_store_explicit(&core->key_meta_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&core->source_fence_active_count, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&core->tombstone_active_count, 0,
+                          memory_order_relaxed);
+    core->replica_applied_seq = 0;
+    return 0;
+}
+
+static int tlc_core_capture_checkpoint_seq(uint32_t meta_shard_id,
+                                           uint64_t captured_seq,
+                                           const void *state,
+                                           uint32_t state_len,
+                                           void *arg) {
+    tlc_core_resync_context_t *context = arg;
+    context->captured_seq[meta_shard_id] = captured_seq;
+    (void)state;
+    (void)state_len;
+    return 0;
+}
 
 static int tlc_core_resync_replay_event(const tlc_cold_event_input_t *input,
                                         uint64_t seq,
@@ -2518,17 +2669,75 @@ static int tlc_core_resync_replay_event(const tlc_cold_event_input_t *input,
     }
     tlc_core_replica_apply_status_t apply_status =
         TLC_CORE_REPLICA_APPLY_ERROR;
-    rc = tlc_core_apply_replica_event(context->follower, input, seq,
-                                      &apply_status);
+    rc = tlc_core_apply_resync_event(context->follower, input, seq,
+                                     context->captured_seq,
+                                     context->shard_count,
+                                     &apply_status);
     if (rc != 0 || (apply_status != TLC_CORE_REPLICA_APPLY_APPLIED &&
                     apply_status != TLC_CORE_REPLICA_APPLY_DUPLICATE &&
-                    apply_status != TLC_CORE_REPLICA_APPLY_STALE)) {
+                    apply_status != TLC_CORE_REPLICA_APPLY_STALE &&
+                    apply_status != TLC_CORE_REPLICA_APPLY_CHECKPOINTED)) {
         serverLog(LL_WARNING,
                   "TLC resync tail apply failed: seq=%llu rc=%d status=%d",
                   (unsigned long long)seq, rc, apply_status);
         return -1;
     }
     return 0;
+}
+
+static int tlc_core_finish_resync_checkpoint(tlc_core_t *core,
+                                             tlc_cold_checkpoint_result_t *result) {
+    if (tlc_core_recover_cold(core) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: follower checkpoint load");
+        return -1;
+    }
+    pthread_mutex_lock(&core->replica_apply_mu);
+    core->replica_applied_seq = result->checkpoint_seq;
+    pthread_mutex_unlock(&core->replica_apply_mu);
+    return 0;
+}
+
+int tlc_core_install_resync_checkpoint(
+    tlc_core_t *core,
+    const void *checkpoint_blob,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!core || !core->persistent_cold || !checkpoint_blob ||
+              checkpoint_blob_bytes == 0 || !result, -1);
+    uint32_t shard_count = core->key_meta_shard_count;
+    if (tlc_core_reset_fenced_for_resync(core) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: follower fenced reset");
+        return -1;
+    }
+    if (tlc_cold_import_checkpoint(core->persistent_cold, shard_count,
+                                   checkpoint_blob, checkpoint_blob_bytes,
+                                   result) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: checkpoint import");
+        return -1;
+    }
+    return tlc_core_finish_resync_checkpoint(core, result);
+}
+
+int tlc_core_install_resync_checkpoint_file(
+    tlc_core_t *core,
+    int checkpoint_fd,
+    const char *checkpoint_path,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!core || !core->persistent_cold || checkpoint_fd < 0 ||
+              !checkpoint_path || checkpoint_blob_bytes == 0 || !result, -1);
+    if (tlc_core_reset_fenced_for_resync(core) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: follower fenced reset");
+        return -1;
+    }
+    if (tlc_cold_import_checkpoint_file(core->persistent_cold,
+                                        core->key_meta_shard_count,
+                                        checkpoint_fd, checkpoint_path,
+                                        checkpoint_blob_bytes, result) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: checkpoint file import");
+        return -1;
+    }
+    return tlc_core_finish_resync_checkpoint(core, result);
 }
 
 int tlc_core_resync_from(tlc_core_t *leader,
@@ -2546,10 +2755,17 @@ int tlc_core_resync_from(tlc_core_t *leader,
     if (boundary > leader_progress.durable_seq)
         return -1;
     uint32_t shard_count = follower->key_meta_shard_count;
+    uint64_t *captured_seq = zmalloc(sizeof(*captured_seq) * shard_count);
+    if (!captured_seq)
+        return -1;
     tlc_cold_checkpoint_result_t checkpoint;
-    if (tlc_cold_validate_checkpoint(leader->persistent_cold, 0, shard_count,
-                                      &checkpoint) != 0) {
-        serverLog(LL_WARNING, "TLC resync rejected: leader checkpoint invalid");
+    void *checkpoint_blob = NULL;
+    size_t checkpoint_blob_bytes = 0;
+    if (tlc_cold_export_checkpoint(leader->persistent_cold, shard_count,
+                                   &checkpoint_blob, &checkpoint_blob_bytes,
+                                   &checkpoint) != 0) {
+        serverLog(LL_WARNING, "TLC resync rejected: leader checkpoint export");
+        zfree(captured_seq);
         return -1;
     }
     if (checkpoint.checkpoint_seq > boundary) {
@@ -2557,39 +2773,46 @@ int tlc_core_resync_from(tlc_core_t *leader,
                   "TLC resync rejected: checkpoint_seq=%llu boundary=%llu",
                   (unsigned long long)checkpoint.checkpoint_seq,
                   (unsigned long long)boundary);
+        tlc_cold_free_checkpoint_blob(checkpoint_blob);
+        zfree(captured_seq);
         return -1;
     }
-    if (tlc_cold_set_replica_base_seq(follower->persistent_cold,
-                                       checkpoint.checkpoint_seq) != 0) {
-        serverLog(LL_WARNING, "TLC resync failed: follower base seq");
+    tlc_core_resync_context_t checkpoint_context = {
+        .captured_seq = captured_seq,
+        .shard_count = shard_count,
+    };
+    if (tlc_cold_load_checkpoint(leader->persistent_cold, shard_count,
+                                 tlc_core_capture_checkpoint_seq,
+                                 &checkpoint_context, NULL) != 0) {
+        serverLog(LL_WARNING, "TLC resync failed: checkpoint metadata load");
+        tlc_cold_free_checkpoint_blob(checkpoint_blob);
+        zfree(captured_seq);
         return -1;
     }
-    if (tlc_cold_clone_checkpoint(leader->persistent_cold,
-                                   follower->persistent_cold, shard_count,
-                                   result) != 0) {
-        serverLog(LL_WARNING, "TLC resync failed: checkpoint clone");
+    int install_rc = tlc_core_install_resync_checkpoint(
+        follower, checkpoint_blob, checkpoint_blob_bytes, result);
+    tlc_cold_free_checkpoint_blob(checkpoint_blob);
+    if (install_rc != 0) {
+        zfree(captured_seq);
         return -1;
     }
-    if (tlc_core_recover_cold(follower) != 0) {
-        serverLog(LL_WARNING, "TLC resync failed: follower checkpoint load");
-        return -1;
-    }
-    pthread_mutex_lock(&follower->replica_apply_mu);
-    follower->replica_applied_seq = checkpoint.checkpoint_seq;
-    pthread_mutex_unlock(&follower->replica_apply_mu);
     if (boundary > checkpoint.checkpoint_seq) {
         tlc_core_resync_context_t context = {
             .follower = follower,
             .follower_cold = follower->persistent_cold,
+            .captured_seq = captured_seq,
+            .shard_count = shard_count,
         };
         if (tlc_cold_replay_range(leader->persistent_cold,
                                   checkpoint.checkpoint_seq + 1, boundary,
                                   tlc_core_resync_replay_event,
                                   &context) != 0) {
             serverLog(LL_WARNING, "TLC resync failed: AOF tail replay");
+            zfree(captured_seq);
             return -1;
         }
     }
+    zfree(captured_seq);
     return 0;
 }
 

@@ -25,7 +25,8 @@
 #define TLC_COLD_FORMAT_VERSION UINT16_C(2)
 #define TLC_COLD_CHECKPOINT_MAGIC UINT32_C(0x544C434B) /* TLCK */
 #define TLC_COLD_CHECKPOINT_VERSION UINT16_C(2)
-#define TLC_COLD_SEQ_INDEX_STRIDE UINT64_C(64)
+#define TLC_COLD_DEFAULT_RETENTION_EVENTS UINT64_C(1048576)
+#define TLC_COLD_MAX_RETENTION_EVENTS (UINT64_C(1) << 61)
 
 typedef struct tlc_cold_frame_header {
     uint32_t magic;
@@ -96,6 +97,12 @@ typedef struct tlc_cold_seq_index_entry {
     uint64_t segment_offset;
 } tlc_cold_seq_index_entry_t;
 
+typedef struct tlc_cold_resync_pin {
+    uint64_t token;
+    uint64_t from_seq;
+    struct tlc_cold_resync_pin *next;
+} tlc_cold_resync_pin_t;
+
 struct tlc_cold {
     char *directory;
     uint64_t segment_bytes;
@@ -135,9 +142,13 @@ struct tlc_cold {
     pthread_mutex_t io_mu;
     pthread_mutex_t checkpoint_mu;
     pthread_mutex_t replica_mu;
+    tlc_cold_resync_pin_t *resync_pins;
+    uint64_t next_resync_pin_token;
     tlc_cold_seq_index_entry_t *seq_index;
-    size_t seq_index_count;
-    size_t seq_index_capacity;
+    uint64_t seq_index_capacity;
+    uint64_t seq_index_mask;
+    uint64_t retention_events;
+    uint64_t retained_floor_seq;
 #ifdef TLC_COLD_ENABLE_FAILPOINT
     tlc_cold_checkpoint_failpoint_t checkpoint_failpoint;
     tlc_cold_compact_failpoint_t compact_failpoint;
@@ -150,26 +161,42 @@ static void cold_seq_index_add(tlc_cold_t *cold,
                                uint64_t seq,
                                uint64_t segment_id,
                                uint64_t segment_offset) {
-    if ((seq - 1u) % TLC_COLD_SEQ_INDEX_STRIDE != 0)
-        return;
-    if (cold->seq_index_count == cold->seq_index_capacity) {
-        size_t next_capacity = cold->seq_index_capacity ?
-            cold->seq_index_capacity * 2u : 64u;
-        tlc_cold_seq_index_entry_t *next = zrealloc(
-            cold->seq_index, next_capacity * sizeof(*next));
-        if (!next)
-            return;
-        cold->seq_index = next;
-        cold->seq_index_capacity = next_capacity;
-    }
-    cold->seq_index[cold->seq_index_count++] = (tlc_cold_seq_index_entry_t){
+    cold->seq_index[seq & cold->seq_index_mask] = (tlc_cold_seq_index_entry_t){
         .seq = seq,
         .segment_id = segment_id,
         .segment_offset = segment_offset,
     };
 }
 
+static int cold_seq_index_get_locked(const tlc_cold_t *cold, uint64_t seq,
+                                     tlc_cold_seq_cursor_t *cursor) {
+    const tlc_cold_seq_index_entry_t *entry =
+        &cold->seq_index[seq & cold->seq_index_mask];
+    if (entry->seq != seq) {
+        errno = ENOENT;
+        return -1;
+    }
+    *cursor = (tlc_cold_seq_cursor_t){
+        .seq = entry->seq,
+        .segment_id = entry->segment_id,
+        .segment_offset = entry->segment_offset,
+    };
+    return 0;
+}
+
 static int cold_read_full(int fd, void *buffer, size_t length);
+static int cold_publish_checkpoint_manifest_locked(
+    tlc_cold_t *cold,
+    const tlc_cold_checkpoint_header_t *header,
+    tlc_cold_checkpoint_result_t *result);
+
+static uint64_t cold_ring_capacity(uint64_t retention_events) {
+    uint64_t required = retention_events + (retention_events + 1u) / 2u;
+    uint64_t capacity = 1;
+    while (capacity < required)
+        capacity <<= 1;
+    return capacity;
+}
 
 #ifdef TLC_COLD_ENABLE_FAILPOINT
 static int cold_checkpoint_failpoint(tlc_cold_t *cold,
@@ -252,6 +279,31 @@ static int cold_read_full(int fd, void *buffer, size_t length) {
     return 0;
 }
 
+/* fd is stable for the caller-owned artifact lifetime. */
+static int cold_pread_full(int fd, void *buffer, size_t length,
+                           uint64_t offset) {
+    uint8_t *cursor = buffer;
+    size_t total = 0;
+    if (offset > INT64_MAX || length > (size_t)(INT64_MAX - offset)) {
+        errno = EFBIG;
+        return -1;
+    }
+    while (total < length) {
+        ssize_t received = pread(fd, cursor + total, length - total,
+                                 (off_t)(offset + total));
+        if (received > 0) {
+            total += (size_t)received;
+            continue;
+        }
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received == 0)
+            errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int cold_make_segment_path(const tlc_cold_t *cold,
                                   uint64_t segment_id,
                                   char *path,
@@ -276,6 +328,33 @@ static int cold_make_checkpoint_path(const tlc_cold_t *cold,
 
 static int cold_fsync_directory(const tlc_cold_t *cold) {
     int fd = open(cold->directory, O_RDONLY | O_DIRECTORY);
+    if (fd < 0)
+        return -1;
+    int rc = fsync(fd);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return rc;
+}
+
+static int cold_fsync_parent_directory(const char *path) {
+    char directory[4096];
+    size_t length = strlen(path);
+    if (length >= sizeof(directory)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(directory, path, length + 1u);
+    char *slash = strrchr(directory, '/');
+    if (!slash) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slash == directory)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+    int fd = open(directory, O_RDONLY | O_DIRECTORY);
     if (fd < 0)
         return -1;
     int rc = fsync(fd);
@@ -623,7 +702,9 @@ static int cold_seq_index_rebuild_locked(tlc_cold_t *cold) {
     size_t segment_count = 0;
     if (cold_collect_segments(cold, &segments, &segment_count) != 0)
         return -1;
-    cold->seq_index_count = 0;
+    memset(cold->seq_index, 0,
+           cold->seq_index_capacity * sizeof(*cold->seq_index));
+    uint64_t retained_floor = 0;
     for (size_t i = 0; i < segment_count; i++) {
         char path[4096];
         if (cold_make_segment_path(cold, segments[i].id,
@@ -652,6 +733,8 @@ static int cold_seq_index_rebuild_locked(tlc_cold_t *cold) {
                 zfree(segments);
                 return -1;
             }
+            if (retained_floor == 0)
+                retained_floor = header.seq;
             cold_seq_index_add(cold, header.seq, segments[i].id, offset);
             offset += sizeof(header) + header.key_len + header.value_len;
         }
@@ -661,6 +744,7 @@ static int cold_seq_index_rebuild_locked(tlc_cold_t *cold) {
         }
     }
     zfree(segments);
+    cold->retained_floor_seq = retained_floor;
     return 0;
 }
 
@@ -701,8 +785,10 @@ static int cold_recover_segment(tlc_cold_t *cold,
             (header.op == TLC_COLD_OP_DEL && header.value_len != 0) ||
             header.key_len > SIZE_MAX - header.value_len - sizeof(header))
             goto failed;
-        if (*expected_seq == 0)
+        if (*expected_seq == 0) {
             *expected_seq = header.seq;
+            cold->retained_floor_seq = header.seq;
+        }
         if (header.seq != *expected_seq)
             goto failed;
         uint8_t *key = zmalloc(header.key_len);
@@ -789,6 +875,7 @@ failed:
 
 static int cold_replay_segment(tlc_cold_t *cold,
                                uint64_t segment_id,
+                               uint64_t segment_offset,
                                uint64_t *expected_seq,
                                const uint64_t *captured_seq,
                                uint32_t meta_shard_count,
@@ -800,6 +887,11 @@ static int cold_replay_segment(tlc_cold_t *cold,
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
+    if (segment_offset != 0 &&
+        lseek(fd, (off_t)segment_offset, SEEK_SET) == (off_t)-1) {
+        close(fd);
+        return -1;
+    }
     for (;;) {
         tlc_cold_frame_header_t header;
         int header_rc = cold_read_full(fd, &header, sizeof(header));
@@ -1068,6 +1160,8 @@ static int cold_append_request(tlc_cold_t *cold, tlc_cold_request_t *request) {
         cold_write_full(cold->fd, request->value, request->input.value_len) != 0)
         return -1;
     cold_seq_index_add(cold, header.seq, segment_id, segment_offset);
+    if (cold->retained_floor_seq == 0)
+        cold->retained_floor_seq = header.seq;
     cold->next_seq = seq + 1;
     atomic_fetch_add_explicit(&cold->segment_offset, frame_bytes,
                               memory_order_release);
@@ -1223,7 +1317,8 @@ static int cold_validate_input(const tlc_cold_event_input_t *input) {
 int tlc_cold_open(tlc_cold_t **out, const tlc_cold_config_t *config) {
     RETURN_IF(!out || !config || !config->directory || !getMonotonicNs ||
               config->segment_bytes == 0 || config->queue_capacity == 0 ||
-              config->group_max_entries == 0 || config->group_max_delay_us == 0, -1);
+              config->group_max_entries == 0 || config->group_max_delay_us == 0 ||
+              config->retention_events > TLC_COLD_MAX_RETENTION_EVENTS, -1);
     *out = NULL;
     tlc_cold_t *cold = zcalloc(sizeof(*cold));
     if (!cold) {
@@ -1236,6 +1331,10 @@ int tlc_cold_open(tlc_cold_t **out, const tlc_cold_config_t *config) {
     cold->queue_capacity = config->queue_capacity;
     cold->group_max_entries = config->group_max_entries;
     cold->group_max_delay_us = config->group_max_delay_us;
+    cold->retention_events = config->retention_events ?
+        config->retention_events : TLC_COLD_DEFAULT_RETENTION_EVENTS;
+    cold->seq_index_capacity = cold_ring_capacity(cold->retention_events);
+    cold->seq_index_mask = cold->seq_index_capacity - 1u;
     cold->fd = -1;
     if (!cold->directory || (mkdir(cold->directory, 0755) != 0 && errno != EEXIST)) {
         serverLog(LL_WARNING,
@@ -1248,6 +1347,15 @@ int tlc_cold_open(tlc_cold_t **out, const tlc_cold_config_t *config) {
         serverLog(LL_WARNING,
                   "COLD queue allocation failed: directory=%s capacity=%u",
                   config->directory, cold->queue_capacity);
+        goto failed;
+    }
+    cold->seq_index = zcalloc_num(cold->seq_index_capacity,
+                                  sizeof(*cold->seq_index));
+    if (!cold->seq_index) {
+        serverLog(LL_WARNING,
+                  "COLD seq index allocation failed: directory=%s capacity=%llu",
+                  config->directory,
+                  (unsigned long long)cold->seq_index_capacity);
         goto failed;
     }
     cold->checksum_state = XXH3_createState();
@@ -1330,6 +1438,11 @@ void tlc_cold_close(tlc_cold_t *cold) {
         if (cold->queue[i])
             cold_request_release(cold->queue[i]);
     }
+    while (cold->resync_pins) {
+        tlc_cold_resync_pin_t *pin = cold->resync_pins;
+        cold->resync_pins = pin->next;
+        zfree(pin);
+    }
     pthread_mutex_destroy(&cold->io_mu);
     pthread_mutex_destroy(&cold->replica_mu);
     pthread_mutex_destroy(&cold->checkpoint_mu);
@@ -1343,6 +1456,125 @@ void tlc_cold_close(tlc_cold_t *cold) {
     zfree(cold->queue);
     zfree(cold->directory);
     zfree(cold);
+}
+
+static int cold_reset_remove_entry(const tlc_cold_t *cold, const char *name) {
+    uint64_t id = 0;
+    int known_aof = cold_parse_segment_id(name, &id) == 1;
+    int known_checkpoint = cold_parse_generation_id(name, &id) == 1;
+    const char checkpoint_prefix[] = "checkpoint-";
+    const char checkpoint_tmp_suffix[] = ".tmp";
+    size_t name_len = strlen(name);
+    size_t prefix_len = sizeof(checkpoint_prefix) - 1u;
+    size_t suffix_len = sizeof(checkpoint_tmp_suffix) - 1u;
+    int known_checkpoint_tmp =
+        name_len > prefix_len + suffix_len &&
+        strncmp(name, checkpoint_prefix, prefix_len) == 0 &&
+        strcmp(name + name_len - suffix_len, checkpoint_tmp_suffix) == 0;
+    for (size_t i = prefix_len;
+         known_checkpoint_tmp && i < name_len - suffix_len; i++) {
+        if (name[i] < '0' || name[i] > '9')
+            known_checkpoint_tmp = 0;
+    }
+    int known_manifest = strcmp(name, "checkpoint.manifest") == 0 ||
+                         strcmp(name, "checkpoint.manifest.tmp") == 0;
+    if (!known_aof && !known_checkpoint && !known_checkpoint_tmp &&
+        !known_manifest)
+        return 0;
+    char path[4096];
+    int written = snprintf(path, sizeof(path), "%s/%s", cold->directory,
+                           name);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+static int cold_reset_owned_files(tlc_cold_t *cold) {
+    DIR *directory = opendir(cold->directory);
+    if (!directory)
+        return -1;
+    int rc = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (cold_reset_remove_entry(cold, entry->d_name) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+    int close_rc = closedir(directory);
+    if (rc != 0 || close_rc != 0)
+        return -1;
+    return cold_fsync_directory(cold);
+}
+
+int tlc_cold_reset_fenced(tlc_cold_t *cold) {
+    RETURN_IF(!cold, -1);
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    int has_resync_pin = cold->resync_pins != NULL;
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    if (has_resync_pin) {
+        errno = EBUSY;
+        return -1;
+    }
+    pthread_mutex_lock(&cold->queue_mu);
+    atomic_store_explicit(&cold->stopping, true, memory_order_release);
+    pthread_cond_broadcast(&cold->queue_not_empty);
+    pthread_cond_broadcast(&cold->queue_not_full);
+    pthread_mutex_unlock(&cold->queue_mu);
+    pthread_join(cold->writer_thread, NULL);
+    pthread_mutex_lock(&cold->pending_mu);
+    pthread_cond_broadcast(&cold->pending_cv);
+    pthread_mutex_unlock(&cold->pending_mu);
+    pthread_join(cold->flush_thread, NULL);
+    if (cold->fd >= 0) {
+        int sync_rc = fsync(cold->fd);
+        int close_rc = close(cold->fd);
+        cold->fd = -1;
+        if (sync_rc != 0 || close_rc != 0)
+            return -1;
+    }
+    cold->fd = -1;
+    if (cold_reset_owned_files(cold) != 0)
+        return -1;
+
+    cold->queue_head = 0;
+    cold->queue_tail = 0;
+    cold->queue_count = 0;
+    cold->pending_head = NULL;
+    cold->pending_tail = NULL;
+    cold->pending_count = 0;
+    cold->pending_since = 0;
+    memset(cold->seq_index, 0,
+           cold->seq_index_capacity * sizeof(*cold->seq_index));
+    cold->retained_floor_seq = 0;
+    cold->next_seq = 1;
+    atomic_store_explicit(&cold->appended_seq, 0, memory_order_release);
+    atomic_store_explicit(&cold->durable_seq, 0, memory_order_release);
+    atomic_store_explicit(&cold->io_error, 0, memory_order_release);
+    atomic_store_explicit(&cold->writer_done, false, memory_order_release);
+    atomic_store_explicit(&cold->stopping, false, memory_order_release);
+    if (cold_open_segment(cold, 0) != 0)
+        goto failed;
+    if (pthread_create(&cold->writer_thread, NULL, cold_writer_main, cold) != 0)
+        goto failed;
+    if (pthread_create(&cold->flush_thread, NULL, cold_flush_main, cold) != 0) {
+        pthread_mutex_lock(&cold->queue_mu);
+        atomic_store_explicit(&cold->stopping, true, memory_order_release);
+        pthread_cond_broadcast(&cold->queue_not_empty);
+        pthread_mutex_unlock(&cold->queue_mu);
+        pthread_join(cold->writer_thread, NULL);
+        goto failed;
+    }
+    return 0;
+
+failed:
+    atomic_store_explicit(&cold->stopping, true, memory_order_release);
+    if (cold->fd >= 0)
+        close(cold->fd);
+    cold->fd = -1;
+    return -1;
 }
 
 static int cold_enqueue_request(tlc_cold_t *cold,
@@ -1464,7 +1696,7 @@ static int cold_compare_replica_range_locked(
     uint64_t expected_seq = 0;
     int rc = 0;
     for (size_t i = 0; i < segment_count; i++) {
-        rc = cold_replay_segment(cold, segments[i].id, &expected_seq,
+        rc = cold_replay_segment(cold, segments[i].id, 0, &expected_seq,
                                  NULL, 0, cold_compare_replica_event,
                                  &compare);
         if (rc != 0)
@@ -1509,30 +1741,40 @@ int tlc_cold_submit_replica_batch(
         return 0;
     }
     if (first_seq < expected_seq) {
+        /* A repair request can race with normal delivery. Validate the
+         * already-appended prefix, then submit only the new suffix. */
+        uint64_t prefix_count64 = expected_seq - first_seq;
+        uint32_t prefix_count = prefix_count64 < event_count ?
+            (uint32_t)prefix_count64 : event_count;
         int conflict = 0;
-        int compare_rc = -1;
-        int fully_appended = last_seq < expected_seq;
-        int fully_acknowledged = last_seq < expected_seq &&
-            last_seq <= (ack_mode == TLC_COLD_ACK_DURABLE ?
-                         current_durable_seq : current_accepted_seq);
-        if (fully_appended)
-            compare_rc = cold_compare_replica_range_locked(
-                cold, first_seq, events, event_count, &conflict);
-        pthread_mutex_unlock(&cold->io_mu);
-        pthread_mutex_unlock(&cold->replica_mu);
-        if (fully_acknowledged && compare_rc == 0) {
+        int compare_rc = cold_compare_replica_range_locked(
+            cold, first_seq, events, prefix_count, &conflict);
+        if (compare_rc != 0) {
+            int fully_appended = last_seq < expected_seq;
+            int fully_acknowledged = fully_appended &&
+                last_seq <= (ack_mode == TLC_COLD_ACK_DURABLE ?
+                             current_durable_seq : current_accepted_seq);
+            pthread_mutex_unlock(&cold->io_mu);
+            pthread_mutex_unlock(&cold->replica_mu);
+            if (conflict) {
+                *status = TLC_COLD_REPLICA_BATCH_CONFLICT;
+                return 0;
+            }
+            *status = fully_acknowledged ?
+                TLC_COLD_REPLICA_BATCH_ERROR : TLC_COLD_REPLICA_BATCH_GAP;
+            return -1;
+        }
+        if (prefix_count == event_count) {
+            pthread_mutex_unlock(&cold->io_mu);
+            pthread_mutex_unlock(&cold->replica_mu);
             *status = TLC_COLD_REPLICA_BATCH_DUPLICATE;
             if (acknowledged_seq)
                 *acknowledged_seq = last_seq;
             return 0;
         }
-        if (conflict) {
-            *status = TLC_COLD_REPLICA_BATCH_CONFLICT;
-            return 0;
-        }
-        *status = fully_acknowledged && compare_rc != 0 ?
-            TLC_COLD_REPLICA_BATCH_ERROR : TLC_COLD_REPLICA_BATCH_GAP;
-        return -1;
+        first_seq = expected_seq;
+        events += prefix_count;
+        event_count -= prefix_count;
     }
     pthread_mutex_unlock(&cold->io_mu);
 
@@ -1601,29 +1843,45 @@ int tlc_cold_get_progress(const tlc_cold_t *cold,
     return 0;
 }
 
+const char *tlc_cold_directory(const tlc_cold_t *cold) {
+    return cold ? cold->directory : NULL;
+}
+
+int tlc_cold_get_retention_window(tlc_cold_t *cold,
+                                  tlc_cold_retention_window_t *window) {
+    RETURN_IF(!cold || !window, -1);
+    pthread_mutex_lock(&cold->io_mu);
+    *window = (tlc_cold_retention_window_t){
+        .retained_floor_seq = cold->retained_floor_seq,
+        .appended_seq = atomic_load_explicit(&cold->appended_seq,
+                                             memory_order_acquire),
+        .target_events = cold->retention_events,
+        .ring_capacity = cold->seq_index_capacity,
+    };
+    pthread_mutex_unlock(&cold->io_mu);
+    return 0;
+}
+
+int tlc_cold_seal_segment(tlc_cold_t *cold) {
+    RETURN_IF(!cold, -1);
+    pthread_mutex_lock(&cold->io_mu);
+    uint64_t offset = atomic_load_explicit(&cold->segment_offset,
+                                           memory_order_acquire);
+    uint64_t segment_id = atomic_load_explicit(&cold->segment_id,
+                                               memory_order_acquire);
+    int rc = offset == 0 ? 0 : cold_open_segment(cold, segment_id + 1u);
+    pthread_mutex_unlock(&cold->io_mu);
+    return rc;
+}
+
 int tlc_cold_get_seq_cursor(tlc_cold_t *cold,
                             uint64_t seq,
                             tlc_cold_seq_cursor_t *cursor) {
     RETURN_IF(!cold || !cursor || seq == 0, -1);
     pthread_mutex_lock(&cold->io_mu);
-    size_t found = SIZE_MAX;
-    for (size_t i = 0; i < cold->seq_index_count; i++) {
-        if (cold->seq_index[i].seq > seq)
-            break;
-        found = i;
-    }
-    if (found == SIZE_MAX) {
-        pthread_mutex_unlock(&cold->io_mu);
-        errno = ENOENT;
-        return -1;
-    }
-    *cursor = (tlc_cold_seq_cursor_t){
-        .seq = cold->seq_index[found].seq,
-        .segment_id = cold->seq_index[found].segment_id,
-        .segment_offset = cold->seq_index[found].segment_offset,
-    };
+    int rc = cold_seq_index_get_locked(cold, seq, cursor);
     pthread_mutex_unlock(&cold->io_mu);
-    return 0;
+    return rc;
 }
 
 int tlc_cold_set_append_sink(tlc_cold_t *cold,
@@ -1638,6 +1896,7 @@ int tlc_cold_set_append_sink(tlc_cold_t *cold,
 static int cold_replay_internal(tlc_cold_t *cold,
                                 const uint64_t *captured_seq,
                                 uint32_t meta_shard_count,
+                                uint64_t seek_seq,
                                 tlc_cold_replay_fn callback,
                                 void *arg) {
     pthread_mutex_lock(&cold->io_mu);
@@ -1646,9 +1905,24 @@ static int cold_replay_internal(tlc_cold_t *cold,
     int rc = cold_collect_segments(cold, &segments, &count);
     uint64_t expected_seq = 0;
     if (rc == 0) {
-        for (size_t i = 0; i < count; i++) {
+        size_t first_segment = 0;
+        tlc_cold_seq_cursor_t cursor = {0};
+        int indexed = seek_seq != 0 &&
+            cold_seq_index_get_locked(cold, seek_seq, &cursor) == 0;
+        if (indexed) {
+            while (first_segment < count &&
+                   segments[first_segment].id != cursor.segment_id)
+                first_segment++;
+            if (first_segment == count) {
+                errno = ENOENT;
+                rc = TLC_COLD_RESYNC_REQUIRED;
+            }
+        }
+        for (size_t i = first_segment; i < count && rc == 0; i++) {
             rc = cold_replay_segment(cold,
                                      segments[i].id,
+                                     indexed && i == first_segment ?
+                                         cursor.segment_offset : 0,
                                      &expected_seq,
                                      captured_seq,
                                      meta_shard_count,
@@ -1660,7 +1934,7 @@ static int cold_replay_internal(tlc_cold_t *cold,
     }
     zfree(segments);
     pthread_mutex_unlock(&cold->io_mu);
-    if (rc != 0) {
+    if (rc < 0) {
         serverLog(LL_WARNING,
                   "COLD AOF replay failed: directory=%s rc=%d expected_seq=%llu",
                   cold->directory,
@@ -1672,12 +1946,17 @@ static int cold_replay_internal(tlc_cold_t *cold,
 
 int tlc_cold_replay(tlc_cold_t *cold, tlc_cold_replay_fn callback, void *arg) {
     RETURN_IF(!cold || !callback, -1);
-    return cold_replay_internal(cold, NULL, 0, callback, arg);
+    return cold_replay_internal(cold, NULL, 0, 0, callback, arg);
 }
 
 typedef struct tlc_cold_range_replay {
     uint64_t start_seq;
     uint64_t end_seq;
+    uint64_t next_seq;
+    uint32_t max_events;
+    uint32_t event_count;
+    bool limit_reached;
+    int complete;
     tlc_cold_replay_fn callback;
     void *arg;
 } tlc_cold_range_replay_t;
@@ -1689,8 +1968,24 @@ static int cold_replay_range_callback(const tlc_cold_event_input_t *input,
     if (seq < range->start_seq)
         return 0;
     if (seq > range->end_seq)
-        return 0;
-    return range->callback(input, seq, range->arg);
+        return range->complete ? 0 : TLC_COLD_RESYNC_REQUIRED;
+    if (seq != range->next_seq)
+        return TLC_COLD_RESYNC_REQUIRED;
+    int rc = range->callback(input, seq, range->arg);
+    if (rc == 0) {
+        range->event_count++;
+        range->next_seq = seq == UINT64_MAX ? 0 : seq + 1;
+        if (range->max_events != 0 && range->event_count == range->max_events &&
+            range->next_seq <= range->end_seq) {
+            range->limit_reached = true;
+            return TLC_COLD_REPLAY_STOP;
+        }
+        if (seq == range->end_seq) {
+            range->complete = 1;
+            return TLC_COLD_REPLAY_STOP;
+        }
+    }
+    return rc;
 }
 
 int tlc_cold_replay_range(tlc_cold_t *cold,
@@ -1703,11 +1998,53 @@ int tlc_cold_replay_range(tlc_cold_t *cold,
     tlc_cold_range_replay_t range = {
         .start_seq = start_seq,
         .end_seq = end_seq,
+        .next_seq = start_seq,
         .callback = callback,
         .arg = arg,
     };
-    int rc = cold_replay_internal(cold, NULL, 0,
+    int rc = cold_replay_internal(cold, NULL, 0, start_seq,
                                   cold_replay_range_callback, &range);
+    if (rc == TLC_COLD_REPLAY_STOP && range.complete)
+        rc = 0;
+    if (rc == 0 && !range.complete)
+        rc = TLC_COLD_RESYNC_REQUIRED;
+    return rc;
+}
+
+int tlc_cold_replay_range_limited(tlc_cold_t *cold,
+                                  uint64_t start_seq,
+                                  uint64_t end_seq,
+                                  uint32_t max_events,
+                                  tlc_cold_replay_fn callback,
+                                  void *arg,
+                                  uint64_t *next_seq,
+                                  uint32_t *event_count) {
+    RETURN_IF(!cold || !callback || !next_seq || !event_count ||
+              start_seq == 0 || end_seq < start_seq || max_events == 0, -1);
+    *next_seq = start_seq;
+    *event_count = 0;
+    tlc_cold_range_replay_t range = {
+        .start_seq = start_seq,
+        .end_seq = end_seq,
+        .next_seq = start_seq,
+        .max_events = max_events,
+        .callback = callback,
+        .arg = arg,
+    };
+    int rc = cold_replay_internal(cold, NULL, 0, start_seq,
+                                  cold_replay_range_callback, &range);
+    if (rc == TLC_COLD_REPLAY_STOP &&
+        (range.limit_reached || range.complete))
+        rc = 0;
+    if (rc == 0 && !range.complete && !range.limit_reached &&
+        range.next_seq != end_seq + 1u) {
+        errno = ENODATA;
+        rc = TLC_COLD_RESYNC_REQUIRED;
+    }
+    if (rc == 0) {
+        *next_seq = range.next_seq;
+        *event_count = range.event_count;
+    }
     return rc;
 }
 
@@ -1717,7 +2054,7 @@ int tlc_cold_replay_after(tlc_cold_t *cold,
                           tlc_cold_replay_fn callback,
                           void *arg) {
     RETURN_IF(!cold || !captured_seq || meta_shard_count == 0 || !callback, -1);
-    return cold_replay_internal(cold, captured_seq, meta_shard_count,
+    return cold_replay_internal(cold, captured_seq, meta_shard_count, 0,
                                 callback, arg);
 }
 
@@ -1877,16 +2214,28 @@ static int cold_publish_checkpoint_locked(
         return -1;
     }
 
+    if (cold_publish_checkpoint_manifest_locked(cold, &header, result) != 0) {
+        XXH3_freeState(state);
+        return -1;
+    }
+    XXH3_freeState(state);
+    return 0;
+}
+
+static int cold_publish_checkpoint_manifest_locked(
+    tlc_cold_t *cold,
+    const tlc_cold_checkpoint_header_t *header,
+    tlc_cold_checkpoint_result_t *result) {
     tlc_cold_checkpoint_manifest_t manifest = {
         .magic = TLC_COLD_CHECKPOINT_MAGIC,
         .format_version = TLC_COLD_CHECKPOINT_VERSION,
         .header_bytes = sizeof(manifest),
-        .generation = generation,
-        .ha_term = header.ha_term,
-        .checkpoint_seq = header.checkpoint_seq,
-        .meta_shard_count = meta_shard_count,
-        .record_count = record_count,
-        .generation_checksum = header.generation_checksum,
+        .generation = header->generation,
+        .ha_term = header->ha_term,
+        .checkpoint_seq = header->checkpoint_seq,
+        .meta_shard_count = header->meta_shard_count,
+        .record_count = header->record_count,
+        .generation_checksum = header->generation_checksum,
     };
     char manifest_tmp[4096];
     char manifest_path[4096];
@@ -1896,39 +2245,39 @@ static int cold_publish_checkpoint_locked(
     int manifest_final_rc = snprintf(manifest_path, sizeof(manifest_path),
                                      "%s/checkpoint.manifest",
                                      cold->directory);
-    if (manifest_path_rc < 0 || (size_t)manifest_path_rc >= sizeof(manifest_tmp) ||
-        manifest_final_rc < 0 || (size_t)manifest_final_rc >= sizeof(manifest_path)) {
-        XXH3_freeState(state);
+    if (manifest_path_rc < 0 ||
+        (size_t)manifest_path_rc >= sizeof(manifest_tmp) ||
+        manifest_final_rc < 0 ||
+        (size_t)manifest_final_rc >= sizeof(manifest_path))
         return -1;
-    }
     int manifest_fd = open(manifest_tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     int manifest_ok = manifest_fd >= 0 &&
         COLD_CHECKPOINT_FAIL(cold,
-                                  TLC_COLD_CHECKPOINT_FAIL_MANIFEST_WRITE) == 0 &&
+                             TLC_COLD_CHECKPOINT_FAIL_MANIFEST_WRITE) == 0 &&
         cold_write_full(manifest_fd, &manifest, sizeof(manifest)) == 0 &&
         COLD_CHECKPOINT_FAIL(cold,
-                                  TLC_COLD_CHECKPOINT_FAIL_MANIFEST_FSYNC) == 0 &&
+                             TLC_COLD_CHECKPOINT_FAIL_MANIFEST_FSYNC) == 0 &&
         fsync(manifest_fd) == 0;
     if (manifest_fd >= 0)
         close(manifest_fd);
     if (!manifest_ok ||
         COLD_CHECKPOINT_FAIL(cold,
-                                  TLC_COLD_CHECKPOINT_FAIL_MANIFEST_RENAME) != 0 ||
+                             TLC_COLD_CHECKPOINT_FAIL_MANIFEST_RENAME) != 0 ||
         rename(manifest_tmp, manifest_path) != 0 ||
         COLD_CHECKPOINT_FAIL(
             cold, TLC_COLD_CHECKPOINT_FAIL_MANIFEST_DIRECTORY_FSYNC) != 0 ||
         cold_fsync_directory(cold) != 0) {
         serverLog(LL_WARNING,
                   "COLD checkpoint manifest publish failed: generation=%llu errno=%d (%s)",
-                  (unsigned long long)generation, errno, strerror(errno));
-        XXH3_freeState(state);
+                  (unsigned long long)header->generation, errno, strerror(errno));
         return -1;
     }
-    result->generation = generation;
-    result->ha_term = header.ha_term;
-    result->checkpoint_seq = header.checkpoint_seq;
-    result->generation_checksum = header.generation_checksum;
-    XXH3_freeState(state);
+    *result = (tlc_cold_checkpoint_result_t){
+        .generation = header->generation,
+        .ha_term = header->ha_term,
+        .checkpoint_seq = header->checkpoint_seq,
+        .generation_checksum = header->generation_checksum,
+    };
     return 0;
 }
 
@@ -2078,17 +2427,12 @@ int tlc_cold_load_checkpoint(tlc_cold_t *cold,
     return rc;
 }
 
-int tlc_cold_export_checkpoint(tlc_cold_t *cold,
-                               uint32_t expected_meta_shard_count,
-                               void **blob,
-                               size_t *blob_bytes,
-                               tlc_cold_checkpoint_result_t *result) {
-    RETURN_IF(!cold || !blob || !blob_bytes || !result ||
-              expected_meta_shard_count == 0, -1);
-    *blob = NULL;
-    *blob_bytes = 0;
-
-    pthread_mutex_lock(&cold->checkpoint_mu);
+static int cold_export_checkpoint_locked(
+    tlc_cold_t *cold,
+    uint32_t expected_meta_shard_count,
+    void **blob,
+    size_t *blob_bytes,
+    tlc_cold_checkpoint_result_t *result) {
     int rc = cold_validate_checkpoint_locked(cold, 0,
                                              expected_meta_shard_count,
                                              result);
@@ -2096,7 +2440,6 @@ int tlc_cold_export_checkpoint(tlc_cold_t *cold,
         serverLog(LL_WARNING,
                   "COLD checkpoint export validation failed: directory=%s errno=%d (%s)",
                   cold->directory, errno, strerror(errno));
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
 
@@ -2104,7 +2447,6 @@ int tlc_cold_export_checkpoint(tlc_cold_t *cold,
     if (cold_make_checkpoint_path(cold, result->generation, "",
                                   path, sizeof(path)) != 0) {
         errno = ENAMETOOLONG;
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
     int fd = open(path, O_RDONLY);
@@ -2113,7 +2455,6 @@ int tlc_cold_export_checkpoint(tlc_cold_t *cold,
                   "COLD checkpoint export open failed: generation=%llu errno=%d (%s)",
                   (unsigned long long)result->generation,
                   errno, strerror(errno));
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
     struct stat st;
@@ -2129,14 +2470,12 @@ int tlc_cold_export_checkpoint(tlc_cold_t *cold,
                   (unsigned long long)result->generation,
                   errno, strerror(errno));
         close(fd);
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
     size_t bytes = (size_t)st.st_size;
     void *buffer = zmalloc(bytes);
     if (!buffer) {
         close(fd);
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
     int read_rc = cold_read_full(fd, buffer, bytes);
@@ -2147,11 +2486,281 @@ int tlc_cold_export_checkpoint(tlc_cold_t *cold,
                   (unsigned long long)result->generation,
                   errno, strerror(errno));
         zfree(buffer);
-        pthread_mutex_unlock(&cold->checkpoint_mu);
         return -1;
     }
     *blob = buffer;
     *blob_bytes = bytes;
+    return 0;
+}
+
+int tlc_cold_export_checkpoint(tlc_cold_t *cold,
+                               uint32_t expected_meta_shard_count,
+                               void **blob,
+                               size_t *blob_bytes,
+                               tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!cold || !blob || !blob_bytes || !result ||
+              expected_meta_shard_count == 0, -1);
+    *blob = NULL;
+    *blob_bytes = 0;
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    int rc = cold_export_checkpoint_locked(cold, expected_meta_shard_count,
+                                           blob, blob_bytes, result);
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    return rc;
+}
+
+static int cold_snapshot_captured_seq(const void *blob,
+                                      size_t blob_bytes,
+                                      uint32_t meta_shard_count,
+                                      uint64_t *captured_seq) {
+    if (blob_bytes < sizeof(tlc_cold_checkpoint_header_t)) {
+        errno = EINVAL;
+        return -1;
+    }
+    tlc_cold_checkpoint_header_t header;
+    memcpy(&header, blob, sizeof(header));
+    if (header.magic != TLC_COLD_CHECKPOINT_MAGIC ||
+        header.format_version != TLC_COLD_CHECKPOINT_VERSION ||
+        header.header_bytes != sizeof(header) ||
+        header.meta_shard_count != meta_shard_count ||
+        header.record_count != meta_shard_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    const uint8_t *cursor = (const uint8_t *)blob + sizeof(header);
+    size_t remaining = blob_bytes - sizeof(header);
+    for (uint32_t i = 0; i < meta_shard_count; i++) {
+        if (remaining < sizeof(tlc_cold_checkpoint_record_header_t)) {
+            errno = EINVAL;
+            return -1;
+        }
+        tlc_cold_checkpoint_record_header_t record;
+        memcpy(&record, cursor, sizeof(record));
+        cursor += sizeof(record);
+        remaining -= sizeof(record);
+        if (record.meta_shard_id != i || record.state_len > remaining) {
+            errno = EINVAL;
+            return -1;
+        }
+        captured_seq[i] = record.captured_seq;
+        cursor += record.state_len;
+        remaining -= record.state_len;
+    }
+    if (remaining != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+static tlc_cold_resync_pin_t *cold_find_resync_pin_locked(
+    tlc_cold_t *cold, uint64_t token) {
+    for (tlc_cold_resync_pin_t *pin = cold->resync_pins; pin;
+         pin = pin->next) {
+        if (pin->token == token)
+            return pin;
+    }
+    return NULL;
+}
+
+int tlc_cold_begin_resync_snapshot(
+    tlc_cold_t *cold,
+    uint32_t expected_meta_shard_count,
+    tlc_cold_resync_snapshot_t *snapshot) {
+    RETURN_IF(!cold || !snapshot || expected_meta_shard_count == 0, -1);
+    *snapshot = (tlc_cold_resync_snapshot_t){0};
+
+    uint64_t *captured_seq = zcalloc_num(expected_meta_shard_count,
+                                         sizeof(*captured_seq));
+    tlc_cold_resync_pin_t *pin = zcalloc(sizeof(*pin));
+    if (!captured_seq || !pin) {
+        zfree(captured_seq);
+        zfree(pin);
+        return -1;
+    }
+
+    void *blob = NULL;
+    size_t blob_bytes = 0;
+    tlc_cold_checkpoint_result_t checkpoint;
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    int rc = cold_export_checkpoint_locked(cold, expected_meta_shard_count,
+                                           &blob, &blob_bytes, &checkpoint);
+    if (rc == 0 && checkpoint.checkpoint_seq == UINT64_MAX) {
+        errno = EOVERFLOW;
+        rc = -1;
+    }
+    if (rc == 0)
+        rc = cold_snapshot_captured_seq(blob, blob_bytes,
+                                        expected_meta_shard_count,
+                                        captured_seq);
+    uint64_t boundary = 0;
+    if (rc == 0) {
+        pthread_mutex_lock(&cold->io_mu);
+        boundary = atomic_load_explicit(&cold->durable_seq,
+                                        memory_order_acquire);
+        pin->from_seq = checkpoint.checkpoint_seq + 1u;
+        pin->token = cold->next_resync_pin_token++;
+        if (pin->token == 0)
+            pin->token = cold->next_resync_pin_token++;
+        pin->next = cold->resync_pins;
+        cold->resync_pins = pin;
+        pthread_mutex_unlock(&cold->io_mu);
+    }
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    if (rc != 0) {
+        tlc_cold_free_checkpoint_blob(blob);
+        zfree(captured_seq);
+        zfree(pin);
+        return -1;
+    }
+
+    *snapshot = (tlc_cold_resync_snapshot_t){
+        .checkpoint_blob = blob,
+        .checkpoint_blob_bytes = blob_bytes,
+        .captured_seq = captured_seq,
+        .meta_shard_count = expected_meta_shard_count,
+        .checkpoint = checkpoint,
+        .checkpoint_blob_checksum = XXH3_64bits(blob, blob_bytes),
+        .captured_seq_checksum = XXH3_64bits(
+            captured_seq, expected_meta_shard_count * sizeof(*captured_seq)),
+        .tail_start_seq = checkpoint.checkpoint_seq + 1u,
+        .durable_boundary_seq = boundary,
+        .retention_pin_token = pin->token,
+    };
+    return 0;
+}
+
+typedef struct tlc_cold_resync_read {
+    uint64_t expected_seq;
+    uint64_t end_seq;
+    uint32_t max_events;
+    uint32_t event_count;
+    bool limit_reached;
+    bool range_complete;
+    tlc_cold_replay_fn callback;
+    void *arg;
+} tlc_cold_resync_read_t;
+
+static int cold_resync_read_callback(const tlc_cold_event_input_t *input,
+                                     uint64_t seq,
+                                     void *arg) {
+    tlc_cold_resync_read_t *read = arg;
+    if (seq < read->expected_seq)
+        return 0;
+    if (seq > read->end_seq) {
+        if (read->expected_seq == read->end_seq + 1u) {
+            read->range_complete = true;
+            return TLC_COLD_REPLAY_STOP;
+        }
+        return TLC_COLD_RESYNC_REQUIRED;
+    }
+    if (seq != read->expected_seq)
+        return TLC_COLD_RESYNC_REQUIRED;
+    int rc = read->callback(input, seq, read->arg);
+    if (rc != 0)
+        return rc;
+    read->event_count++;
+    read->expected_seq++;
+    if (read->event_count == read->max_events &&
+        read->expected_seq <= read->end_seq) {
+        read->limit_reached = true;
+        return TLC_COLD_REPLAY_STOP;
+    }
+    return 0;
+}
+
+int tlc_cold_read_resync_snapshot(
+    tlc_cold_t *cold,
+    const tlc_cold_resync_snapshot_t *snapshot,
+    uint64_t *next_seq,
+    uint32_t max_events,
+    tlc_cold_replay_fn callback,
+    void *arg,
+    uint32_t *event_count) {
+    RETURN_IF(!cold || !snapshot || !next_seq || !callback || !event_count ||
+              max_events == 0 || snapshot->tail_start_seq == 0 ||
+              snapshot->durable_boundary_seq == UINT64_MAX, -1);
+    *event_count = 0;
+    if (*next_seq < snapshot->tail_start_seq ||
+        *next_seq > snapshot->durable_boundary_seq + 1u) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    tlc_cold_resync_pin_t *pin = cold_find_resync_pin_locked(
+        cold, snapshot->retention_pin_token);
+    int active = pin && pin->from_seq == snapshot->tail_start_seq;
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    if (!active) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (*next_seq == snapshot->durable_boundary_seq + 1u)
+        return 0;
+
+    tlc_cold_resync_read_t read = {
+        .expected_seq = *next_seq,
+        .end_seq = snapshot->durable_boundary_seq,
+        .max_events = max_events,
+        .callback = callback,
+        .arg = arg,
+    };
+    int rc = cold_replay_internal(cold, NULL, 0, read.expected_seq,
+                                  cold_resync_read_callback, &read);
+    if (rc == TLC_COLD_REPLAY_STOP &&
+        (read.limit_reached || read.range_complete))
+        rc = 0;
+    if (rc == 0 && read.expected_seq != snapshot->durable_boundary_seq + 1u &&
+        !read.limit_reached) {
+        errno = ENODATA;
+        rc = TLC_COLD_RESYNC_REQUIRED;
+    }
+    if (rc == 0) {
+        *next_seq = read.expected_seq;
+        *event_count = read.event_count;
+    }
+    return rc;
+}
+
+void tlc_cold_end_resync_snapshot(
+    tlc_cold_t *cold,
+    tlc_cold_resync_snapshot_t *snapshot) {
+    if (!cold || !snapshot)
+        return;
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    tlc_cold_resync_pin_t **link = &cold->resync_pins;
+    while (*link && (*link)->token != snapshot->retention_pin_token)
+        link = &(*link)->next;
+    if (*link) {
+        tlc_cold_resync_pin_t *pin = *link;
+        *link = pin->next;
+        zfree(pin);
+    }
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    tlc_cold_free_checkpoint_blob(snapshot->checkpoint_blob);
+    zfree(snapshot->captured_seq);
+    *snapshot = (tlc_cold_resync_snapshot_t){0};
+}
+
+int tlc_cold_extend_resync_snapshot(tlc_cold_t *cold,
+                                    tlc_cold_resync_snapshot_t *snapshot,
+                                    uint64_t durable_boundary_seq) {
+    RETURN_IF(!cold || !snapshot || snapshot->retention_pin_token == 0, -1);
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    tlc_cold_resync_pin_t *pin = cold_find_resync_pin_locked(
+        cold, snapshot->retention_pin_token);
+    pthread_mutex_lock(&cold->io_mu);
+    uint64_t durable = atomic_load_explicit(&cold->durable_seq,
+                                            memory_order_acquire);
+    pthread_mutex_unlock(&cold->io_mu);
+    if (!pin || pin->from_seq != snapshot->tail_start_seq ||
+        durable_boundary_seq < snapshot->durable_boundary_seq ||
+        durable_boundary_seq > durable) {
+        pthread_mutex_unlock(&cold->checkpoint_mu);
+        errno = EINVAL;
+        return -1;
+    }
+    snapshot->durable_boundary_seq = durable_boundary_seq;
     pthread_mutex_unlock(&cold->checkpoint_mu);
     return 0;
 }
@@ -2299,6 +2908,156 @@ int tlc_cold_import_checkpoint(tlc_cold_t *cold,
     return 0;
 }
 
+static int cold_validate_checkpoint_file(int fd,
+                                         uint32_t expected_meta_shard_count,
+                                         size_t blob_bytes,
+                                         tlc_cold_checkpoint_header_t *header) {
+    if (blob_bytes < sizeof(*header) ||
+        cold_pread_full(fd, header, sizeof(*header), 0) != 0)
+        return -1;
+    if (header->magic != TLC_COLD_CHECKPOINT_MAGIC ||
+        header->format_version != TLC_COLD_CHECKPOINT_VERSION ||
+        header->header_bytes != sizeof(*header) || header->generation == 0 ||
+        header->meta_shard_count != expected_meta_shard_count ||
+        header->record_count != expected_meta_shard_count) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint8_t buffer[65536];
+    XXH3_state_t *generation_checksum = XXH3_createState();
+    XXH3_state_t *record_checksum = XXH3_createState();
+    if (!generation_checksum || !record_checksum) {
+        if (generation_checksum)
+            XXH3_freeState(generation_checksum);
+        if (record_checksum)
+            XXH3_freeState(record_checksum);
+        return -1;
+    }
+    XXH3_64bits_reset(generation_checksum);
+    XXH3_64bits_update(generation_checksum, header,
+                       offsetof(tlc_cold_checkpoint_header_t,
+                                generation_checksum));
+    uint64_t offset = sizeof(*header);
+    uint64_t checkpoint_seq = UINT64_MAX;
+    int rc = 0;
+    for (uint32_t i = 0; i < expected_meta_shard_count; i++) {
+        tlc_cold_checkpoint_record_header_t record_header;
+        if (blob_bytes - offset < sizeof(record_header) ||
+            cold_pread_full(fd, &record_header, sizeof(record_header),
+                            offset) != 0) {
+            rc = -1;
+            break;
+        }
+        offset += sizeof(record_header);
+        if (record_header.meta_shard_id != i ||
+            record_header.captured_seq < header->checkpoint_seq ||
+            record_header.state_len > blob_bytes - offset) {
+            rc = -1;
+            break;
+        }
+        XXH3_64bits_reset(record_checksum);
+        XXH3_64bits_update(generation_checksum, &record_header,
+                           sizeof(record_header));
+        uint32_t state_remaining = record_header.state_len;
+        while (state_remaining != 0) {
+            size_t chunk = state_remaining < sizeof(buffer) ?
+                state_remaining : sizeof(buffer);
+            if (cold_pread_full(fd, buffer, chunk, offset) != 0) {
+                rc = -1;
+                break;
+            }
+            XXH3_64bits_update(record_checksum, buffer, chunk);
+            XXH3_64bits_update(generation_checksum, buffer, chunk);
+            offset += chunk;
+            state_remaining -= (uint32_t)chunk;
+        }
+        if (rc != 0 || (uint64_t)XXH3_64bits_digest(record_checksum) !=
+                           record_header.state_checksum) {
+            rc = -1;
+            break;
+        }
+        if (record_header.captured_seq < checkpoint_seq)
+            checkpoint_seq = record_header.captured_seq;
+    }
+    if (rc == 0 && (offset != blob_bytes ||
+                    checkpoint_seq != header->checkpoint_seq ||
+                    (uint64_t)XXH3_64bits_digest(generation_checksum) !=
+                        header->generation_checksum))
+        rc = -1;
+    XXH3_freeState(generation_checksum);
+    XXH3_freeState(record_checksum);
+    if (rc != 0 && errno == 0)
+        errno = EINVAL;
+    return rc;
+}
+
+int tlc_cold_import_checkpoint_file(tlc_cold_t *cold,
+                                    uint32_t expected_meta_shard_count,
+                                    int fd,
+                                    const char *artifact_path,
+                                    size_t blob_bytes,
+                                    tlc_cold_checkpoint_result_t *result) {
+    RETURN_IF(!cold || fd < 0 || !artifact_path || !result ||
+              expected_meta_shard_count == 0 || blob_bytes == 0, -1);
+    tlc_cold_checkpoint_header_t header;
+    if (cold_validate_checkpoint_file(fd, expected_meta_shard_count,
+                                      blob_bytes, &header) != 0) {
+        serverLog(LL_WARNING,
+                  "COLD checkpoint file import validation failed: errno=%d (%s)",
+                  errno, strerror(errno));
+        return -1;
+    }
+
+    pthread_mutex_lock(&cold->checkpoint_mu);
+    tlc_cold_checkpoint_manifest_t manifest;
+    int manifest_rc = cold_read_checkpoint_manifest(cold, &manifest);
+    pthread_mutex_lock(&cold->replica_mu);
+    pthread_mutex_lock(&cold->io_mu);
+    uint64_t appended = atomic_load_explicit(&cold->appended_seq,
+                                             memory_order_acquire);
+    uint64_t durable = atomic_load_explicit(&cold->durable_seq,
+                                            memory_order_acquire);
+    int empty = appended == 0 && durable == 0 && cold->next_seq == 1;
+    pthread_mutex_unlock(&cold->io_mu);
+    pthread_mutex_unlock(&cold->replica_mu);
+    if (manifest_rc != 1 || !empty) {
+        errno = manifest_rc == 0 || !empty ? EBUSY : EINVAL;
+        pthread_mutex_unlock(&cold->checkpoint_mu);
+        return -1;
+    }
+
+    char final_path[4096];
+    if (cold_make_checkpoint_path(cold, header.generation, "", final_path,
+                                  sizeof(final_path)) != 0) {
+        pthread_mutex_unlock(&cold->checkpoint_mu);
+        return -1;
+    }
+    int existing_fd = open(final_path, O_RDONLY);
+    if (existing_fd >= 0 || errno != ENOENT) {
+        if (existing_fd >= 0)
+            close(existing_fd);
+        pthread_mutex_unlock(&cold->checkpoint_mu);
+        return -1;
+    }
+    if (tlc_cold_set_replica_base_seq(cold, header.checkpoint_seq) != 0 ||
+        COLD_CHECKPOINT_FAIL(cold, TLC_COLD_CHECKPOINT_FAIL_FILE_RENAME) != 0 ||
+        rename(artifact_path, final_path) != 0 ||
+        COLD_CHECKPOINT_FAIL(
+            cold, TLC_COLD_CHECKPOINT_FAIL_FILE_DIRECTORY_FSYNC) != 0 ||
+        cold_fsync_directory(cold) != 0 ||
+        cold_fsync_parent_directory(artifact_path) != 0 ||
+        cold_publish_checkpoint_manifest_locked(cold, &header, result) != 0) {
+        serverLog(LL_WARNING,
+                  "COLD checkpoint file import publish failed: generation=%llu errno=%d (%s)",
+                  (unsigned long long)header.generation, errno, strerror(errno));
+        pthread_mutex_unlock(&cold->checkpoint_mu);
+        return -1;
+    }
+    pthread_mutex_unlock(&cold->checkpoint_mu);
+    return 0;
+}
+
 void tlc_cold_free_checkpoint_blob(void *blob) {
     zfree(blob);
 }
@@ -2380,6 +3139,7 @@ int tlc_cold_set_replica_base_seq(tlc_cold_t *cold, uint64_t base_seq) {
         return -1;
     }
     cold->next_seq = base_seq + 1;
+    cold->retained_floor_seq = 0;
     atomic_store_explicit(&cold->appended_seq, base_seq,
                           memory_order_release);
     atomic_store_explicit(&cold->durable_seq, base_seq,
@@ -2471,6 +3231,12 @@ int tlc_cold_compact(tlc_cold_t *cold,
     }
     compact_through = retained_floor_seq < ha_safe_point_seq ?
         retained_floor_seq : ha_safe_point_seq;
+    for (tlc_cold_resync_pin_t *pin = cold->resync_pins; pin;
+         pin = pin->next) {
+        uint64_t pin_through = pin->from_seq - 1u;
+        if (pin_through < compact_through)
+            compact_through = pin_through;
+    }
     pthread_mutex_lock(&cold->io_mu);
     int rc = 0;
     uint64_t active_segment = atomic_load_explicit(&cold->segment_id,

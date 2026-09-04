@@ -71,6 +71,8 @@ static int ha_configure_ring(tlc_ha_replica_ring_config_t *ring,
 }
 
 static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
+    /* TODO(HA control plane): add role/term transitions only with explicit
+     * fencing. M6 deliberately uses a deployment-fixed Leader/Follower role. */
     const char *role = getenv("HPC_REDIS_HA_ROLE");
     if (!role || !*role)
         return 0;
@@ -114,6 +116,8 @@ static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
         .hpc_node_id = node_id,
         .peer_node_id = peer_node_id,
         .ha_term = ha_term,
+        .topology_epoch = 1,
+        .resync_chunk_bytes = 32768,
         .heartbeat_interval_ms = 100,
         .heartbeat_timeout_ms = 3000,
     };
@@ -136,6 +140,16 @@ static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
         config.heartbeat_interval_ms = heartbeat_interval_ms;
         config.heartbeat_timeout_ms = heartbeat_interval_ms * 3u;
     }
+    if (getenv("HPC_REDIS_HA_TOPOLOGY_EPOCH") &&
+        (ha_env_u64("HPC_REDIS_HA_TOPOLOGY_EPOCH",
+                    &config.topology_epoch) != 0 ||
+         config.topology_epoch == 0))
+        return -1;
+    if (getenv("HPC_REDIS_HA_RESYNC_CHUNK_BYTES") &&
+        (ha_env_u32("HPC_REDIS_HA_RESYNC_CHUNK_BYTES",
+                    &config.resync_chunk_bytes) != 0 ||
+         config.resync_chunk_bytes == 0))
+        return -1;
     if (tlc_ha_replica_start(&g_vemb_ha_replica, &config) != 0) {
         serverLog(LL_WARNING, "HA Replica startup failed: role=%s node=%llu peer=%llu",
                   role, (unsigned long long)node_id,
@@ -143,11 +157,12 @@ static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
         return -1;
     }
     serverLog(LL_NOTICE,
-              "HA Replica started: role=%s node=%llu peer=%llu term=%llu "
+              "HA Replica started: role=%s node=%llu peer=%llu term=%llu epoch=%llu "
               "tx=%s@%llu rx=%s@%llu",
               role, (unsigned long long)node_id,
               (unsigned long long)peer_node_id,
               (unsigned long long)ha_term,
+              (unsigned long long)config.topology_epoch,
               config.tx_ring.path,
               (unsigned long long)config.tx_ring.mmap_offset,
               config.rx_ring.path,
