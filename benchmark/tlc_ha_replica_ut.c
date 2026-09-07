@@ -169,6 +169,46 @@ static void node_free(test_node_t *node) {
     zfree(node->region);
 }
 
+static _Atomic uint32_t test_ring_counter = 0;
+
+typedef struct test_ub_rings {
+    char tx_path[64];
+    char rx_path[64];
+    tlc_ha_replica_ring_config_t tx;
+    tlc_ha_replica_ring_config_t rx;
+} test_ub_rings_t;
+
+static int test_ub_rings_create(test_ub_rings_t *out) {
+    uint32_t id = atomic_fetch_add(&test_ring_counter, 1);
+    snprintf(out->tx_path, sizeof(out->tx_path), "/tlc-ha-ut-tx-%u-%u",
+             (unsigned)getpid(), id);
+    snprintf(out->rx_path, sizeof(out->rx_path), "/tlc-ha-ut-rx-%u-%u",
+             (unsigned)getpid(), id);
+    tlc_ha_replica_ring_config_t ring = {
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+        .slot_count = 8,
+        .slot_bytes = 131072,
+        .mmap_offset = 0,
+    };
+    snprintf(ring.path, sizeof(ring.path), "%s", out->tx_path);
+    if (tlc_ha_replica_reset_ring(&ring) != 0)
+        return -1;
+    out->tx = ring;
+    snprintf(ring.path, sizeof(ring.path), "%s", out->rx_path);
+    if (tlc_ha_replica_reset_ring(&ring) != 0) {
+        shm_unlink(out->tx_path);
+        return -1;
+    }
+    out->rx = ring;
+    return 0;
+}
+
+static void test_ub_rings_destroy(test_ub_rings_t *rings) {
+    shm_unlink(rings->tx_path);
+    shm_unlink(rings->rx_path);
+}
+
 static tlc_ha_resync_snapshot_begin_t test_snapshot_begin(
         uint64_t session_id, const void *blob, size_t blob_bytes) {
     return (tlc_ha_resync_snapshot_begin_t){
@@ -365,12 +405,15 @@ static void run_automatic_retention_maintenance_test(void) {
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     tlc_ha_replica_config_t config = {
         .core = leader.core,
         .cold = leader.cold,
-        .fd = sockets[0],
+        .control_fd = sockets[0],
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
         .queue_capacity = 32,
         .max_batch_events = 8,
         .max_batch_bytes = 65536,
@@ -401,6 +444,7 @@ static void run_automatic_retention_maintenance_test(void) {
 
     tlc_ha_replica_stop(replica);
     close(sockets[1]);
+    test_ub_rings_destroy(&rings);
     node_free(&leader);
 }
 
@@ -424,12 +468,15 @@ static void run_retention_pressure_abort_test(void) {
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     tlc_ha_replica_config_t config = {
         .core = leader.core,
         .cold = leader.cold,
-        .fd = sockets[0],
+        .control_fd = sockets[0],
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
         .queue_capacity = 32,
         .max_batch_events = 8,
         .max_batch_bytes = 65536,
@@ -467,10 +514,11 @@ static void run_retention_pressure_abort_test(void) {
 
     tlc_ha_replica_stop(replica);
     close(sockets[1]);
+    test_ub_rings_destroy(&rings);
     node_free(&leader);
 }
 
-static void run_network_test(tlc_ha_replica_transport_t transport) {
+static void run_network_test(void) {
     char leader_dir[] = "/tmp/tlc-ha-leader-XXXXXX";
     char follower_dir[] = "/tmp/tlc-ha-follower-XXXXXX";
     assert(mkdtemp(leader_dir) && mkdtemp(follower_dir));
@@ -479,54 +527,19 @@ static void run_network_test(tlc_ha_replica_transport_t transport) {
     node_init(&leader, 101, leader_dir);
     node_init(&follower, 102, follower_dir);
 
-    int sockets[2] = {-1, -1};
-    char ub_path[128] = {0};
-    int ub_device = 0;
-    const char *tx_offset_text = getenv("TLC_HA_UB_TX_OFFSET");
-    const char *rx_offset_text = getenv("TLC_HA_UB_RX_OFFSET");
-    const uint64_t tx_offset = tx_offset_text ? strtoull(tx_offset_text, NULL, 0) : 0;
-    const uint64_t rx_offset = rx_offset_text ? strtoull(rx_offset_text, NULL, 0) :
-                               (UINT64_C(2) << 20);
-    if (transport == TLC_HA_REPLICA_TRANSPORT_STREAM) {
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    } else {
-        const char *configured_path = getenv("TLC_HA_UB_PATH");
-        ub_device = configured_path && configured_path[0] != '\0';
-        snprintf(ub_path, sizeof(ub_path), "%s", ub_device ?
-                 configured_path : "/tlc-ha-ub-local");
-        tlc_ha_replica_ring_config_t ring = {
-            .backend_type = ub_device ? VEMB_V16_REGION_UB :
-                                        VEMB_V16_REGION_LOCAL_SHM,
-            .cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
-            .slot_count = 8,
-            .slot_bytes = 131072,
-        };
-        snprintf(ring.path, sizeof(ring.path), "%s", ub_path);
-        ring.mmap_offset = tx_offset;
-        if (tlc_ha_replica_reset_ring(&ring) != 0) {
-            if (!ub_device)
-                shm_unlink(ub_path);
-            node_free(&leader);
-            node_free(&follower);
-            return;
-        }
-        ring.mmap_offset = rx_offset;
-        if (tlc_ha_replica_reset_ring(&ring) != 0) {
-            if (!ub_device)
-                shm_unlink(ub_path);
-            node_free(&leader);
-            node_free(&follower);
-            return;
-        }
-    }
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     tlc_ha_replica_t *leader_replica = NULL;
     tlc_ha_replica_t *follower_replica = NULL;
     tlc_ha_replica_config_t leader_config = {
         .core = leader.core,
         .cold = leader.cold,
-        .fd = sockets[0],
+        .control_fd = sockets[0],
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = transport,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
         .queue_capacity = 32,
         .max_batch_events = 8,
         .max_batch_bytes = 65536,
@@ -537,36 +550,33 @@ static void run_network_test(tlc_ha_replica_transport_t transport) {
         .heartbeat_timeout_ms = 100,
         .resync_timeout_ms = 200,
     };
-    if (transport == TLC_HA_REPLICA_TRANSPORT_UB) {
-        leader_config.tx_ring.backend_type = ub_device ? VEMB_V16_REGION_UB :
-                                               VEMB_V16_REGION_LOCAL_SHM;
-        leader_config.tx_ring.cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
-        leader_config.tx_ring.slot_count = 8;
-        leader_config.tx_ring.slot_bytes = 131072;
-        leader_config.tx_ring.mmap_offset = tx_offset;
-        snprintf(leader_config.tx_ring.path, sizeof(leader_config.tx_ring.path),
-                 "%s", ub_path);
-        leader_config.rx_ring = leader_config.tx_ring;
-        leader_config.rx_ring.mmap_offset = rx_offset;
-        snprintf(leader_config.rx_ring.path, sizeof(leader_config.rx_ring.path),
-                 "%s", ub_path);
-    }
     tlc_ha_replica_config_t follower_config = leader_config;
     follower_config.core = follower.core;
-    follower_config.fd = sockets[1];
+    follower_config.control_fd = sockets[1];
     follower_config.role = TLC_HA_REPLICA_FOLLOWER;
     follower_config.cold = follower.cold;
     follower_config.hpc_node_id = 112;
     follower_config.peer_node_id = 111;
-    if (transport == TLC_HA_REPLICA_TRANSPORT_UB) {
-        follower_config.tx_ring = leader_config.rx_ring;
-        follower_config.rx_ring = leader_config.tx_ring;
-    }
+    follower_config.tx_ring = rings.rx;
+    follower_config.rx_ring = rings.tx;
     assert(tlc_ha_replica_start(&follower_replica, &follower_config) == 0);
     /* A restarted Follower can wait for a replay before a Leader attaches.
      * Its apply worker must not interpret the empty initial queue as EOF. */
     usleep(2000);
     assert(tlc_ha_replica_start(&leader_replica, &leader_config) == 0);
+    /* Re-announce the current owner to exercise the M10 control path without
+     * changing the term used by the resync fixtures below. */
+    assert(tlc_ha_replica_transition_role(leader_replica,
+                                          TLC_HA_REPLICA_LEADER,
+                                          TLC_HA_REPLICA_STATE_MASTER, 7) == 0);
+    for (uint32_t i = 0; i < 100 &&
+         !tlc_ha_replica_leader_announce_acked(leader_replica); i++)
+        usleep(1000);
+    assert(tlc_ha_replica_leader_announce_acked(leader_replica));
+    assert(tlc_ha_replica_role(follower_replica) ==
+           TLC_HA_REPLICA_FOLLOWER);
+    assert(tlc_ha_replica_ha_state(follower_replica) ==
+           TLC_HA_REPLICA_STATE_BACKUP);
 
     enum { RESYNC_BLOB_BYTES = 200000 };
     uint8_t *resync_blob = zmalloc(RESYNC_BLOB_BYTES);
@@ -713,12 +723,9 @@ static void run_network_test(tlc_ha_replica_transport_t transport) {
     usleep(20000);
     tlc_ha_replica_stop(leader_replica);
     tlc_ha_replica_stop(follower_replica);
+    test_ub_rings_destroy(&rings);
     node_free(&leader);
     node_free(&follower);
-    if (transport == TLC_HA_REPLICA_TRANSPORT_UB) {
-        if (!ub_device)
-            shm_unlink(ub_path);
-    }
 }
 
 static void run_automatic_gap_resync_test(void) {
@@ -729,6 +736,7 @@ static void run_automatic_gap_resync_test(void) {
     test_node_t follower = {0};
     node_init(&leader, 109, leader_dir);
     node_init(&follower, 110, follower_dir);
+    assert(tlc_core_set_ha_term(leader.core, 7) == 0);
 
     const char *first_key = "auto-gap-first";
     const char *second_key = "auto-gap-second";
@@ -747,12 +755,15 @@ static void run_automatic_gap_resync_test(void) {
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     tlc_ha_replica_config_t leader_config = {
         .core = leader.core,
         .cold = leader.cold,
-        .fd = sockets[0],
+        .control_fd = sockets[0],
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
         .queue_capacity = 32,
         .max_batch_events = 8,
         .max_batch_bytes = 65536,
@@ -767,10 +778,12 @@ static void run_automatic_gap_resync_test(void) {
     tlc_ha_replica_config_t follower_config = leader_config;
     follower_config.core = follower.core;
     follower_config.cold = follower.cold;
-    follower_config.fd = sockets[1];
+    follower_config.control_fd = sockets[1];
     follower_config.role = TLC_HA_REPLICA_FOLLOWER;
     follower_config.hpc_node_id = 112;
     follower_config.peer_node_id = 111;
+    follower_config.tx_ring = rings.rx;
+    follower_config.rx_ring = rings.tx;
     tlc_ha_replica_t *leader_replica = NULL;
     tlc_ha_replica_t *follower_replica = NULL;
     assert(tlc_ha_replica_start(&follower_replica, &follower_config) == 0);
@@ -792,6 +805,7 @@ static void run_automatic_gap_resync_test(void) {
     assert(wait_for_value(follower.core, third_key, third_value));
     tlc_ha_replica_stop(leader_replica);
     tlc_ha_replica_stop(follower_replica);
+    test_ub_rings_destroy(&rings);
     node_free(&leader);
     node_free(&follower);
 }
@@ -826,12 +840,15 @@ static void run_automatic_retention_resync_test(void) {
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     tlc_ha_replica_config_t leader_config = {
         .core = leader.core,
         .cold = leader.cold,
-        .fd = sockets[0],
+        .control_fd = sockets[0],
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
         .queue_capacity = 32,
         .max_batch_events = 8,
         .max_batch_bytes = 65536,
@@ -846,10 +863,12 @@ static void run_automatic_retention_resync_test(void) {
     tlc_ha_replica_config_t follower_config = leader_config;
     follower_config.core = follower.core;
     follower_config.cold = follower.cold;
-    follower_config.fd = sockets[1];
+    follower_config.control_fd = sockets[1];
     follower_config.role = TLC_HA_REPLICA_FOLLOWER;
     follower_config.hpc_node_id = 112;
     follower_config.peer_node_id = 111;
+    follower_config.tx_ring = rings.rx;
+    follower_config.rx_ring = rings.tx;
     tlc_ha_replica_t *leader_replica = NULL;
     tlc_ha_replica_t *follower_replica = NULL;
     assert(tlc_ha_replica_start(&follower_replica, &follower_config) == 0);
@@ -862,20 +881,26 @@ static void run_automatic_retention_resync_test(void) {
                         sizeof(value), &slot) == 0);
     assert(wait_for_value(follower.core, key, value));
     assert(wait_for_cold_durable(follower.cold, 98));
+    for (uint32_t attempt = 0; attempt < 10000 &&
+         tlc_ha_replica_peer_accepted_seq(leader_replica) < 98; attempt++)
+        usleep(1000);
     assert(tlc_ha_replica_peer_accepted_seq(leader_replica) >= 98);
     tlc_ha_replica_stop(leader_replica);
     tlc_ha_replica_stop(follower_replica);
+    test_ub_rings_destroy(&rings);
     node_free(&leader);
     node_free(&follower);
 }
 
-static tlc_ha_replica_t *start_heartbeat_probe(test_node_t *node, int fd) {
+static tlc_ha_replica_t *start_heartbeat_probe(test_node_t *node, int fd,
+                                                test_ub_rings_t *rings) {
     tlc_ha_replica_config_t config = {
         .core = node->core,
         .cold = node->cold,
-        .fd = fd,
+        .control_fd = fd,
         .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .tx_ring = rings->tx,
+        .rx_ring = rings->rx,
         .queue_capacity = 8,
         .max_batch_events = 4,
         .max_batch_bytes = 4096,
@@ -884,6 +909,36 @@ static tlc_ha_replica_t *start_heartbeat_probe(test_node_t *node, int fd) {
         .ha_term = 7,
         .heartbeat_interval_ms = 10,
         .heartbeat_timeout_ms = 50,
+        .heartbeat_failure_threshold = 3,
+        .heartbeat_backoff_max_ms = 20,
+        .heartbeat_suspect_hold_down_ms = 20,
+    };
+    tlc_ha_replica_t *replica = NULL;
+    assert(tlc_ha_replica_start(&replica, &config) == 0);
+    return replica;
+}
+
+static tlc_ha_replica_t *start_follower_heartbeat_probe(test_node_t *node,
+                                                         int fd,
+                                                         test_ub_rings_t *rings) {
+    tlc_ha_replica_config_t config = {
+        .core = node->core,
+        .cold = node->cold,
+        .control_fd = fd,
+        .role = TLC_HA_REPLICA_FOLLOWER,
+        .tx_ring = rings->tx,
+        .rx_ring = rings->rx,
+        .queue_capacity = 4,
+        .max_batch_events = 4,
+        .max_batch_bytes = 4096,
+        .hpc_node_id = 112,
+        .peer_node_id = 111,
+        .ha_term = 7,
+        .heartbeat_interval_ms = 10,
+        .heartbeat_timeout_ms = 50,
+        .heartbeat_failure_threshold = 3,
+        .heartbeat_backoff_max_ms = 20,
+        .heartbeat_suspect_hold_down_ms = 20,
     };
     tlc_ha_replica_t *replica = NULL;
     assert(tlc_ha_replica_start(&replica, &config) == 0);
@@ -898,7 +953,10 @@ static void run_heartbeat_error_tests(void) {
         node_init(&node, 103, directory);
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0]);
+        test_ub_rings_t rings;
+        assert(test_ub_rings_create(&rings) == 0);
+        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0],
+                                                          &rings);
         test_send_heartbeat(sockets[1], 112, 111, 7, 9, 8, 0);
         test_send_heartbeat(sockets[1], 112, 111, 7, 3, 2, 0);
         tlc_ha_replica_progress_t progress;
@@ -911,6 +969,7 @@ static void run_heartbeat_error_tests(void) {
         assert(progress.peer_durable_seq == 9);
         tlc_ha_replica_stop(replica);
         close(sockets[1]);
+        test_ub_rings_destroy(&rings);
         node_free(&node);
     }
 
@@ -921,7 +980,10 @@ static void run_heartbeat_error_tests(void) {
         node_init(&node, 104 + case_id, directory);
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0]);
+        test_ub_rings_t rings;
+        assert(test_ub_rings_create(&rings) == 0);
+        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0],
+                                                          &rings);
         if (case_id == 0)
             test_send_heartbeat(sockets[1], 112, 111, 6, 4, 4, 0);
         else if (case_id == 1)
@@ -933,6 +995,7 @@ static void run_heartbeat_error_tests(void) {
                TLC_HA_REPLICA_HEALTHY);
         tlc_ha_replica_stop(replica);
         close(sockets[1]);
+        test_ub_rings_destroy(&rings);
         node_free(&node);
     }
 
@@ -943,10 +1006,25 @@ static void run_heartbeat_error_tests(void) {
         node_init(&node, 108, directory);
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0]);
+        test_ub_rings_t rings;
+        assert(test_ub_rings_create(&rings) == 0);
+        tlc_ha_replica_t *replica = start_heartbeat_probe(&node, sockets[0],
+                                                          &rings);
+        for (uint32_t i = 0; i < 100 &&
+             tlc_ha_replica_heartbeat_missed_count(replica) == 0; i++)
+            usleep(1000);
+        assert(tlc_ha_replica_heartbeat_missed_count(replica) == 1);
+        assert(tlc_ha_replica_ha_state(replica) ==
+               TLC_HA_REPLICA_STATE_SUSPECT);
+        assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
         usleep(100000);
         assert(tlc_ha_replica_peer_health(replica) ==
                TLC_HA_REPLICA_UNAVAILABLE);
+        assert(!tlc_ha_replica_peer_liveness(replica));
+        assert(tlc_ha_replica_ha_state(replica) ==
+               TLC_HA_REPLICA_STATE_SUSPECT);
+        assert(tlc_ha_replica_heartbeat_missed_count(replica) >= 3);
+        assert(tlc_ha_replica_heartbeat_failure_pending(replica));
         test_send_heartbeat(sockets[1], 112, 111, 7, 1, 1, 0);
         for (uint32_t i = 0; i < 100 &&
              tlc_ha_replica_peer_health(replica) !=
@@ -954,22 +1032,178 @@ static void run_heartbeat_error_tests(void) {
             usleep(1000);
         assert(tlc_ha_replica_peer_health(replica) ==
                TLC_HA_REPLICA_HEALTHY);
+        for (uint32_t i = 0; i < 100 &&
+             !tlc_ha_replica_peer_liveness(replica); i++)
+            usleep(1000);
+        assert(tlc_ha_replica_peer_liveness(replica));
+        assert(tlc_ha_replica_heartbeat_missed_count(replica) == 0);
+        assert(tlc_ha_replica_ha_state(replica) ==
+               TLC_HA_REPLICA_STATE_MASTER);
+        assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
         tlc_ha_replica_stop(replica);
         close(sockets[1]);
+        test_ub_rings_destroy(&rings);
         node_free(&node);
     }
+}
+
+static void run_stream_reconnect_test(void) {
+    char directory[] = "/tmp/tlc-ha-reconnect-XXXXXX";
+    assert(mkdtemp(directory));
+    test_node_t node = {0};
+    node_init(&node, 113, directory);
+    int old_sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, old_sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
+    tlc_ha_replica_t *replica = start_heartbeat_probe(&node, old_sockets[0],
+                                                      &rings);
+    close(old_sockets[1]);
+    usleep(30000);
+
+    int new_sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, new_sockets) == 0);
+    assert(tlc_ha_replica_reconnect(replica, new_sockets[0], 2) == 0);
+    assert(tlc_ha_replica_connection_epoch(replica) == 2);
+    test_send_heartbeat(new_sockets[1], 112, 111, 7, 1, 1, 0);
+    for (uint32_t i = 0; i < 100 &&
+         !tlc_ha_replica_peer_liveness(replica); i++)
+        usleep(1000);
+    assert(tlc_ha_replica_peer_liveness(replica));
+
+    tlc_ha_replica_stop(replica);
+    close(new_sockets[1]);
+    test_ub_rings_destroy(&rings);
+    node_free(&node);
+}
+
+static void run_automatic_promotion_test(void) {
+    char directory[] = "/tmp/tlc-ha-auto-promotion-XXXXXX";
+    assert(mkdtemp(directory));
+    test_node_t node = {0};
+    node_init(&node, 114, directory);
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
+    tlc_ha_replica_t *replica = start_follower_heartbeat_probe(&node,
+                                                                sockets[0],
+                                                                &rings);
+    close(sockets[1]);
+    for (uint32_t i = 0; i < 500 &&
+         tlc_ha_replica_role(replica) != TLC_HA_REPLICA_LEADER; i++)
+        usleep(1000);
+    assert(tlc_ha_replica_role(replica) == TLC_HA_REPLICA_LEADER);
+    assert(tlc_ha_replica_ha_state(replica) == TLC_HA_REPLICA_STATE_MASTER);
+    assert(tlc_ha_replica_ha_term(replica) == 8);
+    assert(tlc_core_ha_term(node.core) == 8);
+    assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
+    assert(!tlc_ha_replica_leader_announce_acked(replica));
+    tlc_ha_replica_stop(replica);
+    test_ub_rings_destroy(&rings);
+    node_free(&node);
+}
+
+static void run_reconnect_leader_announce_test(void) {
+    char leader_dir[] = "/tmp/tlc-ha-reconnect-leader-XXXXXX";
+    char follower_dir[] = "/tmp/tlc-ha-reconnect-follower-XXXXXX";
+    assert(mkdtemp(leader_dir) && mkdtemp(follower_dir));
+    test_node_t leader = {0};
+    test_node_t follower = {0};
+    node_init(&leader, 115, leader_dir);
+    node_init(&follower, 116, follower_dir);
+    assert(tlc_core_set_ha_term(leader.core, 8) == 0);
+    const uint8_t recovered_first[VALUE_SIZE] = {4, 4, 4, 4, 4, 4, 4, 4};
+    const uint8_t recovered_second[VALUE_SIZE] = {5, 5, 5, 5, 5, 5, 5, 5};
+    uint32_t recovered_slot = 0;
+    assert(tlc_core_put(leader.core, "reconnect-first", 15,
+                        vemb_v16_xxh3_64("reconnect-first", 15),
+                        recovered_first, sizeof(recovered_first),
+                        &recovered_slot) == 0);
+    assert(tlc_core_put(leader.core, "reconnect-second", 16,
+                        vemb_v16_xxh3_64("reconnect-second", 16),
+                        recovered_second, sizeof(recovered_second),
+                        &recovered_slot) == 0);
+    assert(wait_for_cold_durable(leader.cold, 2));
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
+    tlc_ha_replica_config_t leader_config = {
+        .core = leader.core,
+        .cold = leader.cold,
+        .control_fd = sockets[0],
+        .role = TLC_HA_REPLICA_LEADER,
+        .tx_ring = rings.tx,
+        .rx_ring = rings.rx,
+        .queue_capacity = 8,
+        .max_batch_events = 4,
+        .max_batch_bytes = 4096,
+        .hpc_node_id = 111,
+        .peer_node_id = 112,
+        .ha_term = 8,
+        .heartbeat_interval_ms = 10,
+        .heartbeat_timeout_ms = 50,
+        .heartbeat_failure_threshold = 3,
+        .heartbeat_backoff_max_ms = 20,
+        .heartbeat_suspect_hold_down_ms = 20,
+    };
+    tlc_ha_replica_config_t follower_config = leader_config;
+    follower_config.core = follower.core;
+    follower_config.cold = follower.cold;
+    follower_config.control_fd = sockets[1];
+    follower_config.role = TLC_HA_REPLICA_FOLLOWER;
+    follower_config.hpc_node_id = 112;
+    follower_config.peer_node_id = 111;
+    follower_config.ha_term = 7;
+    follower_config.heartbeat_timeout_ms = 1000;
+    follower_config.heartbeat_failure_threshold = 1000;
+    follower_config.tx_ring = rings.rx;
+    follower_config.rx_ring = rings.tx;
+    tlc_ha_replica_t *leader_replica = NULL;
+    tlc_ha_replica_t *follower_replica = NULL;
+    assert(tlc_ha_replica_start(&leader_replica, &leader_config) == 0);
+    assert(tlc_ha_replica_start(&follower_replica, &follower_config) == 0);
+
+    shutdown(sockets[0], SHUT_RDWR);
+    shutdown(sockets[1], SHUT_RDWR);
+    usleep(100000);
+    int reconnect_sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, reconnect_sockets) == 0);
+    assert(tlc_ha_replica_reconnect(follower_replica,
+                                    reconnect_sockets[1], 2) == 0);
+    assert(tlc_ha_replica_reconnect(leader_replica,
+                                    reconnect_sockets[0], 2) == 0);
+    for (uint32_t i = 0; i < 100 &&
+         !tlc_ha_replica_leader_announce_acked(leader_replica); i++)
+        usleep(1000);
+    assert(tlc_ha_replica_role(leader_replica) == TLC_HA_REPLICA_LEADER);
+    assert(tlc_ha_replica_ha_state(leader_replica) ==
+           TLC_HA_REPLICA_STATE_MASTER);
+    assert(tlc_ha_replica_leader_announce_acked(leader_replica));
+    assert(wait_for_value(follower.core, "reconnect-first", recovered_first));
+    assert(wait_for_value(follower.core, "reconnect-second", recovered_second));
+    assert(tlc_core_ha_term(follower.core) == 8);
+
+    tlc_ha_replica_stop(leader_replica);
+    tlc_ha_replica_stop(follower_replica);
+    test_ub_rings_destroy(&rings);
+    node_free(&leader);
+    node_free(&follower);
 }
 
 int main(void) {
     assert(monotonicInit() != NULL);
     test_resync_snapshot_assembler();
-    run_network_test(TLC_HA_REPLICA_TRANSPORT_STREAM);
+    run_network_test();
     run_automatic_retention_maintenance_test();
     run_retention_pressure_abort_test();
     run_automatic_gap_resync_test();
     run_automatic_retention_resync_test();
-    run_network_test(TLC_HA_REPLICA_TRANSPORT_UB);
     run_heartbeat_error_tests();
+    run_stream_reconnect_test();
+    run_automatic_promotion_test();
+    run_reconnect_leader_announce_test();
     printf("tlc_ha_replica_ut: PASS\n");
     return 0;
 }

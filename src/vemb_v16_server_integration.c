@@ -55,6 +55,14 @@ static int ha_env_u32(const char *name, uint32_t *out) {
     return 0;
 }
 
+static int ha_env_u16(const char *name, uint16_t *out) {
+    uint32_t value = 0;
+    if (ha_env_u32(name, &value) != 0 || value == 0 || value > UINT16_MAX)
+        return -1;
+    *out = (uint16_t)value;
+    return 0;
+}
+
 static int ha_configure_ring(tlc_ha_replica_ring_config_t *ring,
                              const char *path_name,
                              const char *offset_name) {
@@ -104,12 +112,25 @@ static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
                   "HA Replica requires HPC_REDIS_COLD_DIR before server startup");
         return -1;
     }
+    const char *bind_host = getenv("HPC_REDIS_HA_CONTROL_BIND_HOST");
+    const char *peer_host = getenv("HPC_REDIS_HA_PEER_HOST");
+    uint16_t control_port = 0;
+    uint16_t peer_port = 0;
+    if (!bind_host || !*bind_host || !peer_host || !*peer_host ||
+        ha_env_u16("HPC_REDIS_HA_CONTROL_PORT", &control_port) != 0 ||
+        ha_env_u16("HPC_REDIS_HA_PEER_PORT", &peer_port) != 0) {
+        serverLog(LL_WARNING,
+                  "HA Replica requires control bind/peer host and ports");
+        return -1;
+    }
     tlc_ha_replica_config_t config = {
         .core = core,
         .cold = cold,
-        .fd = -1,
+        .control_bind_host = bind_host,
+        .control_bind_port = control_port,
+        .peer_advertised_host = peer_host,
+        .peer_control_port = peer_port,
         .role = replica_role,
-        .transport = TLC_HA_REPLICA_TRANSPORT_UB,
         /* Must fit the fixed 128 KiB UB Replica ring slots. */
         .max_batch_events = 32,
         .max_batch_bytes = 65536,

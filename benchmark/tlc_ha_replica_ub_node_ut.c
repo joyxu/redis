@@ -4,12 +4,15 @@
 #include "zmalloc.h"
 
 #include <assert.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 enum { VALUE_SIZE = 8, SLOT_COUNT = 32 };
@@ -282,6 +285,9 @@ int main(int argc, char **argv) {
         node_free(&node);
         return recovered ? 0 : 1;
     }
+    const uint64_t ha_term = 9;
+    if (leader_m6_gap || leader_m6_retention)
+        assert(tlc_core_set_ha_term(node.core, ha_term) == 0);
     if (leader_m6_gap) {
         /* Persist seq 1 before the sender exists, then only emit seq 2.
          * Do not publish a checkpoint: M6 GAP recovery must use retained AOF. */
@@ -294,19 +300,32 @@ int main(int argc, char **argv) {
             put_value(node.core, "ub-m6-retention-key", (uint8_t)seq);
         assert(wait_for_durable(cold, 96));
         tlc_cold_checkpoint_result_t checkpoint;
-        assert(tlc_core_publish_checkpoint(node.core, 96, 9, &checkpoint) == 0);
+        assert(tlc_core_publish_checkpoint(node.core, 96, ha_term, &checkpoint) == 0);
         put_value(node.core, "ub-m6-retention-key", 0x61);
         assert(wait_for_durable(cold, 97));
         assert(tlc_cold_compact(cold, checkpoint.checkpoint_seq,
                                 UINT64_MAX, 1) == 0);
     }
+    const char *bind_host = NULL;
+    const char *peer_host = NULL;
+    uint16_t control_port = 0;
+    const char *control_port_text = getenv("TLC_HA_UB_CONTROL_PORT");
+    if (control_port_text) {
+        control_port = (uint16_t)strtoul(control_port_text, NULL, 0);
+        assert(control_port != 0);
+        bind_host = getenv("TLC_HA_UB_BIND_HOST");
+        peer_host = getenv("TLC_HA_UB_PEER_HOST");
+        assert(bind_host && *bind_host && peer_host && *peer_host);
+    }
     tlc_ha_replica_config_t config = {
         .core = node.core,
         .cold = tlc_core_get_cold(node.core),
-        .fd = -1,
+        .control_bind_host = bind_host,
+        .control_bind_port = control_port,
+        .peer_advertised_host = peer_host,
+        .peer_control_port = control_port,
         .role = is_leader ?
             TLC_HA_REPLICA_LEADER : TLC_HA_REPLICA_FOLLOWER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_UB,
         .tx_ring = tx,
         .rx_ring = rx,
         .queue_capacity = 32,
@@ -314,7 +333,7 @@ int main(int argc, char **argv) {
         .max_batch_bytes = 65536,
         .hpc_node_id = is_leader ? 111 : 112,
         .peer_node_id = is_leader ? 112 : 111,
-        .ha_term = 9,
+        .ha_term = ha_term,
         .heartbeat_interval_ms = 20,
         .heartbeat_timeout_ms = 200,
     };

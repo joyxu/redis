@@ -41,6 +41,7 @@ NODE112_RX_PATH=$TLC_HA_NODE112_RX_PATH
 TX_OFFSET=$TLC_HA_UB_TX_OFFSET
 RX_OFFSET=$TLC_HA_UB_RX_OFFSET
 SERVER_PORT=${TLC_HA_REDIS_TCP_PORT:-6399}
+CONTROL_PORT=${TLC_HA_REDIS_TCP_CONTROL_PORT:-9737}
 DIM=${TLC_HA_REDIS_TCP_DIM:-16}
 EVENT_COUNT=${TLC_HA_REDIS_TCP_EVENT_COUNT:-10000}
 # The single local warm region reserves allocator metadata alongside payload;
@@ -137,9 +138,9 @@ write_manifest() {
 start_server() {
     local port=$1 host=$2 role=$3 node_id=$4 peer_id=$5 tx_path=$6 tx_offset=$7
     local rx_path=$8 rx_offset=$9 cold=${10} manifest=${11} pid_file=${12}
-    local log_file=${13} advertise_host=${14}
+    local log_file=${13} advertise_host=${14} peer_host=${15}
     remote "$port" "$host" \
-        "HPC_REDIS_COLD_DIR='$cold' HPC_REDIS_HA_ROLE='$role' HPC_REDIS_HA_NODE_ID='$node_id' HPC_REDIS_HA_PEER_NODE_ID='$peer_id' HPC_REDIS_HA_TERM=1 HPC_REDIS_HA_TX_PATH='$tx_path' HPC_REDIS_HA_TX_OFFSET='$tx_offset' HPC_REDIS_HA_RX_PATH='$rx_path' HPC_REDIS_HA_RX_OFFSET='$rx_offset' ./src/redis-server --port '$SERVER_PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport sniff --vemb-v16-tcp-host '$advertise_host' --vemb-v16-proxy-io-threads 1 --vemb-v16-supernode-workers 1 --daemonize yes --pidfile '$pid_file' --logfile '$log_file' --loglevel notice"
+        "HPC_REDIS_COLD_DIR='$cold' HPC_REDIS_HA_ROLE='$role' HPC_REDIS_HA_NODE_ID='$node_id' HPC_REDIS_HA_PEER_NODE_ID='$peer_id' HPC_REDIS_HA_TERM=1 HPC_REDIS_HA_CONTROL_BIND_HOST='$advertise_host' HPC_REDIS_HA_CONTROL_PORT='$CONTROL_PORT' HPC_REDIS_HA_PEER_HOST='$peer_host' HPC_REDIS_HA_PEER_PORT='$CONTROL_PORT' HPC_REDIS_HA_TX_PATH='$tx_path' HPC_REDIS_HA_TX_OFFSET='$tx_offset' HPC_REDIS_HA_RX_PATH='$rx_path' HPC_REDIS_HA_RX_OFFSET='$rx_offset' ./src/redis-server --port '$SERVER_PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport sniff --vemb-v16-tcp-host '$advertise_host' --vemb-v16-proxy-io-threads 1 --vemb-v16-supernode-workers 1 --daemonize yes --pidfile '$pid_file' --logfile '$log_file' --loglevel notice"
 }
 
 reset_rings() {
@@ -181,7 +182,7 @@ reset_rings
 start_server "$NODE112_PORT" "$NODE112_SSH" follower 112 111 \
              "$NODE112_TX_PATH" "$RX_OFFSET" "$NODE112_RX_PATH" "$TX_OFFSET" \
              "$NODE112_COLD" "$NODE112_MANIFEST" "$NODE112_PID" "$NODE112_LOG" \
-             "$NODE112_HOST"
+             "$NODE112_HOST" "$NODE111_HOST"
 wait_ready "$NODE112_PORT" "$NODE112_SSH" || {
     remote "$NODE112_PORT" "$NODE112_SSH" "cat '$NODE112_LOG'" >&2
     exit 1
@@ -191,7 +192,7 @@ printf '== start Leader and write through TCP SDK ==\n'
 start_server "$NODE111_PORT" "$NODE111_SSH" leader 111 112 \
              "$NODE111_TX_PATH" "$TX_OFFSET" "$NODE111_RX_PATH" "$RX_OFFSET" \
              "$NODE111_COLD" "$NODE111_MANIFEST" "$NODE111_PID" "$NODE111_LOG" \
-             "$NODE111_HOST"
+             "$NODE111_HOST" "$NODE112_HOST"
 wait_ready "$NODE111_PORT" "$NODE111_SSH" || {
     remote "$NODE111_PORT" "$NODE111_SSH" "cat '$NODE111_LOG'" >&2
     exit 1
@@ -218,7 +219,7 @@ reset_rings
 start_server "$NODE112_PORT" "$NODE112_SSH" follower 112 111 \
              "$NODE112_TX_PATH" "$RX_OFFSET" "$NODE112_RX_PATH" "$TX_OFFSET" \
              "$NODE112_COLD" "$NODE112_MANIFEST" "$NODE112_PID" "$NODE112_LOG" \
-             "$NODE112_HOST"
+             "$NODE112_HOST" "$NODE111_HOST"
 wait_ready "$NODE112_PORT" "$NODE112_SSH" || {
     remote "$NODE112_PORT" "$NODE112_SSH" "cat '$NODE112_LOG'" >&2
     exit 1

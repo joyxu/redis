@@ -37,6 +37,9 @@ NODE112_TX_PATH=$TLC_HA_NODE112_TX_PATH
 NODE112_RX_PATH=$TLC_HA_NODE112_RX_PATH
 TX_OFFSET=$TLC_HA_UB_TX_OFFSET
 RX_OFFSET=$TLC_HA_UB_RX_OFFSET
+NODE111_HOST=${TLC_HA_NODE111_HOST:-192.168.90.111}
+NODE112_HOST=${TLC_HA_NODE112_HOST:-192.168.90.112}
+CONTROL_PORT=${TLC_HA_UB_CONTROL_PORT:-9736}
 NODE111_COLD_DIR=${TLC_HA_NODE111_COLD_DIR:-/tmp/tlc-ha-ub-node111-$$}
 NODE112_COLD_DIR=${TLC_HA_NODE112_COLD_DIR:-/tmp/tlc-ha-ub-node112-$$}
 FOLLOWER_LOG=${TLC_HA_FOLLOWER_LOG:-/tmp/tlc_ha_ub_follower.log}
@@ -129,6 +132,10 @@ check_node() {
 reset_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' TLC_HA_UB_RESET=1 TLC_HA_UB_RESET_ONLY=1 ./benchmark/tlc_ha_replica_ub_node_ut follower"
 reset_peer_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' TLC_HA_UB_RESET=1 TLC_HA_UB_RESET_ONLY=1 ./benchmark/tlc_ha_replica_ub_node_ut follower"
 
+# Control plane env: Follower listens, Leader connects to Follower's host.
+CTRL_LEADER="TLC_HA_UB_CONTROL_PORT='$CONTROL_PORT' TLC_HA_UB_BIND_HOST='${TLC_HA_UB_NODE111_BIND_HOST:-$NODE111_HOST}' TLC_HA_UB_PEER_HOST='$NODE112_HOST'"
+CTRL_FOLLOWER="TLC_HA_UB_CONTROL_PORT='$CONTROL_PORT' TLC_HA_UB_BIND_HOST='${TLC_HA_UB_NODE112_BIND_HOST:-$NODE112_HOST}' TLC_HA_UB_PEER_HOST='$NODE111_HOST'"
+
 cleanup() {
     kill "${follower_ssh_pid:-}" 2>/dev/null || true
     kill "${restart_follower_ssh_pid:-}" 2>/dev/null || true
@@ -144,8 +151,8 @@ trap cleanup EXIT
 run_m7_tests() {
     remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
     remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-    m7_retention_follower_command="TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m7-retention"
-    m7_retention_leader_command="TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m7-retention"
+    m7_retention_follower_command="$CTRL_FOLLOWER TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m7-retention"
+    m7_retention_leader_command="$CTRL_LEADER TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m7-retention"
     ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m7_retention_follower_command" >"$FOLLOWER_LOG.m7-retention" 2>&1 &
     m7_retention_follower_ssh_pid=$!
     sleep "$START_DELAY_SECONDS"
@@ -160,8 +167,8 @@ run_m7_tests() {
 
     remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
     remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-    m7_pressure_follower_command="TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m7-pressure-stall"
-    m7_pressure_leader_command="TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m7-pressure"
+    m7_pressure_follower_command="$CTRL_FOLLOWER TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m7-pressure-stall"
+    m7_pressure_leader_command="$CTRL_LEADER TLC_HA_UB_RETENTION_EVENTS=8 TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m7-pressure"
     ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m7_pressure_follower_command" >"$FOLLOWER_LOG.m7-pressure" 2>&1 &
     m7_pressure_follower_ssh_pid=$!
     sleep "$START_DELAY_SECONDS"
@@ -227,8 +234,8 @@ run_visibility_direction \
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
 
-follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE112_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower"
-leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE111_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_REPLAY_START='$REPLAY_START' TLC_HA_UB_REPLAY_END='$REPLAY_END' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader"
+follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE112_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower"
+leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE111_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_REPLAY_START='$REPLAY_START' TLC_HA_UB_REPLAY_END='$REPLAY_END' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader"
 
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $follower_command" >"$FOLLOWER_LOG" 2>&1 &
 follower_ssh_pid=$!
@@ -245,8 +252,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (visibility, replication, append ACK,
 # interleave with this artifact-only transport check.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-snapshot_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-snapshot"
-snapshot_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-snapshot"
+snapshot_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-snapshot"
+snapshot_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-snapshot"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $snapshot_follower_command" >"$FOLLOWER_LOG.snapshot" 2>&1 &
 snapshot_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -262,8 +269,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (111 -> 112 snapshot chunks)\n'
 # enters the lock-free FENCED/quiesce path and installs it in place.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-install_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-install"
-install_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-install"
+install_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-install"
+install_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-install"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $install_follower_command" >"$FOLLOWER_LOG.install" 2>&1 &
 install_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -279,8 +286,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (111 -> 112 checkpoint install)\n'
 # checkpoint tail, boundary extension, final handoff ACK, then H + 1 replay.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-m5_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m5"
-m5_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m5"
+m5_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m5"
+m5_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m5"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m5_follower_command" >"$FOLLOWER_LOG.m5" 2>&1 &
 m5_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -296,8 +303,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (M5 resync tail, handoff, H + 1)\n'
 # Follower artifact while keeping normal emission fenced.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-m5_abort_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m5-abort"
-m5_abort_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m5-abort"
+m5_abort_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m5-abort"
+m5_abort_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m5-abort"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m5_abort_follower_command" >"$FOLLOWER_LOG.m5-abort" 2>&1 &
 m5_abort_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -314,8 +321,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (M5 timeout and abort cleanup)\n'
 # Follower must request and accept AOF [1,2], then accept normal seq 3.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-m6_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m6-gap"
-m6_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m6-gap"
+m6_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m6-gap"
+m6_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m6-gap"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m6_follower_command" >"$FOLLOWER_LOG.m6" 2>&1 &
 m6_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -332,8 +339,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (M6 automatic GAP -> AOF repair)\n'
 # Follower receives seq 98 and must complete automatic snapshot + tail [97,98].
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-m6_retention_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m6-retention"
-m6_retention_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m6-retention"
+m6_retention_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower-m6-retention"
+m6_retention_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' timeout '${TEST_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-m6-retention"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $m6_retention_follower_command" >"$FOLLOWER_LOG.m6-retention" 2>&1 &
 m6_retention_follower_ssh_pid=$!
 sleep "$START_DELAY_SECONDS"
@@ -359,8 +366,8 @@ printf 'tlc_ha_replica_ub_111_to_112: PASS (persistent follower COLD recovery)\n
 # attaching the restarted Follower and issuing a manual replay range.
 remote "$NODE111_PORT" "$NODE111_SSH" "$reset_command"
 remote "$NODE112_PORT" "$NODE112_SSH" "$reset_peer_command"
-restart_follower_command="TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE112_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_WAIT_FOR_REPLAY=1 TLC_HA_UB_WAIT_FOR_REPLAY_MS='$RESTART_REPLAY_TIMEOUT_MS' timeout '${RESTART_REPLAY_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower"
-replay_leader_command="TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE111_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_REPLAY_START='$REPLAY_START' TLC_HA_UB_REPLAY_END='$REPLAY_END' timeout '${RESTART_REPLAY_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-replay"
+restart_follower_command="$CTRL_FOLLOWER TLC_HA_UB_TX_PATH='$NODE112_TX_PATH' TLC_HA_UB_RX_PATH='$NODE112_RX_PATH' TLC_HA_UB_TX_OFFSET='$RX_OFFSET' TLC_HA_UB_RX_OFFSET='$TX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE112_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_WAIT_FOR_REPLAY=1 TLC_HA_UB_WAIT_FOR_REPLAY_MS='$RESTART_REPLAY_TIMEOUT_MS' timeout '${RESTART_REPLAY_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut follower"
+replay_leader_command="$CTRL_LEADER TLC_HA_UB_TX_PATH='$NODE111_TX_PATH' TLC_HA_UB_RX_PATH='$NODE111_RX_PATH' TLC_HA_UB_TX_OFFSET='$TX_OFFSET' TLC_HA_UB_RX_OFFSET='$RX_OFFSET' TLC_HA_UB_COLD_DIR='$NODE111_COLD_DIR' TLC_HA_UB_EXPECTED_EVENTS='$EXPECTED_EVENTS' TLC_HA_UB_REPLAY_START='$REPLAY_START' TLC_HA_UB_REPLAY_END='$REPLAY_END' timeout '${RESTART_REPLAY_TIMEOUT_SECONDS}s' ./benchmark/tlc_ha_replica_ub_node_ut leader-replay"
 ssh -p "$NODE112_PORT" "$NODE112_SSH" "cd '$REMOTE_DIR' && $restart_follower_command" >"$FOLLOWER_LOG.restart" 2>&1 &
 restart_follower_ssh_pid=$!
 sleep 0.1

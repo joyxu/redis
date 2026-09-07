@@ -24,10 +24,18 @@ typedef enum tlc_ha_replica_role {
     TLC_HA_REPLICA_FOLLOWER = 2,
 } tlc_ha_replica_role_t;
 
-typedef enum tlc_ha_replica_transport {
-    TLC_HA_REPLICA_TRANSPORT_STREAM = 0,
-    TLC_HA_REPLICA_TRANSPORT_UB = 1,
-} tlc_ha_replica_transport_t;
+/* Runtime HA ownership state. Role describes replication direction; state
+ * describes liveness and ownership transitions. */
+typedef enum tlc_ha_replica_ha_state {
+    TLC_HA_REPLICA_STATE_INIT = 0,
+    TLC_HA_REPLICA_STATE_BACKUP = 1,
+    TLC_HA_REPLICA_STATE_SUSPECT = 2,
+    TLC_HA_REPLICA_STATE_CANDIDATE = 3,
+    TLC_HA_REPLICA_STATE_RECOVERING = 4,
+    TLC_HA_REPLICA_STATE_MASTER = 5,
+    TLC_HA_REPLICA_STATE_FAULT = 6,
+    TLC_HA_REPLICA_STATE_FENCED = 7,
+} tlc_ha_replica_ha_state_t;
 
 typedef enum tlc_ha_replica_health {
     TLC_HA_REPLICA_HEALTHY = 1,
@@ -146,9 +154,14 @@ typedef struct tlc_ha_replica_ring_config {
 typedef struct tlc_ha_replica_config {
     tlc_core_t *core;
     tlc_cold_t *cold;
-    int fd;
+    /* TCP control endpoint owned by the Replica runtime. */
+    const char *control_bind_host;
+    uint16_t control_bind_port;
+    const char *peer_advertised_host;
+    uint16_t peer_control_port;
+    /* Deprecated compatibility path for legacy in-process tests. */
+    int control_fd;
     tlc_ha_replica_role_t role;
-    tlc_ha_replica_transport_t transport;
     tlc_ha_replica_ring_config_t tx_ring;
     tlc_ha_replica_ring_config_t rx_ring;
     uint32_t queue_capacity;
@@ -162,10 +175,18 @@ typedef struct tlc_ha_replica_config {
     uint64_t peer_node_id;
     /* Owner fencing term carried by events and heartbeats. */
     uint64_t ha_term;
+    /* Initial connection epoch; zero selects epoch 1. */
+    uint64_t connection_epoch;
     /* Local heartbeat cadence; zero selects the default. */
     uint32_t heartbeat_interval_ms;
     /* Receiver-local liveness timeout; zero selects the default. */
     uint32_t heartbeat_timeout_ms;
+    /* Consecutive timeout samples required before publishing failure. */
+    uint32_t heartbeat_failure_threshold;
+    /* Maximum timeout probe backoff; zero selects the default. */
+    uint32_t heartbeat_backoff_max_ms;
+    /* Minimum time spent in SUSPECT before publishing failure. */
+    uint32_t heartbeat_suspect_hold_down_ms;
     /* Controlled resync inactivity timeout; zero selects the default. */
     uint32_t resync_timeout_ms;
     /* Fixed topology lineage for automatic resync; zero selects epoch 1. */
@@ -175,11 +196,12 @@ typedef struct tlc_ha_replica_config {
 } tlc_ha_replica_config_t;
 
 /*
- * Start a bidirectional Replica stream on an already connected blocking fd.
- * The fd is owned by the returned runtime. Leader events are sourced from the
- * core event sink; Follower frames are durably appended before async apply.
- * STREAM uses the connected fd. UB uses tx_ring/rx_ring as an independent
- * bidirectional shared-memory channel and does not use UB RPC pending slots.
+ * Start a bidirectional Replica runtime. The runtime owns the TCP control
+ * listener and connection for the configured endpoint; UB rings carry the
+ * data plane. Leader events are sourced from the core event sink; Follower
+ * frames are durably appended before async apply. Control frames (heartbeat,
+ * announce, resync coordination) flow over TCP; data frames (EVENTS, ACK,
+ * snapshot chunks) flow over UB rings.
  */
 int tlc_ha_replica_start(tlc_ha_replica_t **out,
                          const tlc_ha_replica_config_t *config);
@@ -253,6 +275,40 @@ tlc_ha_replica_health_t tlc_ha_replica_peer_health(
         const tlc_ha_replica_t *replica);
 /* Returns receiver-local monotonic time of the last valid peer heartbeat. */
 uint64_t tlc_ha_replica_last_heartbeat_ns(
+        const tlc_ha_replica_t *replica);
+/* Returns the current runtime replication direction. */
+tlc_ha_replica_role_t tlc_ha_replica_role(
+        const tlc_ha_replica_t *replica);
+/* Returns the current owner fencing term. */
+uint64_t tlc_ha_replica_ha_term(const tlc_ha_replica_t *replica);
+/*
+ * Atomically transition ownership after fencing ingress and draining all
+ * in-flight work. A term increase is persisted before the new role is
+ * published. Leader transitions announce the new owner before normal
+ * emission is unfenced.
+ */
+int tlc_ha_replica_transition_role(tlc_ha_replica_t *replica,
+                                   tlc_ha_replica_role_t role,
+                                   tlc_ha_replica_ha_state_t state,
+                                   uint64_t new_term);
+/* Current connection lineage used by M10 control frames. */
+uint64_t tlc_ha_replica_connection_epoch(const tlc_ha_replica_t *replica);
+/* Deprecated: production reconnects are performed by the control thread. */
+int tlc_ha_replica_reconnect(tlc_ha_replica_t *replica, int control_fd,
+                             uint64_t connection_epoch);
+/* Returns whether the current-term Leader announcement was acknowledged. */
+int tlc_ha_replica_leader_announce_acked(
+        const tlc_ha_replica_t *replica);
+/* Returns whether a valid peer heartbeat was received within the timeout. */
+int tlc_ha_replica_peer_liveness(const tlc_ha_replica_t *replica);
+/* Returns the current runtime HA ownership state. */
+tlc_ha_replica_ha_state_t tlc_ha_replica_ha_state(
+        const tlc_ha_replica_t *replica);
+/* Returns consecutive timeout samples observed by the heartbeat detector. */
+uint32_t tlc_ha_replica_heartbeat_missed_count(
+        const tlc_ha_replica_t *replica);
+/* Returns whether the detector has published a failure event to the controller. */
+int tlc_ha_replica_heartbeat_failure_pending(
         const tlc_ha_replica_t *replica);
 
 #endif

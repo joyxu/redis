@@ -4,9 +4,11 @@
 #include "zmalloc.h"
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -85,6 +87,46 @@ static int value_matches(tlc_core_t *core, const char *key, uint8_t seed) {
            memcmp(actual, expected, sizeof(actual)) == 0;
 }
 
+static atomic_uint test_ring_counter;
+
+typedef struct test_ub_rings {
+    char tx_path[64];
+    char rx_path[64];
+    tlc_ha_replica_ring_config_t tx;
+    tlc_ha_replica_ring_config_t rx;
+} test_ub_rings_t;
+
+static int test_ub_rings_create(test_ub_rings_t *out) {
+    uint32_t id = atomic_fetch_add(&test_ring_counter, 1);
+    snprintf(out->tx_path, sizeof(out->tx_path), "/tlc-ha-proc-tx-%u-%u",
+             (unsigned)getpid(), id);
+    snprintf(out->rx_path, sizeof(out->rx_path), "/tlc-ha-proc-rx-%u-%u",
+             (unsigned)getpid(), id);
+    tlc_ha_replica_ring_config_t ring = {
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+        .slot_count = 8,
+        .slot_bytes = 131072,
+        .mmap_offset = 0,
+    };
+    snprintf(ring.path, sizeof(ring.path), "%s", out->tx_path);
+    if (tlc_ha_replica_reset_ring(&ring) != 0)
+        return -1;
+    out->tx = ring;
+    snprintf(ring.path, sizeof(ring.path), "%s", out->rx_path);
+    if (tlc_ha_replica_reset_ring(&ring) != 0) {
+        shm_unlink(out->tx_path);
+        return -1;
+    }
+    out->rx = ring;
+    return 0;
+}
+
+static void test_ub_rings_destroy(test_ub_rings_t *rings) {
+    shm_unlink(rings->tx_path);
+    shm_unlink(rings->rx_path);
+}
+
 static void write_byte(int fd) {
     uint8_t value = 1;
     assert(write(fd, &value, sizeof(value)) == (ssize_t)sizeof(value));
@@ -103,6 +145,8 @@ int main(void) {
     int sockets[2], ready_pipe[2], release_pipe[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     assert(pipe(ready_pipe) == 0 && pipe(release_pipe) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
     pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
@@ -111,8 +155,10 @@ int main(void) {
         node_init(&follower, 202, follower_dir);
         tlc_ha_replica_config_t config = {
             .core = follower.core, .cold = tlc_core_get_cold(follower.core),
-            .fd = sockets[1], .role = TLC_HA_REPLICA_FOLLOWER,
-            .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+            .control_fd = sockets[1], .role = TLC_HA_REPLICA_FOLLOWER,
+            .tx_ring = rings.rx, .rx_ring = rings.tx,
+            .queue_capacity = 16,
+            .max_batch_events = 8, .max_batch_bytes = 65536,
             .hpc_node_id = 202, .peer_node_id = 201, .ha_term = 9,
             .heartbeat_interval_ms = 20, .heartbeat_timeout_ms = 200,
         };
@@ -141,8 +187,10 @@ int main(void) {
     node_init(&leader, 201, leader_dir);
     tlc_ha_replica_config_t config = {
         .core = leader.core, .cold = tlc_core_get_cold(leader.core),
-        .fd = sockets[0], .role = TLC_HA_REPLICA_LEADER,
-        .transport = TLC_HA_REPLICA_TRANSPORT_STREAM,
+        .control_fd = sockets[0], .role = TLC_HA_REPLICA_LEADER,
+        .tx_ring = rings.tx, .rx_ring = rings.rx,
+        .queue_capacity = 16,
+        .max_batch_events = 8, .max_batch_bytes = 65536,
         .hpc_node_id = 201, .peer_node_id = 202, .ha_term = 9,
         .heartbeat_interval_ms = 20, .heartbeat_timeout_ms = 200,
     };
@@ -166,6 +214,7 @@ int main(void) {
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     close(ready_pipe[0]); close(release_pipe[1]);
+    test_ub_rings_destroy(&rings);
     printf("tlc_ha_replica_process_ut: PASS\n");
     return 0;
 }

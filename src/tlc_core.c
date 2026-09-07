@@ -161,7 +161,7 @@ struct tlc_core {
     tlc_core_location_cache_t location_cache;
     tlc_core_warm_layer_t warm;
     tlc_cold_t *persistent_cold;
-    uint64_t ha_term;
+    atomic_uint_fast64_t ha_term;
     tlc_core_replica_event_sink_fn replica_event_sink;
     void *replica_event_sink_arg;
     pthread_mutex_t replica_apply_mu;
@@ -1788,6 +1788,7 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     RETURN_IF(!core, -1);
     core->value_size = config->value_size;
     core->warm_capacity = config->warm_capacity;
+    atomic_init(&core->ha_term, 0);
     if (pthread_mutex_init(&core->replica_apply_mu, NULL) != 0) {
         zfree(core);
         return -1;
@@ -1870,6 +1871,26 @@ int tlc_core_set_replica_event_sink(tlc_core_t *core,
         tlc_cold_set_append_sink(core->persistent_cold,
                                  sink ? tlc_core_cold_append_sink : NULL,
                                  core) : 0;
+}
+
+uint64_t tlc_core_ha_term(const tlc_core_t *core) {
+    return atomic_load_explicit(&core->ha_term, memory_order_acquire);
+}
+
+int tlc_core_set_ha_term(tlc_core_t *core, uint64_t ha_term) {
+    if (ha_term == 0)
+        return -1;
+    uint64_t current = atomic_load_explicit(&core->ha_term, memory_order_acquire);
+    for (;;) {
+        if (ha_term < current)
+            return -1;
+        if (ha_term == current)
+            return 0;
+        if (atomic_compare_exchange_weak_explicit(
+                &core->ha_term, &current, ha_term, memory_order_release,
+                memory_order_acquire))
+            return 0;
+    }
 }
 
 tlc_cold_t *tlc_core_get_cold(tlc_core_t *core) {
@@ -2081,7 +2102,7 @@ static int tlc_core_persist_event_locked(tlc_core_t *core,
         return -1;
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     tlc_cold_event_input_t event = {
-        .ha_term = core->ha_term,
+        .ha_term = atomic_load_explicit(&core->ha_term, memory_order_acquire),
         .topology_epoch = topology_epoch,
         .op = op,
         .meta_shard_id = shard->lock_id,

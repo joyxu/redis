@@ -7,9 +7,11 @@
 #include "zmalloc.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netdb.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -17,7 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
+#include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,6 +43,8 @@
 #define TLC_HA_REPLICA_KIND_TAIL_EVENTS UINT16_C(14)
 #define TLC_HA_REPLICA_KIND_HANDOFF_ACK UINT16_C(15)
 #define TLC_HA_REPLICA_KIND_RESYNC_REQUIRED UINT16_C(16)
+#define TLC_HA_REPLICA_KIND_LEADER_ANNOUNCE UINT16_C(17)
+#define TLC_HA_REPLICA_KIND_ROLE_ACK UINT16_C(18)
 #define TLC_HA_REPLICA_DEFAULT_QUEUE 256u
 #define TLC_HA_REPLICA_DEFAULT_BATCH_EVENTS 32u
 #define TLC_HA_REPLICA_DEFAULT_BATCH_BYTES (1024u * 1024u)
@@ -49,6 +55,9 @@
 #define TLC_HA_REPLICA_DEFAULT_RING_BYTES (64u * 1024u)
 #define TLC_HA_REPLICA_DEFAULT_HEARTBEAT_INTERVAL_MS 1000u
 #define TLC_HA_REPLICA_DEFAULT_HEARTBEAT_TIMEOUT_MS 3000u
+#define TLC_HA_REPLICA_DEFAULT_HEARTBEAT_FAILURE_THRESHOLD 3u
+#define TLC_HA_REPLICA_DEFAULT_HEARTBEAT_BACKOFF_MAX_MS 5000u
+#define TLC_HA_REPLICA_DEFAULT_HEARTBEAT_SUSPECT_HOLD_DOWN_MS 2000u
 #define TLC_HA_REPLICA_DEFAULT_RESYNC_TIMEOUT_MS 30000u
 #define TLC_HA_REPLICA_DEFAULT_RESYNC_CHUNK_BYTES (32u * 1024u)
 #define TLC_HA_REPLICA_RESYNC_REQUIRED_RETRY_NS UINT64_C(100000000)
@@ -60,11 +69,109 @@
 #define TLC_HA_RESYNC_END_WIRE_BYTES 24u
 #define TLC_HA_RESYNC_CONTROL_WIRE_BYTES 48u
 #define TLC_HA_RESYNC_REQUIRED_WIRE_BYTES 40u
+#define TLC_HA_LEADER_ANNOUNCE_WIRE_BYTES 64u
+#define TLC_HA_ROLE_ACK_WIRE_BYTES 40u
+#define TLC_HA_OWNER_METADATA_MAGIC UINT32_C(0x54484F57) /* THOW */
+#define TLC_HA_OWNER_METADATA_VERSION UINT32_C(1)
 
 typedef struct tlc_ha_replica_ring_slot {
     _Alignas(64) atomic_uint_fast64_t sequence;
     uint8_t payload[];
 } tlc_ha_replica_ring_slot_t;
+
+static int replica_write_full(int fd, const void *data, size_t length);
+static int replica_socket_write_full(int fd, const void *data, size_t length);
+static int replica_read_full(int fd, void *data, size_t length);
+int tlc_ha_replica_reconnect(tlc_ha_replica_t *replica, int control_fd,
+                             uint64_t connection_epoch);
+
+typedef struct tlc_ha_owner_metadata {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t owner_node_id;
+    uint64_t ha_term;
+    uint64_t checksum;
+} tlc_ha_owner_metadata_t;
+
+static int replica_owner_metadata_store(const char *path,
+                                        uint64_t owner_node_id,
+                                        uint64_t ha_term) {
+    if (!path || path[0] == '\0' || owner_node_id == 0 || ha_term == 0)
+        return -1;
+    tlc_ha_owner_metadata_t metadata = {
+        .magic = TLC_HA_OWNER_METADATA_MAGIC,
+        .version = TLC_HA_OWNER_METADATA_VERSION,
+        .owner_node_id = owner_node_id,
+        .ha_term = ha_term,
+    };
+    metadata.checksum = vemb_v16_xxh3_64(&metadata,
+                                         offsetof(tlc_ha_owner_metadata_t,
+                                                  checksum));
+    char temp_path[PATH_MAX];
+    int length = snprintf(temp_path, sizeof(temp_path), "%s.tmp.%ld", path,
+                          (long)getpid());
+    if (length < 0 || (size_t)length >= sizeof(temp_path))
+        return -1;
+    int fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    int rc = replica_write_full(fd, &metadata, sizeof(metadata));
+    if (rc == 0 && fsync(fd) != 0)
+        rc = -1;
+    if (close(fd) != 0)
+        rc = -1;
+    if (rc == 0 && rename(temp_path, path) != 0)
+        rc = -1;
+    if (rc == 0) {
+        char directory[PATH_MAX];
+        const char *slash = strrchr(path, '/');
+        size_t directory_bytes = slash ? (size_t)(slash - path) : 0;
+        if (directory_bytes == 0)
+            memcpy(directory, ".", 2);
+        else if (directory_bytes >= sizeof(directory))
+            rc = -1;
+        else {
+            memcpy(directory, path, directory_bytes);
+            directory[directory_bytes] = '\0';
+        }
+        if (rc == 0) {
+            int directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (directory_fd < 0 || fsync(directory_fd) != 0)
+                rc = -1;
+            if (directory_fd >= 0)
+                close(directory_fd);
+        }
+    }
+    if (rc != 0)
+        unlink(temp_path);
+    return rc;
+}
+
+static int replica_owner_metadata_load(const char *path,
+                                       uint64_t owner_node_id,
+                                       uint64_t *ha_term) {
+    if (!path || !ha_term || owner_node_id == 0)
+        return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT ? 1 : -1;
+    }
+    tlc_ha_owner_metadata_t metadata;
+    int rc = replica_read_full(fd, &metadata, sizeof(metadata));
+    if (close(fd) != 0)
+        rc = -1;
+    uint64_t checksum = vemb_v16_xxh3_64(&metadata,
+                                         offsetof(tlc_ha_owner_metadata_t,
+                                                  checksum));
+    if (rc != 0 || metadata.magic != TLC_HA_OWNER_METADATA_MAGIC ||
+        metadata.version != TLC_HA_OWNER_METADATA_VERSION ||
+        metadata.owner_node_id != owner_node_id || metadata.ha_term == 0 ||
+        metadata.checksum != checksum)
+        return -1;
+    if (metadata.ha_term > *ha_term)
+        *ha_term = metadata.ha_term;
+    return 0;
+}
 
 typedef struct tlc_ha_replica_shared_ring {
     uint32_t magic;
@@ -157,6 +264,26 @@ typedef struct tlc_ha_resync_required {
     uint64_t applied_seq;
     uint32_t reason;
 } tlc_ha_resync_required_t;
+
+typedef struct tlc_ha_leader_announce {
+    uint64_t hpc_node_id;
+    uint64_t old_owner_id;
+    uint64_t new_owner_id;
+    uint64_t ha_term;
+    uint64_t topology_epoch;
+    uint64_t takeover_seq;
+    uint64_t connection_epoch;
+    uint32_t reason;
+} tlc_ha_leader_announce_t;
+
+typedef struct tlc_ha_role_ack {
+    uint64_t hpc_node_id;
+    uint64_t peer_node_id;
+    uint64_t ha_term;
+    uint64_t connection_epoch;
+    uint32_t role;
+    uint32_t state;
+} tlc_ha_role_ack_t;
 
 typedef enum tlc_ha_resync_session_state {
     TLC_HA_RESYNC_SESSION_IDLE = 0,
@@ -422,9 +549,13 @@ _Static_assert(sizeof(tlc_ha_replica_heartbeat_t) == 56,
 struct tlc_ha_replica {
     tlc_core_t *core;
     tlc_cold_t *cold;
-    int fd;
-    tlc_ha_replica_role_t role;
-    tlc_ha_replica_transport_t transport;
+    atomic_int control_fd;
+    int control_listen_fd;
+    char control_bind_host[NI_MAXHOST];
+    char peer_advertised_host[NI_MAXHOST];
+    uint16_t control_bind_port;
+    uint16_t peer_control_port;
+    atomic_uint role;
     tlc_ha_replica_ring_t tx_ring;
     tlc_ha_replica_ring_t rx_ring;
     uint8_t *rx_frame;
@@ -434,10 +565,14 @@ struct tlc_ha_replica {
     uint64_t max_resync_snapshot_bytes;
     uint64_t hpc_node_id;
     uint64_t peer_node_id;
-    uint64_t ha_term;
+    atomic_uint_fast64_t ha_term;
+    char owner_metadata_path[PATH_MAX];
     uint64_t configured_topology_epoch;
     uint32_t heartbeat_interval_ms;
     uint32_t heartbeat_timeout_ms;
+    uint32_t heartbeat_failure_threshold;
+    uint32_t heartbeat_backoff_max_ms;
+    uint32_t heartbeat_suspect_hold_down_ms;
     uint32_t resync_timeout_ms;
     uint32_t resync_chunk_bytes;
     atomic_bool stopping;
@@ -445,9 +580,21 @@ struct tlc_ha_replica {
     atomic_uint_fast64_t peer_durable_seq;
     atomic_uint_fast64_t peer_progress_seq;
     atomic_uint_fast64_t peer_ha_term;
+    atomic_uint_fast64_t connection_epoch;
     atomic_uint_fast64_t applied_seq;
     atomic_uint_fast64_t last_heartbeat_received_ns;
     atomic_uint peer_health;
+    atomic_bool peer_liveness;
+    atomic_uint heartbeat_missed_count;
+    atomic_uint heartbeat_backoff_ms;
+    atomic_uint_fast64_t heartbeat_next_probe_ns;
+    atomic_uint_fast64_t heartbeat_suspect_since_ns;
+    atomic_bool heartbeat_failure_pending;
+    atomic_bool heartbeat_failure_reported;
+    atomic_bool connected;
+    atomic_bool leader_announce_acked;
+    atomic_uint control_send_pending;
+    atomic_uint ha_state;
     atomic_bool resync_fenced;
     atomic_uint_fast32_t ingress_inflight;
     atomic_uint_fast32_t apply_inflight;
@@ -462,6 +609,7 @@ struct tlc_ha_replica {
     atomic_uint_fast64_t resync_required_applied_seq;
     atomic_uint_fast64_t next_resync_session_id;
     atomic_bool resync_install_pending;
+    atomic_uint_fast64_t last_aborted_session_id;
     uint64_t resync_session_id;
     uint64_t resync_generation;
     uint64_t resync_checkpoint_seq;
@@ -485,17 +633,19 @@ struct tlc_ha_replica {
     atomic_uint_fast64_t normal_min_seq;
     atomic_bool sender_discard_pending;
     pthread_t sender_thread;
-    pthread_t receiver_thread;
+    pthread_t control_listener_thread;
+    pthread_t data_listener_thread;
     pthread_t apply_thread;
     pthread_t heartbeat_thread;
     pthread_t resync_controller_thread;
     uint32_t sender_started;
-    uint32_t receiver_started;
+    uint32_t control_listener_started;
+    uint32_t data_listener_started;
     uint32_t apply_started;
     uint32_t heartbeat_started;
     uint32_t resync_controller_started;
-    pthread_mutex_t stream_write_mutex;
-    uint32_t stream_write_mutex_initialized;
+    pthread_mutex_t control_write_mutex;
+    uint32_t control_write_mutex_initialized;
     uint64_t last_progress_log_ns;
     /* Controller-thread only; normal COLD append/send/apply never touch these. */
     uint64_t retention_next_poll_ns;
@@ -534,6 +684,99 @@ static void replica_resync_touch(tlc_ha_replica_t *replica) {
                           memory_order_release);
 }
 
+static unsigned replica_ha_normal_state(const tlc_ha_replica_t *replica) {
+    return replica->role == TLC_HA_REPLICA_LEADER ?
+        TLC_HA_REPLICA_STATE_MASTER : TLC_HA_REPLICA_STATE_BACKUP;
+}
+
+static void replica_heartbeat_mark_valid(tlc_ha_replica_t *replica,
+                                         uint64_t now) {
+    atomic_store_explicit(&replica->peer_liveness, true, memory_order_release);
+    atomic_store_explicit(&replica->last_heartbeat_received_ns, now,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_missed_count, 0,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_backoff_ms,
+                          replica->heartbeat_interval_ms,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_next_probe_ns, 0,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_suspect_since_ns, 0,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_reported, false,
+                          memory_order_release);
+    unsigned state = atomic_load_explicit(&replica->ha_state,
+                                          memory_order_acquire);
+    while (state == TLC_HA_REPLICA_STATE_SUSPECT ||
+           state == TLC_HA_REPLICA_STATE_CANDIDATE) {
+        unsigned expected = state;
+        if (atomic_compare_exchange_weak_explicit(
+                &replica->ha_state, &expected, replica_ha_normal_state(replica),
+                memory_order_acq_rel, memory_order_acquire))
+            break;
+        state = expected;
+    }
+}
+
+/* Record one timeout sample after the current detector backoff expires. */
+static void replica_heartbeat_mark_timeout(tlc_ha_replica_t *replica,
+                                           uint64_t now) {
+    uint64_t last = atomic_load_explicit(&replica->last_heartbeat_received_ns,
+                                         memory_order_acquire);
+    if (last != 0 && now - last <
+                    (uint64_t)replica->heartbeat_timeout_ms * 1000000u)
+        return;
+    uint64_t next_probe = atomic_load_explicit(
+        &replica->heartbeat_next_probe_ns, memory_order_acquire);
+    if (next_probe != 0 && now < next_probe)
+        return;
+
+    atomic_store_explicit(&replica->peer_liveness, false, memory_order_release);
+    unsigned missed = atomic_fetch_add_explicit(
+        &replica->heartbeat_missed_count, 1, memory_order_acq_rel) + 1u;
+    unsigned expected = replica_ha_normal_state(replica);
+    atomic_compare_exchange_strong_explicit(
+        &replica->ha_state, &expected, TLC_HA_REPLICA_STATE_SUSPECT,
+        memory_order_acq_rel, memory_order_acquire);
+
+    uint64_t suspect_since = atomic_load_explicit(
+        &replica->heartbeat_suspect_since_ns, memory_order_acquire);
+    if (suspect_since == 0) {
+        uint64_t unset = 0;
+        atomic_compare_exchange_strong_explicit(
+            &replica->heartbeat_suspect_since_ns, &unset, now,
+            memory_order_acq_rel, memory_order_acquire);
+        suspect_since = unset == 0 ? now : unset;
+    }
+
+    uint32_t backoff = atomic_load_explicit(&replica->heartbeat_backoff_ms,
+                                            memory_order_acquire);
+    if (backoff == 0)
+        backoff = replica->heartbeat_interval_ms;
+    uint32_t next_backoff = backoff > replica->heartbeat_backoff_max_ms / 2u ?
+        replica->heartbeat_backoff_max_ms : backoff * 2u;
+    atomic_store_explicit(&replica->heartbeat_backoff_ms, next_backoff,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_next_probe_ns,
+                          now + (uint64_t)backoff * 1000000u,
+                          memory_order_release);
+
+    uint64_t hold_down_ns = (uint64_t)replica->heartbeat_suspect_hold_down_ms *
+        1000000u;
+    if (missed >= replica->heartbeat_failure_threshold &&
+        now - suspect_since >= hold_down_ns) {
+        bool expected_pending = false;
+        if (atomic_compare_exchange_strong_explicit(
+                &replica->heartbeat_failure_pending, &expected_pending, true,
+                memory_order_acq_rel, memory_order_acquire))
+            serverLog(LL_WARNING,
+                      "HA Replica heartbeat failure detected: role=%u missed=%u backoff_ms=%u",
+                      replica->role, missed, backoff);
+    }
+}
+
 static void replica_atomic_advance(atomic_uint_fast64_t *target,
                                    uint64_t seq) {
     uint64_t current = atomic_load_explicit(target, memory_order_relaxed);
@@ -555,6 +798,7 @@ static int replica_abort_resync_internal(tlc_ha_replica_t *replica,
                                          int notify_peer);
 static void replica_leader_schedule_resync(tlc_ha_replica_t *replica);
 static void replica_discard_sender_queue(tlc_ha_replica_t *replica);
+static int replica_controller_try_promote(tlc_ha_replica_t *replica);
 
 static uint64_t replica_hton64(uint64_t value) {
     uint32_t hi = htonl((uint32_t)(value >> 32));
@@ -912,6 +1156,20 @@ static int replica_write_full(int fd, const void *data, size_t length) {
     return 0;
 }
 
+static int replica_socket_write_full(int fd, const void *data, size_t length) {
+    const uint8_t *cursor = data;
+    while (length != 0) {
+        ssize_t written = send(fd, cursor, length, MSG_NOSIGNAL);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        cursor += (size_t)written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
 static int replica_read_full(int fd, void *data, size_t length) {
     uint8_t *cursor = data;
     while (length != 0) {
@@ -924,6 +1182,132 @@ static int replica_read_full(int fd, void *data, size_t length) {
         length -= (size_t)read_bytes;
     }
     return 0;
+}
+
+static int replica_set_nonblocking(int fd, int enabled) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    if (enabled)
+        flags |= O_NONBLOCK;
+    else
+        flags &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, flags);
+}
+
+static int replica_open_control_listener(tlc_ha_replica_t *replica) {
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    char port[16];
+    snprintf(port, sizeof(port), "%u", (unsigned)replica->control_bind_port);
+    struct addrinfo *results = NULL;
+    int gai = getaddrinfo(replica->control_bind_host[0] ?
+                          replica->control_bind_host : NULL, port, &hints,
+                          &results);
+    if (gai != 0)
+        return -1;
+    int listen_fd = -1;
+    for (struct addrinfo *it = results; it; it = it->ai_next) {
+        listen_fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (listen_fd < 0)
+            continue;
+        int on = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if (bind(listen_fd, it->ai_addr, it->ai_addrlen) == 0 &&
+            listen(listen_fd, 1) == 0 &&
+            replica_set_nonblocking(listen_fd, 1) == 0)
+            break;
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    freeaddrinfo(results);
+    if (listen_fd < 0)
+        return -1;
+    replica->control_listen_fd = listen_fd;
+    return 0;
+}
+
+static int replica_connect_control_peer(tlc_ha_replica_t *replica) {
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port[16];
+    snprintf(port, sizeof(port), "%u", (unsigned)replica->peer_control_port);
+    struct addrinfo *results = NULL;
+    int gai = getaddrinfo(replica->peer_advertised_host, port, &hints,
+                          &results);
+    if (gai != 0)
+        return -1;
+    int connected_fd = -1;
+    for (struct addrinfo *it = results; it; it = it->ai_next) {
+        int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0)
+            continue;
+        if (replica_set_nonblocking(fd, 1) != 0) {
+            close(fd);
+            continue;
+        }
+        int rc = connect(fd, it->ai_addr, it->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            fd_set writable;
+            FD_ZERO(&writable);
+            FD_SET(fd, &writable);
+            struct timeval timeout = {.tv_sec = 0, .tv_usec = 200000};
+            rc = select(fd + 1, NULL, &writable, NULL, &timeout);
+            if (rc > 0) {
+                int error = 0;
+                socklen_t error_len = sizeof(error);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len);
+                rc = error;
+            } else {
+                rc = -1;
+            }
+        }
+        if (rc == 0 && replica_set_nonblocking(fd, 0) == 0) {
+            int on = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+            connected_fd = fd;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(results);
+    return connected_fd;
+}
+
+static int replica_accept_control_peer(tlc_ha_replica_t *replica) {
+    if (replica->control_listen_fd < 0)
+        return -1;
+    int fd = accept(replica->control_listen_fd, NULL, NULL);
+    if (fd < 0)
+        return -1;
+    int on = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    return fd;
+}
+
+static void replica_mark_disconnected_fd(tlc_ha_replica_t *replica,
+                                         int failed_fd) {
+    pthread_mutex_lock(&replica->control_write_mutex);
+    int current_fd = atomic_load_explicit(&replica->control_fd, memory_order_acquire);
+    if (failed_fd >= 0 && current_fd != failed_fd) {
+        pthread_mutex_unlock(&replica->control_write_mutex);
+        return;
+    }
+    atomic_store_explicit(&replica->connected, false, memory_order_release);
+    int fd = atomic_exchange_explicit(&replica->control_fd, -1,
+                                      memory_order_acq_rel);
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+    pthread_mutex_unlock(&replica->control_write_mutex);
+}
+
+static void replica_mark_disconnected(tlc_ha_replica_t *replica) {
+    replica_mark_disconnected_fd(replica, -1);
 }
 
 static void replica_event_free(tlc_ha_replica_event_t *event) {
@@ -963,8 +1347,13 @@ static void replica_stop_signal(tlc_ha_replica_t *replica) {
         atomic_store_explicit(&replica->resync_fenced, true,
                               memory_order_release);
     if (!atomic_exchange_explicit(&replica->stopping, true,
-                                  memory_order_acq_rel))
-        shutdown(replica->fd, SHUT_RDWR);
+                                  memory_order_acq_rel)) {
+        int fd = atomic_load_explicit(&replica->control_fd, memory_order_acquire);
+        if (fd >= 0)
+            shutdown(fd, SHUT_RDWR);
+        if (replica->control_listen_fd >= 0)
+            shutdown(replica->control_listen_fd, SHUT_RDWR);
+    }
 }
 
 /* Serialize only the queue admission decision and tail publication.  The
@@ -1138,6 +1527,73 @@ static void replica_decode_heartbeat(
         .durable_seq = replica_ntoh64(wire->durable_seq),
         .progress_seq = replica_ntoh64(wire->progress_seq),
     };
+}
+
+static void resync_encode_u64(uint8_t **cursor, uint64_t value);
+static uint64_t resync_decode_u64(const uint8_t **cursor);
+static void resync_encode_u32(uint8_t **cursor, uint32_t value);
+static uint32_t resync_decode_u32(const uint8_t **cursor);
+
+static void replica_encode_leader_announce(
+        const tlc_ha_leader_announce_t *announce,
+        uint8_t payload[TLC_HA_LEADER_ANNOUNCE_WIRE_BYTES]) {
+    uint8_t *cursor = payload;
+    resync_encode_u64(&cursor, announce->hpc_node_id);
+    resync_encode_u64(&cursor, announce->old_owner_id);
+    resync_encode_u64(&cursor, announce->new_owner_id);
+    resync_encode_u64(&cursor, announce->ha_term);
+    resync_encode_u64(&cursor, announce->topology_epoch);
+    resync_encode_u64(&cursor, announce->takeover_seq);
+    resync_encode_u64(&cursor, announce->connection_epoch);
+    resync_encode_u32(&cursor, announce->reason);
+    resync_encode_u32(&cursor, 0);
+}
+
+static int replica_decode_leader_announce(
+        const uint8_t *payload, uint32_t bytes,
+        tlc_ha_leader_announce_t *announce) {
+    if (bytes != TLC_HA_LEADER_ANNOUNCE_WIRE_BYTES)
+        return -1;
+    const uint8_t *cursor = payload;
+    *announce = (tlc_ha_leader_announce_t){
+        .hpc_node_id = resync_decode_u64(&cursor),
+        .old_owner_id = resync_decode_u64(&cursor),
+        .new_owner_id = resync_decode_u64(&cursor),
+        .ha_term = resync_decode_u64(&cursor),
+        .topology_epoch = resync_decode_u64(&cursor),
+        .takeover_seq = resync_decode_u64(&cursor),
+        .connection_epoch = resync_decode_u64(&cursor),
+        .reason = resync_decode_u32(&cursor),
+    };
+    return resync_decode_u32(&cursor) == 0 ? 0 : -1;
+}
+
+static void replica_encode_role_ack(
+        const tlc_ha_role_ack_t *ack,
+        uint8_t payload[TLC_HA_ROLE_ACK_WIRE_BYTES]) {
+    uint8_t *cursor = payload;
+    resync_encode_u64(&cursor, ack->hpc_node_id);
+    resync_encode_u64(&cursor, ack->peer_node_id);
+    resync_encode_u64(&cursor, ack->ha_term);
+    resync_encode_u64(&cursor, ack->connection_epoch);
+    resync_encode_u32(&cursor, ack->role);
+    resync_encode_u32(&cursor, ack->state);
+}
+
+static int replica_decode_role_ack(const uint8_t *payload, uint32_t bytes,
+                                   tlc_ha_role_ack_t *ack) {
+    if (bytes != TLC_HA_ROLE_ACK_WIRE_BYTES)
+        return -1;
+    const uint8_t *cursor = payload;
+    *ack = (tlc_ha_role_ack_t){
+        .hpc_node_id = resync_decode_u64(&cursor),
+        .peer_node_id = resync_decode_u64(&cursor),
+        .ha_term = resync_decode_u64(&cursor),
+        .connection_epoch = resync_decode_u64(&cursor),
+        .role = resync_decode_u32(&cursor),
+        .state = resync_decode_u32(&cursor),
+    };
+    return 0;
 }
 
 static void resync_encode_u64(uint8_t **cursor, uint64_t value) {
@@ -1316,6 +1772,7 @@ static int replica_send_frame(tlc_ha_replica_t *replica,
                               uint32_t event_count,
                               const void *payload,
                               uint32_t payload_bytes);
+static int replica_frame_is_control(uint16_t kind);
 
 static int replica_send_resync_control(tlc_ha_replica_t *replica,
                                        uint16_t kind,
@@ -1365,7 +1822,38 @@ static int replica_send_frame(tlc_ha_replica_t *replica,
     replica_encode_frame_header(&header, &wire_header);
 
     int rc = 0;
-    if (replica->transport == TLC_HA_REPLICA_TRANSPORT_UB) {
+    int is_control = replica_frame_is_control(kind);
+    if (is_control)
+        atomic_fetch_add_explicit(&replica->control_send_pending, 1,
+                                  memory_order_acq_rel);
+    else {
+        while (atomic_load_explicit(&replica->control_send_pending,
+                                    memory_order_acquire) != 0 &&
+               !atomic_load_explicit(&replica->stopping, memory_order_acquire))
+            usleep(100);
+    }
+    if (is_control) {
+        int failed_fd = -1;
+        if (!atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+            rc = -1;
+        } else {
+            int fd = atomic_load_explicit(&replica->control_fd, memory_order_acquire);
+            failed_fd = fd;
+            pthread_mutex_lock(&replica->control_write_mutex);
+            if (fd < 0 || !atomic_load_explicit(&replica->connected,
+                                                memory_order_acquire))
+                rc = -1;
+            else {
+                rc = replica_socket_write_full(fd, &wire_header,
+                                               sizeof(wire_header));
+                if (rc == 0 && payload_bytes)
+                    rc = replica_socket_write_full(fd, payload, payload_bytes);
+            }
+            pthread_mutex_unlock(&replica->control_write_mutex);
+        }
+        if (rc != 0)
+            replica_mark_disconnected_fd(replica, failed_fd);
+    } else {
         size_t frame_bytes = sizeof(wire_header) + payload_bytes;
         if (frame_bytes > replica->tx_ring.config.slot_bytes) {
             rc = -1;
@@ -1382,7 +1870,6 @@ static int replica_send_frame(tlc_ha_replica_t *replica,
             if (!slot) {
                 rc = -1;
             } else {
-                /* Each sender owns its reserved slot until release commit. */
                 memcpy(slot->payload, &wire_header, sizeof(wire_header));
                 if (payload_bytes)
                     memcpy(slot->payload + sizeof(wire_header), payload,
@@ -1390,16 +1877,64 @@ static int replica_send_frame(tlc_ha_replica_t *replica,
                 replica_ring_publish(slot, position);
             }
         }
-    } else {
-        pthread_mutex_lock(&replica->stream_write_mutex);
-        rc = replica_write_full(replica->fd, &wire_header, sizeof(wire_header));
-        if (rc == 0 && payload_bytes)
-            rc = replica_write_full(replica->fd, payload, payload_bytes);
-        pthread_mutex_unlock(&replica->stream_write_mutex);
+        if (rc != 0)
+            replica_stop_signal(replica);
     }
-    if (rc != 0)
-        replica_stop_signal(replica);
+    if (is_control)
+        atomic_fetch_sub_explicit(&replica->control_send_pending, 1,
+                                  memory_order_release);
     return rc;
+}
+
+static int replica_frame_is_control(uint16_t kind) {
+    return kind != TLC_HA_REPLICA_KIND_EVENTS &&
+           kind != TLC_HA_REPLICA_KIND_ACK &&
+           kind != TLC_HA_REPLICA_KIND_SNAPSHOT_BEGIN &&
+           kind != TLC_HA_REPLICA_KIND_SNAPSHOT_CHUNK &&
+           kind != TLC_HA_REPLICA_KIND_SNAPSHOT_END &&
+           kind != TLC_HA_REPLICA_KIND_TAIL_EVENTS &&
+           kind != TLC_HA_REPLICA_KIND_TAIL_END;
+}
+
+static int replica_send_role_ack(tlc_ha_replica_t *replica) {
+    tlc_ha_role_ack_t ack = {
+        .hpc_node_id = replica->hpc_node_id,
+        .peer_node_id = replica->peer_node_id,
+        .ha_term = atomic_load_explicit(&replica->ha_term,
+                                        memory_order_acquire),
+        .connection_epoch = atomic_load_explicit(&replica->connection_epoch,
+                                                 memory_order_acquire),
+        .role = atomic_load_explicit(&replica->role, memory_order_acquire),
+        .state = atomic_load_explicit(&replica->ha_state, memory_order_acquire),
+    };
+    uint8_t payload[TLC_HA_ROLE_ACK_WIRE_BYTES];
+    replica_encode_role_ack(&ack, payload);
+    return replica_send_frame(replica, TLC_HA_REPLICA_KIND_ROLE_ACK, 0, 0,
+                              payload, sizeof(payload));
+}
+
+static int replica_send_leader_announce(tlc_ha_replica_t *replica,
+                                        uint64_t old_owner_id,
+                                        uint32_t reason) {
+    tlc_cold_progress_t progress = {0};
+    if (tlc_cold_get_progress(replica->cold, &progress) != 0)
+        return -1;
+    tlc_ha_leader_announce_t announce = {
+        .hpc_node_id = replica->hpc_node_id,
+        .old_owner_id = old_owner_id,
+        .new_owner_id = replica->hpc_node_id,
+        .ha_term = atomic_load_explicit(&replica->ha_term,
+                                        memory_order_acquire),
+        .topology_epoch = replica->configured_topology_epoch,
+        .takeover_seq = progress.durable_seq,
+        .connection_epoch = atomic_load_explicit(&replica->connection_epoch,
+                                                 memory_order_acquire),
+        .reason = reason,
+    };
+    uint8_t payload[TLC_HA_LEADER_ANNOUNCE_WIRE_BYTES];
+    replica_encode_leader_announce(&announce, payload);
+    return replica_send_frame(replica, TLC_HA_REPLICA_KIND_LEADER_ANNOUNCE,
+                              0, 0, payload, sizeof(payload));
 }
 
 int tlc_ha_replica_send_resync_snapshot(
@@ -1714,8 +2249,14 @@ static void replica_log_progress(tlc_ha_replica_t *replica) {
     if (tlc_ha_replica_get_progress(replica, &progress) != 0)
         return;
     serverLog(LL_NOTICE,
-              "HA Replica progress: role=%u appended=%llu durable=%llu applied=%llu peer_accepted=%llu peer_durable=%llu peer_applied=%llu replay_from=%llu peer_health=%u",
-              replica->role, (unsigned long long)progress.appended_seq,
+              "HA Replica progress: role=%u state=%u liveness=%u missed=%u appended=%llu durable=%llu applied=%llu peer_accepted=%llu peer_durable=%llu peer_applied=%llu replay_from=%llu peer_health=%u",
+              replica->role,
+              atomic_load_explicit(&replica->ha_state, memory_order_acquire),
+              atomic_load_explicit(&replica->peer_liveness,
+                                   memory_order_acquire),
+              atomic_load_explicit(&replica->heartbeat_missed_count,
+                                   memory_order_acquire),
+              (unsigned long long)progress.appended_seq,
               (unsigned long long)progress.durable_seq,
               (unsigned long long)progress.applied_seq,
               (unsigned long long)progress.peer_accepted_seq,
@@ -1755,6 +2296,13 @@ static int replica_event_sink(const tlc_cold_event_input_t *input,
                               uint64_t seq,
                               void *arg) {
     tlc_ha_replica_t *replica = arg;
+    /* The sink remains installed across role changes. Follower/Recovery
+     * appends are local state and must not enter the Leader emission queue. */
+    if (replica->role != TLC_HA_REPLICA_LEADER ||
+        atomic_load_explicit(&replica->ha_state, memory_order_acquire) !=
+            TLC_HA_REPLICA_STATE_MASTER ||
+        atomic_load_explicit(&replica->resync_fenced, memory_order_acquire))
+        return 0;
     /* Fast path while replay is active: the event is already durable in the
      * Leader AOF, so only the earliest replay cursor needs updating. The
      * admission-gate check below closes the transition race. */
@@ -1905,6 +2453,12 @@ static int replica_replay_pending(tlc_ha_replica_t *replica) {
     uint64_t start = atomic_exchange_explicit(&replica->replay_from_seq, 0,
                                               memory_order_acq_rel);
     replica_producer_gate_unlock(replica);
+    if (start != 0)
+        serverLog(LL_DEBUG,
+                  "HA Replica replay cursor claimed: start=%llu normal_min=%llu",
+                  (unsigned long long)start,
+                  (unsigned long long)atomic_load_explicit(
+                      &replica->normal_min_seq, memory_order_acquire));
     if (start == 0) {
         if (atomic_exchange_explicit(&replica->replay_log_active, false,
                                      memory_order_acq_rel)) {
@@ -2008,9 +2562,15 @@ int tlc_ha_replica_replay_from(tlc_ha_replica_t *replica,
 static void *replica_sender_main(void *arg) {
     tlc_ha_replica_t *replica = arg;
     while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        if (atomic_load_explicit(&replica->role, memory_order_acquire) !=
+                TLC_HA_REPLICA_LEADER) {
+            usleep(1000);
+            continue;
+        }
         if (atomic_exchange_explicit(&replica->sender_discard_pending, false,
-                                     memory_order_acq_rel))
+                                     memory_order_acq_rel)) {
             replica_discard_sender_queue(replica);
+        }
         if (atomic_load_explicit(&replica->resync_emission_gate,
                                  memory_order_acquire)) {
             usleep(1000);
@@ -2108,9 +2668,16 @@ static void *replica_sender_main(void *arg) {
         }
         atomic_fetch_add_explicit(&replica->sender_inflight, 1,
                                   memory_order_acq_rel);
-        if (!atomic_load_explicit(&replica->stopping, memory_order_acquire))
-            replica_send_frame(replica, TLC_HA_REPLICA_KIND_EVENTS,
-                               first->seq, count, payload, (uint32_t)cursor);
+        if (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+            int send_rc = replica_send_frame(replica,
+                               TLC_HA_REPLICA_KIND_EVENTS, first->seq, count,
+                               payload, (uint32_t)cursor);
+            if (atomic_load_explicit(&replica->replay_mode,
+                                     memory_order_acquire))
+                serverLog(LL_DEBUG,
+                          "HA Replica replay EVENTS sent: first=%llu count=%u rc=%d",
+                          (unsigned long long)first->seq, count, send_rc);
+        }
         atomic_fetch_sub_explicit(&replica->sender_inflight, 1,
                                   memory_order_release);
         for (uint32_t i = 0; i < count; i++)
@@ -2191,33 +2758,15 @@ static void replica_decoded_events_free(tlc_ha_replica_event_t *events,
     zfree(events);
 }
 
-static int replica_read_frame(tlc_ha_replica_t *replica,
-                              tlc_ha_replica_frame_wire_t *header,
-                              uint8_t **payload_out) {
-    tlc_ha_replica_frame_wire_t wire;
-    if (replica->transport == TLC_HA_REPLICA_TRANSPORT_UB) {
-        uint32_t spins = 0;
-        int got = 0;
-        while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
-            got = replica_ring_poll(&replica->rx_ring, replica->rx_frame);
-            if (got != 0)
-                break;
-            replica_queue_wait(&spins);
-        }
-        if (got != 1)
-            return -1;
-        memcpy(&wire, replica->rx_frame, sizeof(wire));
-    } else if (replica_read_full(replica->fd, &wire, sizeof(wire)) != 0) {
-        return -1;
-    }
-    replica_decode_frame_header(&wire, header);
+static int replica_validate_frame_header(
+        const tlc_ha_replica_frame_wire_t *wire,
+        tlc_ha_replica_frame_wire_t *header,
+        const tlc_ha_replica_t *replica) {
+    replica_decode_frame_header(wire, header);
     if (header->magic != TLC_HA_REPLICA_MAGIC ||
         header->version != TLC_HA_REPLICA_VERSION ||
-        header->header_bytes != sizeof(wire) ||
+        header->header_bytes != sizeof(*wire) ||
         header->payload_bytes > replica->max_batch_bytes ||
-        (replica->transport == TLC_HA_REPLICA_TRANSPORT_UB &&
-         header->payload_bytes > replica->rx_ring.config.slot_bytes -
-                                  sizeof(wire)) ||
         (header->kind != TLC_HA_REPLICA_KIND_EVENTS &&
          header->kind != TLC_HA_REPLICA_KIND_ACK &&
          header->kind != TLC_HA_REPLICA_KIND_HEARTBEAT &&
@@ -2233,30 +2782,22 @@ static int replica_read_frame(tlc_ha_replica_t *replica,
          header->kind != TLC_HA_REPLICA_KIND_HANDOFF_COMMIT &&
          header->kind != TLC_HA_REPLICA_KIND_HANDOFF_ACK &&
          header->kind != TLC_HA_REPLICA_KIND_RESYNC_REQUIRED &&
+         header->kind != TLC_HA_REPLICA_KIND_LEADER_ANNOUNCE &&
+         header->kind != TLC_HA_REPLICA_KIND_ROLE_ACK &&
          header->kind != TLC_HA_REPLICA_KIND_TAIL_EVENTS))
         return -1;
-    uint8_t *payload = header->payload_bytes ?
-        zmalloc(header->payload_bytes) : NULL;
-    if (header->payload_bytes && !payload)
-        return -1;
-    if (header->payload_bytes) {
-        if (replica->transport == TLC_HA_REPLICA_TRANSPORT_UB)
-            memcpy(payload, replica->rx_frame + sizeof(wire),
-                   header->payload_bytes);
-        else if (replica_read_full(replica->fd, payload,
-                                   header->payload_bytes) != 0) {
-            zfree(payload);
-            return -1;
-        }
-    }
-    tlc_ha_replica_frame_wire_t checksum_header = wire;
+    return 0;
+}
+
+static int replica_verify_checksum(const tlc_ha_replica_frame_wire_t *wire,
+                                   const tlc_ha_replica_frame_wire_t *header,
+                                   const uint8_t *payload) {
+    tlc_ha_replica_frame_wire_t checksum_header = *wire;
     checksum_header.checksum = 0;
     size_t checksum_bytes = sizeof(checksum_header) + header->payload_bytes;
     uint8_t *checksum_data = zmalloc(checksum_bytes);
-    if (!checksum_data) {
-        zfree(payload);
+    if (!checksum_data)
         return -1;
-    }
     memcpy(checksum_data, &checksum_header, sizeof(checksum_header));
     if (header->payload_bytes)
         memcpy(checksum_data + sizeof(checksum_header), payload,
@@ -2272,6 +2813,72 @@ static int replica_read_frame(tlc_ha_replica_t *replica,
                   (unsigned long long)checksum,
                   (unsigned long long)vemb_v16_xxh3_64(payload,
                                                       header->payload_bytes));
+        return -1;
+    }
+    return 0;
+}
+
+static int replica_read_data_frame(tlc_ha_replica_t *replica,
+                                   tlc_ha_replica_frame_wire_t *header,
+                                   uint8_t **payload_out) {
+    tlc_ha_replica_frame_wire_t wire;
+    uint32_t spins = 0;
+    int got = 0;
+    while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        got = replica_ring_poll(&replica->rx_ring, replica->rx_frame);
+        if (got != 0)
+            break;
+        replica_queue_wait(&spins);
+    }
+    if (got != 1)
+        return -1;
+    memcpy(&wire, replica->rx_frame, sizeof(wire));
+    if (replica_validate_frame_header(&wire, header, replica) != 0)
+        return -1;
+    if (header->payload_bytes > replica->rx_ring.config.slot_bytes -
+                                  sizeof(wire))
+        return -1;
+    uint8_t *payload = header->payload_bytes ?
+        zmalloc(header->payload_bytes) : NULL;
+    if (header->payload_bytes && !payload)
+        return -1;
+    if (header->payload_bytes)
+        memcpy(payload, replica->rx_frame + sizeof(wire),
+               header->payload_bytes);
+    if (replica_verify_checksum(&wire, header, payload) != 0) {
+        zfree(payload);
+        return -1;
+    }
+    *payload_out = payload;
+    return 0;
+}
+
+static int replica_read_control_frame(tlc_ha_replica_t *replica,
+                                      tlc_ha_replica_frame_wire_t *header,
+                                      uint8_t **payload_out) {
+    tlc_ha_replica_frame_wire_t wire;
+    int stream_fd = atomic_load_explicit(&replica->control_fd,
+                                          memory_order_acquire);
+    if (stream_fd < 0 || replica_read_full(stream_fd, &wire,
+                                           sizeof(wire)) != 0) {
+        replica_mark_disconnected_fd(replica, stream_fd);
+        return -1;
+    }
+    if (replica_validate_frame_header(&wire, header, replica) != 0)
+        return -1;
+    uint8_t *payload = header->payload_bytes ?
+        zmalloc(header->payload_bytes) : NULL;
+    if (header->payload_bytes && !payload)
+        return -1;
+    if (header->payload_bytes) {
+        if (replica_read_full(stream_fd, payload,
+                               header->payload_bytes) != 0) {
+            replica_mark_disconnected_fd(replica, stream_fd);
+            zfree(payload);
+            return -1;
+        }
+    }
+    if (replica_verify_checksum(&wire, header, payload) != 0) {
         zfree(payload);
         return -1;
     }
@@ -2435,6 +3042,31 @@ static int replica_maintain_aof_retention(tlc_ha_replica_t *replica,
 static void *replica_resync_controller_main(void *arg) {
     tlc_ha_replica_t *replica = arg;
     while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        if (atomic_load_explicit(&replica->heartbeat_failure_pending,
+                                 memory_order_acquire) &&
+            !atomic_exchange_explicit(&replica->heartbeat_failure_reported,
+                                      true, memory_order_acq_rel)) {
+            serverLog(LL_WARNING,
+                      "HA Replica controller heartbeat failure event: role=%u state=%u missed=%u",
+                      replica->role,
+                      atomic_load_explicit(&replica->ha_state,
+                                           memory_order_acquire),
+                      atomic_load_explicit(&replica->heartbeat_missed_count,
+                                           memory_order_acquire));
+        }
+        if (atomic_load_explicit(&replica->role, memory_order_acquire) ==
+                TLC_HA_REPLICA_FOLLOWER &&
+            atomic_load_explicit(&replica->heartbeat_failure_pending,
+                                 memory_order_acquire)) {
+            int promote_rc = replica_controller_try_promote(replica);
+            if (promote_rc < 0)
+                serverLog(LL_WARNING,
+                          "HA Replica automatic promotion failed: state=%u term=%llu",
+                          atomic_load_explicit(&replica->ha_state,
+                                               memory_order_acquire),
+                          (unsigned long long)atomic_load_explicit(
+                              &replica->ha_term, memory_order_acquire));
+        }
         if (replica->role == TLC_HA_REPLICA_LEADER) {
             replica_maintain_aof_retention(replica, getMonotonicNs());
             if (atomic_exchange_explicit(&replica->resync_required_pending,
@@ -2520,6 +3152,13 @@ static void *replica_resync_controller_main(void *arg) {
 static void *replica_apply_main(void *arg) {
     tlc_ha_replica_t *replica = arg;
     for (;;) {
+        if (atomic_load_explicit(&replica->role, memory_order_acquire) !=
+                TLC_HA_REPLICA_FOLLOWER) {
+            if (atomic_load_explicit(&replica->stopping, memory_order_acquire))
+                break;
+            usleep(1000);
+            continue;
+        }
         tlc_ha_replica_event_t *event = replica_queue_pop(replica);
         if (!event) {
             /* The receiver may start before the first replay frame arrives.
@@ -2542,6 +3181,10 @@ static void *replica_apply_main(void *arg) {
         if (rc == 0 && (status == TLC_CORE_REPLICA_APPLY_APPLIED ||
                         status == TLC_CORE_REPLICA_APPLY_DUPLICATE))
             replica_atomic_advance(&replica->applied_seq, event_seq);
+        if (rc == 0 && (status == TLC_CORE_REPLICA_APPLY_APPLIED ||
+                        status == TLC_CORE_REPLICA_APPLY_DUPLICATE))
+            serverLog(LL_DEBUG, "HA Replica follower event applied: seq=%llu",
+                      (unsigned long long)event_seq);
         replica_event_free(event);
         replica_follower_work_leave(&replica->apply_inflight);
         if (status == TLC_CORE_REPLICA_APPLY_GAP ||
@@ -2587,9 +3230,13 @@ static int replica_handle_heartbeat(tlc_ha_replica_t *replica,
     if (heartbeat.role != (replica->role == TLC_HA_REPLICA_LEADER ?
                            TLC_HA_REPLICA_FOLLOWER :
                            TLC_HA_REPLICA_LEADER)) {
-        serverLog(LL_WARNING, "HA Replica heartbeat role mismatch: role=%u",
+        /* A reconnect can deliver one heartbeat from the previous role before
+         * LEADER_ANNOUNCE establishes the new direction. It is stale control
+         * data, not a framing or identity violation; do not refresh liveness
+         * and keep the listener alive for the announce handshake. */
+        serverLog(LL_DEBUG, "HA Replica stale heartbeat role ignored: role=%u",
                   heartbeat.role);
-        return -1;
+        return 1;
     }
     if (heartbeat.health < TLC_HA_REPLICA_HEALTHY ||
         heartbeat.health > TLC_HA_REPLICA_UNAVAILABLE) {
@@ -2599,26 +3246,25 @@ static int replica_handle_heartbeat(tlc_ha_replica_t *replica,
     }
     if (heartbeat.ha_term < replica->ha_term) {
         serverLog(LL_WARNING,
-                  "HA Replica heartbeat term is stale: local=%llu peer=%llu",
+                  "HA Replica stale heartbeat ignored: local_term=%llu peer_term=%llu",
                   (unsigned long long)replica->ha_term,
                   (unsigned long long)heartbeat.ha_term);
-        return -1;
+        return 1;
     }
     uint64_t previous_term = atomic_load_explicit(&replica->peer_ha_term,
                                                    memory_order_acquire);
     if (heartbeat.ha_term < previous_term) {
         serverLog(LL_WARNING,
-                  "HA Replica heartbeat term regressed: previous=%llu peer=%llu",
+                  "HA Replica heartbeat term regression ignored: previous=%llu peer=%llu",
                   (unsigned long long)previous_term,
                   (unsigned long long)heartbeat.ha_term);
-        return -1;
+        return 1;
     }
     atomic_store_explicit(&replica->peer_ha_term, heartbeat.ha_term,
                           memory_order_release);
-    atomic_store_explicit(&replica->last_heartbeat_received_ns,
-                          getMonotonicNs(), memory_order_release);
     atomic_store_explicit(&replica->peer_health, heartbeat.health,
                           memory_order_release);
+    replica_heartbeat_mark_valid(replica, getMonotonicNs());
     uint64_t old_durable = atomic_load_explicit(&replica->peer_durable_seq,
                                                 memory_order_relaxed);
     while (heartbeat.durable_seq > old_durable &&
@@ -2649,6 +3295,14 @@ static int replica_handle_resync_snapshot(
         tlc_ha_resync_snapshot_begin_t begin;
         if (resync_decode_begin(payload, header->payload_bytes, &begin) != 0)
             return -1;
+        if (begin.session_id != 0 &&
+            begin.session_id <= atomic_load_explicit(
+                &replica->last_aborted_session_id, memory_order_acquire)) {
+            serverLog(LL_NOTICE,
+                      "HA Replica snapshot rejected: session=%llu already aborted",
+                      (unsigned long long)begin.session_id);
+            return -1;
+        }
         if (atomic_load_explicit(&replica->resync_session_state,
                                  memory_order_acquire) ==
                 TLC_HA_RESYNC_SESSION_FOLLOWER_WAIT_INSTALL &&
@@ -2678,6 +3332,15 @@ static int replica_handle_resync_snapshot(
                                             path, sizeof(path), &blob_bytes,
                                             &begin) != 0)
             return -1;
+        if (begin.session_id != 0 &&
+            begin.session_id <= atomic_load_explicit(
+                &replica->last_aborted_session_id, memory_order_acquire)) {
+            serverLog(LL_NOTICE,
+                      "HA Replica snapshot artifact discarded: session=%llu already aborted",
+                      (unsigned long long)begin.session_id);
+            unlink(path);
+            return -1;
+        }
         tlc_ha_resync_artifact_t *artifact = zmalloc(sizeof(*artifact));
         if (!artifact)
             return -1;
@@ -2700,6 +3363,97 @@ static int replica_handle_resync_snapshot(
     return -1;
 }
 
+static int replica_handle_leader_announce(tlc_ha_replica_t *replica,
+                                          const uint8_t *payload,
+                                          uint32_t payload_bytes) {
+    tlc_ha_leader_announce_t announce;
+    if (replica_decode_leader_announce(payload, payload_bytes, &announce) != 0 ||
+        announce.hpc_node_id != replica->peer_node_id ||
+        announce.old_owner_id != replica->hpc_node_id ||
+        announce.new_owner_id != replica->peer_node_id ||
+        announce.ha_term == 0 || announce.connection_epoch == 0 ||
+        announce.topology_epoch != replica->configured_topology_epoch)
+        return -1;
+    uint64_t local_term = atomic_load_explicit(&replica->ha_term,
+                                               memory_order_acquire);
+    uint64_t local_epoch = atomic_load_explicit(&replica->connection_epoch,
+                                                memory_order_acquire);
+    if (announce.ha_term < local_term ||
+        (announce.ha_term == local_term &&
+         atomic_load_explicit(&replica->role, memory_order_acquire) ==
+             TLC_HA_REPLICA_LEADER) ||
+        announce.connection_epoch < local_epoch)
+        return -1;
+    unsigned local_role = atomic_load_explicit(&replica->role,
+                                               memory_order_acquire);
+    unsigned local_state = atomic_load_explicit(&replica->ha_state,
+                                                memory_order_acquire);
+    if (announce.ha_term > local_term || local_role != TLC_HA_REPLICA_FOLLOWER ||
+        local_state != TLC_HA_REPLICA_STATE_BACKUP) {
+        uint64_t transition_term = announce.ha_term > local_term ?
+            announce.ha_term : local_term;
+        if (tlc_ha_replica_transition_role(
+                replica, TLC_HA_REPLICA_FOLLOWER,
+                TLC_HA_REPLICA_STATE_BACKUP, transition_term) != 0)
+            return -1;
+    }
+    if (announce.connection_epoch > local_epoch)
+        atomic_store_explicit(&replica->connection_epoch,
+                              announce.connection_epoch,
+                              memory_order_release);
+    atomic_store_explicit(&replica->peer_ha_term, announce.ha_term,
+                          memory_order_release);
+    atomic_store_explicit(&replica->peer_progress_seq, announce.takeover_seq,
+                          memory_order_release);
+    int ack_rc = replica_send_role_ack(replica);
+    if (ack_rc != 0)
+        return ack_rc;
+
+    /* A recovered old Leader may be behind the new owner's durable prefix,
+     * or may contain an uncommitted suffix from the old term. In both cases
+     * request the new Leader to select H+1 replay or snapshot fallback. */
+    tlc_cold_progress_t progress;
+    if (tlc_cold_get_progress(replica->cold, &progress) != 0)
+        return -1;
+    if (progress.durable_seq != announce.takeover_seq) {
+        uint32_t reason = progress.durable_seq < announce.takeover_seq ?
+            TLC_HA_RESYNC_REQUIRED_GAP : TLC_HA_RESYNC_REQUIRED_CONFLICT;
+        serverLog(LL_WARNING,
+                  "HA Replica announce requires recovery: local_durable=%llu takeover_seq=%llu reason=%s term=%llu",
+                  (unsigned long long)progress.durable_seq,
+                  (unsigned long long)announce.takeover_seq,
+                  replica_resync_required_reason_name(reason),
+                  (unsigned long long)announce.ha_term);
+        replica_follower_schedule_resync(replica, reason);
+    }
+    return 0;
+}
+
+static int replica_handle_role_ack(tlc_ha_replica_t *replica,
+                                   const uint8_t *payload,
+                                   uint32_t payload_bytes) {
+    tlc_ha_role_ack_t ack;
+    if (replica_decode_role_ack(payload, payload_bytes, &ack) != 0 ||
+        ack.hpc_node_id != replica->peer_node_id ||
+        ack.peer_node_id != replica->hpc_node_id ||
+        ack.role != TLC_HA_REPLICA_FOLLOWER ||
+        ack.state != TLC_HA_REPLICA_STATE_BACKUP)
+        return -1;
+    uint64_t term = atomic_load_explicit(&replica->ha_term,
+                                         memory_order_acquire);
+    uint64_t epoch = atomic_load_explicit(&replica->connection_epoch,
+                                          memory_order_acquire);
+    if (ack.ha_term != term || ack.connection_epoch != epoch ||
+        atomic_load_explicit(&replica->role, memory_order_acquire) !=
+            TLC_HA_REPLICA_LEADER)
+        return -1;
+    atomic_store_explicit(&replica->peer_ha_term, ack.ha_term,
+                          memory_order_release);
+    atomic_store_explicit(&replica->leader_announce_acked, true,
+                          memory_order_release);
+    return 0;
+}
+
 static void replica_discard_sender_queue(tlc_ha_replica_t *replica) {
     for (;;) {
         tlc_ha_replica_event_t *event = replica_queue_try_pop(replica);
@@ -2707,6 +3461,87 @@ static void replica_discard_sender_queue(tlc_ha_replica_t *replica) {
             return;
         replica_event_free(event);
     }
+}
+
+/* Promote one fenced Follower after the detector has reached its failure
+ * threshold. This remains a controller decision; heartbeat sampling itself
+ * never publishes MASTER. */
+static int replica_controller_try_promote(tlc_ha_replica_t *replica) {
+    if (atomic_load_explicit(&replica->role, memory_order_acquire) !=
+            TLC_HA_REPLICA_FOLLOWER ||
+        !atomic_load_explicit(&replica->heartbeat_failure_pending,
+                              memory_order_acquire))
+        return 0;
+
+    unsigned expected = TLC_HA_REPLICA_STATE_SUSPECT;
+    if (!atomic_compare_exchange_strong_explicit(
+            &replica->ha_state, &expected, TLC_HA_REPLICA_STATE_CANDIDATE,
+            memory_order_acq_rel, memory_order_acquire)) {
+        if (expected != TLC_HA_REPLICA_STATE_CANDIDATE)
+            return 0;
+    } else {
+        serverLog(LL_NOTICE,
+                  "HA Replica entering CANDIDATE: missed=%u term=%llu",
+                  atomic_load_explicit(&replica->heartbeat_missed_count,
+                                       memory_order_acquire),
+                  (unsigned long long)atomic_load_explicit(
+                      &replica->ha_term, memory_order_acquire));
+    }
+
+    if (!atomic_load_explicit(&replica->heartbeat_failure_pending,
+                              memory_order_acquire) ||
+        atomic_load_explicit(&replica->peer_liveness, memory_order_acquire)) {
+        expected = TLC_HA_REPLICA_STATE_CANDIDATE;
+        atomic_compare_exchange_strong_explicit(
+            &replica->ha_state, &expected, TLC_HA_REPLICA_STATE_BACKUP,
+            memory_order_acq_rel, memory_order_acquire);
+        return 0;
+    }
+
+    unsigned resync_state = atomic_load_explicit(
+        &replica->resync_session_state, memory_order_acquire);
+    if (replica_resync_state_active(resync_state))
+        return 0;
+
+    uint64_t current_term = atomic_load_explicit(&replica->ha_term,
+                                                 memory_order_acquire);
+    if (current_term == UINT64_MAX) {
+        atomic_store_explicit(&replica->ha_state, TLC_HA_REPLICA_STATE_FAULT,
+                              memory_order_release);
+        atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                              memory_order_release);
+        return -1;
+    }
+
+    tlc_cold_progress_t progress;
+    if (tlc_cold_get_progress(replica->cold, &progress) != 0) {
+        serverLog(LL_WARNING,
+                  "HA Replica promotion blocked: COLD progress unavailable");
+        atomic_store_explicit(&replica->ha_state, TLC_HA_REPLICA_STATE_FAULT,
+                              memory_order_release);
+        atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                              memory_order_release);
+        return -1;
+    }
+
+    uint64_t new_term = current_term + 1u;
+    serverLog(LL_NOTICE,
+              "HA Replica promoting CANDIDATE to MASTER: term=%llu durable=%llu",
+              (unsigned long long)new_term,
+              (unsigned long long)progress.durable_seq);
+    if (tlc_ha_replica_transition_role(replica, TLC_HA_REPLICA_LEADER,
+                                       TLC_HA_REPLICA_STATE_MASTER,
+                                       new_term) != 0) {
+        if (atomic_load_explicit(&replica->ha_state, memory_order_acquire) !=
+                TLC_HA_REPLICA_STATE_FAULT)
+            atomic_store_explicit(&replica->ha_state,
+                                  TLC_HA_REPLICA_STATE_FAULT,
+                                  memory_order_release);
+        atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                              memory_order_release);
+        return -1;
+    }
+    return 1;
 }
 
 static void replica_reset_resync_artifact(tlc_ha_replica_t *replica) {
@@ -2765,6 +3600,9 @@ static int replica_abort_resync_internal(tlc_ha_replica_t *replica,
         atomic_store_explicit(&replica->sender_discard_pending, true,
                               memory_order_release);
     } else {
+        atomic_store_explicit(&replica->last_aborted_session_id,
+                              replica->resync_session_id,
+                              memory_order_release);
         replica_reset_resync_artifact(replica);
         zfree(replica->resync_captured_seq);
         replica->resync_captured_seq = NULL;
@@ -3077,6 +3915,12 @@ static int replica_handle_resync_control(
          * like a missing AOF record and can strand the sender in replay mode. */
         uint64_t replay_from = atomic_exchange_explicit(
             &replica->replay_from_seq, 0, memory_order_acq_rel);
+        serverLog(LL_DEBUG,
+                  "HA Replica handoff ACK release: H=%llu replay_from=%llu gate_before=%d",
+                  (unsigned long long)control.durable_seq,
+                  (unsigned long long)replay_from,
+                  atomic_load_explicit(&replica->resync_emission_gate,
+                                       memory_order_acquire));
         if (replay_from > replica->resync_boundary_seq)
             replica_record_replay_from(replica, replay_from);
         atomic_store_explicit(&replica->normal_min_seq,
@@ -3087,6 +3931,13 @@ static int replica_handle_resync_control(
                               memory_order_release);
         atomic_store_explicit(&replica->resync_emission_gate, false,
                               memory_order_release);
+        serverLog(LL_DEBUG,
+                  "HA Replica handoff ACK released: H=%llu normal_min=%llu gate_after=%d",
+                  (unsigned long long)control.durable_seq,
+                  (unsigned long long)atomic_load_explicit(
+                      &replica->normal_min_seq, memory_order_acquire),
+                  atomic_load_explicit(&replica->resync_emission_gate,
+                                       memory_order_acquire));
         serverLog(LL_NOTICE, "HA resync handoff complete: session=%llu H=%llu",
                   (unsigned long long)control.session_id,
                   (unsigned long long)control.durable_seq);
@@ -3112,18 +3963,20 @@ static void *replica_heartbeat_main(void *arg) {
         nanosleep(&pause, NULL);
         if (atomic_load_explicit(&replica->stopping, memory_order_acquire))
             break;
-        if (replica_send_heartbeat(replica) != 0)
-            atomic_store_explicit(&replica->peer_health,
-                                  TLC_HA_REPLICA_UNAVAILABLE,
-                                  memory_order_release);
+        if (!atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+            /* Connection establishment/reconnect is not a peer failure. */
+            replica_log_progress(replica);
+            continue;
+        }
+        int heartbeat_send_failed = replica_send_heartbeat(replica) != 0;
         replica_log_progress(replica);
         uint64_t last = atomic_load_explicit(
             &replica->last_heartbeat_received_ns, memory_order_acquire);
-        if (last != 0 && elapsedNs(last) >=
-                         (uint64_t)replica->heartbeat_timeout_ms * 1000000u)
-            atomic_store_explicit(&replica->peer_health,
-                                  TLC_HA_REPLICA_UNAVAILABLE,
-                                  memory_order_release);
+        uint64_t now = getMonotonicNs();
+        if (heartbeat_send_failed ||
+            (last != 0 && now - last >=
+             (uint64_t)replica->heartbeat_timeout_ms * 1000000u))
+            replica_heartbeat_mark_timeout(replica, now);
         unsigned state = atomic_load_explicit(&replica->resync_session_state,
                                               memory_order_acquire);
         uint64_t last_resync = atomic_load_explicit(
@@ -3137,41 +3990,77 @@ static void *replica_heartbeat_main(void *arg) {
 }
 
 /*
- * Replica listener mirrors UB RPC listener_main's batch poll/dispatch loop,
- * but consumes only the dedicated Replica channel and never uses RPC pending
- * request state. On a Leader it dispatches ACK frames; on a Follower it
- * dispatches EVENTS frames before enqueueing them for asynchronous apply.
+ * Control listener reads control frames from the TCP control_fd. Handles
+ * HEARTBEAT, LEADER_ANNOUNCE, ROLE_ACK, and resync coordination frames.
+ * TCP EOF triggers disconnect/reconnect, not full stop.
  */
-static void *replica_listener_main(void *arg) {
+static void *replica_control_listener_main(void *arg) {
     tlc_ha_replica_t *replica = arg;
     while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        if (!atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+            int fd = replica->role == TLC_HA_REPLICA_LEADER ?
+                replica_connect_control_peer(replica) :
+                replica_accept_control_peer(replica);
+            if (fd >= 0) {
+                serverLog(LL_NOTICE,
+                          "HA Replica control TCP %s: fd=%d",
+                          replica->role == TLC_HA_REPLICA_LEADER ?
+                          "connected to peer" : "accepted peer", fd);
+                uint64_t epoch = atomic_load_explicit(
+                    &replica->connection_epoch, memory_order_acquire) + 1u;
+                if (tlc_ha_replica_reconnect(replica, fd, epoch) == 0)
+                    continue;
+            }
+            usleep(10000);
+            continue;
+        }
         tlc_ha_replica_frame_wire_t header;
         uint8_t *payload = NULL;
-        if (replica_read_frame(replica, &header, &payload) != 0) {
+        if (replica_read_control_frame(replica, &header, &payload) != 0) {
+            if (!atomic_load_explicit(&replica->connected,
+                                      memory_order_acquire))
+                continue;
             replica_stop_signal(replica);
             break;
         }
-        if (header.kind == TLC_HA_REPLICA_KIND_HEARTBEAT) {
-            int heartbeat_rc = replica_handle_heartbeat(replica, &header,
-                                                        payload);
+        if (header.kind == TLC_HA_REPLICA_KIND_LEADER_ANNOUNCE) {
+            if (header.first_seq != 0 || header.event_count != 0) {
+                zfree(payload);
+                replica_stop_signal(replica);
+                break;
+            }
+            int announce_rc = replica_handle_leader_announce(
+                replica, payload, header.payload_bytes);
             zfree(payload);
-            if (heartbeat_rc != 0) {
+            if (announce_rc != 0) {
                 replica_stop_signal(replica);
                 break;
             }
             continue;
         }
-        if (header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_BEGIN ||
-            header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_CHUNK ||
-            header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_END) {
-            int resync_rc = replica_handle_resync_snapshot(replica, &header,
-                                                            payload);
-            zfree(payload);
-            if (resync_rc != 0) {
+        if (header.kind == TLC_HA_REPLICA_KIND_ROLE_ACK) {
+            if (header.first_seq != 0 || header.event_count != 0) {
+                zfree(payload);
                 replica_stop_signal(replica);
                 break;
             }
-            replica_resync_touch(replica);
+            int ack_rc = replica_handle_role_ack(replica, payload,
+                                                  header.payload_bytes);
+            zfree(payload);
+            if (ack_rc != 0) {
+                replica_stop_signal(replica);
+                break;
+            }
+            continue;
+        }
+        if (header.kind == TLC_HA_REPLICA_KIND_HEARTBEAT) {
+            int heartbeat_rc = replica_handle_heartbeat(replica, &header,
+                                                        payload);
+            zfree(payload);
+            if (heartbeat_rc < 0) {
+                replica_stop_signal(replica);
+                break;
+            }
             continue;
         }
         if (header.kind == TLC_HA_REPLICA_KIND_RESYNC_REQUEST ||
@@ -3179,7 +4068,6 @@ static void *replica_listener_main(void *arg) {
             header.kind == TLC_HA_REPLICA_KIND_RESYNC_ABORT ||
             header.kind == TLC_HA_REPLICA_KIND_RESYNC_REQUIRED ||
             header.kind == TLC_HA_REPLICA_KIND_TAIL_REQUEST ||
-            header.kind == TLC_HA_REPLICA_KIND_TAIL_END ||
             header.kind == TLC_HA_REPLICA_KIND_RESYNC_ACK ||
             header.kind == TLC_HA_REPLICA_KIND_HANDOFF_COMMIT ||
             header.kind == TLC_HA_REPLICA_KIND_HANDOFF_ACK) {
@@ -3192,6 +4080,42 @@ static void *replica_listener_main(void *arg) {
                           replica->role, header.kind,
                           atomic_load_explicit(&replica->resync_session_state,
                                                memory_order_acquire));
+                replica_stop_signal(replica);
+                break;
+            }
+            replica_resync_touch(replica);
+            continue;
+        }
+        zfree(payload);
+        serverLog(LL_WARNING,
+                  "HA Replica control listener unexpected data frame: kind=%u",
+                  header.kind);
+        replica_stop_signal(replica);
+        break;
+    }
+    return NULL;
+}
+
+/*
+ * Data listener polls the UB rx_ring for data frames: EVENTS, ACK,
+ * SNAPSHOT_BEGIN/CHUNK/END, and TAIL_EVENTS. UB poll failure is terminal.
+ */
+static void *replica_data_listener_main(void *arg) {
+    tlc_ha_replica_t *replica = arg;
+    while (!atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        tlc_ha_replica_frame_wire_t header;
+        uint8_t *payload = NULL;
+        if (replica_read_data_frame(replica, &header, &payload) != 0) {
+            replica_stop_signal(replica);
+            break;
+        }
+        if (header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_BEGIN ||
+            header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_CHUNK ||
+            header.kind == TLC_HA_REPLICA_KIND_SNAPSHOT_END) {
+            int resync_rc = replica_handle_resync_snapshot(replica, &header,
+                                                            payload);
+            zfree(payload);
+            if (resync_rc != 0) {
                 replica_stop_signal(replica);
                 break;
             }
@@ -3216,7 +4140,24 @@ static void *replica_listener_main(void *arg) {
             replica_resync_touch(replica);
             continue;
         }
-        if (replica->role == TLC_HA_REPLICA_LEADER) {
+        if (header.kind == TLC_HA_REPLICA_KIND_TAIL_END) {
+            int control_rc = replica_handle_resync_control(replica, &header,
+                                                            payload);
+            zfree(payload);
+            if (control_rc != 0) {
+                serverLog(LL_WARNING,
+                          "HA Replica resync data control rejected: role=%u kind=%u state=%u",
+                          replica->role, header.kind,
+                          atomic_load_explicit(&replica->resync_session_state,
+                                               memory_order_acquire));
+                replica_stop_signal(replica);
+                break;
+            }
+            replica_resync_touch(replica);
+            continue;
+        }
+        if (atomic_load_explicit(&replica->role, memory_order_acquire) ==
+                TLC_HA_REPLICA_LEADER) {
             if (header.kind != TLC_HA_REPLICA_KIND_ACK ||
                 header.payload_bytes != sizeof(uint64_t)) {
                 zfree(payload);
@@ -3256,6 +4197,49 @@ static void *replica_listener_main(void *arg) {
             replica_follower_work_leave(&replica->ingress_inflight);
             replica_stop_signal(replica);
             break;
+        }
+        uint64_t local_term = atomic_load_explicit(&replica->ha_term,
+                                                   memory_order_acquire);
+        int stale_term = 0;
+        int future_term = 0;
+        for (uint32_t i = 0; i < header.event_count; i++) {
+            if (events[i].input.ha_term < local_term) {
+                stale_term = 1;
+                serverLog(LL_WARNING,
+                          "HA Replica dropped stale EVENTS: seq=%llu event_term=%llu local_term=%llu first_seq=%llu count=%u epoch=%llu",
+                          (unsigned long long)events[i].seq,
+                          (unsigned long long)events[i].input.ha_term,
+                          (unsigned long long)local_term,
+                          (unsigned long long)header.first_seq,
+                          header.event_count,
+                          (unsigned long long)atomic_load_explicit(
+                              &replica->connection_epoch, memory_order_acquire));
+                break;
+            }
+            if (events[i].input.ha_term > local_term) {
+                future_term = 1;
+                serverLog(LL_WARNING,
+                          "HA Replica rejected future-term EVENTS: seq=%llu event_term=%llu local_term=%llu first_seq=%llu count=%u epoch=%llu",
+                          (unsigned long long)events[i].seq,
+                          (unsigned long long)events[i].input.ha_term,
+                          (unsigned long long)local_term,
+                          (unsigned long long)header.first_seq,
+                          header.event_count,
+                          (unsigned long long)atomic_load_explicit(
+                              &replica->connection_epoch, memory_order_acquire));
+                break;
+            }
+        }
+        if (stale_term || future_term) {
+            replica_decoded_events_free(events, header.event_count);
+            zfree(payload);
+            replica_follower_work_leave(&replica->ingress_inflight);
+            if (stale_term)
+                replica_follower_schedule_resync(replica,
+                                                 TLC_HA_RESYNC_REQUIRED_GAP);
+            else
+                replica_stop_signal(replica);
+            continue;
         }
         tlc_cold_event_input_t *inputs =
             zcalloc_num(header.event_count, sizeof(*inputs));
@@ -3302,6 +4286,11 @@ static void *replica_listener_main(void *arg) {
             replica_stop_signal(replica);
             break;
         }
+        serverLog(LL_DEBUG,
+                  "HA Replica follower EVENTS durable: first=%llu count=%u accepted=%llu",
+                  (unsigned long long)header.first_seq, header.event_count,
+                  (unsigned long long)(accepted_seq != 0 ? accepted_seq :
+                                       header.first_seq + header.event_count - 1u));
         if ((status == TLC_COLD_REPLICA_BATCH_APPLIED ||
              status == TLC_COLD_REPLICA_BATCH_DUPLICATE) &&
             atomic_load_explicit(&replica->resync_session_state,
@@ -3346,10 +4335,6 @@ static void *replica_listener_main(void *arg) {
 int tlc_ha_replica_start(tlc_ha_replica_t **out,
                          const tlc_ha_replica_config_t *config) {
     if (!out || !config || !config->core || !config->cold ||
-        (config->transport == TLC_HA_REPLICA_TRANSPORT_STREAM &&
-         config->fd < 0) ||
-        (config->transport != TLC_HA_REPLICA_TRANSPORT_STREAM &&
-         config->transport != TLC_HA_REPLICA_TRANSPORT_UB) ||
         (config->role != TLC_HA_REPLICA_LEADER &&
          config->role != TLC_HA_REPLICA_FOLLOWER))
         return -1;
@@ -3363,9 +4348,28 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
     int failure_errno = 0;
     replica->core = config->core;
     replica->cold = config->cold;
-    replica->fd = config->fd;
-    replica->role = config->role;
-    replica->transport = config->transport;
+    int legacy_control_fd = config->control_fd;
+    assert(legacy_control_fd >= 0 ||
+           (config->control_bind_host && *config->control_bind_host &&
+            config->peer_advertised_host && *config->peer_advertised_host &&
+            config->control_bind_port != 0 && config->peer_control_port != 0));
+    replica->control_listen_fd = -1;
+    if (legacy_control_fd < 0) {
+        assert(strlen(config->control_bind_host) <
+               sizeof(replica->control_bind_host));
+        assert(strlen(config->peer_advertised_host) <
+               sizeof(replica->peer_advertised_host));
+        snprintf(replica->control_bind_host,
+                 sizeof(replica->control_bind_host), "%s",
+                 config->control_bind_host);
+        snprintf(replica->peer_advertised_host,
+                 sizeof(replica->peer_advertised_host), "%s",
+                 config->peer_advertised_host);
+        replica->control_bind_port = config->control_bind_port;
+        replica->peer_control_port = config->peer_control_port;
+    }
+    atomic_init(&replica->control_fd, legacy_control_fd);
+    atomic_init(&replica->role, config->role);
     atomic_init(&replica->received_snapshot_artifact, (uintptr_t)NULL);
     replica->queue_capacity = config->queue_capacity ? config->queue_capacity :
                               TLC_HA_REPLICA_DEFAULT_QUEUE;
@@ -3380,7 +4384,7 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
         TLC_HA_REPLICA_DEFAULT_RESYNC_SNAPSHOT_BYTES;
     replica->hpc_node_id = config->hpc_node_id;
     replica->peer_node_id = config->peer_node_id;
-    replica->ha_term = config->ha_term;
+    atomic_init(&replica->ha_term, config->ha_term);
     replica->configured_topology_epoch = config->topology_epoch ?
         config->topology_epoch : 1;
     replica->heartbeat_interval_ms = config->heartbeat_interval_ms ?
@@ -3389,12 +4393,50 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
     replica->heartbeat_timeout_ms = config->heartbeat_timeout_ms ?
         config->heartbeat_timeout_ms :
         TLC_HA_REPLICA_DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    replica->heartbeat_failure_threshold =
+        config->heartbeat_failure_threshold ?
+        config->heartbeat_failure_threshold :
+        TLC_HA_REPLICA_DEFAULT_HEARTBEAT_FAILURE_THRESHOLD;
+    replica->heartbeat_backoff_max_ms = config->heartbeat_backoff_max_ms ?
+        config->heartbeat_backoff_max_ms :
+        TLC_HA_REPLICA_DEFAULT_HEARTBEAT_BACKOFF_MAX_MS;
+    if (config->heartbeat_backoff_max_ms == 0 &&
+        replica->heartbeat_backoff_max_ms < replica->heartbeat_interval_ms)
+        replica->heartbeat_backoff_max_ms = replica->heartbeat_interval_ms;
+    replica->heartbeat_suspect_hold_down_ms =
+        config->heartbeat_suspect_hold_down_ms ?
+        config->heartbeat_suspect_hold_down_ms :
+        TLC_HA_REPLICA_DEFAULT_HEARTBEAT_SUSPECT_HOLD_DOWN_MS;
     replica->resync_timeout_ms = config->resync_timeout_ms ?
         config->resync_timeout_ms : TLC_HA_REPLICA_DEFAULT_RESYNC_TIMEOUT_MS;
     replica->resync_chunk_bytes = config->resync_chunk_bytes ?
         config->resync_chunk_bytes : TLC_HA_REPLICA_DEFAULT_RESYNC_CHUNK_BYTES;
-    if (replica->heartbeat_timeout_ms < replica->heartbeat_interval_ms) {
-        failure = "heartbeat timeout is shorter than interval";
+    const char *cold_directory = tlc_cold_directory(replica->cold);
+    if (!cold_directory || snprintf(replica->owner_metadata_path,
+                                    sizeof(replica->owner_metadata_path),
+                                    "%s.ha-owner", cold_directory) < 0 ||
+        strlen(cold_directory) + sizeof(".ha-owner") >=
+            sizeof(replica->owner_metadata_path)) {
+        failure = "owner metadata path";
+        goto failed;
+    }
+    uint64_t persisted_term = config->ha_term;
+    int metadata_rc = replica_owner_metadata_load(
+        replica->owner_metadata_path, replica->hpc_node_id, &persisted_term);
+    if (metadata_rc < 0) {
+        failure = "owner metadata validation";
+        goto failed;
+    }
+    atomic_store_explicit(&replica->ha_term, persisted_term,
+                          memory_order_release);
+    if (tlc_core_set_ha_term(replica->core, persisted_term) != 0) {
+        failure = "core HA term synchronization";
+        goto failed;
+    }
+    if (replica->heartbeat_timeout_ms < replica->heartbeat_interval_ms ||
+        replica->heartbeat_failure_threshold == 0 ||
+        replica->heartbeat_backoff_max_ms < replica->heartbeat_interval_ms) {
+        failure = "invalid heartbeat detector configuration";
         goto failed;
     }
     replica->queue_capacity = replica_round_queue_capacity(
@@ -3414,40 +4456,54 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
         failure = "queue allocation";
         goto failed;
     }
-    if (replica->transport == TLC_HA_REPLICA_TRANSPORT_UB) {
-        if (replica_ring_open(&replica->tx_ring, &config->tx_ring) != 0) {
-            failure = "TX ring open";
-            goto failed;
-        }
-        if (replica_ring_open(&replica->rx_ring, &config->rx_ring) != 0) {
-            failure = "RX ring open";
-            goto failed;
-        }
-        if (replica->tx_ring.config.slot_bytes !=
-                replica->rx_ring.config.slot_bytes ||
-            replica->tx_ring.config.slot_bytes <
-                sizeof(tlc_ha_replica_frame_wire_t) +
-                replica->max_batch_bytes ||
-            replica->rx_ring.config.slot_bytes <
-                sizeof(tlc_ha_replica_frame_wire_t) +
-                replica->max_batch_bytes) {
-            failure = "ring slot is smaller than one configured batch";
-            goto failed;
-        }
-        replica->rx_frame = zmalloc(replica->rx_ring.config.slot_bytes);
-        if (!replica->rx_frame) {
-            failure = "UB frame allocation";
-            goto failed;
-        }
+    if (replica_ring_open(&replica->tx_ring, &config->tx_ring) != 0) {
+        failure = "TX ring open";
+        goto failed;
+    }
+    if (replica_ring_open(&replica->rx_ring, &config->rx_ring) != 0) {
+        failure = "RX ring open";
+        goto failed;
+    }
+    if (replica->tx_ring.config.slot_bytes !=
+            replica->rx_ring.config.slot_bytes ||
+        replica->tx_ring.config.slot_bytes <
+            sizeof(tlc_ha_replica_frame_wire_t) +
+            replica->max_batch_bytes ||
+        replica->rx_ring.config.slot_bytes <
+            sizeof(tlc_ha_replica_frame_wire_t) +
+            replica->max_batch_bytes) {
+        failure = "ring slot is smaller than one configured batch";
+        goto failed;
+    }
+    replica->rx_frame = zmalloc(replica->rx_ring.config.slot_bytes);
+    if (!replica->rx_frame) {
+        failure = "UB frame allocation";
+        goto failed;
     }
     atomic_init(&replica->stopping, false);
     atomic_init(&replica->peer_accepted_seq, 0);
     atomic_init(&replica->peer_durable_seq, 0);
     atomic_init(&replica->peer_progress_seq, 0);
     atomic_init(&replica->peer_ha_term, 0);
+    atomic_init(&replica->connection_epoch,
+                config->connection_epoch ? config->connection_epoch : 1);
     atomic_init(&replica->applied_seq, 0);
     atomic_init(&replica->last_heartbeat_received_ns, getMonotonicNs());
     atomic_init(&replica->peer_health, TLC_HA_REPLICA_UNAVAILABLE);
+    atomic_init(&replica->peer_liveness, false);
+    atomic_init(&replica->heartbeat_missed_count, 0);
+    atomic_init(&replica->heartbeat_backoff_ms,
+                replica->heartbeat_interval_ms);
+    atomic_init(&replica->heartbeat_next_probe_ns, 0);
+    atomic_init(&replica->heartbeat_suspect_since_ns, 0);
+    atomic_init(&replica->heartbeat_failure_pending, false);
+    atomic_init(&replica->heartbeat_failure_reported, false);
+    atomic_init(&replica->connected, legacy_control_fd >= 0);
+    atomic_init(&replica->leader_announce_acked, false);
+    atomic_init(&replica->control_send_pending, 0);
+    atomic_init(&replica->ha_state,
+                replica->role == TLC_HA_REPLICA_LEADER ?
+                TLC_HA_REPLICA_STATE_MASTER : TLC_HA_REPLICA_STATE_BACKUP);
     atomic_init(&replica->resync_fenced, false);
     atomic_init(&replica->ingress_inflight, 0);
     atomic_init(&replica->apply_inflight, 0);
@@ -3462,17 +4518,28 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
     atomic_init(&replica->resync_required_applied_seq, 0);
     atomic_init(&replica->next_resync_session_id, getMonotonicNs());
     atomic_init(&replica->resync_install_pending, false);
-    if (replica->transport == TLC_HA_REPLICA_TRANSPORT_STREAM) {
-        failure_errno = pthread_mutex_init(&replica->stream_write_mutex, NULL);
-        if (failure_errno != 0) {
-            failure = "stream write mutex initialization";
-            goto failed;
-        }
-        replica->stream_write_mutex_initialized = 1;
+    atomic_init(&replica->last_aborted_session_id, 0);
+    failure_errno = pthread_mutex_init(&replica->control_write_mutex, NULL);
+    if (failure_errno != 0) {
+        failure = "control write mutex initialization";
+        goto failed;
     }
-    if (replica->role == TLC_HA_REPLICA_FOLLOWER) {
+    replica->control_write_mutex_initialized = 1;
+    if (legacy_control_fd < 0 &&
+        replica_open_control_listener(replica) != 0) {
+        failure = "control listener bind";
+        goto failed;
+    }
+    if (legacy_control_fd < 0)
+        serverLog(LL_NOTICE,
+                  "HA Replica control endpoint: bind=%s:%u peer=%s:%u role=%u",
+                  replica->control_bind_host,
+                  (unsigned)replica->control_bind_port,
+                  replica->peer_advertised_host,
+                  (unsigned)replica->peer_control_port,
+                  (unsigned)replica->role);
+    {
         char artifact_directory[PATH_MAX];
-        const char *cold_directory = tlc_cold_directory(replica->cold);
         if (!cold_directory ||
             snprintf(artifact_directory, sizeof(artifact_directory), "%s.resync",
                      cold_directory) < 0 ||
@@ -3499,42 +4566,39 @@ int tlc_ha_replica_start(tlc_ha_replica_t **out,
     atomic_init(&replica->replay_log_start_seq, 0);
     atomic_init(&replica->normal_min_seq, 0);
     atomic_init(&replica->sender_discard_pending, false);
-    if (replica->role == TLC_HA_REPLICA_LEADER) {
-        if (tlc_core_set_replica_event_sink(replica->core,
-                                            replica_event_sink, replica) != 0) {
-            failure = "Leader replica event sink binding";
-            goto failed;
-        }
-        failure_errno = pthread_create(&replica->sender_thread, NULL,
-                                       replica_sender_main, replica);
-        if (failure_errno != 0) {
-            failure = "Leader sender thread creation";
-            goto failed_started;
-        }
-        replica->sender_started = 1;
-        failure_errno = pthread_create(&replica->receiver_thread, NULL,
-                                       replica_listener_main, replica);
-        if (failure_errno != 0) {
-            failure = "Leader receiver thread creation";
-            goto failed_started;
-        }
-        replica->receiver_started = 1;
-    } else {
-        failure_errno = pthread_create(&replica->receiver_thread, NULL,
-                                       replica_listener_main, replica);
-        if (failure_errno != 0) {
-            failure = "Follower receiver thread creation";
-            goto failed_started;
-        }
-        replica->receiver_started = 1;
-        failure_errno = pthread_create(&replica->apply_thread, NULL,
-                                       replica_apply_main, replica);
-        if (failure_errno != 0) {
-            failure = "Follower apply thread creation";
-            goto failed_started;
-        }
-        replica->apply_started = 1;
+    if (tlc_core_set_replica_event_sink(replica->core,
+                                        replica_event_sink, replica) != 0) {
+        failure = "replica event sink binding";
+        goto failed;
     }
+    failure_errno = pthread_create(&replica->sender_thread, NULL,
+                                   replica_sender_main, replica);
+    if (failure_errno != 0) {
+        failure = "sender thread creation";
+        goto failed_started;
+    }
+    replica->sender_started = 1;
+    failure_errno = pthread_create(&replica->control_listener_thread, NULL,
+                                   replica_control_listener_main, replica);
+    if (failure_errno != 0) {
+        failure = "control listener thread creation";
+        goto failed_started;
+    }
+    replica->control_listener_started = 1;
+    failure_errno = pthread_create(&replica->data_listener_thread, NULL,
+                                   replica_data_listener_main, replica);
+    if (failure_errno != 0) {
+        failure = "data listener thread creation";
+        goto failed_started;
+    }
+    replica->data_listener_started = 1;
+    failure_errno = pthread_create(&replica->apply_thread, NULL,
+                                   replica_apply_main, replica);
+    if (failure_errno != 0) {
+        failure = "apply thread creation";
+        goto failed_started;
+    }
+    replica->apply_started = 1;
     failure_errno = pthread_create(&replica->heartbeat_thread, NULL,
                                    replica_heartbeat_main, replica);
     if (failure_errno != 0) {
@@ -3558,21 +4622,23 @@ failed_started:
         pthread_join(replica->resync_controller_thread, NULL);
     if (replica->sender_started)
         pthread_join(replica->sender_thread, NULL);
-    if (replica->receiver_started)
-        pthread_join(replica->receiver_thread, NULL);
+    if (replica->control_listener_started)
+        pthread_join(replica->control_listener_thread, NULL);
+    if (replica->data_listener_started)
+        pthread_join(replica->data_listener_thread, NULL);
     if (replica->apply_started)
         pthread_join(replica->apply_thread, NULL);
     if (replica->heartbeat_started)
         pthread_join(replica->heartbeat_thread, NULL);
-    if (replica->role == TLC_HA_REPLICA_LEADER)
-        tlc_core_set_replica_event_sink(replica->core, NULL, NULL);
+    tlc_core_set_replica_event_sink(replica->core, NULL, NULL);
 failed:
     serverLog(LL_WARNING,
-              "HA Replica start failed: stage=%s role=%u transport=%u "
+              "HA Replica start failed: stage=%s role=%u "
               "queue=%u batch_events=%u batch_bytes=%u tx_slot_bytes=%u "
               "rx_slot_bytes=%u error=%d",
-              failure ? failure : "unknown", replica->role,
-              replica->transport, replica->queue_capacity,
+              failure ? failure : "unknown",
+              atomic_load_explicit(&replica->role, memory_order_acquire),
+              replica->queue_capacity,
               replica->max_batch_events, replica->max_batch_bytes,
               replica->tx_ring.config.slot_bytes,
               replica->rx_ring.config.slot_bytes, failure_errno);
@@ -3584,8 +4650,10 @@ failed:
     resync_artifact_free((tlc_ha_resync_artifact_t *)
         atomic_exchange_explicit(&replica->received_snapshot_artifact,
                                  (uintptr_t)NULL, memory_order_acquire));
-    if (replica->stream_write_mutex_initialized)
-        pthread_mutex_destroy(&replica->stream_write_mutex);
+    if (replica->control_write_mutex_initialized)
+        pthread_mutex_destroy(&replica->control_write_mutex);
+    if (replica->control_listen_fd >= 0)
+        close(replica->control_listen_fd);
     replica_ring_close(&replica->tx_ring);
     replica_ring_close(&replica->rx_ring);
     zfree(replica->rx_frame);
@@ -3602,16 +4670,23 @@ void tlc_ha_replica_stop(tlc_ha_replica_t *replica) {
         pthread_join(replica->resync_controller_thread, NULL);
     if (replica->sender_started)
         pthread_join(replica->sender_thread, NULL);
-    if (replica->receiver_started)
-        pthread_join(replica->receiver_thread, NULL);
+    if (replica->control_listener_started)
+        pthread_join(replica->control_listener_thread, NULL);
+    if (replica->data_listener_started)
+        pthread_join(replica->data_listener_thread, NULL);
     if (replica->apply_started)
         pthread_join(replica->apply_thread, NULL);
     if (replica->heartbeat_started)
         pthread_join(replica->heartbeat_thread, NULL);
-    if (replica->role == TLC_HA_REPLICA_LEADER)
-        tlc_core_set_replica_event_sink(replica->core, NULL, NULL);
-    if (replica->fd >= 0)
-        close(replica->fd);
+    tlc_core_set_replica_event_sink(replica->core, NULL, NULL);
+    int fd = atomic_exchange_explicit(&replica->control_fd, -1,
+                                      memory_order_acq_rel);
+    if (fd >= 0)
+        close(fd);
+    if (replica->control_listen_fd >= 0) {
+        close(replica->control_listen_fd);
+        replica->control_listen_fd = -1;
+    }
     for (uint32_t i = 0; i < replica->queue_capacity; i++)
         replica_event_free(replica->queue[i]);
     zfree(replica->queue);
@@ -3626,8 +4701,8 @@ void tlc_ha_replica_stop(tlc_ha_replica_t *replica) {
     resync_artifact_free((tlc_ha_resync_artifact_t *)
         atomic_exchange_explicit(&replica->received_snapshot_artifact,
                                  (uintptr_t)NULL, memory_order_acquire));
-    if (replica->stream_write_mutex_initialized)
-        pthread_mutex_destroy(&replica->stream_write_mutex);
+    if (replica->control_write_mutex_initialized)
+        pthread_mutex_destroy(&replica->control_write_mutex);
     zfree(replica);
 }
 
@@ -3671,4 +4746,202 @@ uint64_t tlc_ha_replica_last_heartbeat_ns(
         const tlc_ha_replica_t *replica) {
     return replica ? atomic_load_explicit(
         &replica->last_heartbeat_received_ns, memory_order_acquire) : 0;
+}
+
+int tlc_ha_replica_peer_liveness(const tlc_ha_replica_t *replica) {
+    return replica && atomic_load_explicit(&replica->peer_liveness,
+                                           memory_order_acquire);
+}
+
+tlc_ha_replica_ha_state_t tlc_ha_replica_ha_state(
+        const tlc_ha_replica_t *replica) {
+    return replica ? (tlc_ha_replica_ha_state_t)atomic_load_explicit(
+        &replica->ha_state, memory_order_acquire) :
+        TLC_HA_REPLICA_STATE_FAULT;
+}
+
+uint32_t tlc_ha_replica_heartbeat_missed_count(
+        const tlc_ha_replica_t *replica) {
+    return replica ? atomic_load_explicit(&replica->heartbeat_missed_count,
+                                          memory_order_acquire) : 0;
+}
+
+int tlc_ha_replica_heartbeat_failure_pending(
+        const tlc_ha_replica_t *replica) {
+    return replica && atomic_load_explicit(&replica->heartbeat_failure_pending,
+                                           memory_order_acquire);
+}
+
+tlc_ha_replica_role_t tlc_ha_replica_role(
+        const tlc_ha_replica_t *replica) {
+    return replica ? (tlc_ha_replica_role_t)atomic_load_explicit(
+        &replica->role, memory_order_acquire) : TLC_HA_REPLICA_FOLLOWER;
+}
+
+uint64_t tlc_ha_replica_ha_term(const tlc_ha_replica_t *replica) {
+    return replica ? atomic_load_explicit(&replica->ha_term,
+                                          memory_order_acquire) : 0;
+}
+
+uint64_t tlc_ha_replica_connection_epoch(
+        const tlc_ha_replica_t *replica) {
+    return replica ? atomic_load_explicit(&replica->connection_epoch,
+                                          memory_order_acquire) : 0;
+}
+
+int tlc_ha_replica_reconnect(tlc_ha_replica_t *replica, int control_fd,
+                             uint64_t connection_epoch) {
+    if (!replica || control_fd < 0)
+        return -1;
+    if (connection_epoch == 0 ||
+        atomic_load_explicit(&replica->stopping, memory_order_acquire)) {
+        close(control_fd);
+        return -1;
+    }
+    uint64_t current_epoch = atomic_load_explicit(&replica->connection_epoch,
+                                                  memory_order_acquire);
+    if (connection_epoch <= current_epoch ||
+        atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+        close(control_fd);
+        return -1;
+    }
+    pthread_mutex_lock(&replica->control_write_mutex);
+    if (atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+        pthread_mutex_unlock(&replica->control_write_mutex);
+        close(control_fd);
+        return -1;
+    }
+    int old_fd = atomic_exchange_explicit(&replica->control_fd, control_fd,
+                                          memory_order_acq_rel);
+    if (old_fd >= 0) {
+        shutdown(old_fd, SHUT_RDWR);
+        close(old_fd);
+    }
+    pthread_mutex_unlock(&replica->control_write_mutex);
+    atomic_store_explicit(&replica->connection_epoch, connection_epoch,
+                          memory_order_release);
+    atomic_store_explicit(&replica->last_heartbeat_received_ns,
+                          getMonotonicNs(), memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_missed_count, 0,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_backoff_ms,
+                          replica->heartbeat_interval_ms,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_reported, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->leader_announce_acked, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->connected, true, memory_order_release);
+    if (atomic_load_explicit(&replica->role, memory_order_acquire) ==
+        TLC_HA_REPLICA_LEADER) {
+        unsigned state = atomic_load_explicit(&replica->ha_state,
+                                              memory_order_acquire);
+        uint64_t term = atomic_load_explicit(&replica->ha_term,
+                                             memory_order_acquire);
+        int announce_rc = state == TLC_HA_REPLICA_STATE_MASTER ?
+            replica_send_leader_announce(replica, replica->peer_node_id, 2) :
+            tlc_ha_replica_transition_role(replica,
+                                           TLC_HA_REPLICA_LEADER,
+                                           TLC_HA_REPLICA_STATE_MASTER, term);
+        if (announce_rc != 0) {
+            replica_mark_disconnected(replica);
+            return -1;
+        }
+    }
+    serverLog(LL_NOTICE,
+              "HA Replica control reconnected: epoch=%llu",
+              (unsigned long long)connection_epoch);
+    return 0;
+}
+
+int tlc_ha_replica_leader_announce_acked(
+        const tlc_ha_replica_t *replica) {
+    return replica && atomic_load_explicit(&replica->leader_announce_acked,
+                                           memory_order_acquire);
+}
+
+int tlc_ha_replica_transition_role(tlc_ha_replica_t *replica,
+                                   tlc_ha_replica_role_t role,
+                                   tlc_ha_replica_ha_state_t state,
+                                   uint64_t new_term) {
+    if (!replica || (role != TLC_HA_REPLICA_LEADER &&
+                     role != TLC_HA_REPLICA_FOLLOWER) ||
+        state == TLC_HA_REPLICA_STATE_INIT ||
+        state == TLC_HA_REPLICA_STATE_SUSPECT ||
+        state == TLC_HA_REPLICA_STATE_CANDIDATE ||
+        new_term == 0)
+        return -1;
+    uint64_t current_term = atomic_load_explicit(&replica->ha_term,
+                                                 memory_order_acquire);
+    if (new_term < current_term ||
+        (role == TLC_HA_REPLICA_LEADER &&
+         state != TLC_HA_REPLICA_STATE_MASTER) ||
+        (role == TLC_HA_REPLICA_FOLLOWER &&
+         state == TLC_HA_REPLICA_STATE_MASTER))
+        return -1;
+
+    /* Publish the fence first. The ordinary ingress/apply/sender paths only
+     * perform atomic admission checks, so this low-frequency transition can
+     * drain them without introducing a hot-path mutex. */
+    atomic_store_explicit(&replica->resync_fenced, true, memory_order_release);
+    atomic_store_explicit(&replica->resync_emission_gate, true,
+                          memory_order_release);
+    while (atomic_load_explicit(&replica->ingress_inflight,
+                                memory_order_acquire) != 0 ||
+           atomic_load_explicit(&replica->apply_inflight,
+                                memory_order_acquire) != 0 ||
+           atomic_load_explicit(&replica->sender_inflight,
+                                memory_order_acquire) != 0) {
+        if (atomic_load_explicit(&replica->stopping, memory_order_acquire))
+            return -1;
+        usleep(1000);
+    }
+    if (new_term > current_term && replica_owner_metadata_store(
+            replica->owner_metadata_path, replica->hpc_node_id, new_term) != 0)
+        return -1;
+    if (tlc_core_set_ha_term(replica->core, new_term) != 0)
+        return -1;
+    atomic_store_explicit(&replica->ha_term, new_term, memory_order_release);
+    atomic_store_explicit(&replica->role, role, memory_order_release);
+    atomic_store_explicit(&replica->ha_state, state, memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_pending, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->heartbeat_failure_reported, false,
+                          memory_order_release);
+    atomic_store_explicit(&replica->leader_announce_acked, false,
+                          memory_order_release);
+    if (role == TLC_HA_REPLICA_LEADER &&
+        state == TLC_HA_REPLICA_STATE_MASTER) {
+        /* Keep ingress fenced until the peer has received the ownership
+         * announcement. The peer's ROLE_ACK is observable through the public
+         * ack flag; it does not gate local emission after a successful send. */
+        if (replica_send_leader_announce(replica, replica->peer_node_id, 1) !=
+            0) {
+            /* During failover the old Leader is the failed endpoint, so the
+             * announce may legitimately have no live control connection. The
+             * new Leader can publish locally and the recovered peer will
+             * receive the higher term after reconnect. */
+            if (atomic_load_explicit(&replica->connected, memory_order_acquire)) {
+                atomic_store_explicit(&replica->ha_state,
+                                      TLC_HA_REPLICA_STATE_FAULT,
+                                      memory_order_release);
+                return -1;
+            }
+            serverLog(LL_NOTICE,
+                      "HA Replica Leader announce deferred: peer disconnected");
+        }
+    }
+    atomic_store_explicit(&replica->resync_emission_gate, false,
+                          memory_order_release);
+    if (state == TLC_HA_REPLICA_STATE_MASTER ||
+        state == TLC_HA_REPLICA_STATE_BACKUP)
+        atomic_store_explicit(&replica->resync_fenced, false,
+                              memory_order_release);
+    serverLog(LL_NOTICE,
+              "HA Replica role transition: role=%u state=%u term=%llu",
+              (unsigned)role, (unsigned)state,
+              (unsigned long long)new_term);
+    return 0;
 }

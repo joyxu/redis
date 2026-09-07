@@ -104,7 +104,8 @@ Follower 仍须持久化从 checkpoint 最小 seq 之后的完整有序 event �
 | M7 | 已完成（数据面） | 固定容量 cursor ring、soft compact、hard pressure abort、retention pin 维护及 111/112 UB 专项回归。 |
 
 上述 M3-M7 不包含 HA control plane、自动 reconnect、failover、角色晋升、owner fencing
-和 lineage transition；这些仍是后续独立阶段。当前待验证项包括失败注入矩阵（import/reset、
+和 lineage transition；这些仍是后续独立阶段。心跳检测、退避、动态角色、Leader 通知和
+切主恢复设计见 [TLC HA 心跳检测与切主设计](./TLC_HA_FAILOVER_HEARTBEAT_DESIGN.md)。当前待验证项包括失败注入矩阵（import/reset、
 AOF append/fsync、WARM apply、ACK/handoff、进程中断）、重复/过期 frame 幂等性、长时间
 queue saturation/gate 压测，以及 v2 descriptor ring/payload arena 变更后的全量回归。
 
@@ -720,7 +721,8 @@ node id、`ha_term` 与 `topology_epoch` 在启动配置中一次确定；server
 外部 `TLC.HA` 工具干预。
 
 TODO(HA control plane)：在具备持久 term、角色切换 fencing、peer 重连和晋升约束后，再
-增加 `TLC.HA` 管理命令；它不能成为当前 resync 的前置条件。
+增加 `TLC.HA` 管理命令；它不能成为当前 resync 的前置条件。完整控制面方案见
+[TLC HA 心跳检测与切主设计](./TLC_HA_FAILOVER_HEARTBEAT_DESIGN.md)。
 
 TODO(lineage transition)：切主导致 `ha_term` 变化、扩缩容或迁移导致
 `topology_epoch` 变化后，control plane 必须证明新 Leader 包含 Follower 的 durable
@@ -898,3 +900,16 @@ restart-replay 阶段需要从持久 COLD 将 10k event 重新 apply 到 WARM，
 
 通过上述测试只能证明跨节点 checkpoint + AOF tail resync。自动 reconnect、failover、
 fencing 和角色提升必须使用独立故障模型与回归。
+
+## M8/M9 当前状态
+
+M8 heartbeat 故障检测和已完成的 M9 动态角色/term 基础能力、线程模型、owner/term
+metadata 持久化，以及两个关键问题（Leader apply 与 sender 队列所有权冲突、已定位修复的
+post-handoff resync gate/replay 问题）统一记录在
+`docs/TLC_HA_FAILOVER_HEARTBEAT_DESIGN.md` 的“当前落地状态”章节。本文件中的
+M10 `LEADER_ANNOUNCE`/`ROLE_ACK`、connection epoch 和常驻线程 reconnect 基础也已接入；
+自动 failover、严格 UB 控制帧 reservation 优先级、reconnect 后 replay/snapshot 闭环和
+角色提升的跨进程恢复验收仍未完成。M11 第一项 heartbeat failure 驱动的
+`CANDIDATE -> MASTER` controller 状态机已实现并由单测覆盖；新 Leader reconnect 后
+announce、旧 Leader 高 term 降级和 STREAM `SIGPIPE` 防护也已加入测试。replay/snapshot
+跨进程收敛仍未完成。
