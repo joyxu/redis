@@ -80,17 +80,6 @@ RECOVERY_LOG="$REMOTE_RUN_DIR/sdk-follower-recovery.log"
 REGION_BYTES=$((DIM * 4 * MAX_VECTORS * 2))
 EVENTS_TOTAL=$((EVENT_COUNT + 4))
 
-SYNC_FILES=(
-    src/Makefile
-    src/tlc_cold.c src/tlc_cold.h src/tlc_core.c src/tlc_core.h
-    src/tlc_ha_replica.c src/tlc_ha_replica.h
-    src/vemb_v16_mapped_region.c src/vemb_v16_mapped_region.h
-    src/vemb_v16_server_integration.c src/vemb_v16_storage.c
-    src/vemb_v16_tlc.c src/vemb_v16_tlc.h
-    benchmark/Makefile benchmark/tlc_ha_replica_ub_node_ut.c
-    clients/c/Makefile clients/c/sdk_ha_replica_tcp.c
-)
-
 remote() {
     local port=$1 host=$2 command=$3
     ssh -p "$port" "$host" "cd '$REMOTE_DIR' && $command"
@@ -98,9 +87,9 @@ remote() {
 
 sync_node() {
     local port=$1 host=$2
-    for file in "${SYNC_FILES[@]}"; do
-        scp -P "$port" "$REPO_DIR/$file" "$host:$REMOTE_DIR/$file"
-    done
+    NODE="$host" SSH_PORT="$port" REMOTE_ROOT="$REMOTE_DIR" \
+        bash "$REPO_DIR/scripts/sync_changed_code_to_peer.sh" \
+        --build all --verify-build all
     remote "$port" "$host" \
         "make -C src redis-server && make -C benchmark tlc_ha_replica_ub_node_ut && make -C clients/c ha-replica-tcp"
 }

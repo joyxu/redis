@@ -298,6 +298,9 @@ struct vemb_v16_client {
     uint64_t topology_fetch_attempts;
     uint64_t topology_snapshot_id;
     sdk_bootstrap_seed_t bootstrap_seeds[VEMB_V16_SDK_MAX_ENDPOINTS];
+    char ha_endpoint_host[64];
+    uint16_t ha_endpoint_port;
+    uint8_t ha_endpoint_override;
 
     /* Shared routing, retry and logical-completion state. It deliberately
      * does not own any transport channel or mapping. */
@@ -1317,6 +1320,11 @@ vemb_v16_client_t *vemb_v16_client_create(const char *seeds[],
          transport_type != VEMB_V16_TRANSPORT_AERON))
         return NULL;
 
+    /* UB polling uses the shared monotonic function pointers for its
+     * bounded spin window. Initialize them once at the public SDK boundary
+     * before any transport can submit or poll a request. */
+    monotonicInit();
+
     vemb_v16_client_t *c = calloc(1, sizeof(*c));
     assert(c != NULL);
     c->dim               = dim;
@@ -1530,6 +1538,14 @@ static int ensure_owner_channel_slow(vemb_v16_client_t *client,
                 owner_id);
         return -1;
     }
+    vemb_v16_topology_endpoint_t effective_endpoint = *ep;
+    if (client->ha_endpoint_override) {
+        strncpy(effective_endpoint.host, client->ha_endpoint_host,
+                sizeof(effective_endpoint.host) - 1);
+        effective_endpoint.host[sizeof(effective_endpoint.host) - 1] = '\0';
+        effective_endpoint.tcp_port = client->ha_endpoint_port;
+    }
+    ep = &effective_endpoint;
     const vemb_v16_data_transport_ops_t *transport =
         client->transport_type == VEMB_V16_TRANSPORT_AERON ?
             &sdk_ub_data_transport_ops : &sdk_tcp_data_transport_ops;
@@ -5085,6 +5101,42 @@ int vemb_v16_client_topology_refresh(vemb_v16_client_t *client)
     return fetch_topology_via_bootstrap_seeds(client);
 }
 
+int vemb_v16_client_set_ha_endpoint(vemb_v16_client_t *client,
+                                    const char *host, uint16_t port)
+{
+    if (!client || !host || !host[0] || strlen(host) >=
+            sizeof(client->ha_endpoint_host) || port == 0)
+        return -1;
+    for (uint32_t owner = 0;
+         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
+        if (client->owner_channel_inited[owner])
+            return -1;
+    }
+    memcpy(client->ha_endpoint_host, host, strlen(host) + 1);
+    client->ha_endpoint_port = port;
+    client->ha_endpoint_override = 1;
+    return 0;
+}
+
+int vemb_v16_client_reconnect(vemb_v16_client_t *client)
+{
+    if (client->handle_session || client->vector_session)
+        return -1;
+
+    /* A failed UB poll already closes the broken owner channel. Explicit
+     * failover must also tear down healthy-looking mappings: the VIP may now
+     * resolve ATTACH to a different server even though the topology epoch is
+     * unchanged. The next operation will open fresh rings from the snapshot.
+     */
+    for (uint32_t owner = 0;
+         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
+        if (client->owner_channel_inited[owner])
+            sdk_owner_channel_close(client, owner);
+        client->owner_v2[owner].unavailable = 0;
+    }
+    return fetch_topology_via_bootstrap_seeds(client);
+}
+
 int vemb_v16_client_prepare_active_owner_channels(vemb_v16_client_t *client)
 {
     if (client->transport_type != VEMB_V16_TRANSPORT_AERON ||
@@ -6243,11 +6295,21 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
     memset(&resp, 0, sizeof(resp));
     /* Inline ATTACH exchange (write_full/read_full from vemb_v16_net.h) —
      * avoids linking the server-only vemb_v16_aeron_attach.c into the SDK. */
-    if (vemb_v16_net_write_full(fd, &req,  sizeof(req))  != 0 ||
-        vemb_v16_net_read_full (fd, &resp, sizeof(resp)) != 0 ||
+    int exchange_rc = vemb_v16_net_write_full(fd, &req, sizeof(req));
+    if (exchange_rc == 0)
+        exchange_rc = vemb_v16_net_read_full(fd, &resp, sizeof(resp));
+    if (exchange_rc == 0 &&
         memcmp(resp.magic, VEMB_V16_AERON_ATTACHED_MAGIC,
-               VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0 ||
-        resp.status != 0) {
+               VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0)
+        exchange_rc = -2;
+    if (exchange_rc == 0 && resp.status != 0)
+        exchange_rc = -3;
+    if (exchange_rc != 0) {
+        fprintf(stderr,
+                "[sdk] aeron attach exchange failed endpoint=%s:%u rc=%d "
+                "errno=%d status=%u channel=%llu\n",
+                host, (unsigned)port, exchange_rc, errno, resp.status,
+                (unsigned long long)resp.channel_id);
         close(fd);
         return NULL;
     }
@@ -6271,6 +6333,16 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
           resp.warm_path[0] == '\0' ||
           resp.warm_backend_type != VEMB_V16_REGION_UB ||
           resp.warm_region_bytes == 0))) {
+        fprintf(stderr,
+                "[sdk] aeron attach response invalid endpoint=%s:%u "
+                "channel=%llu req=%s/%u resp=%s/%u slots=%u/%u rings=%u "
+                "warm_count=%u warm_path=%s warm_bytes=%llu errno=%d\n",
+                host, (unsigned)port, (unsigned long long)resp.channel_id,
+                resp.request_shmdev_path, resp.request_shmdev_path_len,
+                resp.response_shmdev_path, resp.response_shmdev_path_len,
+                resp.req_slot_size, resp.resp_slot_size,
+                resp.ring_size_slots, resp.warm_region_count, resp.warm_path,
+                (unsigned long long)resp.warm_region_bytes, errno);
         char rejected_endpoint[256];
         snprintf(rejected_endpoint, sizeof(rejected_endpoint),
                  "tcp://%s:%u", host, (unsigned)port);
@@ -6281,14 +6353,21 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
     snprintf(endpoint, sizeof(endpoint), "tcp://%s:%u", host, (unsigned)port);
     vemb_v16_ub_peer_view_mapping_t request_view;
     vemb_v16_ub_peer_view_mapping_t response_view;
-    if (vemb_v16_ub_peer_view_manifest_resolve(
+    int request_view_rc = vemb_v16_ub_peer_view_manifest_resolve(
             peer_view_manifest, client_host, owner_id,
             VEMB_V16_UB_PEER_VIEW_V1_REQUEST_RING,
-            resp.request_shmdev_path, 0, &request_view) != 0 ||
+            resp.request_shmdev_path, 0, &request_view);
+    int response_view_rc = request_view_rc == 0 ?
         vemb_v16_ub_peer_view_manifest_resolve(
             peer_view_manifest, client_host, owner_id,
             VEMB_V16_UB_PEER_VIEW_V1_RESPONSE_RING,
-            resp.response_shmdev_path, 0, &response_view) != 0) {
+            resp.response_shmdev_path, 0, &response_view) : -1;
+    if (request_view_rc != 0 || response_view_rc != 0) {
+        fprintf(stderr,
+                "[sdk] aeron attach peer-view resolve failed client=%s "
+                "owner=%u req_rc=%d resp_rc=%d req_path=%s resp_path=%s\n",
+                client_host, owner_id, request_view_rc, response_view_rc,
+                resp.request_shmdev_path, resp.response_shmdev_path);
         vemb_v16_aeron_notify_close(endpoint, resp.channel_id);
         return NULL;
     }
@@ -6306,16 +6385,27 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
 
     void *request_ring = NULL;
     void *response_ring = NULL;
-    if (vemb_v16_aeron_map_ub_resource(
+    int request_map_rc = vemb_v16_aeron_map_ub_resource(
             &request_view, resp.req_ring_off,
             vemb_v16_client_ring_bytes(resp.req_slot_size), 1,
             &ch->req_ring_mapping,
-            &ch->req_ring_mapping_bytes, &request_ring) != 0 ||
-    vemb_v16_aeron_map_ub_resource(
+            &ch->req_ring_mapping_bytes, &request_ring);
+    int response_map_rc = request_map_rc == 0 ?
+        vemb_v16_aeron_map_ub_resource(
             &response_view, resp.resp_ring_off,
             vemb_v16_client_ring_bytes(resp.resp_slot_size), 1,
             &ch->resp_ring_mapping,
-            &ch->resp_ring_mapping_bytes, &response_ring) != 0) {
+            &ch->resp_ring_mapping_bytes, &response_ring) : -1;
+    if (request_map_rc != 0 || response_map_rc != 0) {
+        fprintf(stderr,
+                "[sdk] aeron attach UB mmap failed owner=%u req_rc=%d "
+                "resp_rc=%d errno=%d(%s) req_path=%s req_off=%llu "
+                "resp_path=%s resp_off=%llu\n",
+                owner_id, request_map_rc, response_map_rc, errno,
+                strerror(errno), resp.request_shmdev_path,
+                (unsigned long long)resp.req_ring_off,
+                resp.response_shmdev_path,
+                (unsigned long long)resp.resp_ring_off);
         if (ch->req_ring_mapping)
             munmap(ch->req_ring_mapping, ch->req_ring_mapping_bytes);
         if (ch->resp_ring_mapping)
@@ -6326,8 +6416,16 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
     }
     ch->req_ring = request_ring;
     ch->resp_ring = response_ring;
-    if (!vemb_v16_aeron_ring_header_valid(ch->req_ring, resp.req_slot_size) ||
-        !vemb_v16_aeron_ring_header_valid(ch->resp_ring, resp.resp_slot_size)) {
+    int request_header_ok = vemb_v16_aeron_ring_header_valid(
+        ch->req_ring, resp.req_slot_size);
+    int response_header_ok = vemb_v16_aeron_ring_header_valid(
+        ch->resp_ring, resp.resp_slot_size);
+    if (!request_header_ok || !response_header_ok) {
+        fprintf(stderr,
+                "[sdk] aeron attach ring header invalid owner=%u "
+                "req_ok=%d resp_ok=%d req_ptr=%p resp_ptr=%p\n",
+                owner_id, request_header_ok, response_header_ok,
+                (void *)ch->req_ring, (void *)ch->resp_ring);
         munmap(ch->req_ring_mapping, ch->req_ring_mapping_bytes);
         munmap(ch->resp_ring_mapping, ch->resp_ring_mapping_bytes);
         vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);

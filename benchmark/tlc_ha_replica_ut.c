@@ -909,9 +909,7 @@ static tlc_ha_replica_t *start_heartbeat_probe(test_node_t *node, int fd,
         .ha_term = 7,
         .heartbeat_interval_ms = 10,
         .heartbeat_timeout_ms = 50,
-        .heartbeat_failure_threshold = 3,
         .heartbeat_backoff_max_ms = 20,
-        .heartbeat_suspect_hold_down_ms = 20,
     };
     tlc_ha_replica_t *replica = NULL;
     assert(tlc_ha_replica_start(&replica, &config) == 0);
@@ -936,9 +934,7 @@ static tlc_ha_replica_t *start_follower_heartbeat_probe(test_node_t *node,
         .ha_term = 7,
         .heartbeat_interval_ms = 10,
         .heartbeat_timeout_ms = 50,
-        .heartbeat_failure_threshold = 3,
         .heartbeat_backoff_max_ms = 20,
-        .heartbeat_suspect_hold_down_ms = 20,
     };
     tlc_ha_replica_t *replica = NULL;
     assert(tlc_ha_replica_start(&replica, &config) == 0);
@@ -1015,16 +1011,16 @@ static void run_heartbeat_error_tests(void) {
             usleep(1000);
         assert(tlc_ha_replica_heartbeat_missed_count(replica) == 1);
         assert(tlc_ha_replica_ha_state(replica) ==
-               TLC_HA_REPLICA_STATE_SUSPECT);
+               TLC_HA_REPLICA_STATE_MASTER);
         assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
         usleep(100000);
         assert(tlc_ha_replica_peer_health(replica) ==
                TLC_HA_REPLICA_UNAVAILABLE);
         assert(!tlc_ha_replica_peer_liveness(replica));
         assert(tlc_ha_replica_ha_state(replica) ==
-               TLC_HA_REPLICA_STATE_SUSPECT);
+               TLC_HA_REPLICA_STATE_MASTER);
         assert(tlc_ha_replica_heartbeat_missed_count(replica) >= 3);
-        assert(tlc_ha_replica_heartbeat_failure_pending(replica));
+        assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
         test_send_heartbeat(sockets[1], 112, 111, 7, 1, 1, 0);
         for (uint32_t i = 0; i < 100 &&
              tlc_ha_replica_peer_health(replica) !=
@@ -1077,7 +1073,7 @@ static void run_stream_reconnect_test(void) {
     node_free(&node);
 }
 
-static void run_automatic_promotion_test(void) {
+static void run_external_failover_guard_test(void) {
     char directory[] = "/tmp/tlc-ha-auto-promotion-XXXXXX";
     assert(mkdtemp(directory));
     test_node_t node = {0};
@@ -1091,15 +1087,64 @@ static void run_automatic_promotion_test(void) {
                                                                 &rings);
     close(sockets[1]);
     for (uint32_t i = 0; i < 500 &&
-         tlc_ha_replica_role(replica) != TLC_HA_REPLICA_LEADER; i++)
+         tlc_ha_replica_heartbeat_missed_count(replica) < 3; i++)
         usleep(1000);
-    assert(tlc_ha_replica_role(replica) == TLC_HA_REPLICA_LEADER);
-    assert(tlc_ha_replica_ha_state(replica) == TLC_HA_REPLICA_STATE_MASTER);
-    assert(tlc_ha_replica_ha_term(replica) == 8);
-    assert(tlc_core_ha_term(node.core) == 8);
+    assert(tlc_ha_replica_role(replica) == TLC_HA_REPLICA_FOLLOWER);
+    assert(tlc_ha_replica_ha_state(replica) == TLC_HA_REPLICA_STATE_BACKUP);
+    assert(tlc_ha_replica_ha_term(replica) == 7);
+    assert(tlc_core_ha_term(node.core) == 7);
     assert(!tlc_ha_replica_heartbeat_failure_pending(replica));
     assert(!tlc_ha_replica_leader_announce_acked(replica));
     tlc_ha_replica_stop(replica);
+    test_ub_rings_destroy(&rings);
+    node_free(&node);
+}
+
+static void run_external_promote_apply_lag_timeout_test(void) {
+    char directory[] = "/tmp/tlc-ha-promote-lag-XXXXXX";
+    assert(mkdtemp(directory));
+    test_node_t node = {0};
+    node_init(&node, 117, directory);
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    test_ub_rings_t rings;
+    assert(test_ub_rings_create(&rings) == 0);
+    tlc_ha_replica_t *replica = start_follower_heartbeat_probe(&node,
+                                                                sockets[0],
+                                                                &rings);
+
+    /* Append a durable replica event without routing it through the apply
+     * queue. This models a Follower whose COLD append has completed while
+     * its Core apply cursor is still behind. */
+    const uint8_t value[VALUE_SIZE] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const char key[] = "promote-lag";
+    tlc_cold_event_input_t event = {
+        .ha_term = 7,
+        .topology_epoch = 1,
+        .op = TLC_COLD_OP_PUT,
+        .meta_shard_id = 0,
+        .version = 1,
+        .key = key,
+        .key_len = (uint32_t)(sizeof(key) - 1u),
+        .value = value,
+        .value_len = sizeof(value),
+    };
+    tlc_cold_replica_batch_status_t batch_status;
+    uint64_t durable_seq = 0;
+    assert(tlc_cold_submit_replica_batch(node.cold, 1, &event, 1,
+                                         TLC_COLD_ACK_DURABLE,
+                                         &batch_status, &durable_seq) == 0);
+    assert(batch_status == TLC_COLD_REPLICA_BATCH_APPLIED);
+    assert(durable_seq == 1);
+
+    int rc = tlc_ha_replica_external_promote(replica);
+    assert(rc == TLC_HA_REPLICA_ERR_APPLY_LAG);
+    assert(tlc_ha_replica_role(replica) == TLC_HA_REPLICA_FOLLOWER);
+    assert(tlc_ha_replica_ha_state(replica) == TLC_HA_REPLICA_STATE_BACKUP);
+    assert(tlc_ha_replica_write_fenced(replica));
+
+    tlc_ha_replica_stop(replica);
+    close(sockets[1]);
     test_ub_rings_destroy(&rings);
     node_free(&node);
 }
@@ -1144,9 +1189,7 @@ static void run_reconnect_leader_announce_test(void) {
         .ha_term = 8,
         .heartbeat_interval_ms = 10,
         .heartbeat_timeout_ms = 50,
-        .heartbeat_failure_threshold = 3,
         .heartbeat_backoff_max_ms = 20,
-        .heartbeat_suspect_hold_down_ms = 20,
     };
     tlc_ha_replica_config_t follower_config = leader_config;
     follower_config.core = follower.core;
@@ -1157,7 +1200,6 @@ static void run_reconnect_leader_announce_test(void) {
     follower_config.peer_node_id = 111;
     follower_config.ha_term = 7;
     follower_config.heartbeat_timeout_ms = 1000;
-    follower_config.heartbeat_failure_threshold = 1000;
     follower_config.tx_ring = rings.rx;
     follower_config.rx_ring = rings.tx;
     tlc_ha_replica_t *leader_replica = NULL;
@@ -1202,7 +1244,8 @@ int main(void) {
     run_automatic_retention_resync_test();
     run_heartbeat_error_tests();
     run_stream_reconnect_test();
-    run_automatic_promotion_test();
+    run_external_failover_guard_test();
+    run_external_promote_apply_lag_timeout_test();
     run_reconnect_leader_announce_test();
     printf("tlc_ha_replica_ut: PASS\n");
     return 0;

@@ -11,6 +11,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -162,6 +163,7 @@ struct tlc_core {
     tlc_core_warm_layer_t warm;
     tlc_cold_t *persistent_cold;
     atomic_uint_fast64_t ha_term;
+    atomic_bool write_fenced;
     tlc_core_replica_event_sink_fn replica_event_sink;
     void *replica_event_sink_arg;
     pthread_mutex_t replica_apply_mu;
@@ -1789,6 +1791,7 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     core->value_size = config->value_size;
     core->warm_capacity = config->warm_capacity;
     atomic_init(&core->ha_term, 0);
+    atomic_init(&core->write_fenced, false);
     if (pthread_mutex_init(&core->replica_apply_mu, NULL) != 0) {
         zfree(core);
         return -1;
@@ -1891,6 +1894,23 @@ int tlc_core_set_ha_term(tlc_core_t *core, uint64_t ha_term) {
                 memory_order_acquire))
             return 0;
     }
+}
+
+uint64_t tlc_core_replica_applied_seq(const tlc_core_t *core) {
+    return core ? core->replica_applied_seq : 0;
+}
+
+int tlc_core_set_write_fenced(tlc_core_t *core, int fenced) {
+    if (!core)
+        return -1;
+    atomic_store_explicit(&core->write_fenced, fenced != 0,
+                          memory_order_release);
+    return 0;
+}
+
+int tlc_core_write_fenced(const tlc_core_t *core) {
+    return core && atomic_load_explicit(&core->write_fenced,
+                                        memory_order_acquire);
 }
 
 tlc_cold_t *tlc_core_get_cold(tlc_core_t *core) {
@@ -2373,9 +2393,18 @@ int tlc_core_recover_cold(tlc_core_t *core) {
         core->persistent_cold, 0, meta_shard_count, NULL) == 0;
     if (!checkpoint_valid) {
         zfree(captured_seq);
-        return tlc_cold_replay(core->persistent_cold,
-                               tlc_core_recover_event,
-                               core);
+        int rc = tlc_cold_replay(core->persistent_cold,
+                                 tlc_core_recover_event,
+                                 core);
+        if (rc != 0)
+            return rc;
+        tlc_cold_progress_t progress;
+        if (tlc_cold_get_progress(core->persistent_cold, &progress) != 0)
+            return -1;
+        pthread_mutex_lock(&core->replica_apply_mu);
+        core->replica_applied_seq = progress.durable_seq;
+        pthread_mutex_unlock(&core->replica_apply_mu);
+        return 0;
     }
     tlc_core_checkpoint_recovery_t recovery = {
         .core = core,
@@ -2394,7 +2423,15 @@ int tlc_core_recover_cold(tlc_core_t *core) {
                                    tlc_core_recover_event,
                                    core);
     zfree(captured_seq);
-    return rc;
+    if (rc != 0)
+        return rc;
+    tlc_cold_progress_t progress;
+    if (tlc_cold_get_progress(core->persistent_cold, &progress) != 0)
+        return -1;
+    pthread_mutex_lock(&core->replica_apply_mu);
+    core->replica_applied_seq = progress.durable_seq;
+    pthread_mutex_unlock(&core->replica_apply_mu);
+    return 0;
 }
 
 static int checkpoint_state_append(tlc_core_checkpoint_state_t *state,
@@ -2851,6 +2888,8 @@ int tlc_core_put_location_epoch(tlc_core_t *core,
     tlc_core_key_meta_shard_t *shard = NULL;
     tlc_core_key_meta_entry_t *failure_meta = NULL;
     int update_location_cache = 0;
+    if (tlc_core_write_fenced(core))
+        return -1;
     if (unlikely(!valid_key || value_size != core->value_size)) {
         failure_reason = !valid_key ? "invalid_key" : "value_size_mismatch";
         goto rollback;
@@ -2972,6 +3011,8 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
                                tlc_core_key_migration_info_t *info) {
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!core || !valid_key, -1);
+    if (tlc_core_write_fenced(core))
+        return -1;
     if (info)
         memset(info, 0, sizeof(*info));
 
@@ -3025,6 +3066,8 @@ int tlc_core_cold_append(tlc_core_t *core,
     uint32_t value_size) {
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!core || !valid_key || value_size != core->value_size, -1);
+    if (tlc_core_write_fenced(core))
+        return -1;
     RETURN_IF(!core->persistent_cold, -1);
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     tlc_cold_event_input_t event = {

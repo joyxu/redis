@@ -1,0 +1,16 @@
+{
+    "PROGRESS": {
+        "summary": "Return local and peer replication progress.",
+        "complexity": "O(1)",
+        "group": "server",
+        "since": "8.4.0",
+        "arity": 2,
+        "container": "HA",
+        "function": "haCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "LOADING"
+        ]
+    }
+}

@@ -172,6 +172,10 @@ int tlc_core_set_replica_event_sink(tlc_core_t *core,
 uint64_t tlc_core_ha_term(const tlc_core_t *core);
 /* Publish a monotonically increasing HA owner term before new writes. */
 int tlc_core_set_ha_term(tlc_core_t *core, uint64_t ha_term);
+uint64_t tlc_core_replica_applied_seq(const tlc_core_t *core);
+/* Gate new business writes during an HA ownership transition. */
+int tlc_core_set_write_fenced(tlc_core_t *core, int fenced);
+int tlc_core_write_fenced(const tlc_core_t *core);
 /* Return the borrowed COLD runtime; ownership remains with core. */
 tlc_cold_t *tlc_core_get_cold(tlc_core_t *core);
 uint32_t tlc_core_meta_shard_count(const tlc_core_t *core);

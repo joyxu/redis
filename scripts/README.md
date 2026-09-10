@@ -7,6 +7,42 @@ NODE=192.168.90.112 \
   bash scripts/sync_changed_code_to_peer.sh --dry-run
 ```
 
+## HPC-Redis keepalived HA
+
+`deploy_keepalived_ha.sh` builds the existing remote
+`/root/szz/codespace/LVS/tools/keepalived` checkout as a VRRP-only 1.2.2
+binary, installs the HA hooks and generated config, and provides explicit
+`check/start/stop/restart/reload/status` actions. The VIP is deliberately
+required so an operator cannot deploy an unreviewed address:
+
+```sh
+scripts/deploy_keepalived_ha.sh --all \
+  --vip 192.168.90.202/24 --install-deps deploy
+scripts/deploy_keepalived_ha.sh --all \
+  --vip 192.168.90.202/24 start
+scripts/deploy_keepalived_ha.sh --all \
+  --vip 192.168.90.202/24 status
+```
+
+每次 keepalived 状态通知都会更新节点本地的
+`/run/hpc-redis-keepalived/notify.status`。查询和失败重试：
+
+```sh
+/opt/hpc-redis/keepalived/scripts/ha_notify.sh status
+redis-cli HA NOTIFY STATUS
+/opt/hpc-redis/keepalived/scripts/ha_notify.sh retry
+```
+
+`retry` 只重放最近一次失败的状态通知；重试前应先确认 Redis 已恢复且
+VIP 仍在正确的节点。notify 失败不会回滚 VRRP/VIP。
+
+The 1.2.2 source supports VRRP multicast but not `unicast_peer`; use a common
+L2 broadcast domain. `--install-deps` is explicit because the target machines
+need the `popt-devel` package to compile keepalived. `deploy` leaves the daemon
+stopped after parsing the config; use `start` only after reviewing the VIP and
+interface. After a config change, prefer `stop` then `start` when VIP cleanup
+matters; `reload` sends SIGHUP but may retain a VIP from an older child.
+
 跨节点 VEMB 测试必须在启动任一角色前完成代码同步和构建：
 
 ```sh
@@ -137,10 +173,11 @@ batch 大小、测试时长、build policy 和源码 commit，只改变正在测
 | `SSH_USER`, `SSH_PORT` | `root`, 空 | SSH 用户和端口；`SSH_PORT` 为空时不传 `-p`，直接使用 `~/.ssh/config` 中主机别名的端口配置。 |
 | `SERVER_ROOT`, `CLIENT_ROOT` | `/root/szz/codespace/hpc-redis` | 远端源码根目录。 |
 | `FLAMEGRAPH_DIR` | `/root/FlameGraph` | 远端 FlameGraph 工具目录。 |
-| `SERVER_MANIFEST` | `$SERVER_ROOT/examples/vemb_perf_warm_111.yaml` | server warm-region manifest；默认使用仓库内的 4 GiB `/dev/obmm_shmdev4` 配置。 |
+| `SERVER_MANIFEST` | `$SERVER_ROOT/examples/vemb_perf_warm_111_ha.yaml` | server warm-region manifest；默认使用避让 HA Replica 的 1 GiB `/dev/obmm_shmdev1` 配置。 |
 | `PORT`, `SERVER_IP` | `6395`, `192.168.90.111` | Redis control endpoint。 |
-| `SERVER_REQUEST_UB_PATH`, `SERVER_RESPONSE_UB_PATH`, `SERVER_WARM_UB_PATH` | `/dev/obmm_shmdev3`, `/dev/obmm_shmdev6`, `/dev/obmm_shmdev4` | server request/response/warm UB 设备。 |
-| `CLIENT_REQUEST_UB_PATH`, `CLIENT_RESPONSE_UB_PATH`, `CLIENT_WARM_UB_PATH` | `/dev/obmm_shmdev7`, `/dev/obmm_shmdev2`, `/dev/obmm_shmdev8` | client request/response/warm UB 设备。 |
+| `SERVER_REQUEST_UB_PATH`, `SERVER_RESPONSE_UB_PATH`, `SERVER_WARM_UB_PATH` | `/dev/obmm_shmdev3`, `/dev/obmm_shmdev6`, `/dev/obmm_shmdev1` | server request/response/warm UB 设备；避开 111 HA Replica 的 `dev4/dev13`。 |
+| `CLIENT_REQUEST_UB_PATH`, `CLIENT_RESPONSE_UB_PATH`, `CLIENT_WARM_UB_PATH` | `/dev/obmm_shmdev7`, `/dev/obmm_shmdev2`, `/dev/obmm_shmdev5` | CLI@112 request/response/warm UB 设备；避开 112 HA Replica 的 `dev8/dev9`。 |
+| `SERVER_RESERVED_UB_PATHS`, `CLIENT_RESERVED_UB_PATHS` | `dev4 dev13`、`dev8 dev9` | HA Replica 保留设备；脚本在启动前拒绝 path 重叠，其他硬件必须显式覆盖。 |
 | `FREQ`, `EVENT` | `99`, `cycles` | `perf` 采样频率和 event。 |
 | `BUILD` | `verify` | `verify` 要求 O3/LTO/SVE build stamp 匹配；`build` 会先重建对应远端角色。 |
 | `KEEP_SERVER` | `0` | 设为 `1` 时，测试结束后保留临时 server。 |
@@ -158,7 +195,9 @@ batch 大小、测试时长、build policy 和源码 commit，只改变正在测
 `SERVER_REQUEST_UB_PATH`、`SERVER_RESPONSE_UB_PATH`、`SERVER_WARM_UB_PATH`、
 `CLIENT_REQUEST_UB_PATH`、`CLIENT_RESPONSE_UB_PATH` 和 `CLIENT_WARM_UB_PATH`
 可覆盖默认 UB 设备。该脚本使用 Aeron TCP control 加 UB ring 的跨节点路径，
-不要与 local loopback runner 的参数混用。
+不要与 local loopback runner 的参数混用。默认拒绝 111 的 `dev4/dev13` 和
+112 的 `dev8/dev9`（HA Replica 保留设备）；更换硬件分配时必须显式覆盖
+`SERVER_RESERVED_UB_PATHS`/`CLIENT_RESERVED_UB_PATHS`。
 
 ### 门禁与进程清理
 

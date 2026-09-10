@@ -6,10 +6,28 @@
 
 当前真实双机的 UB 映射关系已经确认应为：
 
-- `1 -> 5`
-- `2 -> 6`
-- `3 -> 7`
-- `4 -> 8`
+| 本地 Export | 对端 Import |
+|---|---|
+| 111 `/dev/obmm_shmdev1` | 112 `/dev/obmm_shmdev5` |
+| 111 `/dev/obmm_shmdev2` | 112 `/dev/obmm_shmdev6` |
+| 111 `/dev/obmm_shmdev3` | 112 `/dev/obmm_shmdev7` |
+| 111 `/dev/obmm_shmdev4` | 112 `/dev/obmm_shmdev8` |
+| 112 `/dev/obmm_shmdev1` | 111 `/dev/obmm_shmdev5` |
+| 112 `/dev/obmm_shmdev2` | 111 `/dev/obmm_shmdev6` |
+| 112 `/dev/obmm_shmdev3` | 111 `/dev/obmm_shmdev7` |
+| 112 `/dev/obmm_shmdev4` | 111 `/dev/obmm_shmdev8` |
+| 111 `/dev/obmm_shmdev9` | 112 `/dev/obmm_shmdev13` |
+| 111 `/dev/obmm_shmdev10` | 112 `/dev/obmm_shmdev14` |
+| 111 `/dev/obmm_shmdev11` | 112 `/dev/obmm_shmdev15` |
+| 111 `/dev/obmm_shmdev12` | 112 `/dev/obmm_shmdev16` |
+| 112 `/dev/obmm_shmdev9` | 111 `/dev/obmm_shmdev13` |
+| 112 `/dev/obmm_shmdev10` | 111 `/dev/obmm_shmdev14` |
+| 112 `/dev/obmm_shmdev11` | 111 `/dev/obmm_shmdev15` |
+| 112 `/dev/obmm_shmdev12` | 111 `/dev/obmm_shmdev16` |
+
+即第一组按 `1..4 -> 5..8` 偏移 4，第二组按 `9..12 -> 13..16` 偏移 4。
+扩容脚本当前使用第一组的四条方向；HA Replica 回归使用 `111:4 -> 112:8`
+和 `112:9 -> 111:13`，不要将两组编号混用。
 
 ## 测试机器
 

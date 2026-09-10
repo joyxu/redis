@@ -1,0 +1,16 @@
+{
+    "NOTIFY": {
+        "summary": "Return the most recent keepalived notify result.",
+        "complexity": "O(1)",
+        "group": "server",
+        "since": "8.4.0",
+        "arity": -3,
+        "container": "HA",
+        "function": "haCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "LOADING"
+        ]
+    }
+}

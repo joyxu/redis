@@ -1,5 +1,12 @@
 # TLC HA 心跳检测与切主设计
 
+> **历史方案说明**：本文记录早期 heartbeat-driven 自动晋升方案。当前实现已经采用
+> [TLC HA/LVS/Keepalived 设计](./TLC_HA_LVS_KEEPALIVED_DESIGN.md)：keepalived 负责
+> 故障检测、VRRP 和 VIP，HPC-Redis 只通过外部 `HA PROMOTE/DEMOTE/FENCE` 执行角色
+> 转换。本文中关于 `SUSPECT/CANDIDATE`、heartbeat 自动晋升、双通道 heartbeat、
+> `heartbeat_failure_threshold` 和 `heartbeat_suspect_hold_down_ms` 的内容均为历史
+> 设计记录，不是当前运行时契约；当前代码和验收以 keepalived 设计及回归方案为准。
+
 ## 1. 目标与范围
 
 本文定义固定双机 Node group 中的故障检测、切主、角色通知、动态线程模型和旧节点
@@ -375,7 +382,10 @@ heartbeat 中的 durable_seq 可以补足丢失的 ACK，并推进 Leader 的 re
 - 复用 AOF replay/snapshot resync 完成新旧 owner 收敛；
 - 完成单个 `hpc_node_id` 的故障注入和跨节点回归。
 
-### 当前落地状态（2026-09-06）
+### 历史落地状态（2026-09-06）
+
+以下记录对应 heartbeat-driven 方案的历史实现阶段。后续 keepalived 方案移除了自主
+晋升和双通道 liveness 判断，不能将本节的自动晋升描述当作当前行为。
 
 M8 已落地。当前实现包含 `ha_state`、连续 timeout 计数、SUSPECT、退避探测、
 SUSPECT hold-down、peer liveness/peer health 分离，以及 heartbeat failure pending
@@ -1088,7 +1098,38 @@ peer endpoint
 Proxy 刷新 owner 后将后续请求路由到新 Leader。发送后超时的非幂等写请求不能盲目重试，
 需要 `client_request_id` 或等价去重机制。
 
-#### 7. 最终验收场景
+#### 7. M11-1 当前落地状态（2026-09-08）
+
+已落地的运行时基础设施：
+
+- owner metadata 使用 version=2，并持久化固定 `takeover_seq`；`LEADER_ANNOUNCE`
+  同时携带固定边界和发送时的 `current_durable_seq`。
+- 角色转换由 `transition_mutex` 串行化。转换先关闭 ingress、普通 emission、Core
+  写入和 data producer admission，再等待 ingress/apply/sender/replay/data-listener
+  清空；Follower 晋升前必须满足 `applied_seq == durable_seq`，超时进入 `FAULT`。
+- data producer 的计数覆盖 `reserve -> write -> publish`。故障晋升且控制连接已断开时，
+  在 drain 后重置 RX ring consumer cursor，并递增 recovery generation，隔离旧 UB 帧。
+- TCP 控制面发送 heartbeat 和复制进度用于诊断；UB ring 只承载数据帧，不再发送 heartbeat。
+  超时只记录带 backoff 的诊断日志，不改变 `ha_state`、不自动晋升，也不 self-fence。
+  keepalived 通过 RESP `HA PROMOTE/DEMOTE/FENCE` 显式触发角色切换和紧急 fencing。
+- `local_durable < takeover_seq` 的 GAP replay 在恢复状态下允许接收恢复 EVENTS；
+  replay/apply 追平后恢复到 BACKUP。snapshot handoff 仍沿用现有
+  `HANDOFF_COMMIT/HANDOFF_ACK` 闭环。
+
+尚未完成、不能宣称验收通过的部分：
+
+- 真实双机 keepalived/VIP 漂移和 notify 脚本联调仍需在 111/112 环境完成。
+- 完整的 `RECOVERY_REQUEST/RECOVERY_DONE` 独立协议和 target 动态扩展；当前 GAP 和
+  snapshot 继续复用既有 resync 控制帧。
+- Proxy/Supernode 的 `HA_NOT_OWNER`/`HA_REDIRECT` 客户端路由和非幂等请求去重。
+- 真实双机 TCP-only 诊断、VIP 漂移和外部 promote/demote/fence 切换测试。
+
+验证记录：相关 Replica、process、UB node 三个单元目标均可编译通过，只有既有的
+`_GNU_SOURCE` 重定义警告。当前沙箱禁止创建 POSIX shared memory，运行时测试在创建
+`/tlc-ha-*-tx-*` 区域时收到 `Operation not permitted`，因此跨进程/UB 协议断言需在
+具备 shm 权限的环境（111/112 真机或等效 CI runner）执行。
+
+#### 8. 最终验收场景
 
 至少覆盖：
 

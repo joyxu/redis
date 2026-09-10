@@ -1,0 +1,13 @@
+{
+    "HA": {
+        "summary": "A container for high availability control commands.",
+        "complexity": "Depends on subcommand.",
+        "group": "server",
+        "since": "8.4.0",
+        "arity": -2,
+        "command_flags": [
+            "ADMIN",
+            "STALE"
+        ]
+    }
+}

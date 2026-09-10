@@ -19,17 +19,26 @@ FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
 SERVER_IP="${SERVER_IP:-192.168.90.111}"
 PORT="${PORT:-6395}"
-SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111.yaml}"
+# HA-compatible lane: preserve the validated request/response pair (111 dev3/dev6
+# -> 112 dev7/dev2) and move warm to 111 dev1 -> 112 dev5. This avoids HA
+# Replica dev4/dev13 on 111 and dev8/dev9 on 112.
+SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111_ha.yaml}"
 SERVER_REQUEST_UB_PATH="${SERVER_REQUEST_UB_PATH:-/dev/obmm_shmdev3}"
 SERVER_RESPONSE_UB_PATH="${SERVER_RESPONSE_UB_PATH:-/dev/obmm_shmdev6}"
-SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev4}"
+SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev1}"
+# CLI@112 paths use 111 request/response/warm Export 3/6/1 -> Import 7/2/5.
+# Keep them away from the HA Replica paths reserved on 112 (dev9 TX, dev8 RX).
 CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev7}"
 CLIENT_RESPONSE_UB_PATH="${CLIENT_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}"
-CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev8}"
+CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev5}"
 CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/vemb_v16_ub_peer_view_112_to_111.yaml}"
 CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
 CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
 AERON_UB_CACHEABLE="${AERON_UB_CACHEABLE:-0}"
+# Device paths reserved by the HA Replica process on the default 111/112
+# hosts. Override explicitly when running against a different allocation.
+SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev4 /dev/obmm_shmdev13}"
+CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev8 /dev/obmm_shmdev9}"
 
 DIM="${DIM:-300}"
 MAX_VECTORS="${MAX_VECTORS:-131072}"
@@ -103,6 +112,24 @@ SERVER_SCP_OPTIONS=(-P "$SERVER_SSH_PORT")
 CLIENT_SCP_OPTIONS=(-P "$CLIENT_SSH_PORT")
 server_started=0
 
+assert_no_reserved_overlap() {
+    local role=$1 reserved=$2 path held
+    shift 2
+    for path in "$@"; do
+        for held in $reserved; do
+            if [ "$path" = "$held" ]; then
+                echo "ERROR: $role UB path $path is reserved by HA Replica" >&2
+                exit 2
+            fi
+        done
+    done
+}
+
+assert_no_reserved_overlap server "$SERVER_RESERVED_UB_PATHS" \
+    "$SERVER_REQUEST_UB_PATH" "$SERVER_RESPONSE_UB_PATH" "$SERVER_WARM_UB_PATH"
+assert_no_reserved_overlap client "$CLIENT_RESERVED_UB_PATHS" \
+    "$CLIENT_REQUEST_UB_PATH" "$CLIENT_RESPONSE_UB_PATH" "$CLIENT_WARM_UB_PATH"
+
 usage() {
     cat <<'USAGE'
 Run a fresh VEMB v16 cross-node read benchmark and generate full process
@@ -112,12 +139,12 @@ Usage:
   bash scripts/run_aeron_cross_node_flamegraph.sh
   KEY_PATTERN=Z:Z ZIPF_S=1.5 bash scripts/run_aeron_cross_node_flamegraph.sh
 
-The default is the validated 111 -> 112 setup:
+The default is the HA-compatible 111 -> 112 setup:
   SSH server (111)=root@43.154.145.18:8111, client (112)=root@43.154.145.18:8112
   server=192.168.90.111:6395, client=192.168.90.112 (internal network)
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
   server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
-  client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev8
+  server warm=/dev/obmm_shmdev1; client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev5
   peer-view=CLI@112 -> owner 0@111, using examples/vemb_v16_ub_peer_view_112_to_111.yaml
 
 Important environment variables:
@@ -125,6 +152,7 @@ Important environment variables:
   SERVER_ROOT CLIENT_ROOT SERVER_IP PORT
   SERVER_MANIFEST SERVER_REQUEST_UB_PATH SERVER_RESPONSE_UB_PATH SERVER_WARM_UB_PATH
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
+  SERVER_RESERVED_UB_PATHS CLIENT_RESERVED_UB_PATHS
   CLIENT_PEER_VIEW_MANIFEST CLIENT_PEER_VIEW_HOST CLIENT_PEER_VIEW_OWNER_ID
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
   THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES

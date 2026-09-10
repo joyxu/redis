@@ -29,13 +29,15 @@ typedef enum tlc_ha_replica_role {
 typedef enum tlc_ha_replica_ha_state {
     TLC_HA_REPLICA_STATE_INIT = 0,
     TLC_HA_REPLICA_STATE_BACKUP = 1,
-    TLC_HA_REPLICA_STATE_SUSPECT = 2,
-    TLC_HA_REPLICA_STATE_CANDIDATE = 3,
-    TLC_HA_REPLICA_STATE_RECOVERING = 4,
-    TLC_HA_REPLICA_STATE_MASTER = 5,
-    TLC_HA_REPLICA_STATE_FAULT = 6,
-    TLC_HA_REPLICA_STATE_FENCED = 7,
+    TLC_HA_REPLICA_STATE_RECOVERING = 2,
+    TLC_HA_REPLICA_STATE_MASTER = 3,
+    TLC_HA_REPLICA_STATE_FAULT = 4,
+    TLC_HA_REPLICA_STATE_FENCED = 5,
 } tlc_ha_replica_ha_state_t;
+
+/* Removed detector states kept as source-compatible aliases. */
+#define TLC_HA_REPLICA_STATE_SUSPECT TLC_HA_REPLICA_STATE_BACKUP
+#define TLC_HA_REPLICA_STATE_CANDIDATE TLC_HA_REPLICA_STATE_BACKUP
 
 typedef enum tlc_ha_replica_health {
     TLC_HA_REPLICA_HEALTHY = 1,
@@ -181,12 +183,8 @@ typedef struct tlc_ha_replica_config {
     uint32_t heartbeat_interval_ms;
     /* Receiver-local liveness timeout; zero selects the default. */
     uint32_t heartbeat_timeout_ms;
-    /* Consecutive timeout samples required before publishing failure. */
-    uint32_t heartbeat_failure_threshold;
     /* Maximum timeout probe backoff; zero selects the default. */
     uint32_t heartbeat_backoff_max_ms;
-    /* Minimum time spent in SUSPECT before publishing failure. */
-    uint32_t heartbeat_suspect_hold_down_ms;
     /* Controlled resync inactivity timeout; zero selects the default. */
     uint32_t resync_timeout_ms;
     /* Fixed topology lineage for automatic resync; zero selects epoch 1. */
@@ -199,9 +197,9 @@ typedef struct tlc_ha_replica_config {
  * Start a bidirectional Replica runtime. The runtime owns the TCP control
  * listener and connection for the configured endpoint; UB rings carry the
  * data plane. Leader events are sourced from the core event sink; Follower
- * frames are durably appended before async apply. Control frames (heartbeat,
- * announce, resync coordination) flow over TCP; data frames (EVENTS, ACK,
- * snapshot chunks) flow over UB rings.
+ * frames are durably appended before async apply. Announce and resync control
+ * frames flow over TCP; ordinary data and ACK frames flow over UB rings.
+ * TCP heartbeat is one-way for progress exchange and observability only.
  */
 int tlc_ha_replica_start(tlc_ha_replica_t **out,
                          const tlc_ha_replica_config_t *config);
@@ -304,11 +302,28 @@ int tlc_ha_replica_peer_liveness(const tlc_ha_replica_t *replica);
 /* Returns the current runtime HA ownership state. */
 tlc_ha_replica_ha_state_t tlc_ha_replica_ha_state(
         const tlc_ha_replica_t *replica);
-/* Returns consecutive timeout samples observed by the heartbeat detector. */
+/* Returns consecutive timeout samples retained for diagnostics. */
 uint32_t tlc_ha_replica_heartbeat_missed_count(
         const tlc_ha_replica_t *replica);
-/* Returns whether the detector has published a failure event to the controller. */
+/* Deprecated compatibility query; always returns false. */
 int tlc_ha_replica_heartbeat_failure_pending(
         const tlc_ha_replica_t *replica);
+
+/* External keepalived control plane. Return 0 on success or one of the
+ * negative TLC_HA_REPLICA_ERR_* values below. Apply lag is a transient
+ * readiness failure: external_promote() returns ERR_APPLY_LAG while leaving
+ * the Follower in BACKUP with Core writes fenced, so replication can continue
+ * and a later notify retry can promote it. COLD progress failures and other
+ * internal transition failures may instead enter FAULT/FENCED. */
+enum {
+    TLC_HA_REPLICA_ERR_ALREADY_LEADER = -2,
+    TLC_HA_REPLICA_ERR_INVALID_STATE = -3,
+    TLC_HA_REPLICA_ERR_APPLY_LAG = -4,
+    TLC_HA_REPLICA_ERR_NOT_READY = -5,
+};
+int tlc_ha_replica_external_promote(tlc_ha_replica_t *replica);
+int tlc_ha_replica_external_demote(tlc_ha_replica_t *replica);
+int tlc_ha_replica_external_fence(tlc_ha_replica_t *replica);
+int tlc_ha_replica_write_fenced(const tlc_ha_replica_t *replica);
 
 #endif

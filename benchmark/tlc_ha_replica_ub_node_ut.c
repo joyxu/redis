@@ -320,6 +320,7 @@ int main(int argc, char **argv) {
     tlc_ha_replica_config_t config = {
         .core = node.core,
         .cold = tlc_core_get_cold(node.core),
+        .control_fd = -1,
         .control_bind_host = bind_host,
         .control_bind_port = control_port,
         .peer_advertised_host = peer_host,
@@ -679,8 +680,13 @@ int main(int argc, char **argv) {
             put_value(node.core, keys[i], (uint8_t)(7 + i));
         assert(expected_events >= 6);
         const uint32_t update_events = expected_events - 6;
-        for (uint32_t i = 0; i < update_events; i++)
+        for (uint32_t i = 0; i < update_events; i++) {
             put_value(node.core, keys[i % 4], (uint8_t)(100 + (i % 4)));
+            /* Keep the fixture producer below the tiny eight-slot device ring
+             * so this regression exercises replication/recovery rather than
+             * an intentional overwrite storm. */
+            usleep(1000);
+        }
         tlc_core_key_migration_info_t delete_info = {0};
         for (uint32_t i = 2; i < 4; i++) {
             uint64_t hash = vemb_v16_xxh3_64(keys[i], strlen(keys[i]));

@@ -344,6 +344,11 @@ static int proxy_aeron_channel_snapshot_update(vemb_v16_proxy_t *proxy,
                                                 int add) {
     if (ch->transport_type != VEMB_V16_TRANSPORT_AERON)
         return 0;
+    /* TCP mode uses the epoll worker, which scans AERON channels directly.
+     * Its workers intentionally do not own AERON snapshots, so an ATTACH
+     * channel must not try to update an uninitialized snapshot here. */
+    if (proxy->data_transport_type != VEMB_V16_TRANSPORT_AERON)
+        return 0;
     if (proxy->proxy_io_worker_count == 0 ||
         !proxy->proxy_io_pool_started)
         return 0;
@@ -707,6 +712,21 @@ void vemb_v16_proxy_fill_attach_warm_region(
     for (uint32_t i = 0; i < desc.warm_region_count; i++) {
         if (desc.warm_regions[i].region_id != region->region_id)
             continue;
+        serverLog(LL_NOTICE,
+                  "aeron ATTACH warm candidate: region=%u backend=%u path=%s bytes=%llu offset=%llu",
+                  desc.warm_regions[i].region_id,
+                  desc.warm_regions[i].backend_type,
+                  desc.warm_regions[i].path,
+                  (unsigned long long)desc.warm_regions[i].region_bytes,
+                  (unsigned long long)desc.warm_regions[i].mmap_offset);
+        /* A cross-node ATTACH can only remap UB resources through the
+         * client peer-view manifest.  POSIX SHM warm regions are local to
+         * the server process namespace, so advertising one here produces a
+         * response the remote SDK cannot legally map. */
+        if (desc.warm_regions[i].backend_type != VEMB_V16_REGION_UB) {
+            resp->warm_region_count = 0;
+            return;
+        }
         resp->warm_region_count = 1;
         resp->warm_region_id    = desc.warm_regions[i].region_id;
         resp->warm_backend_type = desc.warm_regions[i].backend_type;
