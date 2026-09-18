@@ -1948,7 +1948,6 @@ struct redisServer {
     int vemb_v16_enabled;
 
     int vemb_v16_dim;              /* startup-only; 0 means unset */
-    int vemb_v16_max_vectors;
     char *vemb_v16_warm_regions_manifest;
     int vemb_v16_reset_warm_regions;
     int vemb_v16_supernode_workers;

@@ -19,18 +19,19 @@ FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
 SERVER_IP="${SERVER_IP:-192.168.90.111}"
 PORT="${PORT:-6395}"
-# HA-compatible lane: preserve the validated request/response pair (111 dev3/dev6
-# -> 112 dev7/dev2) and move warm to 111 dev1 -> 112 dev5. This avoids HA
-# Replica dev4/dev13 on 111 and dev8/dev9 on 112.
+# HA-compatible lane: requests flow from the client's NC import to the
+# server's local CC export (112 dev5 -> 111 dev1). Responses retain the
+# 111 dev6 -> 112 dev2 path, and warm uses 111 dev3 -> 112 dev7. This avoids
+# HA Replica dev4/dev13 on 111 and dev8/dev9 on 112.
 SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111_ha.yaml}"
-SERVER_REQUEST_UB_PATH="${SERVER_REQUEST_UB_PATH:-/dev/obmm_shmdev3}"
+SERVER_REQUEST_UB_PATH="${SERVER_REQUEST_UB_PATH:-/dev/obmm_shmdev1}"
 SERVER_RESPONSE_UB_PATH="${SERVER_RESPONSE_UB_PATH:-/dev/obmm_shmdev6}"
-SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev1}"
-# CLI@112 paths use 111 request/response/warm Export 3/6/1 -> Import 7/2/5.
+SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev3}"
+# CLI@112 paths use request/response/warm devices 5/2/7.
 # Keep them away from the HA Replica paths reserved on 112 (dev9 TX, dev8 RX).
-CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev7}"
+CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev5}"
 CLIENT_RESPONSE_UB_PATH="${CLIENT_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}"
-CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev5}"
+CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev7}"
 CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/vemb_v16_ub_peer_view_112_to_111.yaml}"
 CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
 CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
@@ -41,7 +42,6 @@ SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev4 /dev/obm
 CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev8 /dev/obmm_shmdev9}"
 
 DIM="${DIM:-300}"
-MAX_VECTORS="${MAX_VECTORS:-131072}"
 NUM_KEYS="${NUM_KEYS:-100000}"
 KEY_PATTERN="${KEY_PATTERN:-R:R}"
 # OP_TYPE: VEMB(默认读) / VSIM_2KEY / VADD / VREM; VADD/VREM 自动切 ratio=1:0 + S:S
@@ -143,8 +143,8 @@ The default is the HA-compatible 111 -> 112 setup:
   SSH server (111)=root@43.154.145.18:8111, client (112)=root@43.154.145.18:8112
   server=192.168.90.111:6395, client=192.168.90.112 (internal network)
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
-  server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
-  server warm=/dev/obmm_shmdev1; client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev5
+  server request/response=/dev/obmm_shmdev1,/dev/obmm_shmdev6
+  server warm=/dev/obmm_shmdev3; client request/response/warm=/dev/obmm_shmdev5,/dev/obmm_shmdev2,/dev/obmm_shmdev7
   peer-view=CLI@112 -> owner 0@111, using examples/vemb_v16_ub_peer_view_112_to_111.yaml
 
 Important environment variables:
@@ -154,7 +154,7 @@ Important environment variables:
   CLIENT_REQUEST_UB_PATH CLIENT_RESPONSE_UB_PATH CLIENT_WARM_UB_PATH
   SERVER_RESERVED_UB_PATHS CLIENT_RESERVED_UB_PATHS
   CLIENT_PEER_VIEW_MANIFEST CLIENT_PEER_VIEW_HOST CLIENT_PEER_VIEW_OWNER_ID
-  NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
+  NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM
   THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES
   PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
@@ -282,7 +282,7 @@ fi
     die "KILL_MUTAGEN must be 0 or 1"
 [ "$DRY_RUN" = 0 ] || [ "$DRY_RUN" = 1 ] || die "DRY_RUN must be 0 or 1"
 
-for value in "$PORT" "$DIM" "$MAX_VECTORS" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
+for value in "$PORT" "$DIM" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" \
     "$PROXY_REQUEST_BATCH" "$PROXY_RESPONSE_BATCH" "$PROXY_QUEUE_BATCH" \
     "$PIO" "$SNW" \
@@ -291,7 +291,7 @@ for value in "$PORT" "$DIM" "$MAX_VECTORS" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
     "$MAX_FOREIGN_CPUSET_BUSY_PCT" "$MAX_FOREIGN_RSS_MB"; do
     is_uint "$value" || die "numeric parameters must be non-negative integers"
 done
-[ "$PORT" -gt 0 ] && [ "$DIM" -gt 0 ] && [ "$MAX_VECTORS" -gt 0 ] &&
+[ "$PORT" -gt 0 ] && [ "$DIM" -gt 0 ] &&
     [ "$NUM_KEYS" -gt 0 ] && [ "$THREADS" -gt 0 ] && [ "$CLIENTS" -gt 0 ] &&
     [ "$PIPELINE" -gt 0 ] && [ "$BATCH_REQUEST_SIZE" -gt 0 ] &&
     [ "$PROXY_REQUEST_BATCH" -gt 0 ] && [ "$PROXY_RESPONSE_BATCH" -gt 0 ] &&
@@ -511,7 +511,7 @@ status "preflighting server UB paths and starting fresh server"
 server_ssh bash -s -- \
     "$SERVER_ROOT" "$REMOTE_RUN_DIR" "$PORT" "$SERVER_IP" "$SERVER_MANIFEST" \
     "$SERVER_REQUEST_UB_PATH" "$SERVER_RESPONSE_UB_PATH" "$SERVER_WARM_UB_PATH" \
-    "$DIM" "$MAX_VECTORS" "$BATCH_REQUEST_SIZE" "$PIO" "$SNW" \
+    "$DIM" "$BATCH_REQUEST_SIZE" "$PIO" "$SNW" \
     "$SERVER_CPU_MASK" "$AERON_UB_CACHEABLE_CONFIG" <<'REMOTE_SERVER_START'
 set -euo pipefail
 
@@ -524,12 +524,11 @@ request_path=$6
 response_path=$7
 warm_path=$8
 dim=$9
-max_vectors=${10}
-batch_size=${11}
-proxy_io_threads=${12}
-supernode_workers=${13}
-cpu_mask=${14}
-ub_cacheable=${15}
+batch_size=${10}
+proxy_io_threads=${11}
+supernode_workers=${12}
+cpu_mask=${13}
+ub_cacheable=${14}
 
 mkdir -p "$run"
 pidfile="$run/server.pid"
@@ -554,7 +553,6 @@ cd "$root"
 setsid -f taskset -c "$cpu_mask" ./src/redis-server \
     --port "$port" --bind "$server_ip" --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim "$dim" \
-    --vemb-v16-max-vectors "$max_vectors" \
     --vemb-v16-warm-regions-manifest "$manifest" \
     --vemb-v16-reset-warm-regions yes \
     --vemb-v16-transport aeron \
@@ -608,7 +606,7 @@ peer_view_manifest=$4
 peer_view_host=$5
 peer_view_owner_id=$6
 ub_cacheable=$7
-op_type=${17:-VEMB}
+op_type=${8:-VEMB}
 export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
 
 for path in "$request_path" "$response_path" "$warm_path"; do
@@ -643,8 +641,19 @@ taskset -c "$cpu_mask" ./memtier_benchmark \
     >"$run/prefill.log" 2>&1
 
 ! grep -q 'Connection error' "$run/prefill.log"
-awk '/^Totals/ { found = 1; if ($2 > 0) ok = 1 } END { exit !(found && ok) }' \
-    "$run/prefill.log"
+awk -v expected="$keys" '
+/^\[common-core\] w[0-9]+ done:/ {
+    found = 1
+    for (i = 1; i <= NF; i++) {
+        split($i, field, "=")
+        if (field[1] == "status_ok") ok += field[2]
+        else if (field[1] == "status_nf") nf += field[2]
+        else if (field[1] == "status_err") err += field[2]
+        else if (field[1] == "unmatched") unmatched += field[2]
+    }
+}
+END { exit !(found && ok == expected && nf == 0 && err == 0 && unmatched == 0) }
+' "$run/prefill.log"
 REMOTE_PREFILL
 
 if [ "$PROFILE" = 1 ]; then

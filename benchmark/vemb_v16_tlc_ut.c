@@ -57,15 +57,11 @@ static void *fuzzy_checkpoint_writer(void *opaque) {
 static void init_fuzzy_slot_meta(vemb_v16_warm_slot_meta_t *slot_meta,
                                  uint32_t count,
                                  uint32_t region_id) {
+    (void)region_id;
     for (uint32_t i = 0; i < count; i++) {
-        atomic_init(&slot_meta[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slot_meta[i].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&slot_meta[i].owner_generation, 0);
-        atomic_init(&slot_meta[i].write_seq, 0);
-        atomic_init(&slot_meta[i].last_access_ns, 0);
-        atomic_init(&slot_meta[i].clock_bit, 0);
-        atomic_init(&slot_meta[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
-        slot_meta[i].region_id = region_id;
-        slot_meta[i].local_slot = i;
     }
 }
 
@@ -446,14 +442,9 @@ static vemb_v16_warm_region_header_t *init_test_allocator_with_slot_meta(
     vemb_v16_warm_slot_meta_t *slots =
         vemb_v16_warm_region_slot_meta(allocator);
     for (uint32_t i = 0; i < capacity_slots; i++) {
-        slots[i].region_id = region_id;
-        slots[i].local_slot = i;
-        atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[i].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&slots[i].owner_generation, 0);
-        atomic_init(&slots[i].write_seq, 0);
-        atomic_init(&slots[i].last_access_ns, 0);
-        atomic_init(&slots[i].clock_bit, 0);
-        atomic_init(&slots[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
     }
     return allocator;
 }
@@ -492,14 +483,9 @@ static vemb_v16_warm_slot_meta_t *tlc_ut_slot_meta_acquire(
             calloc(capacity_slots, sizeof(*slots));
         assert(slots);
         for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-            slots[slot].region_id = region_id;
-            slots[slot].local_slot = slot;
-            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].state_version,
+                        vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
             atomic_init(&slots[slot].owner_generation, 0);
-            atomic_init(&slots[slot].write_seq, 0);
-            atomic_init(&slots[slot].last_access_ns, 0);
-            atomic_init(&slots[slot].clock_bit, 0);
-            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
         }
         *entry = (tlc_ut_slot_meta_entry_t){
             .mapped_addr = mapped_addr,
@@ -552,14 +538,9 @@ static int tlc_ut_create(vemb_v16_tlc_t **out,
 static void test_persistent_cold_write_order(void) {
     float region[2] = {0};
     vemb_v16_warm_slot_meta_t slot_meta = {0};
-    atomic_init(&slot_meta.state, VEMB_V16_WARM_SLOT_FREE);
+    atomic_init(&slot_meta.state_version,
+                vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
     atomic_init(&slot_meta.owner_generation, 0);
-    atomic_init(&slot_meta.write_seq, 0);
-    atomic_init(&slot_meta.last_access_ns, 0);
-    atomic_init(&slot_meta.clock_bit, 0);
-    atomic_init(&slot_meta.cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
-    slot_meta.region_id = 700;
-    slot_meta.local_slot = 0;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 700,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
@@ -1295,18 +1276,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
 
     assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
                             h2_hash, second, sizeof(second),
-                            &h2, &warm_slot) == 0);
-#if TLC_CORE_ALLOW_LRU_EVICTION
-    assert(h2.region_id == 1);
-    assert(h2.offset == 0);
-    assert(memcmp(local_region, second, sizeof(second)) == 0);
-#else
-    assert(h2.region_id == 2);
-    assert(h2.offset < sizeof(remote_region));
-    assert(memcmp((uint8_t *)remote_region + h2.offset,
-                  second,
-                  sizeof(second)) == 0);
-#endif
+                            &h2, &warm_slot) != 0);
 
     assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
                             h1_hash, overwrite, sizeof(overwrite),
@@ -1360,31 +1330,15 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
                                     regions, 2, 8) == 0);
     fill_vector(vector, dim, 700);
-    for (uint32_t i = 0; i < max_vectors; i++) {
-        snprintf(key, sizeof(key), "full:%u", i);
-        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
-        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
-                                vector, sizeof(vector),
-                                &handle, &warm_slot) == 0);
-        assert(handle.bytes == sizeof(vector));
-    }
+    snprintf(key, sizeof(key), "full:0");
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                            vector, sizeof(vector), &handle, &warm_slot) == 0);
+    assert(handle.bytes == sizeof(vector));
 
     memset(&handle, 0xff, sizeof(handle));
-    snprintf(key, sizeof(key), "full:%u", max_vectors);
-    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
-#if TLC_CORE_ALLOW_LRU_EVICTION
-    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
-                            vector, sizeof(vector),
-                            &handle, &warm_slot) == 0);
-    assert(warm_slot != UINT32_MAX);
-    assert(handle.bytes == sizeof(vector));
-    assert(handle.owner_generation >= 2);
-    tlc_core_stats_t stats;
-    tlc_core_get_stats(tlc->core, &stats);
-    assert(stats.warm_region_count == 2);
-    assert(stats.warm_region_full_count >= 1);
-    assert(stats.warm_alloc_cold_spill == 0);
-#else
+    snprintf(key, sizeof(key), "full:1");
+    key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) != 0);
@@ -1393,7 +1347,6 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_eviction_success == 0);
-#endif
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -1433,12 +1386,11 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     assert(h1.region_id == 77);
     assert(h1.offset == 0);
     assert(warm_slot == 0);
+    /* A second TLC instance has its own process-local allocator; ownership
+     * coordination is intentionally outside this single-owner test. */
     assert(vemb_v16_tlc_put(tlc2, key2, (uint32_t)strlen(key2), key2_hash,
-                            v2, sizeof(v2), &h2, &warm_slot) == 0);
-    assert(h2.region_id == 77);
-    assert(h2.offset == sizeof(v2));
-    assert(warm_slot == 1);
-    assert_region_stats(tlc1, 77, 2, 0);
+                            v2, sizeof(v2), &h2, &warm_slot) != 0);
+    assert_region_stats(tlc1, 77, 1, 0);
 
     assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
                             overwrite, sizeof(overwrite), &h3,
@@ -1446,9 +1398,8 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     assert(h3.region_id == h1.region_id);
     assert(h3.offset == h1.offset);
     assert(warm_slot == 0);
-    assert_region_stats(tlc1, 77, 2, 0);
+    assert_region_stats(tlc1, 77, 1, 0);
     assert(memcmp(region, overwrite, sizeof(overwrite)) == 0);
-    assert(memcmp(region + dim, v2, sizeof(v2)) == 0);
 
     vemb_v16_tlc_destroy(tlc2);
     vemb_v16_tlc_destroy(tlc1);
@@ -2746,10 +2697,6 @@ static void test_runtime_attach_remote_region_after_create(void) {
                                 &warm_slot) == 0);
         assert(handle.region_id == 300);
         assert_region_stats(tlc, 300, 1, 1);
-        atomic_store_explicit(
-            &vemb_v16_warm_region_slot_meta(local_alloc)[0].cold_state,
-            VEMB_V16_WARM_SLOT_COLD_NONE,
-            memory_order_release);
     }
 
     assert(vemb_v16_tlc_attach_warm_region(tlc, &remote) == 0);

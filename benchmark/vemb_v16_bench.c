@@ -119,6 +119,7 @@ typedef struct worker_arg {
     uint64_t read_bytes;
     uint64_t vemb_sent;
     uint64_t vadd_sent;
+    uint64_t vrem_sent;
     uint64_t vsim_sent;
     uint64_t dual_write_sent;
     uint64_t stale_topology_refreshes;
@@ -142,6 +143,7 @@ enum {
     MODE_VSIM_INLINE = 5,
     MODE_VSIM_KEY_KEY = 6,
     MODE_VREM = 7,
+    MODE_MIXED_80W20D = 8,
 };
 
 enum {
@@ -1787,23 +1789,39 @@ static void *common_core_worker_main(void *arg)
         uint32_t key_id = workload_key_id(&w->cfg, global_id);
         int mixed_write = w->cfg.mode == MODE_MIXED_80R20W &&
                           (i % 5u) == 0;
+        int mixed_delete = w->cfg.mode == MODE_MIXED_80W20D &&
+                           (i % 5u) == 4u;
         int rc = -1;
 
         if (w->cfg.hot_key_enabled)
             key_id = w->cfg.hot_key_id;
         if (w->cfg.mode == MODE_PING) {
             rc = vemb_v16_client_ping(client);
-        } else if (w->cfg.mode == MODE_VADD || mixed_write) {
-            uint32_t write_key_id = mixed_write ? key_id :
-                (w->cfg.keyspace ? key_id : global_id + 100000000u);
+        } else if (w->cfg.mode == MODE_VADD || mixed_write ||
+                   w->cfg.mode == MODE_MIXED_80W20D) {
+            uint32_t write_key_id;
+            if (w->cfg.mode == MODE_MIXED_80W20D) {
+                uint32_t first_write_in_cycle = global_id - (i % 5u);
+                write_key_id = 100000000u +
+                    (mixed_delete ? first_write_in_cycle : global_id);
+            } else {
+                write_key_id = mixed_write ? key_id :
+                    (w->cfg.keyspace ? key_id : global_id + 100000000u);
+            }
             make_key(key, sizeof(key), write_key_id);
-            fill_vector(vector, w->cfg.dim, global_id);
-            rc = vemb_v16_client_vadd(client, NULL, key, vector, w->cfg.dim);
-            w->vadd_sent++;
+            if (mixed_delete) {
+                rc = vemb_v16_client_vrem(client, NULL, key);
+                w->vrem_sent++;
+            } else {
+                fill_vector(vector, w->cfg.dim, global_id);
+                rc = vemb_v16_client_vadd(client, NULL, key, vector,
+                                          w->cfg.dim);
+                w->vadd_sent++;
+            }
         } else if (w->cfg.mode == MODE_VREM) {
             make_key(key, sizeof(key), key_id);
             rc = vemb_v16_client_vrem(client, NULL, key);
-            w->vadd_sent++;
+            w->vrem_sent++;
         } else if (w->cfg.mode == MODE_VSIM_INLINE) {
             float score = 0.0f;
             make_key(key, sizeof(key), key_id);
@@ -1922,7 +1940,7 @@ static int run_common_core_once(bench_cfg_t cfg)
         pthread_join(threads[i], NULL);
 
     uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0;
-    uint64_t vadd_sent = 0, vsim_sent = 0, ask_redirects = 0;
+    uint64_t vadd_sent = 0, vrem_sent = 0, vsim_sent = 0, ask_redirects = 0;
     uint64_t moved_redirects = 0, stale_refreshes = 0, refresh_calls = 0;
     uint64_t max_ns = 0;
     double score_sum = 0.0;
@@ -1932,6 +1950,7 @@ static int run_common_core_once(bench_cfg_t cfg)
         read_bytes += args[i].read_bytes;
         vemb_sent += args[i].vemb_sent;
         vadd_sent += args[i].vadd_sent;
+        vrem_sent += args[i].vrem_sent;
         vsim_sent += args[i].vsim_sent;
         ask_redirects += args[i].ask_redirects;
         moved_redirects += args[i].moved_redirects;
@@ -1954,9 +1973,10 @@ static int run_common_core_once(bench_cfg_t cfg)
            (unsigned long long)moved_redirects,
            (unsigned long long)stale_refreshes,
            (unsigned long long)refresh_calls);
-    if (vemb_sent || vadd_sent || vsim_sent) {
-        printf("[client] sent_vemb=%llu sent_vadd=%llu sent_vsim=%llu score_sum=%.6f\n",
+    if (vemb_sent || vadd_sent || vrem_sent || vsim_sent) {
+        printf("[client] sent_vemb=%llu sent_vadd=%llu sent_vrem=%llu sent_vsim=%llu score_sum=%.6f\n",
                (unsigned long long)vemb_sent, (unsigned long long)vadd_sent,
+               (unsigned long long)vrem_sent,
                (unsigned long long)vsim_sent, score_sum);
     }
     for (uint32_t n = 0; n < cfg.node_count; n++) {
@@ -2373,6 +2393,7 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "vadd")) return MODE_VADD;
     if (!strcmp(s, "vrem")) return MODE_VREM;
     if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
+    if (!strcmp(s, "mixed-80w20d")) return MODE_MIXED_80W20D;
     if (!strcmp(s, "vsim-inline")) return MODE_VSIM_INLINE;
     if (!strcmp(s, "vsim-key-key")) return MODE_VSIM_KEY_KEY;
     return -1;
@@ -2386,6 +2407,7 @@ static const char *mode_name(int mode) {
     case MODE_VADD: return "vadd";
     case MODE_VREM: return "vrem";
     case MODE_MIXED_80R20W: return "mixed-80r20w";
+    case MODE_MIXED_80W20D: return "mixed-80w20d";
     case MODE_VSIM_INLINE: return "vsim-inline";
     case MODE_VSIM_KEY_KEY: return "vsim-key-key";
     default: return "unknown";
@@ -2401,7 +2423,8 @@ static int mode_is_read(int mode) {
 static int mode_has_write(int mode) {
     return mode == MODE_VADD ||
            mode == MODE_VREM ||
-           mode == MODE_MIXED_80R20W;
+           mode == MODE_MIXED_80R20W ||
+           mode == MODE_MIXED_80W20D;
 }
 
 static int append_thread_count(int **threads,
@@ -3001,7 +3024,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--ha-endpoint HOST:PORT] [--dim N] [--prefill N] [--keyspace N] [--key-pattern sequential|random] [--ops N] [--timeout-ms N] [--pipeline 1] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--ub-peer-view-manifest FILE --ub-peer-view-client-host HOST] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline]\n", argv[0]);
+            printf("usage: %s [--endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--ha-endpoint HOST:PORT] [--dim N] [--prefill N] [--keyspace N] [--key-pattern sequential|random] [--ops N] [--timeout-ms N] [--pipeline 1] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--ub-peer-view-manifest FILE --ub-peer-view-client-host HOST] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|mixed-80w20d|vsim-inline]\n", argv[0]);
             return 0;
         }
         else {

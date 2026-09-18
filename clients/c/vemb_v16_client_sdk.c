@@ -554,9 +554,8 @@ vemb_v16_resp_class_t vemb_v16_classify_resp_status(uint8_t status) {
 }
 
 /* Forward decl: defined below (shared by ring + warm-region mmap paths). */
-static void *vemb_v16_mmap_shmdev_region(const char *path,
+static void *vemb_v16_mapped_region_open(const char *path,
                                           uint32_t backend_type,
-                                          int use_sync,
                                           int writable,
                                           uint64_t offset, size_t bytes,
                                           size_t *out_map_bytes,
@@ -598,9 +597,8 @@ static int vemb_v16_open_warm_region_internal(const vemb_v16_channel_desc_t *des
         : (size_t)desc->vector_stride * desc->max_vectors;
 
     size_t map_bytes = 0, offset_delta = 0;
-    void *ptr = vemb_v16_mmap_shmdev_region(desc->vector_region_name,
+    void *ptr = vemb_v16_mapped_region_open(desc->vector_region_name,
                                             desc->warm_backend_type,
-                                            0,
                                             0,
                                             desc->warm_mmap_offset, size,
                                             &map_bytes, &offset_delta);
@@ -5745,8 +5743,7 @@ static int vemb_v16_aeron_tcp_status_control(int fd,
 }
 
 /* Open a same-host UB-backed ring encoded as <device>@off<bytes> + slot
- * size. Both rings share the local data plane and use ordinary O_RDWR;
- * remote peer-view mappings select their cache policy separately. */
+ * size. UB open/mmap permission failures select the O_SYNC fallback. */
 static int vemb_v16_aeron_ring_open(const char *name,
                                     uint32_t slot_size,
                                     vemb_v16_client_ring_t **out) {
@@ -5764,8 +5761,8 @@ static int vemb_v16_aeron_ring_open(const char *name,
     if (end == offset_marker + 4 || *end != '\0') return -1;
     size_t bytes = vemb_v16_client_ring_bytes(slot_size);
     size_t map_bytes = 0, offset_delta = 0;
-    void *base = vemb_v16_mmap_shmdev_region(
-        path, VEMB_V16_REGION_UB, 0, 1, mmap_offset, bytes,
+    void *base = vemb_v16_mapped_region_open(
+        path, VEMB_V16_REGION_UB, 1, mmap_offset, bytes,
         &map_bytes, &offset_delta);
     if (!base) return -1;
     *out = (vemb_v16_client_ring_t *)((uint8_t *)base + offset_delta);
@@ -5778,15 +5775,23 @@ static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
     munmap(r, vemb_v16_client_ring_bytes(slot_size));
 }
 
-/* Map a shared region with explicitly selected process access. The UB driver
- * requires a read/write mapping for a consumer-only warm-region view and
+/* The caller supplies a validated UB path. Export devices may accept O_RDWR;
+ * only a permission failure triggers the synchronous open retry. */
+static int vemb_v16_open_ub_with_fallback(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0 && (errno == EPERM || errno == EACCES))
+        fd = open(path, O_RDWR | O_SYNC);
+    return fd;
+}
+
+/* Attach an existing shared region; SHM is never created or resized here.
+ * The returned mapping and byte count belong to the caller for munmap.
+ * The UB driver requires a read/write mapping for a consumer-only warm view and
  * rejects a later mprotect downgrade. The client read APIs expose that view as
  * const and never write it; rings and batch arenas remain read/write.
- * UB cacheability is selected by the direction owner, not by whether its local
- * device path was translated. */
-static void *vemb_v16_mmap_shmdev_region(const char *path,
+ * UB cacheability follows device open/mmap permissions, not the client role. */
+static void *vemb_v16_mapped_region_open(const char *path,
                                           uint32_t backend_type,
-                                          int use_sync,
                                           int writable,
                                           uint64_t offset, size_t bytes,
                                           size_t *out_map_bytes,
@@ -5802,16 +5807,8 @@ static void *vemb_v16_mmap_shmdev_region(const char *path,
 
     int map_writable = writable || backend_type == VEMB_V16_REGION_UB;
     int flags = map_writable ? O_RDWR : O_RDONLY;
-    int used_sync = 0;
     int fd = backend_type == VEMB_V16_REGION_LOCAL_SHM ?
-        shm_open(path, flags, 0666) : open(path, flags);
-    (void)use_sync;
-    if (fd < 0 && backend_type == VEMB_V16_REGION_UB &&
-        (errno == EPERM || errno == EACCES)) {
-        fd = open(path, O_RDWR | O_SYNC);
-        if (fd >= 0)
-            used_sync = 1;
-    }
+        shm_open(path, flags, 0666) : vemb_v16_open_ub_with_fallback(path);
     if (fd < 0) return NULL;
     int protection = map_writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
     void *ptr = mmap(NULL, map_size, protection, MAP_SHARED,
@@ -5820,16 +5817,16 @@ static void *vemb_v16_mmap_shmdev_region(const char *path,
         (errno == EPERM || errno == EACCES)) {
         close(fd);
         fd = open(path, O_RDWR | O_SYNC);
-        if (fd >= 0) {
-            used_sync = 1;
-            ptr = mmap(NULL, map_size, protection, MAP_SHARED,
-                       fd, (off_t)aligned_offset);
-        }
+        if (fd < 0) return NULL;
+        ptr = mmap(NULL, map_size, protection, MAP_SHARED,
+                   fd, (off_t)aligned_offset);
     }
+    int mmap_errno = errno;
     close(fd);
-    if (ptr == MAP_FAILED) ptr = NULL;
-    (void)used_sync;
-    if (!ptr) return NULL;
+    if (ptr == MAP_FAILED) {
+        errno = mmap_errno;
+        return NULL;
+    }
     if (out_map_bytes)    *out_map_bytes    = map_size;
     if (out_offset_delta) *out_offset_delta = offset_delta;
     return ptr;
@@ -5854,9 +5851,8 @@ static int vemb_v16_aeron_map_ub_resource(
     }
 
     size_t offset_delta = 0;
-    void *mapping = vemb_v16_mmap_shmdev_region(
+    void *mapping = vemb_v16_mapped_region_open(
         peer_view->client_path, VEMB_V16_REGION_UB,
-        0,
         writable, mapping_offset,
         mapping_bytes,
         out_mapping_bytes, &offset_delta);
@@ -6624,7 +6620,6 @@ uint32_t vemb_v16_aeron_poll_response_batch(vemb_v16_aeron_channel_t *ch,
 static int aeron_mmap_one_region(const char *path,
                                   uint32_t backend_type,
                                   uint32_t map_flags,
-                                  uint32_t cache_policy,
                                   uint64_t region_bytes, uint64_t mmap_offset,
                                   void **out_mapping_addr, size_t *out_mapping_bytes,
                                   const uint8_t **out_mapped_addr) {
@@ -6634,9 +6629,8 @@ static int aeron_mmap_one_region(const char *path,
         (mmap_offset > SIZE_MAX || region_bytes > SIZE_MAX - (size_t)mmap_offset))
         return -1;
     size_t map_bytes = 0, offset_delta = 0;
-    void *ptr = vemb_v16_mmap_shmdev_region(
+    void *ptr = vemb_v16_mapped_region_open(
         path, backend_type,
-        cache_policy == VEMB_V16_UB_PEER_VIEW_NONCACHEABLE,
         0, map_from_start ? 0 : mmap_offset,
         (size_t)region_bytes + (map_from_start ? (size_t)mmap_offset : 0),
         &map_bytes, &offset_delta);
@@ -6689,7 +6683,6 @@ int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
         if (aeron_mmap_one_region(ch->desc.warm_regions[i].path,
                                    ch->desc.warm_regions[i].backend_type,
                                    ch->warm_peer_views[i].map_flags,
-                                   VEMB_V16_UB_PEER_VIEW_CACHEABLE,
                                    ch->desc.warm_regions[i].region_bytes,
                                    ch->desc.warm_regions[i].mmap_offset,
                                    &ch->warm[i].mapping_addr,

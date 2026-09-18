@@ -1052,7 +1052,21 @@ static void publish_response(vemb_v16_channel_t *ch,
             return;
         }
     } else {
-        if (vemb_v16_aeron_publish_response(ch, &resp) != 0)
+        int trace = ch->channel_id == 1 && resp.req_id <= 32;
+        if (trace)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=response_single_begin cid=%llu req_id=%u status=%u head=%llu tail=%llu",
+                      (unsigned long long)ch->channel_id, resp.req_id, resp.status,
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->head, memory_order_acquire),
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->tail, memory_order_relaxed));
+        int rc = vemb_v16_aeron_publish_response(ch, &resp);
+        if (trace)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=response_single_end cid=%llu req_id=%u rc=%d head=%llu tail=%llu",
+                      (unsigned long long)ch->channel_id, resp.req_id, rc,
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->head, memory_order_acquire),
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->tail, memory_order_relaxed));
+        if (rc != 0)
             return;
     }
 }
@@ -1127,9 +1141,21 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
         for (uint32_t i = 0; i < ready_count; i++)
             vemb_v16_make_response_from(&resps[i],
                                         &completions[ready_indices[i]]);
-        if (vemb_v16_aeron_publish_response_batch(ch,
-                                                  resps,
-                                                  ready_count) != 0) {
+        int trace = ch->channel_id == 1 && resps[0].req_id <= 32;
+        if (trace)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=response_batch_begin cid=%llu count=%u ring=%p head=%llu tail=%llu",
+                      (unsigned long long)ch->channel_id, ready_count, (void *)ch->response_ring,
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->head, memory_order_acquire),
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->tail, memory_order_relaxed));
+        int rc = vemb_v16_aeron_publish_response_batch(ch, resps, ready_count);
+        if (trace)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=response_batch_end cid=%llu count=%u rc=%d head=%llu tail=%llu",
+                      (unsigned long long)ch->channel_id, ready_count, rc,
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->head, memory_order_acquire),
+                      (unsigned long long)atomic_load_explicit(&ch->response_ring->tail, memory_order_relaxed));
+        if (rc != 0) {
             for (uint32_t i = 0; i < ready_count; i++)
                 completion_release_payload(&completions[ready_indices[i]]);
             return -1;
@@ -1464,6 +1490,12 @@ static void vemb_v16_proxy_handle_request_ptr_batch_internal(
     for (uint32_t i = 0; i < req_count; i++) {
         const vemb_v16_req_t *req = reqs[i];
         int req_len = req_lens ? req_lens[i] : common_req_len;
+        if (ch->transport_type == VEMB_V16_TRANSPORT_AERON &&
+            ch->channel_id == 1 && req->req_id <= 32)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=dispatch cid=%llu req_id=%u op=%u worker=%u key_len=%u dim=%u vector_bytes=%u",
+                      (unsigned long long)ch->channel_id, req->req_id, req->op,
+                      proxy_io_worker_id, req->key_len, req->dim, req->vector_bytes);
 
         if (req->op == VEMB_V16_OP_PING) {
             if (prepare_request_job(ch, req, 0, proxy_io_worker_id,
@@ -1516,11 +1548,21 @@ static void vemb_v16_proxy_handle_request_ptr_batch_internal(
                               VEMB_V16_JOB_SLOT_PUBLISHED,
                               memory_order_release);
     }
-    if (likely(publish_shard_job_batch(ch,
-                                       refs,
-                                       pending_count,
-                                       proxy_io_worker_id,
-                                       ch->proxy->job_shard_queues) == 0)) {
+    int trace = ch->transport_type == VEMB_V16_TRANSPORT_AERON &&
+        ch->channel_id == 1 && refs[0].req_id <= 32;
+    if (trace)
+        serverLog(LL_WARNING,
+                  "vemb_v16 proxy trace stage=job_submit_begin cid=%llu worker=%u decoded=%u jobs=%u",
+                  (unsigned long long)ch->channel_id, proxy_io_worker_id,
+                  req_count, pending_count);
+    int publish_rc = publish_shard_job_batch(ch, refs, pending_count,
+                                             proxy_io_worker_id, ch->proxy->job_shard_queues);
+    if (trace)
+        serverLog(LL_WARNING,
+                  "vemb_v16 proxy trace stage=job_submit_end cid=%llu worker=%u jobs=%u rc=%d",
+                  (unsigned long long)ch->channel_id, proxy_io_worker_id,
+                  pending_count, publish_rc);
+    if (likely(publish_rc == 0)) {
         return;
     }
 
@@ -1750,6 +1792,14 @@ static int drain_completions(vemb_v16_channel_t *ch) {
         }
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
+            if (ch->transport_type == VEMB_V16_TRANSPORT_AERON &&
+                ch->channel_id == 1 && completions[i].req_id <= 32)
+                serverLog(LL_WARNING,
+                          "vemb_v16 proxy trace stage=completion cid=%llu completion_cid=%llu req_id=%u op=%u status=%u active=%d",
+                          (unsigned long long)ch->channel_id,
+                          (unsigned long long)completions[i].channel_id,
+                          completions[i].req_id, completions[i].op, completions[i].status,
+                          atomic_load_explicit(&ch->active, memory_order_acquire));
             if (completions[i].channel_id != ch->channel_id ||
                 !atomic_load_explicit(&ch->active, memory_order_acquire)) {
                 completion_release_payload(&completions[i]);

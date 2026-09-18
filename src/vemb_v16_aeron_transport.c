@@ -4,6 +4,7 @@
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_proxy_types.h"
+#include "vemb_v16_log.h"
 
 #include <stdint.h>
 
@@ -45,13 +46,35 @@ int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
     if (wire_count == 0)
         return 0;
 
+    /* Temporary bounded trace for the first prefill channel and 32 slots. */
+    int trace = ch->channel_id == 1 &&
+        atomic_load_explicit(&request_ring->head, memory_order_relaxed) <= 32;
+    if (trace)
+        serverLog(LL_WARNING,
+                  "vemb_v16 proxy trace stage=rx_batch cid=%llu worker=%u wire_count=%u ring=%p head=%llu tail=%llu",
+                  (unsigned long long)ch->channel_id, proxy_io_worker_id,
+                  wire_count, (void *)request_ring,
+                  (unsigned long long)atomic_load_explicit(&request_ring->head, memory_order_relaxed),
+                  (unsigned long long)atomic_load_explicit(&request_ring->tail, memory_order_acquire));
     uint32_t req_count = 0;
     for (uint32_t i = 0; i < wire_count; i++) {
-        if (vemb_v16_req_decode(&reqs[req_count], wire[i], wire_lens[i]) != 0)
+        int decode_rc = vemb_v16_req_decode(&reqs[req_count], wire[i], wire_lens[i]);
+        if (trace)
+            serverLog(LL_WARNING,
+                      "vemb_v16 proxy trace stage=decode cid=%llu wire_index=%u len=%u rc=%d req_id=%u op=%u",
+                      (unsigned long long)ch->channel_id, i, wire_lens[i], decode_rc,
+                      decode_rc == 0 ? reqs[req_count].req_id : 0,
+                      decode_rc == 0 ? reqs[req_count].op : 0);
+        if (decode_rc != 0)
             continue;
         req_ptrs[req_count] = &reqs[req_count];
         req_count++;
     }
+    if (trace)
+        serverLog(LL_WARNING,
+                  "vemb_v16 proxy trace stage=decoded_batch cid=%llu wire_count=%u req_count=%u dropped=%u",
+                  (unsigned long long)ch->channel_id, wire_count,
+                  req_count, wire_count - req_count);
     if (req_count == 0)
         return (int)wire_count;
     vemb_v16_proxy_handle_request_ptr_batch(ch,

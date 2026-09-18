@@ -1,8 +1,9 @@
 # HA failover peer view for CLI@112 (owners 0@111 and 1@112).
 # owner_id 是 topology 的逻辑身份，而不是主机编号 111。ATTACH offset 仍是
 # 每个 channel 动态返回的值；此文件只选择客户端可见设备及映射策略。
-# CLI@112 使用 7/2/5（request/response/warm），其中分别对应 111 的
-# `dev3/dev6/dev1`，避开 112 上 HA Replica 保留的 RX dev8 和 TX dev9。
+# CLI@112 使用 5/2/7（request/response/warm），其中 request 从 112 远端
+# Import dev5 写到 111 Export dev1，response 使用 111 dev6 -> 112 dev2，
+# warm 使用 111 dev3 -> 112 dev7；避开 112 上 HA Replica 保留的 dev8/dev9。
 # The same file also carries the failover target owner 1 when it is local to
 # CLI@112; those entries use local dev1/dev2/dev3 and avoid dev8/dev9.
 version: 1
@@ -68,8 +69,8 @@ peer_views:
     resource_role: v1_request_ring
     resource_id: owner111-v1-request
     generation: 1
-    provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev5
     map_from_start: true
   - client_host: 112
     owner_id: 0
@@ -84,24 +85,24 @@ peer_views:
     resource_role: warm_region
     resource_id: owner111-warm
     generation: 1
-    provider_path: /dev/obmm_shmdev1
-    client_path: /dev/obmm_shmdev5
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
     map_from_start: true
   - client_host: 112
     owner_id: 0
     resource_role: v2_request_descriptor
     resource_id: owner111-v2-request-descriptor
     generation: 1
-    provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev5
     map_from_start: true
   - client_host: 112
     owner_id: 0
     resource_role: v2_request_arena
     resource_id: owner111-v2-request-arena
     generation: 1
-    provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev5
     map_from_start: true
   - client_host: 112
     owner_id: 0

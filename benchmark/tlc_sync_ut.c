@@ -19,15 +19,11 @@ typedef struct test_core {
 
 static void init_slot_meta(vemb_v16_warm_slot_meta_t *slot_meta,
                            uint32_t region_id) {
+    (void)region_id;
     for (uint32_t i = 0; i < SLOT_COUNT; i++) {
-        atomic_init(&slot_meta[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slot_meta[i].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&slot_meta[i].owner_generation, 0);
-        atomic_init(&slot_meta[i].write_seq, 0);
-        atomic_init(&slot_meta[i].last_access_ns, 0);
-        atomic_init(&slot_meta[i].clock_bit, 0);
-        atomic_init(&slot_meta[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
-        slot_meta[i].region_id = region_id;
-        slot_meta[i].local_slot = i;
     }
 }
 

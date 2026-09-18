@@ -449,7 +449,7 @@ REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet
                     vemb_v16_remote_meta.o vemb_v16_ub_rpc.o vemb_v16_topology.o \
                     vemb_v16_migration_outbox.o \
                     vemb_v16_shared_allocator.o vemb_v16_mapped_region.o \
-                    vemb_v16_warm_region_layout.o \
+                    vemb_v16_warm_region_layout.o tlc_warm_allocator.o \
                     vemb_v16_control_listener.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
@@ -690,10 +690,10 @@ endif
 VEMB_V16_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE)
 VEMB_V16_CFLAGS += $(VEMB_V16_EXTRA_CFLAGS)
 
-vemb_v16_server: vemb_v16_server.c futex.c futex.h vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_aeron_attach.h vemb_v16_storage.h vemb_v16_warm_region_layout.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h
+vemb_v16_server: vemb_v16_server.c futex.c futex.h vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c tlc_warm_allocator.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_aeron_attach.h vemb_v16_storage.h vemb_v16_warm_region_layout.h tlc_warm_allocator.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h
 	@echo 'WARNING: vemb_v16_server is deprecated; do not use it for performance benchmarks. Use redis-server + memtier_benchmark.' 1>&2
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
-	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c futex.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c tlc_cold.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c -pthread -lm
+	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c futex.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c tlc_warm_allocator.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c tlc_cold.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c -pthread -lm
 
 ifdef TLC_VERSION
 tlc_single: $(OUT_DIR)/tlc_$(TLC_VERSION)_server

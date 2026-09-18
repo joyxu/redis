@@ -53,13 +53,8 @@ static void on_signal(int sig) {
 int main(int argc, char **argv) {
     int ret = 1;
     vemb_v16_storage_ctx_t *storage = NULL;
-    const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     const char *warm_regions_manifest = NULL;
     uint32_t dim = 0;
-    uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
-    uint32_t warm_region_id = 0;
-    uint32_t warm_backend_type = VEMB_V16_REGION_UB;
-    uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
@@ -95,37 +90,19 @@ int main(int argc, char **argv) {
             supernode_workers = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--batch-request-size") && i + 1 < argc) {
             batch_request_size = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
-            vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--warm-regions-manifest") && i + 1 < argc) {
             warm_regions_manifest = argv[++i];
         } else if (!strcmp(argv[i], "--reset-warm-regions")) {
             reset_warm_regions = 1;
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
             dim = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--max-vectors") && i + 1 < argc) {
-            max_vectors = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--region-id") && i + 1 < argc) {
-            warm_region_id = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--warm-backend") && i + 1 < argc) {
-            const char *backend = argv[++i];
-            if (!strcmp(backend, "shm")) {
-                warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
-            } else if (!strcmp(backend, "ub")) {
-                warm_backend_type = VEMB_V16_REGION_UB;
-            } else {
-                fprintf(stderr, "invalid warm backend\n");
-                goto cleanup;
-            }
-        } else if (!strcmp(argv[i], "--warm-mmap-offset") && i + 1 < argc) {
-            warm_mmap_offset = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--loglevel") && i + 1 < argc) {
             if (vemb_v16_parse_log_level(argv[++i], &loglevel) != 0) {
                 fprintf(stderr, "invalid loglevel\n");
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-        printf("usage: %s [--transport tcp|aeron] [--aeron-ub-path PATH] [--aeron-response-ub-path PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+        printf("usage: %s [--transport tcp|aeron] [--aeron-ub-path PATH] [--aeron-response-ub-path PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] --warm-regions-manifest PATH [--reset-warm-regions] [--dim N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -149,8 +126,8 @@ int main(int argc, char **argv) {
                 VEMB_V16_MAX_DIM);
         goto cleanup;
     }
-    if (max_vectors == 0) {
-        fprintf(stderr, "--max-vectors must be >= 1\n");
+    if (!warm_regions_manifest || !warm_regions_manifest[0]) {
+        fprintf(stderr, "--warm-regions-manifest is required; capacity is manifest-derived\n");
         goto cleanup;
     }
 
@@ -160,10 +137,10 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s tcp_control=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s tcp_control=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u warm_regions_manifest=%s",
               transport, tcp_host, tcp_port,
               proxy_io_threads,
-              supernode_workers, dim, max_vectors, vector_region_name,
+              supernode_workers, dim,
               warm_regions_manifest ? warm_regions_manifest : "(none)");
 
     vemb_v16_warm_regions_manifest_t manifest;
@@ -176,30 +153,6 @@ int main(int argc, char **argv) {
                       warm_regions_manifest);
             goto cleanup;
         }
-    } else {
-        if (!vector_region_name || !vector_region_name[0])
-            vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
-        if (vector_region_name[0] != '/' ||
-            strlen(vector_region_name) >= sizeof(manifest.regions[0].path)) {
-            serverLog(LL_WARNING, "invalid vemb_v16 vector region name: %s",
-                      vector_region_name);
-            goto cleanup;
-        }
-        manifest.local_region_weight = 4;
-        manifest.region_count = 1;
-        vemb_v16_manifest_region_t *region = &manifest.regions[0];
-        region->region_id = warm_region_id;
-        region->backend_type = warm_backend_type ?
-            warm_backend_type : VEMB_V16_REGION_LOCAL_SHM;
-        region->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
-        region->has_cache_policy = 1;
-        region->is_local = 1;
-        region->has_is_local = 1;
-        region->weight = 1;
-        region->value_size = dim * sizeof(float);
-        region->mmap_offset = warm_mmap_offset;
-        region->region_bytes = (uint64_t)region->value_size * max_vectors;
-        strncpy(region->path, vector_region_name, sizeof(region->path) - 1);
     }
     if (reset_warm_regions) {
         serverLog(LL_NOTICE, "resetting vemb_v16 warm regions before storage open");
@@ -211,7 +164,7 @@ int main(int argc, char **argv) {
     int storage_rc = vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                                dim,
                                                                dim * sizeof(float),
-                                                               max_vectors,
+                                                               0,
                                                                &manifest);
     if (storage_rc != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 storage");
@@ -219,7 +172,7 @@ int main(int argc, char **argv) {
     }
     if (vemb_v16_proxy_create(&g_proxy,
                               dim,
-                              max_vectors,
+                              storage->max_vectors,
                               storage,
                               &manifest) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");

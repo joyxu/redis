@@ -81,7 +81,7 @@ PUBLIC_HEADERS := \
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
 
 # ---- targets ----
-.PHONY: all static shared install-headers example example_so correctness cluster-smoke ha-replica-tcp clean
+.PHONY: all static shared install-headers example example_so correctness cluster-smoke ha-replica-tcp mapped-region-ut clean
 
 all: static shared install-headers
 
@@ -205,6 +205,13 @@ example_so: $(LIB_DIR)/libvemb_v16_client.so install-headers
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $(BUILD_DIR)/example_so example.c \
 		-L$(LIB_DIR) -lvemb_v16_client \
 		-Wl,-rpath,$(LIB_DIR)
+
+# Exercise the SDK mapping entry with injected syscall failures.
+mapped-region-ut: $(LIB_DIR)/libvemb_v16_client.a
+	$(CC) $(CFLAGS) $(ARCH_FLAGS) $(INCLUDES) \
+		-o $(BUILD_DIR)/vemb_v16_cli_mapped_region_ut ../../benchmark/vemb_v16_cli_mapped_region_ut.c \
+		$(LIB_DIR)/libvemb_v16_client.a -lpthread -lm
+	./$(BUILD_DIR)/vemb_v16_cli_mapped_region_ut
 
 # Multi-region Aeron correctness test — compiled from source tree (not flat
 # install) so vemb_v16_hash.h → xxhash.h relative includes resolve.

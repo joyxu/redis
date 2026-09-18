@@ -116,15 +116,9 @@ static void node_init_with_retention(test_node_t *node, uint32_t region_id,
     node->slot_meta = zcalloc_num(SLOT_COUNT, sizeof(*node->slot_meta));
     assert(node->region && node->slot_meta);
     for (uint32_t i = 0; i < SLOT_COUNT; i++) {
-        atomic_init(&node->slot_meta[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&node->slot_meta[i].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&node->slot_meta[i].owner_generation, 0);
-        atomic_init(&node->slot_meta[i].write_seq, 0);
-        atomic_init(&node->slot_meta[i].last_access_ns, 0);
-        atomic_init(&node->slot_meta[i].clock_bit, 0);
-        atomic_init(&node->slot_meta[i].cold_state,
-                    VEMB_V16_WARM_SLOT_COLD_NONE);
-        node->slot_meta[i].region_id = region_id;
-        node->slot_meta[i].local_slot = i;
     }
     tlc_core_warm_region_config_t warm = {
         .region_id = region_id,
