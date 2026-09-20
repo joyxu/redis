@@ -313,8 +313,6 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
                              uint32_t *vector_bytes);
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats);
-void vemb_v16_tlc_note_handle_lookup_miss(vemb_v16_tlc_t *tlc,
-                                          uint8_t status);
 void vemb_v16_tlc_get_lookup_diagnostic_stats(
     vemb_v16_tlc_t *tlc,
     vemb_v16_tlc_lookup_diagnostic_stats_t *stats);

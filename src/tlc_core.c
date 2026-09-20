@@ -1151,34 +1151,6 @@ static int resolve_warm_region_for_location(
     return 0;
 }
 
-static void note_lookup_location(tlc_core_t *core,
-                                 const tlc_warm_location_t *location,
-                                 int cold_promote) {
-    tlc_core_warm_region_runtime_t *region = NULL;
-    uint32_t region_index = UINT32_MAX;
-    if (resolve_warm_region_for_location(core, location, &region,
-                                         &region_index) != 0)
-        return;
-    if (!cold_promote) {
-        if (region->is_local)
-            atomic_fetch_add_explicit(&core->lookup_warm_local_hit, 1,
-                                      memory_order_relaxed);
-        else
-            atomic_fetch_add_explicit(&core->lookup_warm_imported_hit, 1,
-                                      memory_order_relaxed);
-    }
-    if (region_index < TLC_CORE_MAX_TOTAL_WARM_REGIONS) {
-        if (!cold_promote)
-            atomic_fetch_add_explicit(
-                &core->region_lookup_hits[region_index], 1,
-                memory_order_relaxed);
-        else
-            atomic_fetch_add_explicit(
-                &core->region_cold_promotes[region_index], 1,
-                memory_order_relaxed);
-    }
-}
-
 static int location_cache_validate_location(tlc_core_t *core,
                                             uint64_t key_hash,
                                             const tlc_warm_location_t *cached,
@@ -1998,25 +1970,16 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
                                           uint64_t key_hash,
                                           tlc_warm_location_t *location) {
     if (location_cache_get(core, key, key_len, key_hash, location) == 0) {
-        atomic_fetch_add_explicit(&core->lookup_cache_hit, 1,
-                                  memory_order_relaxed);
-        note_lookup_location(core, location, 0);
         return 0;
     }
-    atomic_fetch_add_explicit(&core->lookup_cache_miss, 1,
-                              memory_order_relaxed);
     int32_t hot_idx = hot_get(core, key_hash);
     if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0) {
-        note_lookup_location(core, location, 0);
         goto found;
     }
     if (warm_lookup(core, key, key_len, key_hash, location) == 0) {
-        note_lookup_location(core, location, 0);
         goto found;
     }
 
-    atomic_fetch_add_explicit(&core->lookup_final_miss, 1,
-                              memory_order_relaxed);
     return -1;
 
 found:

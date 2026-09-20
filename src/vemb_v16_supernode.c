@@ -125,8 +125,6 @@ static void completion_set_lookup_miss(
     } else {
         completion->status = VEMB_V16_STATUS_NOT_FOUND;
     }
-    if (completion->op == VEMB_V16_OP_VEMB_HANDLE)
-        vemb_v16_tlc_note_handle_lookup_miss(tlc, completion->status);
 }
 
 static void completion_set_vector_handle(
