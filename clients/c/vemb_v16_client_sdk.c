@@ -6103,7 +6103,20 @@ vemb_v16_aeron_open_remote_batch_with_peer_view(
     ch->response_descriptor_ring = response_descriptor;
     ch->request_arena = request_arena;
     ch->response_arena = response_arena;
-    batch_arena_producer_init(&ch->request_arena_producer);
+    if (!vemb_v16_aeron_ring_header_valid(ch->request_descriptor_ring,
+                                          resp.descriptor_slot_size) ||
+        !vemb_v16_aeron_ring_header_valid(ch->response_descriptor_ring,
+                                          resp.descriptor_slot_size) ||
+        atomic_load_explicit(&ch->request_descriptor_ring->head, memory_order_acquire) != 0 ||
+        atomic_load_explicit(&ch->request_descriptor_ring->tail, memory_order_acquire) != 0 ||
+        atomic_load_explicit(&ch->response_descriptor_ring->head, memory_order_acquire) != 0 ||
+        atomic_load_explicit(&ch->response_descriptor_ring->tail, memory_order_acquire) != 0) {
+        vemb_v16_aeron_batch_unmap(ch);
+        vemb_v16_aeron_notify_close(ch->control_endpoint, ch->channel_id);
+        free(ch);
+        return NULL;
+    }
+    batch_arena_producer_init(&ch->request_arena_producer, ch->request_descriptor_ring);
     return ch;
 }
 
