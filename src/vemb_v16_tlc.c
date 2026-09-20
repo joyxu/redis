@@ -2184,17 +2184,6 @@ void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
     stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);
 }
 
-void vemb_v16_tlc_note_handle_lookup_miss(vemb_v16_tlc_t *tlc,
-                                          uint8_t status) {
-    tlc_counter_add(&tlc->handle_lookup_miss, 1);
-    if (status == VEMB_V16_STATUS_MOVED)
-        tlc_counter_add(&tlc->handle_lookup_miss_moved, 1);
-    else if (status == VEMB_V16_STATUS_STALE_TOPOLOGY)
-        tlc_counter_add(&tlc->handle_lookup_miss_stale, 1);
-    else if (status == VEMB_V16_STATUS_NOT_FOUND)
-        tlc_counter_add(&tlc->handle_lookup_miss_not_found, 1);
-}
-
 void vemb_v16_tlc_get_lookup_diagnostic_stats(
     vemb_v16_tlc_t *tlc,
     vemb_v16_tlc_lookup_diagnostic_stats_t *stats) {
