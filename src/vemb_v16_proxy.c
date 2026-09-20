@@ -358,7 +358,7 @@ static int proxy_aeron_channel_snapshot_update(vemb_v16_proxy_t *proxy,
     vemb_v16_proxy_io_worker_t *worker =
         &proxy->proxy_io_workers[worker_id];
     vemb_v16_aeron_channel_snapshot_t *current =
-        atomic_load_explicit(&worker->aeron_snapshot, memory_order_seq_cst);
+        atomic_load_explicit(&worker->aeron_snapshot, memory_order_acquire);
     vemb_v16_aeron_channel_snapshot_t *next =
         current == worker->aeron_snapshot_buffers[0]
             ? worker->aeron_snapshot_buffers[1]
@@ -367,7 +367,7 @@ static int proxy_aeron_channel_snapshot_update(vemb_v16_proxy_t *proxy,
     /* There is one poller per lane.  Readers are incremented before loading
      * the pointer, so waiting here makes it safe to reuse the other buffer. */
     while (atomic_load_explicit(&worker->aeron_snapshot_readers,
-                                memory_order_seq_cst) != 0)
+                                memory_order_acquire) != 0)
         cpu_relax();
 
     uint32_t found = worker->aeron_snapshot_capacity;
@@ -400,7 +400,7 @@ static int proxy_aeron_channel_snapshot_update(vemb_v16_proxy_t *proxy,
     next->count = next_count;
     atomic_exchange_explicit(&worker->aeron_snapshot,
                              next,
-                             memory_order_seq_cst);
+                             memory_order_release);
     serverLog(LL_NOTICE,
               "vemb_v16 aeron snapshot %s: channel=%u worker=%u count=%u",
               add ? "add" : "remove", ch->index, worker_id, next_count);
@@ -2518,10 +2518,10 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
 
         atomic_fetch_add_explicit(&worker->aeron_snapshot_readers,
                                   1,
-                                  memory_order_seq_cst);
+                                  memory_order_acq_rel);
         vemb_v16_aeron_channel_snapshot_t *snapshot =
             atomic_load_explicit(&worker->aeron_snapshot,
-                                 memory_order_seq_cst);
+                                 memory_order_acquire);
         for (uint32_t i = 0; i < snapshot->count; i++) {
             uint32_t channel_index = snapshot->indices[i];
             /* Snapshot updates place each Aeron channel in the buffer owned
@@ -2561,7 +2561,7 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
         }
         atomic_fetch_sub_explicit(&worker->aeron_snapshot_readers,
                                   1,
-                                  memory_order_seq_cst);
+                                  memory_order_release);
 
         if (!did_work) {
             aeron_io_tiny_pause(idle_rounds);
