@@ -1,10 +1,8 @@
 # HA failover peer view for CLI@112 (owners 0@111 and 1@112).
 # owner_id 是 topology 的逻辑身份，而不是主机编号 111。ATTACH offset 仍是
 # 每个 channel 动态返回的值；此文件只选择客户端可见设备及映射策略。
-# CLI@112 使用 7/2/5（request/response/warm），其中分别对应 111 的
-# `dev3/dev6/dev1`，避开 112 上 HA Replica 保留的 RX dev8 和 TX dev9。
-# The same file also carries the failover target owner 1 when it is local to
-# CLI@112; those entries use local dev1/dev2/dev3 and avoid dev8/dev9.
+# CLI@112 使用 7/2/8（request/response/warm），其中分别对应 111 的
+# `dev3/dev6/dev4`。
 version: 1
 peer_views:
   - client_host: 112
@@ -84,8 +82,8 @@ peer_views:
     resource_role: warm_region
     resource_id: owner111-warm
     generation: 1
-    provider_path: /dev/obmm_shmdev1
-    client_path: /dev/obmm_shmdev5
+    provider_path: /dev/obmm_shmdev4
+    client_path: /dev/obmm_shmdev8
     map_from_start: true
   - client_host: 112
     owner_id: 0

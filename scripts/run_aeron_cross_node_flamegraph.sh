@@ -19,26 +19,25 @@ FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
 SERVER_IP="${SERVER_IP:-192.168.90.111}"
 PORT="${PORT:-6395}"
-# HA-compatible lane: preserve the validated request/response pair (111 dev3/dev6
-# -> 112 dev7/dev2) and move warm to 111 dev1 -> 112 dev5. This avoids HA
-# Replica dev4/dev13 on 111 and dev8/dev9 on 112.
-SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111_ha.yaml}"
+# Warm uses dev4 on 111, dev8 on 112. Request/response pair: 111 dev3/dev6
+# -> 112 dev7/dev2.
+SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111.yaml}"
 SERVER_REQUEST_UB_PATH="${SERVER_REQUEST_UB_PATH:-/dev/obmm_shmdev3}"
 SERVER_RESPONSE_UB_PATH="${SERVER_RESPONSE_UB_PATH:-/dev/obmm_shmdev6}"
-SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev1}"
-# CLI@112 paths use 111 request/response/warm Export 3/6/1 -> Import 7/2/5.
-# Keep them away from the HA Replica paths reserved on 112 (dev9 TX, dev8 RX).
+SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev4}"
+# CLI@112 paths use 111 request/response Export 3/6 -> Import 7/2.
+# Warm Export dev4 -> Import dev8.
 CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev7}"
 CLIENT_RESPONSE_UB_PATH="${CLIENT_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}"
-CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev5}"
+CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev8}"
 CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/vemb_v16_ub_peer_view_112_to_111.yaml}"
 CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
 CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
 AERON_UB_CACHEABLE="${AERON_UB_CACHEABLE:-0}"
-# Device paths reserved by the HA Replica process on the default 111/112
-# hosts. Override explicitly when running against a different allocation.
-SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev4 /dev/obmm_shmdev13}"
-CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev8 /dev/obmm_shmdev9}"
+# Device paths reserved on 111/112 (not used by this benchmark).
+# Override explicitly when running against a different allocation.
+SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev13}"
+CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev9}"
 
 DIM="${DIM:-300}"
 MAX_VECTORS="${MAX_VECTORS:-131072}"
@@ -75,8 +74,8 @@ L1_ENTRIES="${L1_ENTRIES:-0}"
 PROXY_REQUEST_BATCH="${PROXY_REQUEST_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_QUEUE_BATCH="${PROXY_QUEUE_BATCH:-$BATCH_REQUEST_SIZE}"
-PIO="${PIO:-21}"
-SNW="${SNW:-21}"
+PIO="${PIO:-6}"
+SNW="${SNW:-6}"
 SERVER_CPU_MASK="${SERVER_CPU_MASK:-0-15}"
 CLIENT_CPU_MASK="${CLIENT_CPU_MASK:-96-191}"
 
@@ -92,8 +91,8 @@ MAX_FOREIGN_CPU_PCT="${MAX_FOREIGN_CPU_PCT:-10}"
 MAX_FOREIGN_TOTAL_CPU_PCT="${MAX_FOREIGN_TOTAL_CPU_PCT:-20}"
 MAX_FOREIGN_CPUSET_BUSY_PCT="${MAX_FOREIGN_CPUSET_BUSY_PCT:-10}"
 MAX_FOREIGN_RSS_MB="${MAX_FOREIGN_RSS_MB:-256}"
-KILL_OPENCODE="${KILL_OPENCODE:-1}"
-KILL_MUTAGEN="${KILL_MUTAGEN:-1}"
+KILL_OPENCODE="${KILL_OPENCODE:-0}"
+KILL_MUTAGEN="${KILL_MUTAGEN:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
 case "$AERON_UB_CACHEABLE" in
@@ -139,12 +138,12 @@ Usage:
   bash scripts/run_aeron_cross_node_flamegraph.sh
   KEY_PATTERN=Z:Z ZIPF_S=1.5 bash scripts/run_aeron_cross_node_flamegraph.sh
 
-The default is the HA-compatible 111 -> 112 setup:
+The default is the 111 -> 112 setup:
   SSH server (111)=root@43.154.145.18:8111, client (112)=root@43.154.145.18:8112
   server=192.168.90.111:6395, client=192.168.90.112 (internal network)
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
   server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
-  server warm=/dev/obmm_shmdev1; client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev5
+  server warm=/dev/obmm_shmdev4; client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev8
   peer-view=CLI@112 -> owner 0@111, using examples/vemb_v16_ub_peer_view_112_to_111.yaml
 
 Important environment variables:
@@ -161,11 +160,12 @@ Important environment variables:
   TEST_TIME SERVER_FLAME_DURATION FREQ EVENT PROFILE=0|1
   MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_CPUSET_BUSY_PCT MAX_FOREIGN_RSS_MB
   KILL_OPENCODE=0|1 KILL_MUTAGEN=0|1
-  BUILD=verify|build PROFILE=0|1 KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
+  BUILD=verify|build|skip PROFILE=0|1 KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
 
 BUILD=verify requires current O3/LTO/SVE build stamps. BUILD=build force-builds
-the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run. The
+the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run.
+BUILD=skip bypasses stamp checks entirely (use with pre-built artifacts). The
 three server-internal batch macros default to BATCH_REQUEST_SIZE and are
 recorded in the server build stamp.
 
@@ -268,8 +268,8 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exit 0
 fi
 
-[ "$BUILD" = verify ] || [ "$BUILD" = build ] ||
-    die "BUILD must be verify or build"
+[ "$BUILD" = verify ] || [ "$BUILD" = build ] || [ "$BUILD" = skip ] ||
+    die "BUILD must be verify, build, or skip"
 [ "$PROFILE" = 0 ] || [ "$PROFILE" = 1 ] ||
     die "PROFILE must be 0 or 1"
 [ "$KEEP_SERVER" = 0 ] || [ "$KEEP_SERVER" = 1 ] ||
@@ -349,7 +349,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 status "checking build stamps"
-if [ "$BUILD" = build ]; then
+if [ "$BUILD" = skip ]; then
+    echo "VEMB server build stamp: SKIPPED"
+    echo "VEMB client build stamp: SKIPPED"
+elif [ "$BUILD" = build ]; then
     server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' bash scripts/vemb_v16_build_stamp.sh build server"
     client_ssh "cd '$CLIENT_ROOT' && bash scripts/vemb_v16_build_stamp.sh build client"
 else
