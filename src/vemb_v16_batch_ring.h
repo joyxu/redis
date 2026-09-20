@@ -27,7 +27,7 @@
  *                                              dispatch batch
  * consume descriptor (head, release)  <-----  finish processing
  * acquire head
- * scan released descriptors
+ * look up locally recorded frame end
  * advance local arena_head
  * reuse arena space
  *
@@ -38,7 +38,7 @@
  *
  * The producer owns arena_tail. The consumer advances ring->head only after
  * processing succeeds. The producer observes that head with acquire ordering,
- * then derives reclaimable arena_head from the consumed descriptors. The
+ * then derives reclaimable arena_head from its local frame-end ledger. The
  * commit marker must remain the final frame write; descriptor publication
  * makes the completed frame visible to the consumer.
  */
@@ -72,18 +72,33 @@ typedef struct batch_desc {
     uint64_t sequence;   /* Descriptor sequence, expected to equal head + 1. */
 } batch_desc_t;
 
-/* The descriptor ring is the shared SPSC control plane.  Each endpoint keeps
- * this small producer cursor locally; reclaimed arena space is derived from
- * descriptors whose consumer-owned ring head has advanced. */
+/* One producer owns this state for the entire lifetime of a fresh channel.
+ * Ring layout is fixed at attach and validated by the mapping boundary. */
 typedef struct batch_arena_producer {
     uint64_t arena_tail;    /* Next absolute arena byte to write. */
     uint64_t observed_head; /* Consumer head position already used for reclaim. */
     uint64_t arena_head;    /* First absolute arena byte safe to reuse. */
+    uint64_t descriptor_tail;
+    uint8_t *slots_base;
+    uint32_t slot_stride;
+    uint32_t slot_count;
+    uint32_t slot_mask;
+    uint64_t frame_end[VEMB_V16_CLIENT_RING_SIZE];
 } batch_arena_producer_t;
 
+/* The ring must be newly initialized, empty, and have the fixed v2 layout.
+ * Reconnect creates a new ring and reinitializes this producer with it. */
 static inline void batch_arena_producer_init(
-    batch_arena_producer_t *producer) {
-    *producer = (batch_arena_producer_t){0};
+    batch_arena_producer_t *producer, vemb_v16_client_ring_t *ring) {
+    producer->arena_tail = 0;
+    producer->observed_head = 0;
+    producer->arena_head = 0;
+    producer->descriptor_tail = 0;
+    producer->slots_base = (uint8_t *)ring + ring->slots_off;
+    producer->slot_stride = RING_SLOT_META_BYTES + ring->slot_size;
+    producer->slot_count = ring->slot_count;
+    producer->slot_mask = ring->slot_mask;
+    /* Ledger entries become valid only after their descriptor is published. */
 }
 
 static inline int batch_desc_is_current(
@@ -95,28 +110,14 @@ static inline ring_rc_t batch_arena_publish(
     vemb_v16_client_ring_t *ring, uint8_t *arena, uint32_t arena_bytes,
     batch_arena_producer_t *producer, const void *frame,
     uint32_t frame_bytes, uint32_t item_count, uint64_t batch_id) {
-    /* WARNING: Only RING_ERR_FULL is retryable. All other errors indicate
-     * invalid input or incompatible ring layout. */
+    /* The same producer exclusively owns this ring; generic publication must
+     * not be interleaved. Layout/lifetime are guaranteed by attach. Only FULL
+     * is retryable; an oversized frame cannot fit even in an empty arena. */
     /* ERR_INVALID: a frame that cannot fit the arena cannot be published. */
     RETURN_IF(frame_bytes < VEMB_V16_BATCH_COMMIT_BYTES ||
               frame_bytes > arena_bytes, RING_ERR_INVALID);
 
-    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
-    /* WARNING: This reads only the final released descriptor. The consumer
-     * must consume descriptors strictly in order and advance head only after
-     * successfully processing each descriptor's frame. */
-    if (producer->observed_head < head) {
-        uint8_t *slot = ring_slot_base(ring, head - 1);
-        batch_desc_t released;
-        /* NOTE: descriptors are fixed control records; keep memcpy. */
-        memcpy(&released, slot + RING_SLOT_META_BYTES, sizeof(released));
-        producer->arena_head = released.start + released.bytes;
-        producer->observed_head = head;
-    }
-
-    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-    /* ERR_FULL: retry after the consumer advances ring->head. */
-    RETURN_IF(tail - head >= ring->slot_count, RING_ERR_FULL);
+    uint64_t tail = producer->descriptor_tail;
     uint64_t start = producer->arena_tail;
     uint32_t offset = (uint32_t)(start % arena_bytes);
     /* Keep each frame contiguous for direct consumer decode; skip tail
@@ -125,7 +126,22 @@ static inline ring_rc_t batch_arena_publish(
         start += arena_bytes - offset;
         offset = 0;
     }
-    /* ERR_FULL: retry after the consumer releases more arena bytes. */
+    /* A stale cached head is conservative. Refresh only under pressure and
+     * reclaim from local memory, never by reading back NC descriptors. */
+    if (tail - producer->observed_head >= producer->slot_count ||
+        start + frame_bytes - producer->arena_head > arena_bytes) {
+        uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (head != producer->observed_head) {
+            producer->arena_head = producer->frame_end[(head - 1) & producer->slot_mask];
+            producer->observed_head = head;
+        }
+        /* An empty arena may discard wrap padding, including when the next
+         * frame occupies the entire arena. No unconsumed frame is skipped. */
+        if (head == tail)
+            producer->arena_head = start;
+    }
+    RETURN_IF(tail - producer->observed_head >= producer->slot_count,
+              RING_ERR_FULL);
     RETURN_IF(start + frame_bytes - producer->arena_head > arena_bytes,
               RING_ERR_FULL);
 
@@ -152,9 +168,16 @@ static inline ring_rc_t batch_arena_publish(
         .item_count = item_count,
         .sequence = tail + 1,
     };
-    ring_rc_t rc = vemb_v16_client_publish(ring, &desc, sizeof(desc));
-    RETURN_IF(rc != RING_OK, rc);
+    /* Descriptor and arena capacity were reserved together above. The sole
+     * consumer can only free space, so commit cannot fail or need rechecking. */
+    uint8_t *slot = producer->slots_base +
+        (tail & producer->slot_mask) * producer->slot_stride;
+    sve_streaming_load_f32(&desc, slot + RING_SLOT_META_BYTES, sizeof(desc));
+    *(uint32_t *)slot = sizeof(desc);
+    atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
     producer->arena_tail = start + frame_bytes;
+    producer->frame_end[tail & producer->slot_mask] = producer->arena_tail;
+    producer->descriptor_tail = tail + 1;
     return RING_OK;
 }
 

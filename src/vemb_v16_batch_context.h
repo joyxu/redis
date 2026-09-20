@@ -42,6 +42,9 @@ static inline int vemb_v16_batch_token_decode(uint64_t token,
     return 0;
 }
 
+/* Contexts are zero-initialized at worker creation and owned by that worker.
+ * The decoder validates item_count. Each response entry must be fully assigned
+ * by its completion/error writer before publication; unused entries stay stale. */
 static inline vemb_v16_batch_context_t *vemb_v16_batch_context_acquire(
     vemb_v16_batch_context_t *contexts, uint32_t context_count,
     uint64_t channel_id, uint64_t batch_id, uint64_t topology_epoch,
@@ -53,18 +56,17 @@ static inline vemb_v16_batch_context_t *vemb_v16_batch_context_acquire(
         uint32_t generation = context->generation + 1u;
         if (generation == 0)
             generation = 1;
-        memset(context, 0, sizeof(*context));
         context->channel_id = channel_id;
         context->batch_id = batch_id;
         context->topology_epoch = topology_epoch;
         context->generation = generation;
         context->item_count = item_count;
+        context->pending_count = 0;
         context->active = 1;
-        context->response = (batch_response_t){
-            .batch_id = batch_id,
-            .topology_epoch = topology_epoch,
-            .item_count = item_count,
-        };
+        memset(context->completed, 0, sizeof(context->completed));
+        context->response.batch_id = batch_id;
+        context->response.topology_epoch = topology_epoch;
+        context->response.item_count = item_count;
         *out_slot = i;
         return context;
     }

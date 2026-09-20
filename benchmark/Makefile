@@ -168,6 +168,9 @@ vemb_v16_batch_ring_ut: vemb_v16_batch_ring_ut.c ../src/vemb_v16_batch_ring.h ..
 	$(CC) -O2 -Wall -Wextra -std=gnu11 -DSVE_OP_STANDALONE -I../src -o $@ $< ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c -pthread -lm
 	./$@
 
+vemb_v16_batch_read_job_ut: vemb_v16_batch_read_job_ut.c ../src/vemb_v16_proxy.c ../src/vemb_v16_proxy_types.h ../src/vemb_v16_protocol.h ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -ffunction-sections -fdata-sections -I../src -o $@ $< ../src/redisassert.c -Wl,--gc-sections -lm
+
 vemb_v16_batch_context_ut: vemb_v16_batch_context_ut.c ../src/vemb_v16_batch_context.h ../src/vemb_v16_batch_ring.h ../src/vemb_v16_protocol.h ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c
 	$(CC) -O2 -Wall -Wextra -std=gnu11 -DSVE_OP_STANDALONE -I../src -o $@ $< ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c -pthread -lm
 	./$@

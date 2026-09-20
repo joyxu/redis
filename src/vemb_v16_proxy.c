@@ -1267,6 +1267,18 @@ static int job_pool_alloc_slot(vemb_v16_job_pool_t *pool, uint32_t *slot_id) {
     return 0;
 }
 
+static int job_pool_alloc_slot_with_retry(vemb_v16_job_pool_t *pool,
+                                         uint32_t *slot_id) {
+    if (job_pool_alloc_slot(pool, slot_id) == 0)
+        return 0;
+    for (uint32_t retry = 0; retry < 8; retry++) {
+        cpu_relax();
+        if (job_pool_alloc_slot(pool, slot_id) == 0)
+            return 0;
+    }
+    return -1;
+}
+
 static void job_pool_release_slot(vemb_v16_job_pool_t *pool,
                                   uint32_t slot_id,
                                   int bump_generation) {
@@ -1384,17 +1396,8 @@ static int prepare_request_job(vemb_v16_channel_t *ch,
     vemb_v16_job_pool_t *pool =
         &ch->proxy->proxy_io_workers[proxy_io_worker_id].job_pools[pool_type];
     uint32_t slot_id = 0;
-    if (job_pool_alloc_slot(pool, &slot_id) != 0) {
-        /* 池满: 高并发突发时 supernode 正在消费, 短暂自旋等释放
-         * 而不是立刻回 ERR (client 侧表现为 status_err) */
-        for (uint32_t retry = 0; retry < 8; retry++) {
-            cpu_relax();
-            if (job_pool_alloc_slot(pool, &slot_id) == 0)
-                goto alloc_ok;
-        }
+    if (job_pool_alloc_slot_with_retry(pool, &slot_id) != 0)
         return -1;
-    }
-alloc_ok:
     GOTO_IF(fill_job_slot(pool,
                           slot_id,
                           ch,
@@ -1418,6 +1421,49 @@ alloc_ok:
 release_slot:
     job_pool_release_slot(pool, slot_id, 0);
     return -1;
+}
+
+/* The v2 decoder validates key bounds; the owning proxy worker keeps the
+ * frame alive until this function has copied the key into its READ pool. */
+static int prepare_batch_read_job(vemb_v16_channel_t *ch,
+                                  const uint8_t *key, uint32_t key_len,
+                                  uint32_t req_id, uint64_t epoch,
+                                  uint64_t batch_token,
+                                  uint32_t proxy_io_worker_id,
+                                  vemb_v16_pending_job_publish_t *pending) {
+    vemb_v16_job_pool_t *pool =
+        &ch->proxy->proxy_io_workers[proxy_io_worker_id].job_pools[VEMB_V16_JOB_POOL_READ];
+    uint32_t slot_id;
+    if (job_pool_alloc_slot_with_retry(pool, &slot_id) != 0)
+        return -1;
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
+    vemb_v16_vemb_job_t *job = &slot->u.read_job;
+    memcpy(job->key, key, key_len);
+    job->base = (vemb_v16_job_base_t){
+        .kind = VEMB_V16_JOB_KIND_READ,
+        .op = VEMB_V16_OP_VEMB_HANDLE,
+        .req_id = req_id,
+        .channel_index = ch->index,
+        .channel_id = ch->channel_id,
+        .key_hash = vemb_v16_xxh3_64_str(job->key, key_len),
+        .topology_epoch = epoch,
+        .batch_token = batch_token,
+    };
+    job->key_len = key_len;
+    job->dim = ch->proxy->vector_dim;
+    job->vector_bytes = ch->proxy->vector_stride;
+    slot->hdr.op = VEMB_V16_OP_VEMB_HANDLE;
+    pending->pool = pool;
+    pending->slot_id = slot_id;
+    pending->ref = (vemb_v16_job_ref_t){
+        .proxy_worker_id = (uint16_t)proxy_io_worker_id,
+        .pool_type = VEMB_V16_JOB_POOL_READ,
+        .slot_id = slot_id,
+        .generation = slot->hdr.generation,
+        .req_id = req_id,
+        .op = VEMB_V16_OP_VEMB_HANDLE,
+    };
+    return 0;
 }
 
 static int publish_request_job(vemb_v16_channel_t *ch,
@@ -1676,25 +1722,11 @@ int vemb_v16_proxy_handle_batch_request(
     const uint8_t *key = view->keys;
     for (uint32_t i = 0; i < view->item_count; i++) {
         uint16_t key_len = batch_request_key_len_at(view, i);
-        vemb_v16_req_t req = {
-            .op = VEMB_V16_OP_VEMB_HANDLE,
-            .req_id = i,
-            .channel_id = ch->channel_id,
-            .key_len = key_len,
-            .topology_epoch = epoch,
-            .dim = ch->proxy->vector_dim,
-            .vector_bytes = ch->proxy->vector_stride,
-        };
-        memcpy(req.key, key, key_len);
-        req.key_hash = vemb_v16_xxh3_64_str(req.key, key_len);
-        key += key_len;
-        if (prepare_request_job(ch, &req, key_len, proxy_io_worker_id,
-                                &pending[pending_count]) == 0) {
-            vemb_v16_job_slot_t *slot =
-                job_pool_slot(pending[pending_count].pool,
-                              pending[pending_count].slot_id);
-            slot->u.read_job.base.batch_token = vemb_v16_batch_token_make(
-                proxy_io_worker_id, context_slot, context->generation, i);
+        uint64_t token = vemb_v16_batch_token_make(
+            proxy_io_worker_id, context_slot, context->generation, i);
+        if (prepare_batch_read_job(ch, key, key_len, i, epoch, token,
+                                    proxy_io_worker_id,
+                                    &pending[pending_count]) == 0) {
             refs[pending_count] = pending[pending_count].ref;
             pending_indices[pending_count++] = (uint16_t)i;
             context->pending_count++;
@@ -1704,6 +1736,7 @@ int vemb_v16_proxy_handle_batch_request(
                 .op = VEMB_V16_OP_VEMB_HANDLE,
             };
         }
+        key += key_len;
     }
     for (uint32_t i = 0; i < pending_count; i++) {
         vemb_v16_job_slot_t *slot =
@@ -2163,7 +2196,7 @@ static int attach_cross_node_batch_channel_locked(
     ch->batch_allocation = *allocation;
     ch->batch_effective_size = effective_batch_size;
     ch->batch_max_bytes = max_batch_bytes;
-    batch_arena_producer_init(&ch->batch_response_producer);
+    batch_arena_producer_init(&ch->batch_response_producer, ch->response_ring);
     ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
         .worker_id = ch->supernode_worker_id,
         .channel_active = &ch->active,

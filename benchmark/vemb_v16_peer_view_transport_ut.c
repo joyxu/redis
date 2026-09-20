@@ -59,6 +59,7 @@ typedef struct sdk_v2_fake_server {
     void *request_arena_mapping;
     void *response_descriptor_mapping;
     void *response_arena_mapping;
+    batch_arena_producer_t response_producer;
 } sdk_v2_fake_server_t;
 
 static void setup_v1_server(peer_view_fake_server_t *server);
@@ -553,6 +554,8 @@ static void setup_sdk_v2_server(sdk_v2_fake_server_t *server) {
                 &server->request_arena_mapping);
     map_file_rw(server->response_arena_path, VEMB_V16_BATCH_MAX_BYTES_DEFAULT,
                 &server->response_arena_mapping);
+    batch_arena_producer_init(&server->response_producer,
+                              server->response_descriptor_mapping);
 }
 
 static void teardown_sdk_v2_server(sdk_v2_fake_server_t *server) {
@@ -659,11 +662,9 @@ static void sdk_v2_publish_handle_response(sdk_v2_fake_server_t *server,
     }
     uint8_t frame[VEMB_V16_BATCH_MAX_BYTES_MAX];
     size_t frame_bytes = batch_response_encode(frame, &response);
-    batch_arena_producer_t producer;
-    batch_arena_producer_init(&producer);
     assert(batch_arena_publish(server->response_descriptor_mapping,
                                server->response_arena_mapping,
-                               VEMB_V16_BATCH_MAX_BYTES_DEFAULT, &producer,
+                               VEMB_V16_BATCH_MAX_BYTES_DEFAULT, &server->response_producer,
                                frame, (uint32_t)frame_bytes,
                                response.item_count,
                                response.batch_id) == RING_OK);
