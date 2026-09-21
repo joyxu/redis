@@ -2442,6 +2442,8 @@ int vemb_v16_client_handle_session_poll(
     callbacks += sdk_handle_session_route_requests(session, cb, priv);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
+        if (!session->client->owner_channel_inited[owner])
+            continue;
         sdk_owner_v2_t *v2 = &session->client->owner_v2[owner];
         if (v2->l0 && vemb_v16_cli_deadline_flush_due(
                 &session->deadlines[owner],
