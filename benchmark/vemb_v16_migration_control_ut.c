@@ -130,6 +130,7 @@ static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
     memset(ring, 0, sizeof(*ring));
     ring->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    ring->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     snprintf(ring->path, sizeof(ring->path), "%s", path);
 }
 
@@ -1121,7 +1122,7 @@ static void test_supernode_lookup_miss_classification(void) {
 }
 
 static void test_proxy_migration_control_primitives(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 2, max_vectors = 16 };
     char manifest_path[128];
     char shm1[64];
     char remote_meta_default[64];
@@ -1966,6 +1967,7 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
                                  max_vectors,
                                  storage,
                                  &manifest) == 0);
+    assert(vemb_v16_proxy_enable_tcp(proxy, "127.0.0.1", 6399) == 0);
 
     memset(&req, 0, sizeof(req));
     req.peer_view_map_req.flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
@@ -2996,13 +2998,15 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_GC);
     assert(info.target_owner == 1);
     assert(info.topology_epoch == 24);
-    assert(vemb_v16_storage_migration_mark_source_gc(&source_storage,
-                                                      key,
-                                                      (uint32_t)strlen(key),
-                                                      key_hash,
-                                                      24,
-                                                      1,
-                                                      &info) == 0);
+    assert(vemb_v16_storage_migration_mark_source_gc_in_shard(
+               &source_storage,
+               key,
+               (uint32_t)strlen(key),
+               key_hash,
+               24,
+               1,
+               info.shard_id,
+               &info) == 0);
     assert(!vemb_v16_storage_migration_active(&source_storage));
 
     for (uint32_t i = 0; i < source_storage.migration_outbox_count; i++)
@@ -3023,7 +3027,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
 static void test_supernode_vadd_pushes_migration_delta(void) {
     enum {
         dim = 2,
-        max_vectors = 256,
+        max_vectors = 512,
         large_range_key_count = 129,
         large_range_page_limit = 17,
     };
@@ -3254,7 +3258,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     source_storage.local_owner_id = 1;
     source_storage.tlc = source;
     source_storage.ub_rpc = source_rpc;
-    init_storage_runtime_fields(&source_storage, 60, 60);
+    init_storage_runtime_fields(&source_storage, 50, 50);
     assert(pthread_mutex_init(&source_storage.topology_lock, NULL) == 0);
     assert(pthread_mutex_init(&source_storage.migration_outbox_lock,
                               NULL) == 0);
@@ -3262,7 +3266,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     dest_storage.local_owner_id = 3;
     dest_storage.tlc = dest;
     dest_storage.ub_rpc = dest_rpc;
-    init_storage_runtime_fields(&dest_storage, 60, 60);
+    init_storage_runtime_fields(&dest_storage, 50, 50);
     assert(pthread_mutex_init(&dest_storage.topology_lock, NULL) == 0);
     assert(pthread_mutex_init(&dest_storage.migration_outbox_lock,
                               NULL) == 0);
@@ -3352,6 +3356,13 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                                    &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 51);
+    assert(info.tombstone == 1);
+    tlc_warm_location_t source_location2;
+    assert(tlc_core_get_warm_location(source->core,
+                                      baseline_key,
+                                      baseline_key_len,
+                                      baseline_key_hash,
+                                      &source_location2) != 0);
     memset(&info, 0, sizeof(info));
     assert(tlc_core_get_migration_info(dest->core,
                                            baseline_key,
@@ -4680,6 +4691,13 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 61);
     assert(info.target_owner == 3);
+    assert(info.tombstone == 1);
+    tlc_warm_location_t source_location;
+    assert(tlc_core_get_warm_location(source->core,
+                                      key,
+                                      key_len,
+                                      key_hash,
+                                      &source_location) != 0);
 
     fill_vector(deleted_value, dim, 6500);
     assert(vemb_v16_tlc_put_with_epoch(source,

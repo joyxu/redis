@@ -37,6 +37,9 @@ VNODE_COUNT="${VNODE_COUNT:-100}"
 CONTROL_TIMEOUT_MS="${CONTROL_TIMEOUT_MS:-5000}"
 KEEP_SERVERS="${KEEP_SERVERS:-0}"
 ARCHIVE_LOCAL="${ARCHIVE_LOCAL:-1}"
+# 非空时给两节点 server 注入 HPC_REDIS_COLD_DIR 打开 COLD 持久化
+# (storage_enable_configured_cold 只认这个 env, 无 conf 参数形式)
+COLD_DIR="${HPC_REDIS_COLD_DIR:-}"
 RUN_ID="${RUN_ID:-aeron_cluster_tput_$(date +%Y%m%d_%H%M%S)}"
 
 # UB 布局与 scaleout 脚本一致 (node0 dev1-4 / node1 dev9-12, 详见 examples yaml)
@@ -184,14 +187,20 @@ YAML
 # owner1 response 条目重写: examples yaml 编码的是 scaleout 布局 (server resp
 # 在 dev15@112), 本脚本 rings 落在 dev10/dev11@112, provider 需为 ATTACH 广播值
 # ($NODE1_AERON_RESPONSE_PATH), client 需为 111 侧同窗口视图 dev15。
-sed -n '/^  - client_host: 111$/,\$p' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' \
+# 只提取 owner_id: 1 段: heredoc 已含 owner0 视图, 整段提取会重复 owner0
+# 条目, peer-view 加载器的 duplicate-entry 校验会拒绝整个文件。
+OWN1_START=\$(grep -n '^    owner_id: 1\$' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' | head -1 | cut -d: -f1)
+OWN1_START=\$((OWN1_START - 1))
+sed -n \"\${OWN1_START},\\\$p\" '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' \
   | sed -e 's|^    provider_path: /dev/obmm_shmdev15$|    provider_path: $NODE1_AERON_RESPONSE_PATH|' \
         -e 's|^    client_path: /dev/obmm_shmdev11$|    client_path: $NODE1_AERON_RESPONSE_CLIENT_PATH|' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
 
 # ── P3: start servers ──────────────────────────────────────────────────────
 start_server() {
     local node="$1" manifest="$2" logfile="$3" pid_file="$4" req="$5" resp="$6"
-    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$req' --vemb-v16-aeron-response-ub-path '$resp' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel warning"
+    local cold_pre=""
+    [ -n "$COLD_DIR" ] && cold_pre="mkdir -p '$COLD_DIR' && HPC_REDIS_COLD_DIR='$COLD_DIR' "
+    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && ${cold_pre}numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$req' --vemb-v16-aeron-response-ub-path '$resp' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel warning"
 }
 wait_server_ready() {
     ssh_run "$1" "cd '$REMOTE_DIR' || exit 1; for _ in \$(seq 1 100); do if ./benchmark/vemb_v16_topology_ctl --get --ctl-endpoint tcp --host '$1' --port '$SERVER_PORT' --timeout-ms 1000 >/dev/null 2>&1; then exit 0; fi; if ! kill -0 \$(cat '$2') 2>/dev/null; then exit 1; fi; sleep 1; done; exit 1"

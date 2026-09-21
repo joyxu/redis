@@ -41,6 +41,30 @@ static void strip_comment(char *s) {
     }
 }
 
+static int storage_enable_configured_cold(vemb_v16_storage_ctx_t *storage) {
+    const char *directory = getenv("HPC_REDIS_COLD_DIR");
+    if (!directory || !*directory)
+        return 0;
+    tlc_cold_config_t config = {
+        .directory = directory,
+        .segment_bytes = UINT64_C(64) * 1024 * 1024,
+        .queue_capacity = 131072,
+        .group_max_entries = 64,
+        .group_max_delay_us = 1000,
+        .retention_events = 1048576,
+    };
+    if (vemb_v16_tlc_enable_cold(storage->tlc, &config) != 0) {
+        serverLog(LL_WARNING,
+                  "failed to enable COLD persistence: directory=%s",
+                  directory);
+        return -1;
+    }
+    serverLog(LL_NOTICE,
+              "COLD persistence enabled: directory=%s",
+              directory);
+    return 0;
+}
+
 static int parse_u32_value(const char *s, uint32_t *out) {
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
@@ -1916,6 +1940,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                   storage->warm_region_count);
         goto err;
     }
+    if (storage_enable_configured_cold(storage) != 0)
+        goto err;
     vemb_v16_tlc_set_remote_meta_view(storage->tlc,
                                       &storage->remote_meta_view,
                                       VEMB_V16_REMOTE_META_DEFAULT_RETRIES);
@@ -4487,13 +4513,37 @@ int vemb_v16_storage_migration_mark_cutover_in_shard(
         return -1;
     }
 
-    return tlc_core_mark_cutover(storage->tlc->core,
-                                     key,
-                                     key_len,
-                                     key_hash,
-                                     topology_epoch,
-                                     target_owner,
-                                     info);
+    /*
+     * CUTOVER is a topology-control transition.  Once the target lease is
+     * committed, remove the source value with the same ordinary DEL event
+     * used by client deletes.  The COLD append sink carries this event to the
+     * source Follower; no migration-specific Replica opcode is required.
+     */
+    tlc_core_key_migration_info_t deleted = {0};
+    int delete_ok = current.tombstone ||
+        tlc_core_delete_with_epoch(storage->tlc->core,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   topology_epoch,
+                                   &deleted) == 0;
+    int mark_ok = delete_ok &&
+        tlc_core_mark_cutover(storage->tlc->core,
+                              key,
+                              key_len,
+                              key_hash,
+                              topology_epoch,
+                              target_owner,
+                              info) == 0;
+    if (!mark_ok) {
+        serverLog(LL_WARNING,
+                  "migration cutover source DEL/state transition failed: key_hash=%llu target_owner=%u delete_ok=%d",
+                  (unsigned long long)key_hash,
+                  target_owner,
+                  delete_ok);
+        return -1;
+    }
+    return 0;
 }
 
 int vemb_v16_storage_migration_mark_cutover(
@@ -4877,7 +4927,16 @@ int vemb_v16_storage_migration_range_mark_cutover(
                                                      cutover_topology_epoch,
                                                      target_owner,
                                                      shard_id);
-        int mark_ok = lease_ok &&
+        tlc_core_key_migration_info_t deleted = {0};
+        int delete_ok = lease_ok &&
+            (keys[i].info.tombstone ||
+             tlc_core_delete_with_epoch(storage->tlc->core,
+                                        keys[i].key,
+                                        keys[i].key_len,
+                                        keys[i].key_hash,
+                                        cutover_topology_epoch,
+                                        &deleted) == 0);
+        int mark_ok = delete_ok &&
             tlc_core_mark_cutover(storage->tlc->core,
                                   keys[i].key,
                                   keys[i].key_len,
@@ -4896,6 +4955,10 @@ int vemb_v16_storage_migration_range_mark_cutover(
                           shard_id,
                           (unsigned long long)keys[i].key_hash,
                           lease_ok);
+                serverLog(LL_WARNING,
+                          "vemb_v16 range cutover source DEL/state transition failed: key_hash=%llu delete_ok=%d",
+                          (unsigned long long)keys[i].key_hash,
+                          delete_ok);
             }
             error_count++;
             break;

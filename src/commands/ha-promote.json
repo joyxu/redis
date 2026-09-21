@@ -1,0 +1,16 @@
+{
+    "PROMOTE": {
+        "summary": "Promote the local high availability replica to master.",
+        "complexity": "O(1) plus bounded replication drain.",
+        "group": "server",
+        "since": "8.4.0",
+        "arity": 2,
+        "container": "HA",
+        "function": "haCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "NO_ASYNC_LOADING"
+        ]
+    }
+}

@@ -497,3 +497,67 @@
 | pure_local_100k | aeron | 32.60M | 0.85% | 0.17500 / 0.33500 |
 | small_7to1_100k | tcp | 11.50M | 0.00% | 0.71100 / 0.94300 |
 | small_7to1_100k | aeron | 32.87M | 0.00% | 0.18300 / 0.32700 |
+
+## 3.2.8 COLD 层影响对比（VEMB 读 64x1x32）
+
+### 本地回环（Aeron，WORKERS=2:2，TEST_TIME=20）
+
+> COLD off 行的值取自 §3.2.1「本地回环 VEMB」64x1x32 行，不重测
+> 文件:
+
+| 场景 | COLD | ops_sec | avg_lat_ms | p50_ms | p99_ms | cores | rss_kb |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| VEMB 64x1x32 | off |  |  |  |  |  |  |
+| VEMB 64x1x32 | on |  |  |  |  |  |  |
+
+### 跨节点双机 cluster（Aeron，TEST_TIME=30）
+
+> COLD off 行的值取自 §3.2.3「DIM=300 VEMB · Hpc Aeron 双机 cluster」64x1x32 行，不重测
+> 文件:
+
+| 场景 | COLD | ops_sec | avg_lat_ms | p50_ms | p99_ms | cores | rss_kb |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| VEMB 64x1x32 | off |  |  |  |  |  |  |
+| VEMB 64x1x32 | on |  |  |  |  |  |  |
+
+## 3.2.9 HA 功能性回归（双机主备）
+
+keepalived 部署 check 结果（前置）：111/112 `config=valid`。
+
+### HA Replica UB 数据面
+
+> 文件：
+
+| 阶段 | 结果 |
+| --- | --- |
+| visibility 111 -> 112 |  |
+| visibility 112 -> 111 |  |
+| 复制 / append ACK / heartbeat / async apply |  |
+| snapshot chunks |  |
+| checkpoint install |  |
+| M5 resync tail / handoff |  |
+| M5 timeout / abort cleanup |  |
+| M6 automatic GAP -> AOF repair |  |
+| M6 automatic retention -> snapshot |  |
+| M7 retention soft compact |  |
+| M7 retention hard pressure abort |  |
+| persistent follower COLD recovery |  |
+| manual AOF replay after follower restart |  |
+
+### Redis TCP/SDK 固定角色
+
+> 文件：
+
+| 场景 | events | 结果 |
+| --- | --- | --- |
+| Leader 写入 -> UB 复制 -> Follower 读校验 | 10004 |  |
+| Follower COLD 重启恢复 | 10004 |  |
+
+### Aeron/UB failover（keepalived/VIP 真实切主）
+
+> 文件：
+
+| 方向 | run_id | 初始读写 fail | 切主后读写 fail | VIP 归属 | 旧节点恢复 | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 正向 0 -> 1 |  | 0 | 0 | 唯一，漂至 standby | FOLLOWER，seq 追平 |  |
+| 反向 1 -> 0 |  | 0 | 0 | 唯一，漂至 standby | FOLLOWER，seq 追平 |  |

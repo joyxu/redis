@@ -3,16 +3,12 @@
 
 #include "vemb_v16_warm_region_layout.h"
 #include "vemb_v16_protocol.h"
+#include "tlc_cold.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define TLC_CORE_DEFAULT_HOT_CAPACITY 65536u
-#define TLC_CORE_DEFAULT_COLD_MAX_SEGMENTS 64u
-#define TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS 4096u
-#ifndef TLC_CORE_ENABLE_COLD_LAYER
-#define TLC_CORE_ENABLE_COLD_LAYER 0
-#endif
 #ifndef TLC_CORE_ALLOW_LRU_EVICTION
 #define TLC_CORE_ALLOW_LRU_EVICTION 0
 #endif
@@ -50,6 +46,16 @@ typedef enum tlc_core_migration_apply_status {
     TLC_CORE_MIGRATION_RETRY = 3,
     TLC_CORE_MIGRATION_ERROR = 4,
 } tlc_core_migration_apply_status_t;
+
+typedef enum tlc_core_replica_apply_status {
+    TLC_CORE_REPLICA_APPLY_APPLIED = 0,
+    TLC_CORE_REPLICA_APPLY_DUPLICATE = 1,
+    TLC_CORE_REPLICA_APPLY_GAP = 2,
+    TLC_CORE_REPLICA_APPLY_STALE = 3,
+    TLC_CORE_REPLICA_APPLY_ERROR = 4,
+    /* Event is covered by the per-shard checkpoint; only global seq advances. */
+    TLC_CORE_REPLICA_APPLY_CHECKPOINTED = 5,
+} tlc_core_replica_apply_status_t;
 
 typedef struct tlc_core_key_migration_info {
     uint64_t key_hash;
@@ -142,17 +148,77 @@ typedef struct tlc_core_config {
     uint32_t value_size;
     uint32_t warm_capacity;
     uint32_t hot_capacity;
-    uint32_t cold_max_segments;
-    uint32_t cold_segment_records;
     const tlc_core_warm_region_config_t *warm_regions;
     uint32_t warm_region_count;
     uint32_t local_region_weight;
 } tlc_core_config_t;
 
 typedef struct tlc_core tlc_core_t;
+typedef int (*tlc_core_replica_event_sink_fn)(
+    const tlc_cold_event_input_t *event,
+    uint64_t seq,
+    void *arg);
 
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config);
 void tlc_core_destroy(tlc_core_t *core);
+/* Must be called once, before concurrent writes begin; resolver_arg remains live. */
+int tlc_core_enable_cold(tlc_core_t *core,
+                         const tlc_cold_config_t *cold_config);
+/* Configure the Leader event sink before concurrent writes begin. */
+int tlc_core_set_replica_event_sink(tlc_core_t *core,
+                                    tlc_core_replica_event_sink_fn sink,
+                                    void *arg);
+/* Return the current HA owner term used for new persistent events. */
+uint64_t tlc_core_ha_term(const tlc_core_t *core);
+/* Publish a monotonically increasing HA owner term before new writes. */
+int tlc_core_set_ha_term(tlc_core_t *core, uint64_t ha_term);
+uint64_t tlc_core_replica_applied_seq(const tlc_core_t *core);
+/* Gate new business writes during an HA ownership transition. */
+int tlc_core_set_write_fenced(tlc_core_t *core, int fenced);
+int tlc_core_write_fenced(const tlc_core_t *core);
+/* Return the borrowed COLD runtime; ownership remains with core. */
+tlc_cold_t *tlc_core_get_cold(tlc_core_t *core);
+uint32_t tlc_core_meta_shard_count(const tlc_core_t *core);
+int tlc_core_recover_cold(tlc_core_t *core);
+/* Preconditions: v16 boundary validated generation and output shape. */
+int tlc_core_publish_checkpoint(tlc_core_t *core,
+                                uint64_t generation,
+                                uint64_t ha_term,
+                                tlc_cold_checkpoint_result_t *result);
+int tlc_core_compact(tlc_core_t *core,
+                     uint64_t checkpoint_floor_seq,
+                     uint64_t ha_safe_point_seq,
+                     uint32_t checkpoint_retention_count);
+/*
+ * Install one verified checkpoint artifact into this Follower's only runtime.
+ * The caller has stopped all writes, Replica ingress/apply and COLD lifecycle
+ * users. Failure after the reset leaves the runtime fenced and unusable until
+ * a new resync attempt; it never restores the previous generation.
+ */
+int tlc_core_install_resync_checkpoint(
+    tlc_core_t *core,
+    const void *checkpoint_blob,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result);
+/* Same fenced install boundary, consuming one exclusively owned artifact file. */
+int tlc_core_install_resync_checkpoint_file(
+    tlc_core_t *core,
+    int checkpoint_fd,
+    const char *checkpoint_path,
+    size_t checkpoint_blob_bytes,
+    tlc_cold_checkpoint_result_t *result);
+/*
+ * Resync a fenced follower from the leader's active checkpoint and AOF tail.
+ * The caller has stopped all Follower writes, reads, Replica apply and COLD
+ * lifecycle users, and the Leader checkpoint plus requested tail remain
+ * retained for this call. The Follower is reset in place after the Leader
+ * artifact validates; a failure after reset leaves it fenced and not
+ * recoverable from its old generation.
+ */
+int tlc_core_resync_from(tlc_core_t *leader,
+                         tlc_core_t *follower,
+                         uint64_t boundary_seq,
+                         tlc_cold_checkpoint_result_t *result);
 int tlc_core_source_fence_active(const tlc_core_t *core);
 int tlc_core_attach_warm_region(tlc_core_t *core,
                                 const tlc_core_warm_region_config_t *region,
@@ -200,6 +266,28 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
                                uint64_t key_hash,
                                uint64_t topology_epoch,
                                tlc_core_key_migration_info_t *info);
+/*
+ * Apply one already-normalized event received from the paired Leader.
+ * The ingress boundary validates event operation, key/value shape and seq.
+ * The event is applied only to in-memory HA/WARM state; this API does not
+ * append to local COLD.
+ */
+int tlc_core_apply_replica_event(tlc_core_t *core,
+                                 const tlc_cold_event_input_t *event,
+                                 uint64_t seq,
+                                 tlc_core_replica_apply_status_t *status);
+/*
+ * Apply one resync tail event after durable append. Events at or below the
+ * checkpoint boundary for their meta shard advance the global prefix without
+ * changing WARM state. captured_seq has core->key_meta_shard_count entries.
+ */
+int tlc_core_apply_resync_event(tlc_core_t *core,
+                                const tlc_cold_event_input_t *event,
+                                uint64_t seq,
+                                const uint64_t *captured_seq,
+                                uint32_t shard_count,
+                                tlc_core_replica_apply_status_t *status);
+/* Legacy explicit durable PUT; requires persistent COLD to be enabled. */
 int tlc_core_cold_append(tlc_core_t *core,
                          const char *key,
                          uint32_t key_len,

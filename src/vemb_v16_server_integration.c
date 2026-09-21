@@ -7,6 +7,7 @@
 #include "vemb_v16_protocol.h"
 #include "vemb_v16_control_listener.h"
 #include "vemb_v16_aeron_attach.h"   /* cross-node aeron ATTACH magic sniff */
+#include "tlc_ha_replica.h"
 #include "server.h"
 #include "connection.h"
 #include "connhelpers.h"   /* callHandler ref-counting: connDecrRefs / CONN_FLAG_CLOSE_SCHEDULED */
@@ -18,6 +19,9 @@
 int vemb_v16_log_verbosity_value = LL_NOTICE;
 
 #include <pthread.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -29,6 +33,358 @@ static void *proxy_run_thread(void *arg) {
 }
 
 static vemb_v16_storage_ctx_t *g_vemb_storage = NULL;
+static tlc_ha_replica_t *g_vemb_ha_replica = NULL;
+
+static const char *ha_role_name(tlc_ha_replica_role_t role) {
+    return role == TLC_HA_REPLICA_LEADER ? "LEADER" : "FOLLOWER";
+}
+
+static const char *ha_state_name(tlc_ha_replica_ha_state_t state) {
+    switch (state) {
+    case TLC_HA_REPLICA_STATE_INIT: return "INIT";
+    case TLC_HA_REPLICA_STATE_BACKUP: return "BACKUP";
+    case TLC_HA_REPLICA_STATE_RECOVERING: return "RECOVERING";
+    case TLC_HA_REPLICA_STATE_MASTER: return "MASTER";
+    case TLC_HA_REPLICA_STATE_FAULT: return "FAULT";
+    case TLC_HA_REPLICA_STATE_FENCED: return "FENCED";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *ha_health_name(tlc_ha_replica_health_t health) {
+    switch (health) {
+    case TLC_HA_REPLICA_HEALTHY: return "HEALTHY";
+    case TLC_HA_REPLICA_DEGRADED: return "DEGRADED";
+    case TLC_HA_REPLICA_RECOVERING: return "RECOVERING";
+    case TLC_HA_REPLICA_FAILED: return "FAILED";
+    default: return "UNKNOWN";
+    }
+}
+
+/* The sniff transport multiplexes RESP, VEMB data/control, and the
+ * cross-node AERON_ATTACH handshake on one Redis listener. */
+static int vemb_aeron_attach_enabled(void) {
+    return server.vemb_v16_transport &&
+        (!strcmp(server.vemb_v16_transport, "aeron") ||
+         !strcmp(server.vemb_v16_transport, "sniff"));
+}
+
+static void ha_reply_error(client *c, int rc) {
+    switch (rc) {
+    case TLC_HA_REPLICA_ERR_ALREADY_LEADER:
+        addReplyError(c, "ERR already leader");
+        break;
+    case TLC_HA_REPLICA_ERR_APPLY_LAG:
+        addReplyError(c, "ERR replica apply lag did not clear before timeout");
+        break;
+    case TLC_HA_REPLICA_ERR_INVALID_STATE:
+        addReplyError(c, "ERR invalid HA state");
+        break;
+    default:
+        addReplyError(c, "ERR HA operation failed");
+        break;
+    }
+}
+
+static int ha_notify_status_reply(client *c) {
+    const char *path = getenv("HPC_REDIS_HA_NOTIFY_STATUS");
+    if (!path || !*path)
+        path = "/run/hpc-redis-keepalived/notify.status";
+
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+
+    char state[32] = "UNKNOWN";
+    char operation[32] = "UNKNOWN";
+    char result[32] = "unknown";
+    char rc[32] = "-1";
+    char attempt[32] = "0";
+    char timestamp[64] = "";
+    char detail[768] = "";
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *value = strchr(line, '=');
+        if (!value)
+            continue;
+        *value++ = '\0';
+        value[strcspn(value, "\r\n")] = '\0';
+        if (!strcmp(line, "state"))
+            snprintf(state, sizeof(state), "%s", value);
+        else if (!strcmp(line, "operation"))
+            snprintf(operation, sizeof(operation), "%s", value);
+        else if (!strcmp(line, "result"))
+            snprintf(result, sizeof(result), "%s", value);
+        else if (!strcmp(line, "rc"))
+            snprintf(rc, sizeof(rc), "%s", value);
+        else if (!strcmp(line, "attempt"))
+            snprintf(attempt, sizeof(attempt), "%s", value);
+        else if (!strcmp(line, "timestamp"))
+            snprintf(timestamp, sizeof(timestamp), "%s", value);
+        else if (!strcmp(line, "detail"))
+            snprintf(detail, sizeof(detail), "%s", value);
+    }
+    fclose(fp);
+
+    addReplyMapLen(c, 7);
+    addReplyBulkCString(c, "state");
+    addReplyBulkCString(c, state);
+    addReplyBulkCString(c, "operation");
+    addReplyBulkCString(c, operation);
+    addReplyBulkCString(c, "result");
+    addReplyBulkCString(c, result);
+    addReplyBulkCString(c, "rc");
+    addReplyBulkCString(c, rc);
+    addReplyBulkCString(c, "attempt");
+    addReplyBulkCString(c, attempt);
+    addReplyBulkCString(c, "timestamp");
+    addReplyBulkCString(c, timestamp);
+    addReplyBulkCString(c, "detail");
+    addReplyBulkCString(c, detail);
+    return 0;
+}
+
+void haCommand(client *c) {
+    if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr, "help")) {
+        const char *help[] = {
+            "DEMOTE", "    Demote the local replica to backup.",
+            "FENCE", "     Fence local writes immediately.",
+            "NOTIFY", "    Return keepalived notify status.",
+            "PROGRESS", " Return local and peer replication progress.",
+            "PROMOTE", "  Promote the local replica to master.",
+            "STATE", "    Return local HA role and state.",
+            NULL
+        };
+        addReplyHelp(c, help);
+        return;
+    }
+    if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr, "notify") &&
+        !strcasecmp(c->argv[2]->ptr, "status")) {
+        if (ha_notify_status_reply(c) != 0)
+            addReplyError(c, "ERR HA notify status unavailable");
+        return;
+    }
+    if (!g_vemb_ha_replica) {
+        addReplyError(c, "ERR HA replica is not configured");
+        return;
+    }
+    const char *subcommand = c->argv[1]->ptr;
+    if (!strcasecmp(subcommand, "promote")) {
+        int rc = tlc_ha_replica_external_promote(g_vemb_ha_replica);
+        if (rc == 0)
+            addReplyStatus(c, "OK");
+        else
+            ha_reply_error(c, rc);
+    } else if (!strcasecmp(subcommand, "demote")) {
+        int rc = tlc_ha_replica_external_demote(g_vemb_ha_replica);
+        if (rc == 0)
+            addReplyStatus(c, "OK");
+        else
+            ha_reply_error(c, rc);
+    } else if (!strcasecmp(subcommand, "fence")) {
+        int rc = tlc_ha_replica_external_fence(g_vemb_ha_replica);
+        if (rc == 0)
+            addReplyStatus(c, "OK");
+        else
+            ha_reply_error(c, rc);
+    } else if (!strcasecmp(subcommand, "state")) {
+        tlc_ha_replica_role_t role = tlc_ha_replica_role(g_vemb_ha_replica);
+        tlc_ha_replica_ha_state_t state =
+            tlc_ha_replica_ha_state(g_vemb_ha_replica);
+        addReplyMapLen(c, 4);
+        addReplyBulkCString(c, "role");
+        addReplyBulkCString(c, ha_role_name(role));
+        addReplyBulkCString(c, "ha_state");
+        addReplyBulkCString(c, ha_state_name(state));
+        addReplyBulkCString(c, "ha_term");
+        addReplyLongLong(c, (long long)tlc_ha_replica_ha_term(
+            g_vemb_ha_replica));
+        addReplyBulkCString(c, "fenced");
+        addReplyBool(c, tlc_ha_replica_write_fenced(g_vemb_ha_replica));
+    } else if (!strcasecmp(subcommand, "progress")) {
+        tlc_ha_replica_progress_t progress;
+        if (tlc_ha_replica_get_progress(g_vemb_ha_replica, &progress) != 0) {
+            addReplyError(c, "ERR HA progress unavailable");
+            return;
+        }
+        addReplyMapLen(c, 7);
+        addReplyBulkCString(c, "appended_seq");
+        addReplyLongLong(c, (long long)progress.appended_seq);
+        addReplyBulkCString(c, "durable_seq");
+        addReplyLongLong(c, (long long)progress.durable_seq);
+        addReplyBulkCString(c, "applied_seq");
+        addReplyLongLong(c, (long long)progress.applied_seq);
+        addReplyBulkCString(c, "peer_durable_seq");
+        addReplyLongLong(c, (long long)progress.peer_durable_seq);
+        addReplyBulkCString(c, "peer_applied_seq");
+        addReplyLongLong(c, (long long)progress.peer_applied_seq);
+        addReplyBulkCString(c, "peer_health");
+        addReplyBulkCString(c, ha_health_name(
+            tlc_ha_replica_peer_health(g_vemb_ha_replica)));
+        addReplyBulkCString(c, "peer_accepted_seq");
+        addReplyLongLong(c, (long long)progress.peer_accepted_seq);
+    } else {
+        addReplySubcommandSyntaxError(c);
+    }
+}
+
+static int ha_env_u64(const char *name, uint64_t *out) {
+    const char *value = getenv(name);
+    char *end = NULL;
+    if (!value || !*value)
+        return -1;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 0);
+    if (errno || end == value || *end != '\0')
+        return -1;
+    *out = (uint64_t)parsed;
+    return 0;
+}
+
+static int ha_env_u32(const char *name, uint32_t *out) {
+    uint64_t value = 0;
+    if (ha_env_u64(name, &value) != 0 || value > UINT32_MAX)
+        return -1;
+    *out = (uint32_t)value;
+    return 0;
+}
+
+static int ha_env_u16(const char *name, uint16_t *out) {
+    uint32_t value = 0;
+    if (ha_env_u32(name, &value) != 0 || value == 0 || value > UINT16_MAX)
+        return -1;
+    *out = (uint16_t)value;
+    return 0;
+}
+
+static int ha_configure_ring(tlc_ha_replica_ring_config_t *ring,
+                             const char *path_name,
+                             const char *offset_name) {
+    const char *path = getenv(path_name);
+    if (!path || !*path || strlen(path) >= sizeof(ring->path) ||
+        ha_env_u64(offset_name, &ring->mmap_offset) != 0)
+        return -1;
+    ring->backend_type = VEMB_V16_REGION_UB;
+    ring->cache_policy = VEMB_V16_UB_CACHE_POLICY_NONCACHEABLE;
+    ring->slot_count = 8;
+    ring->slot_bytes = 131072;
+    memcpy(ring->path, path, strlen(path) + 1u);
+    return 0;
+}
+
+static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
+    /* keepalived owns failure detection and invokes the HA RESP commands for
+     * role changes; the configured role is only the process boot state. */
+    const char *role = getenv("HPC_REDIS_HA_ROLE");
+    if (!role || !*role)
+        return 0;
+    tlc_ha_replica_role_t replica_role;
+    if (!strcmp(role, "leader"))
+        replica_role = TLC_HA_REPLICA_LEADER;
+    else if (!strcmp(role, "follower"))
+        replica_role = TLC_HA_REPLICA_FOLLOWER;
+    else {
+        serverLog(LL_WARNING, "invalid HPC_REDIS_HA_ROLE: %s", role);
+        return -1;
+    }
+    uint64_t node_id = 0;
+    uint64_t peer_node_id = 0;
+    uint64_t ha_term = 0;
+    if (ha_env_u64("HPC_REDIS_HA_NODE_ID", &node_id) != 0 ||
+        ha_env_u64("HPC_REDIS_HA_PEER_NODE_ID", &peer_node_id) != 0 ||
+        ha_env_u64("HPC_REDIS_HA_TERM", &ha_term) != 0 ||
+        node_id == 0 || peer_node_id == 0 || ha_term == 0) {
+        serverLog(LL_WARNING,
+                  "HA Replica requires non-zero HPC_REDIS_HA_NODE_ID, "
+                  "HPC_REDIS_HA_PEER_NODE_ID, and HPC_REDIS_HA_TERM");
+        return -1;
+    }
+    tlc_core_t *core = storage->tlc->core;
+    tlc_cold_t *cold = tlc_core_get_cold(core);
+    if (!cold) {
+        serverLog(LL_WARNING,
+                  "HA Replica requires HPC_REDIS_COLD_DIR before server startup");
+        return -1;
+    }
+    const char *bind_host = getenv("HPC_REDIS_HA_CONTROL_BIND_HOST");
+    const char *peer_host = getenv("HPC_REDIS_HA_PEER_HOST");
+    uint16_t control_port = 0;
+    uint16_t peer_port = 0;
+    if (!bind_host || !*bind_host || !peer_host || !*peer_host ||
+        ha_env_u16("HPC_REDIS_HA_CONTROL_PORT", &control_port) != 0 ||
+        ha_env_u16("HPC_REDIS_HA_PEER_PORT", &peer_port) != 0) {
+        serverLog(LL_WARNING,
+                  "HA Replica requires control bind/peer host and ports");
+        return -1;
+    }
+    tlc_ha_replica_config_t config = {
+        .core = core,
+        .cold = cold,
+        .control_fd = -1,
+        .control_bind_host = bind_host,
+        .control_bind_port = control_port,
+        .peer_advertised_host = peer_host,
+        .peer_control_port = peer_port,
+        .role = replica_role,
+        /* Must fit the fixed 128 KiB UB Replica ring slots. */
+        .max_batch_events = 32,
+        .max_batch_bytes = 65536,
+        .hpc_node_id = node_id,
+        .peer_node_id = peer_node_id,
+        .ha_term = ha_term,
+        .topology_epoch = 1,
+        .resync_chunk_bytes = 32768,
+        .heartbeat_interval_ms = 100,
+        .heartbeat_timeout_ms = 3000,
+    };
+    if (ha_configure_ring(&config.tx_ring, "HPC_REDIS_HA_TX_PATH",
+                          "HPC_REDIS_HA_TX_OFFSET") != 0 ||
+        ha_configure_ring(&config.rx_ring, "HPC_REDIS_HA_RX_PATH",
+                          "HPC_REDIS_HA_RX_OFFSET") != 0) {
+        serverLog(LL_WARNING,
+                  "HA Replica requires valid HPC_REDIS_HA_TX_PATH/RX_PATH "
+                  "and HPC_REDIS_HA_TX_OFFSET/RX_OFFSET");
+        return -1;
+    }
+    uint32_t heartbeat_interval_ms = 0;
+    if (getenv("HPC_REDIS_HA_HEARTBEAT_INTERVAL_MS")) {
+        if (ha_env_u32("HPC_REDIS_HA_HEARTBEAT_INTERVAL_MS",
+                       &heartbeat_interval_ms) != 0 ||
+            heartbeat_interval_ms == 0 ||
+            heartbeat_interval_ms > UINT32_MAX / 3u)
+            return -1;
+        config.heartbeat_interval_ms = heartbeat_interval_ms;
+        config.heartbeat_timeout_ms = heartbeat_interval_ms * 3u;
+    }
+    if (getenv("HPC_REDIS_HA_TOPOLOGY_EPOCH") &&
+        (ha_env_u64("HPC_REDIS_HA_TOPOLOGY_EPOCH",
+                    &config.topology_epoch) != 0 ||
+         config.topology_epoch == 0))
+        return -1;
+    if (getenv("HPC_REDIS_HA_RESYNC_CHUNK_BYTES") &&
+        (ha_env_u32("HPC_REDIS_HA_RESYNC_CHUNK_BYTES",
+                    &config.resync_chunk_bytes) != 0 ||
+         config.resync_chunk_bytes == 0))
+        return -1;
+    if (tlc_ha_replica_start(&g_vemb_ha_replica, &config) != 0) {
+        serverLog(LL_WARNING, "HA Replica startup failed: role=%s node=%llu peer=%llu",
+                  role, (unsigned long long)node_id,
+                  (unsigned long long)peer_node_id);
+        return -1;
+    }
+    serverLog(LL_NOTICE,
+              "HA Replica started: role=%s node=%llu peer=%llu term=%llu epoch=%llu "
+              "tx=%s@%llu rx=%s@%llu",
+              role, (unsigned long long)node_id,
+              (unsigned long long)peer_node_id,
+              (unsigned long long)ha_term,
+              (unsigned long long)config.topology_epoch,
+              config.tx_ring.path,
+              (unsigned long long)config.tx_ring.mmap_offset,
+              config.rx_ring.path,
+              (unsigned long long)config.rx_ring.mmap_offset);
+    return 0;
+}
 
 static const char *vemb_v16_redis_control_host(void) {
     /* Explicit advertisement host wins: with --bind 0.0.0.0 the fallback
@@ -211,11 +567,23 @@ int vemb_v16_server_integration_init(void) {
                   "VEMB V16 TCP data path enabled through Redis listening ports");
     }
 
+    if (vemb_v16_server_start_ha_replica(storage) != 0) {
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        g_vemb_storage = NULL;
+        vemb_v16_storage_ctx_destroy(storage);
+        return -1;
+    }
+
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
                        proxy_run_thread, server.vemb_v16_proxy) != 0) {
         serverLog(LL_WARNING, "pthread_create for proxy_run_thread failed");
+        tlc_ha_replica_stop(g_vemb_ha_replica);
+        g_vemb_ha_replica = NULL;
         vemb_v16_proxy_destroy(server.vemb_v16_proxy);
         server.vemb_v16_proxy = NULL;
+        g_vemb_storage = NULL;
+        vemb_v16_storage_ctx_destroy(storage);
         return -1;
     }
 
@@ -262,8 +630,7 @@ int vemb_v16_server_integration_init(void) {
 static int vemb_try_aeron_attach_steal(connection *conn) {
     int fd = conn->fd;
     if (fd < 0) return 0;
-    if (!server.vemb_v16_transport ||
-        strcmp(server.vemb_v16_transport, "aeron") != 0)
+    if (!vemb_aeron_attach_enabled())
         return 0;
 
     /* Peek 24 bytes without consuming. If not yet available, brief poll
@@ -461,8 +828,7 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
              * RESP here would silently swallow the ATTACH.
              * Skipped when cross-node aeron is disabled (pre-cross-node
              * behavior: anything non-VEMB_V16_MAGIC falls through to RESP). */
-            if (server.vemb_v16_transport &&
-                !strcmp(server.vemb_v16_transport, "aeron") &&
+            if (vemb_aeron_attach_enabled() &&
                 memcmp(buf, VEMB_V16_AERON_ATTACH_MAGIC, 4) == 0) {
                 if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)
                     return 2;
@@ -538,6 +904,11 @@ void vemb_v16_server_integration_shutdown(void) {
 
     /* Close the internal TCP client connection before stopping proxy */
     vemb_v16_stc_cleanup();
+
+    if (g_vemb_ha_replica) {
+        tlc_ha_replica_stop(g_vemb_ha_replica);
+        g_vemb_ha_replica = NULL;
+    }
 
     if (server.vemb_v16_proxy) {
         vemb_v16_proxy_stop(server.vemb_v16_proxy);

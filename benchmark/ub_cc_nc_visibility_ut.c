@@ -225,6 +225,17 @@ static int map_range(const char *path,
     mapping_bytes = data_offset + bytes;
 
     fd = open(path, flags);
+    if (fd < 0 && (errno == EPERM || errno == EACCES) &&
+        !(flags & O_SYNC)) {
+        /* Some UB device nodes only permit synchronous opens.  Keep the
+         * requested mapping mode where possible, but use the same fallback
+         * as the production mapped-region opener on restricted hosts. */
+        fd = open(path, flags | O_SYNC);
+        if (fd >= 0)
+            fprintf(stderr,
+                    "OPEN_FALLBACK_SYNC path=%s requested_flags=0x%x\n",
+                    path, flags);
+    }
     if (fd < 0) {
         fprintf(stderr, "open(%s, flags=0x%x) failed: %s\n",
                 path, flags, strerror(errno));

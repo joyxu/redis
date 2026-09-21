@@ -75,7 +75,7 @@ cd "$ROOT"
 
 is_sync_file() {
     case "$1" in
-        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.inc|*.S|*.s|*.go|*.rs|*.java|*.py|*.pl|*.rb|*.sh|*.mk|*.yaml|*.yml|Makefile|*/Makefile|GNUmakefile|*/GNUmakefile|CMakeLists.txt|*/CMakeLists.txt|meson.build|*/meson.build)
+        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.inc|*.S|*.s|*.go|*.rs|*.java|*.py|*.pl|*.rb|*.sh|*.mk|*.yaml|*.yml|*.json|*.def|Makefile|*/Makefile|GNUmakefile|*/GNUmakefile|CMakeLists.txt|*/CMakeLists.txt|meson.build|*/meson.build)
             return 0
             ;;
         *) return 1 ;;

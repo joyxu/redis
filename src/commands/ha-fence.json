@@ -1,0 +1,16 @@
+{
+    "FENCE": {
+        "summary": "Fence local high availability writes immediately.",
+        "complexity": "O(1)",
+        "group": "server",
+        "since": "8.4.0",
+        "arity": 2,
+        "container": "HA",
+        "function": "haCommand",
+        "command_flags": [
+            "ADMIN",
+            "STALE",
+            "NO_ASYNC_LOADING"
+        ]
+    }
+}

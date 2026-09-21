@@ -259,6 +259,21 @@ int vemb_v16_client_diagnostic_stats(
  * Returns 0 on success, -1 on failure. */
 int vemb_v16_client_topology_refresh(vemb_v16_client_t *client);
 
+/* Override the topology-advertised data endpoint for HA failover. Bootstrap
+ * seeds remain the control-plane addresses; this endpoint is used only for
+ * owner-channel ATTACH/open calls. Configure it before the first operation,
+ * and use a VIP that resolves to the current active owner. */
+int vemb_v16_client_set_ha_endpoint(vemb_v16_client_t *client,
+                                    const char *host, uint16_t port);
+
+/* Drop all current data channels and force the next operation to perform a
+ * fresh topology-backed ATTACH. This is the application-level failover hook
+ * for a VIP move: an Aeron/UB ring is a process-local mapping and cannot be
+ * migrated in place. Preconditions: no handle/vector session is active and
+ * the caller owns the client setup thread. Returns 0 when topology refresh
+ * succeeds, -1 when the refresh or a lifecycle check fails. */
+int vemb_v16_client_reconnect(vemb_v16_client_t *client);
+
 /* Prepare all owners in the current active ring for an Aeron handle session.
  * Preconditions: peer-view configuration, batch size, and topology refresh
  * have completed; the caller owns the client setup thread. */

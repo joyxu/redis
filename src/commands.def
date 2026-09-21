@@ -7311,6 +7311,136 @@ struct COMMAND_ARG FLUSHDB_Args[] = {
 {MAKE_ARG("flush-type",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_OPTIONAL,2,NULL),.subargs=FLUSHDB_flush_type_Subargs},
 };
 
+/********** HA DEMOTE ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA DEMOTE history */
+#define HA_DEMOTE_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA DEMOTE tips */
+#define HA_DEMOTE_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA DEMOTE key specs */
+#define HA_DEMOTE_Keyspecs NULL
+#endif
+
+/********** HA FENCE ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA FENCE history */
+#define HA_FENCE_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA FENCE tips */
+#define HA_FENCE_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA FENCE key specs */
+#define HA_FENCE_Keyspecs NULL
+#endif
+
+/********** HA NOTIFY ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA NOTIFY history */
+#define HA_NOTIFY_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA NOTIFY tips */
+#define HA_NOTIFY_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA NOTIFY key specs */
+#define HA_NOTIFY_Keyspecs NULL
+#endif
+
+/********** HA PROGRESS ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA PROGRESS history */
+#define HA_PROGRESS_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA PROGRESS tips */
+#define HA_PROGRESS_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA PROGRESS key specs */
+#define HA_PROGRESS_Keyspecs NULL
+#endif
+
+/********** HA PROMOTE ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA PROMOTE history */
+#define HA_PROMOTE_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA PROMOTE tips */
+#define HA_PROMOTE_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA PROMOTE key specs */
+#define HA_PROMOTE_Keyspecs NULL
+#endif
+
+/********** HA STATE ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA STATE history */
+#define HA_STATE_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA STATE tips */
+#define HA_STATE_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA STATE key specs */
+#define HA_STATE_Keyspecs NULL
+#endif
+
+/* HA command table */
+struct COMMAND_STRUCT HA_Subcommands[] = {
+{MAKE_CMD("demote","Demote the local high availability replica to backup.","O(1) plus bounded replication drain.","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_DEMOTE_History,0,HA_DEMOTE_Tips,0,haCommand,2,CMD_ADMIN|CMD_STALE|CMD_NO_ASYNC_LOADING,0,HA_DEMOTE_Keyspecs,0,NULL,0)},
+{MAKE_CMD("fence","Fence local high availability writes immediately.","O(1)","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_FENCE_History,0,HA_FENCE_Tips,0,haCommand,2,CMD_ADMIN|CMD_STALE|CMD_NO_ASYNC_LOADING,0,HA_FENCE_Keyspecs,0,NULL,0)},
+{MAKE_CMD("notify","Return the most recent keepalived notify result.","O(1)","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_NOTIFY_History,0,HA_NOTIFY_Tips,0,haCommand,-3,CMD_ADMIN|CMD_STALE|CMD_LOADING,0,HA_NOTIFY_Keyspecs,0,NULL,0)},
+{MAKE_CMD("progress","Return local and peer replication progress.","O(1)","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_PROGRESS_History,0,HA_PROGRESS_Tips,0,haCommand,2,CMD_ADMIN|CMD_STALE|CMD_LOADING,0,HA_PROGRESS_Keyspecs,0,NULL,0)},
+{MAKE_CMD("promote","Promote the local high availability replica to master.","O(1) plus bounded replication drain.","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_PROMOTE_History,0,HA_PROMOTE_Tips,0,haCommand,2,CMD_ADMIN|CMD_STALE|CMD_NO_ASYNC_LOADING,0,HA_PROMOTE_Keyspecs,0,NULL,0)},
+{MAKE_CMD("state","Return local high availability role and state.","O(1)","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_STATE_History,0,HA_STATE_Tips,0,haCommand,2,CMD_ADMIN|CMD_STALE|CMD_LOADING,0,HA_STATE_Keyspecs,0,NULL,0)},
+{0}
+};
+
+/********** HA ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* HA history */
+#define HA_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* HA tips */
+#define HA_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* HA key specs */
+#define HA_Keyspecs NULL
+#endif
+
 /********** HOTKEYS GET ********************/
 
 #ifndef SKIP_CMD_HISTORY_TABLE
@@ -11832,6 +11962,7 @@ struct COMMAND_STRUCT redisCommandTable[] = {
 {MAKE_CMD("failover","Starts a coordinated failover from a server to one of its replicas.","O(1)","6.2.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,FAILOVER_History,0,FAILOVER_Tips,0,failoverCommand,-1,CMD_ADMIN|CMD_NOSCRIPT|CMD_STALE,0,FAILOVER_Keyspecs,0,NULL,3),.args=FAILOVER_Args},
 {MAKE_CMD("flushall","Removes all keys from all databases.","O(N) where N is the total number of keys in all databases","1.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,FLUSHALL_History,2,FLUSHALL_Tips,2,flushallCommand,-1,CMD_WRITE,ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_DANGEROUS,FLUSHALL_Keyspecs,0,NULL,1),.args=FLUSHALL_Args},
 {MAKE_CMD("flushdb","Remove all keys from the current database.","O(N) where N is the number of keys in the selected database","1.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,FLUSHDB_History,2,FLUSHDB_Tips,2,flushdbCommand,-1,CMD_WRITE,ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_DANGEROUS,FLUSHDB_Keyspecs,0,NULL,1),.args=FLUSHDB_Args},
+{MAKE_CMD("ha","A container for high availability control commands.","Depends on subcommand.","8.4.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HA_History,0,HA_Tips,0,NULL,-2,CMD_ADMIN|CMD_STALE,0,HA_Keyspecs,0,NULL,0),.subcommands=HA_Subcommands},
 {MAKE_CMD("hotkeys","A container for hotkeys tracking commands.","Depends on subcommand.","8.6.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,HOTKEYS_History,0,HOTKEYS_Tips,0,NULL,-2,0,0,HOTKEYS_Keyspecs,0,NULL,0),.subcommands=HOTKEYS_Subcommands},
 {MAKE_CMD("info","Returns information and statistics about the server.","O(1)","1.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,INFO_History,1,INFO_Tips,3,infoCommand,-1,CMD_LOADING|CMD_STALE|CMD_SENTINEL,ACL_CATEGORY_DANGEROUS,INFO_Keyspecs,0,NULL,1),.args=INFO_Args},
 {MAKE_CMD("lastsave","Returns the Unix timestamp of the last successful save to disk.","O(1)","1.0.0",CMD_DOC_NONE,NULL,NULL,"server",COMMAND_GROUP_SERVER,LASTSAVE_History,0,LASTSAVE_Tips,1,lastsaveCommand,1,CMD_LOADING|CMD_STALE|CMD_FAST,ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS,LASTSAVE_Keyspecs,0,NULL,0)},

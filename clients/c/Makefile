@@ -81,7 +81,7 @@ PUBLIC_HEADERS := \
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
 
 # ---- targets ----
-.PHONY: all static shared install-headers example example_so correctness cluster-smoke clean
+.PHONY: all static shared install-headers example example_so correctness cluster-smoke ha-replica-tcp clean
 
 all: static shared install-headers
 
@@ -216,6 +216,11 @@ correctness: $(LIB_DIR)/libvemb_v16_client.a
 cluster-smoke: $(LIB_DIR)/libvemb_v16_client.a
 	$(CC) $(CFLAGS) $(ARCH_FLAGS) $(INCLUDES) \
 		-o $(BUILD_DIR)/sdk_cluster_topology_smoke sdk_cluster_topology_smoke.c \
+		$(LIB_DIR)/libvemb_v16_client.a -lpthread -lm
+
+ha-replica-tcp: $(LIB_DIR)/libvemb_v16_client.a
+	$(CC) $(CFLAGS) $(ARCH_FLAGS) $(INCLUDES) \
+		-o $(BUILD_DIR)/sdk_ha_replica_tcp sdk_ha_replica_tcp.c \
 		$(LIB_DIR)/libvemb_v16_client.a -lpthread -lm
 
 clean:

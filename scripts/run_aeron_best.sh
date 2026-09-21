@@ -88,6 +88,8 @@ case "$WORKERS" in
 esac
 PIO="${WORKERS%%:*}"
 SNW="${WORKERS##*:}"
+# COLD_DIR 非空时给 server 注入 HPC_REDIS_COLD_DIR 打开 COLD 持久化
+COLD_DIR=${COLD_DIR:-}
 AERON_UB_PATH=${AERON_UB_PATH:-/dev/obmm_shmdev1}
 AERON_RESPONSE_UB_PATH=${AERON_RESPONSE_UB_PATH:-/dev/obmm_shmdev3}
 AERON_TRANSPORT=${AERON_TRANSPORT:-aeron}
@@ -533,8 +535,11 @@ fi
 
 # ── 启动 server ──
 start_local_server() {
-    echo "=== start server: mask=$SERVER_MASK pio=$PIO snw=$SNW op=$OP_TYPE ==="
-    taskset -c "$SERVER_MASK" $REDIS \
+    echo "=== start server: mask=$SERVER_MASK pio=$PIO snw=$SNW op=$OP_TYPE cold=${COLD_DIR:-off} ==="
+    # 注意: 必须用 env 传递——$var 展开的 "VAR=x" 不会被 bash 当作赋值前缀
+    local -a cold_env=()
+    [ -n "$COLD_DIR" ] && { mkdir -p "$COLD_DIR"; cold_env=("HPC_REDIS_COLD_DIR=$COLD_DIR"); }
+    env "${cold_env[@]}" taskset -c "$SERVER_MASK" $REDIS \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
         --vemb-v16-max-vectors $MAX_VECTORS \

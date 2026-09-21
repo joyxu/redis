@@ -70,6 +70,7 @@ typedef struct bench_cfg {
     vemb_v16_client_topology_t client_topology;
     const char *ub_peer_view_manifest_path;
     const char *ub_peer_view_client_host;
+    const char *ha_endpoint;
     uint32_t ub_peer_view_owner_id;
     int ub_peer_view_ready;
     vemb_v16_ub_peer_view_manifest_t ub_peer_view_manifest;
@@ -1671,6 +1672,27 @@ static vemb_v16_client_t *open_common_core_client(const bench_cfg_t *cfg)
         vemb_v16_client_destroy(client);
         return NULL;
     }
+    if (cfg->ha_endpoint) {
+        char host[VEMB_V16_BENCH_PATH_MAX];
+        const char *colon = strrchr(cfg->ha_endpoint, ':');
+        if (!colon || colon == cfg->ha_endpoint || !colon[1]) {
+            vemb_v16_client_destroy(client);
+            return NULL;
+        }
+        size_t host_len = (size_t)(colon - cfg->ha_endpoint);
+        if (host_len >= sizeof(host)) {
+            vemb_v16_client_destroy(client);
+            return NULL;
+        }
+        memcpy(host, cfg->ha_endpoint, host_len);
+        host[host_len] = '\0';
+        unsigned long port = strtoul(colon + 1, NULL, 10);
+        if (port == 0 || port > UINT16_MAX ||
+            vemb_v16_client_set_ha_endpoint(client, host, (uint16_t)port) != 0) {
+            vemb_v16_client_destroy(client);
+            return NULL;
+        }
+    }
     if (vemb_v16_client_topology_refresh(client) != 0) {
         vemb_v16_client_destroy(client);
         return NULL;
@@ -2927,6 +2949,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ub-peer-view-client-host") && i + 1 < argc) {
             cfg.ub_peer_view_client_host = argv[++i];
         }
+        else if (!strcmp(argv[i], "--ha-endpoint") && i + 1 < argc) {
+            cfg.ha_endpoint = argv[++i];
+        }
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--keyspace") && i + 1 < argc) cfg.keyspace = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -2976,7 +3001,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--key-pattern sequential|random] [--ops N] [--timeout-ms N] [--pipeline 1] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--ub-peer-view-manifest FILE --ub-peer-view-client-host HOST] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline]\n", argv[0]);
+            printf("usage: %s [--endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--ha-endpoint HOST:PORT] [--dim N] [--prefill N] [--keyspace N] [--key-pattern sequential|random] [--ops N] [--timeout-ms N] [--pipeline 1] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--ub-peer-view-manifest FILE --ub-peer-view-client-host HOST] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline]\n", argv[0]);
             return 0;
         }
         else {
