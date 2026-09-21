@@ -113,6 +113,26 @@ done
 
 产物：TCP/baseline 在 `benchmark/results/<op小写>_cross_node_sweep/<时间戳>/summary.tsv`（含 nic_util_pct）；Aeron 每档在 `benchmark/results/.../<run-id>/client.workload.summary.tsv`（ops/avg/p50/p99）+ `server.cpu.cpuset.summary.tsv`（ut/st/si 由 %usr/%sys/%softirq 换算）。Aeron 数据面走 UB 不走网卡，报告 nic_util 列记 NA。
 
+### 1.3.1 跨节点 VEMB Zipf 分布（64x1x32，baseline vs hpc Aeron）
+
+```bash
+# baseline【HW01 执行】（memtier_benchmark_origin 已打 zipf 补丁，zipf_port.patch 可追溯）
+SERVERS_ONLY=baseline OP_TYPE=VEMB KEY_PATTERN=Z ZIPF_S=1.2 TS="64" CS="1" PS="32" TEST_TIME=30 \
+  bash benchmark/run_vemb_cross_node_sweep.sh
+
+# hpc Aeron【本地 Mac 执行】
+OP_TYPE=VEMB THREADS=64 CLIENTS=1 PIPELINE=32 \
+KEY_PATTERN=Z:Z ZIPF_S=1.2 \
+PROFILE=0 TEST_TIME=30 PIO=3 SNW=3 \
+SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
+CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
+SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
+CLIENT_PEER_VIEW_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_ub_peer_view_112_to_111_xnode_aeron.yaml \
+    bash scripts/run_aeron_cross_node_flamegraph.sh
+```
+
+两侧同 keyspace（item:1..100000）、同指数 1.2、同并发；zipf 生成器为同一份代码（origin 补丁自 fork 原样移植）。产物：baseline 在 `benchmark/results/vemb_cross_node_sweep/<时间戳>/summary.tsv`，Aeron run-id 中段标记 `zipf1.2`。
+
 ### 1.4 跨节点 64x1x32 高维（DIM=1024/2048/3072）
 
 baseline【HW01 执行】：
@@ -398,3 +418,12 @@ tlc_ha_aeron_failover_111_to_112: PASS active_owner=1 standby_owner=0 run=<RUN_I
 ## 10. 环境备注
 
 - HW05 失联影响：原生 4 节点 cluster（§3）与原生扩容（§4），待管理员恢复后执行对应标注命令。
+
+OP_TYPE=VEMB \
+KEY_PATTERN=Z:Z ZIPF_S=1.2 \
+PROFILE=0 TEST_TIME=30 PIO=3 SNW=3 \
+SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
+CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
+SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
+CLIENT_PEER_VIEW_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_ub_peer_view_112_to_111_xnode_aeron.yaml \
+    bash scripts/run_aeron_cross_node_flamegraph.sh

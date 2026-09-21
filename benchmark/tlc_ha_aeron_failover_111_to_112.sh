@@ -463,9 +463,22 @@ set_topology 112 "$([ "$INITIAL_NODE" = 111 ] && printf 0 || printf 1)" "$EPOCH"
 wait_ha_state "$INITIAL_NODE" LEADER MASTER
 wait_ha_state "$([ "$INITIAL_NODE" = 111 ] && printf 112 || printf 111)" FOLLOWER BACKUP
 if [ "$SKIP_KEEPALIVED" != 1 ]; then
+    # --all 部署固定 111=100/112=90，反向模式需反转 priority 使 VIP 初始落在 leader 节点；
+    # 两个方向都显式 deploy，避免上次运行的 priority 残留串扰
+    if [ "$INITIAL_NODE" = 111 ]; then
+        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 111 --priority 100 --vip "$VIP_CIDR" deploy
+        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 112 --priority 90 --vip "$VIP_CIDR" deploy
+    else
+        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 111 --priority 90 --vip "$VIP_CIDR" deploy
+        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 112 --priority 100 --vip "$VIP_CIDR" deploy
+    fi
     bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --all --vip "$VIP_CIDR" check
-    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --all --vip "$VIP_CIDR" start
+    # 模板固定 state BACKUP + nopreempt：初始 MASTER 由启动顺序决定（后起者不抢占）。
+    # 先起 leader 让它必然赢得侦听期成为 MASTER 并持有 VIP，再起 standby
+    STANDBY_NODE="$([ "$INITIAL_NODE" = 111 ] && printf 112 || printf 111)"
+    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node "$INITIAL_NODE" --vip "$VIP_CIDR" start
     wait_vip_owner "$INITIAL_NODE"
+    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node "$STANDBY_NODE" --vip "$VIP_CIDR" start
 fi
 
 step "P5 initial CLI Aeron ATTACH and VADD"

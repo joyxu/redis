@@ -70,6 +70,21 @@ VECTORS_PER_VSET=${VECTORS_PER_VSET:-6250}   # 16*6250 = 100K (仅 VEMB)
 KEY_OFFSET=${KEY_OFFSET:-1}
 NUM_KEYS=${NUM_KEYS:-100000}
 
+# === 读分布 (仅 baseline VEMB; hpc 分支固定 R:R) ===
+KEY_PATTERN=${KEY_PATTERN:-R}
+ZIPF_S=${ZIPF_S:-}
+case "$KEY_PATTERN" in
+    R) ;;
+    Z)
+        [ "$OP_TYPE" = "VEMB" ] || { echo "ERROR: KEY_PATTERN=Z only supports OP_TYPE=VEMB"; exit 2; }
+        [ -n "$ZIPF_S" ] || { echo "ERROR: ZIPF_S is required when KEY_PATTERN=Z"; exit 2; }
+        awk -v s="$ZIPF_S" 'BEGIN { exit !(s ~ /^[0-9]+([.][0-9]+)?$/ && s > 0) }' || \
+            { echo "ERROR: ZIPF_S must be a positive decimal (got: $ZIPF_S)"; exit 2; }
+        ;;
+    *) echo "ERROR: KEY_PATTERN must be R or Z (got: $KEY_PATTERN)"; exit 2 ;;
+esac
+[ "$KEY_PATTERN" = "Z" ] || [ -z "$ZIPF_S" ] || { echo "ERROR: ZIPF_S is only allowed when KEY_PATTERN=Z"; exit 2; }
+
 # === server 固定口径 (跟本地脚本一致) ===
 BASELINE_IO_THREADS=${BASELINE_IO_THREADS:-4}
 HPC_PIO=${HPC_PIO:-2}
@@ -298,6 +313,8 @@ deploy_bench_helper() {
 op_type=$1; t=$2; c=$3; p=$4; test_time=$5
 host=$6; port=$7; dim=$8; prefix=$9; kmin=${10}; kmax=${11}
 fixed_vec="${12}"; memtier=${13}; out_file=${14}; is_hpc="${15:-0}"
+kp="${16:-R}"; zipf_s="${17:-}"
+[ "$zipf_s" = "-" ] && zipf_s=""
 
 # 用数组传参, 避免 eval/嵌套引号问题
 cmd=("$memtier" -s "$host" -p "$port" -t "$t" -c "$c" --pipeline="$p" \
@@ -307,6 +324,13 @@ case "$op_type" in
     VEMB)
         if [ "$is_hpc" = "1" ]; then
             cmd+=(--protocol vemb_v16 --vemb-v16-dim "$dim" --ratio=0:1 --key-pattern=R:R)
+        elif [ "$kp" = "Z" ]; then
+            # arbitrary command 模式禁止主 --key-pattern, 指数锚点走
+            # --command-key-pattern=Z; --distinct-client-seed 对齐 aeron 每
+            # worker 独立种子, 避免 TCP 默认 seed 0 下所有线程同一 zipf
+            # 序列同步热点。
+            cmd+=(--protocol=resp3 --command="VEMB myset __key__ raw" --command-key-pattern=Z \
+                --key-zipfian-s="$zipf_s" --distinct-client-seed)
         else
             cmd+=(--protocol=resp3 --command="VEMB myset __key__ raw" --command-key-pattern=R)
         fi ;;
@@ -351,8 +375,10 @@ run_one_config() {
     local t=${TS[$idx]} c=${CS[$idx]} p=${PS[$idx]}
     local prefix kmin kmax
     read prefix kmin kmax < <(op_key_range)
-    local raw_local="$RAWDIR/${server_type}_${OP_TYPE}_t${t}_c${c}_p${p}.log"
-    local raw_remote="/tmp/${OP_TYPE}_${server_type}_t${t}_c${c}_p${p}.log"
+    local kp_tag=""
+    [ "$KEY_PATTERN" = "Z" ] && kp_tag="_zipf${ZIPF_S}"
+    local raw_local="$RAWDIR/${server_type}_${OP_TYPE}_t${t}_c${c}_p${p}${kp_tag}.log"
+    local raw_remote="/tmp/${OP_TYPE}_${server_type}_t${t}_c${c}_p${p}${kp_tag}.log"
     log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s"
 
     local client_memtier
@@ -377,13 +403,15 @@ run_one_config() {
     local jb_ns=$(date +%s%N)
 
     # === run memtier on CLIENT ===
-    # is_hpc 通过位置参数 ${15} 传给 helper (ssh 不传环境变量)
+    # is_hpc 通过位置参数 ${15} 传给 helper (ssh 不传环境变量); ${16}/${17} 为
+    # KEY_PATTERN / ZIPF_S (空 ZIPF_S 用 - 占位, 保证位置参数不漂移)
     local is_hpc_arg=0
     [ "$server_type" = "hpc" ] && is_hpc_arg=1
+    local zipf_arg=${ZIPF_S:--}
     ssh "$CLIENT" "bash /tmp/$BENCH_HELPER_NAME \
             $OP_TYPE $t $c $p $TEST_TIME \
             $SERVER_HOST $SERVER_PORT $DIM $prefix $kmin $kmax \
-            '$FIXED_VECTOR' $client_memtier $raw_remote $is_hpc_arg" 2>&1
+            '$FIXED_VECTOR' $client_memtier $raw_remote $is_hpc_arg $KEY_PATTERN $zipf_arg" 2>&1
     ssh "$CLIENT" "cat $raw_remote" > "$raw_local" 2>/dev/null || true
 
     # === jiffies after (ut/st split) ===

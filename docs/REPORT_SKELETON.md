@@ -178,6 +178,26 @@
 | T | C | P | 原生 ops/core | hpc ops/core | 加速比 |
 |---|---|---:|---:|---:|---:|
 
+
+#### baseline（zipf，Z:Z s=1.2）
+> 文件:
+
+| op | t | c | pipeline | ops_sec | avg_lat_ms | p50_ms | p99_ms | cores | core_ut | core_st | si | hi | rss_kb |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| VEMB | 64 | 1 | 32 |  |  |  |  |  |  |  |  |  |  |
+
+#### hpc Aeron（zipf，Z:Z s=1.2）
+> 文件:
+
+| op | t | c | pipeline | ops_sec | avg_lat_ms | p50_ms | p99_ms | cores | core_ut | core_st | si | hi | rss_kb |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| VEMB | 64 | 1 | 32 |  |  |  |  |  |  |  |  |  |  |
+
+#### 汇总：baseline vs hpc aeron（zipf）
+| T | C | P | 分布 | 原生 ops/core | hpc ops/core | 加速比 |
+|---|---|---:|---|---:|---:|---:|
+| 64 | 1 | 32 | Z:Z s=1.2 |  |  |  |
+
 ### 跨节点 VSIM_2KEY
 #### baseline
 > 文件:
