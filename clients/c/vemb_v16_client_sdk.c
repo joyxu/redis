@@ -104,6 +104,8 @@ typedef struct sdk_ub_channel {
     uint32_t pending_cap;
 } sdk_ub_channel_t;
 
+static sdk_ub_channel_t *sdk_ub_state(const vemb_v16_data_channel_t *channel);
+
 /* sdk_ub_poll 快路径自旋窗口 (ns), VEMB_V16_UB_POLL_SPIN_US 可调 (默认 300us);
  * 覆盖典型 server 批处理 RTT (cluster key-key ~250us), 避免每批落进 1ms poll
  * 睡眠。实测 300us 已到吞吐平台 (~540K ops/s), 更长窗口无收益 */
@@ -2701,6 +2703,8 @@ static uint32_t sdk_handle_session_poll_v1(
     sdk_backend_t *backend = &session->client->owner_channels[owner_id];
     if (backend->ops != &sdk_ub_data_transport_ops || !sdk_backend_ready(backend))
         return 0;
+    if (sdk_ub_state(backend)->pending_count == 0)
+        return 0;
 
     uint32_t callbacks = 0;
     for (;;) {
@@ -2892,9 +2896,9 @@ int vemb_v16_client_handle_session_poll_at(
         session, cb, priv, drive_sessions_start_ns, slot_poll_start_ns);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
-        sdk_owner_v2_t *v2 = &session->client->owner_v2[owner];
-        if (!v2->l0 && !session->client->owner_channel_inited[owner])
+        if (!session->client->owner_channel_inited[owner])
             continue;
+        sdk_owner_v2_t *v2 = &session->client->owner_v2[owner];
         vemb_v16_client_owner_stats_t *owner_stats =
             sdk_owner_stats(session->client, owner);
         uint64_t poll_index = owner_stats->poll_calls++;
