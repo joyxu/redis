@@ -28,16 +28,12 @@ static void init_slot_meta(vemb_v16_warm_region_header_t *header,
                            uint32_t capacity_slots) {
     vemb_v16_warm_slot_meta_t *slots =
         vemb_v16_warm_region_slot_meta(header);
+    (void)region_id;
     memset(slots, 0, slot_meta_bytes(capacity_slots));
     for (uint32_t i = 0; i < capacity_slots; i++) {
-        slots[i].region_id = region_id;
-        slots[i].local_slot = i;
-        atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[i].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&slots[i].owner_generation, 0);
-        atomic_init(&slots[i].write_seq, 0);
-        atomic_init(&slots[i].last_access_ns, 0);
-        atomic_init(&slots[i].clock_bit, 0);
-        atomic_init(&slots[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
     }
 }
 

@@ -179,16 +179,12 @@ static void warm_region_layout_init_slot_meta(
         uint32_t capacity_slots) {
     vemb_v16_warm_slot_meta_t *slots =
         vemb_v16_warm_region_slot_meta(header);
+    (void)region_id;
     memset(slots, 0, sizeof(*slots) * capacity_slots);
     for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-        slots[slot].region_id = region_id;
-        slots[slot].local_slot = slot;
-        atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[slot].state_version,
+                    vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
         atomic_init(&slots[slot].owner_generation, 0);
-        atomic_init(&slots[slot].write_seq, 0);
-        atomic_init(&slots[slot].last_access_ns, 0);
-        atomic_init(&slots[slot].clock_bit, 0);
-        atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
     }
 }
 
@@ -1700,11 +1696,12 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                               uint32_t vector_stride,
                                               uint32_t max_vectors,
                                               const vemb_v16_warm_regions_manifest_t *manifest) {
+    (void)max_vectors;
     RETURN_IF(!out || !manifest ||
               vector_dim == 0 || vector_stride == 0 ||
               vector_dim > VEMB_V16_MAX_DIM ||
               vector_stride != vector_dim * sizeof(float) ||
-              max_vectors == 0 || manifest->region_count == 0 ||
+              manifest->region_count == 0 ||
               manifest->region_count > VEMB_V16_MAX_MANIFEST_REGIONS, -1);
 
     for (uint32_t i = 0; i < manifest->region_count; i++) {
@@ -1712,6 +1709,17 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         RETURN_IF(region->value_size != vector_stride ||
                   region->region_bytes < region->value_size, -1);
     }
+
+    uint64_t derived_capacity = 0;
+    for (uint32_t i = 0; i < manifest->region_count; i++) {
+        const vemb_v16_manifest_region_t *region = &manifest->regions[i];
+        if (!region->is_local)
+            continue;
+        uint64_t slots = region->region_bytes / region->value_size;
+        RETURN_IF(slots == 0 || derived_capacity > UINT32_MAX - slots, -1);
+        derived_capacity += slots;
+    }
+    RETURN_IF(derived_capacity == 0 || derived_capacity > UINT32_MAX, -1);
 
     vemb_v16_storage_ctx_t *storage = zcalloc(sizeof(*storage));
     RETURN_IF(!storage, -1);
@@ -1726,7 +1734,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     }
     storage->vector_dim = vector_dim;
     storage->vector_stride = vector_stride;
-    storage->max_vectors = max_vectors;
+    storage->max_vectors = (uint32_t)derived_capacity;
     storage->local_owner_id = manifest->has_local_ub_node_id ?
         manifest->local_ub_node_id : 0;
     atomic_init(&storage->current_topology_epoch, 0);

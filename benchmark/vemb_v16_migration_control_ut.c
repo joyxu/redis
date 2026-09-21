@@ -65,14 +65,9 @@ static vemb_v16_warm_slot_meta_t *migration_ut_slot_meta_acquire(
             calloc(capacity_slots, sizeof(*slots));
         assert(slots);
         for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-            slots[slot].region_id = region_id;
-            slots[slot].local_slot = slot;
-            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].state_version,
+                        vemb_v16_warm_slot_pack(0, VEMB_V16_WARM_SLOT_FREE));
             atomic_init(&slots[slot].owner_generation, 0);
-            atomic_init(&slots[slot].write_seq, 0);
-            atomic_init(&slots[slot].last_access_ns, 0);
-            atomic_init(&slots[slot].clock_bit, 0);
-            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
         }
         *entry = (migration_ut_slot_meta_entry_t){
             .mapped_addr = mapped_addr,

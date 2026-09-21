@@ -620,9 +620,10 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight) {
+    (void)max_vectors;
     RETURN_IF(!out || warm_region_count == 0 ||
         warm_region_count > TLC_CORE_MAX_WARM_REGIONS ||
-        vector_dim == 0 || max_vectors == 0, -1);
+        vector_dim == 0, -1);
     /* Region ids must stay unique because vector handles address data by region_id. */
     for (uint32_t i = 0; i < warm_region_count; i++) {
         for (uint32_t j = 0; j < i; j++) {
@@ -635,7 +636,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     RETURN_IF(!tlc, -1);
     tlc->vector_dim = vector_dim;
     tlc->value_size = vector_dim * sizeof(float);
-    tlc->max_vectors = max_vectors;
     tlc->region_id = warm_regions[0].region_id;
     tlc->backend_type = warm_regions[0].backend_type;
     tlc->warm_region_count = warm_region_count;
@@ -668,6 +668,30 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     }
     memcpy(tlc->warm_regions, warm_regions,
            sizeof(vemb_v16_tlc_warm_region_t) * warm_region_count);
+    /* A single configured region is necessarily local; explicit locality is
+     * still required for multi-region manifests. */
+    uint32_t local_region_count = 0;
+    for (uint32_t i = 0; i < warm_region_count; i++)
+        local_region_count += tlc->warm_regions[i].is_local ? 1u : 0u;
+    if (local_region_count == 0 && warm_region_count == 1)
+        tlc->warm_regions[0].is_local = 1;
+    uint64_t derived_capacity = 0;
+    for (uint32_t i = 0; i < warm_region_count; i++) {
+        if (!tlc->warm_regions[i].is_local)
+            continue;
+        uint64_t slots = tlc->warm_regions[i].region_bytes /
+                         tlc->warm_regions[i].value_size;
+        if (slots == 0 || derived_capacity > UINT32_MAX - slots) {
+            vemb_v16_tlc_destroy(tlc);
+            return -1;
+        }
+        derived_capacity += slots;
+    }
+    if (derived_capacity == 0 || derived_capacity > UINT32_MAX) {
+        vemb_v16_tlc_destroy(tlc);
+        return -1;
+    }
+    tlc->max_vectors = (uint32_t)derived_capacity;
     tlc->region_index_id_mapping_count = warm_region_count;
     for (uint32_t i = 0; i < warm_region_count; i++) {
         tlc->region_index_id_mappings[i] =
@@ -683,25 +707,25 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     memset(core_regions, 0, sizeof(core_regions));
     for (uint32_t i = 0; i < warm_region_count; i++) {
         core_regions[i] = (tlc_core_warm_region_config_t){
-            .region_id = warm_regions[i].region_id,
-            .backend_type = warm_regions[i].backend_type,
-            .is_local = warm_regions[i].is_local,
-            .weight = warm_regions[i].weight,
-            .value_size = warm_regions[i].value_size,
-            .region_bytes = warm_regions[i].region_bytes,
-            .mapped_addr = warm_regions[i].mapped_addr,
-            .slot_meta = warm_regions[i].slot_meta,
+            .region_id = tlc->warm_regions[i].region_id,
+            .backend_type = tlc->warm_regions[i].backend_type,
+            .is_local = tlc->warm_regions[i].is_local,
+            .weight = tlc->warm_regions[i].weight,
+            .value_size = tlc->warm_regions[i].value_size,
+            .region_bytes = tlc->warm_regions[i].region_bytes,
+            .mapped_addr = tlc->warm_regions[i].mapped_addr,
+            .slot_meta = tlc->warm_regions[i].slot_meta,
         };
     }
     tlc_core_config_t core_config = {
         .value_size = tlc->value_size,
-        .warm_capacity = max_vectors,
+        .warm_capacity = (uint32_t)derived_capacity,
         .hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY,
         .warm_regions = core_regions,
         .warm_region_count = warm_region_count,
         .local_region_weight = local_region_weight,
     };
-    if (bitmap_init(&tlc->bitmap, max_vectors) != 0 ||
+    if (bitmap_init(&tlc->bitmap, (uint32_t)derived_capacity) != 0 ||
         tlc_core_create(&tlc->core, &core_config) != 0) {
         vemb_v16_tlc_destroy(tlc);
         return -1;

@@ -59,12 +59,14 @@ static int manifest_ut_claim_slot(manifest_ut_layout_view_t *view,
         vemb_v16_warm_region_slot_meta(view->header);
     RETURN_IF(!slots, -1);
     for (uint32_t slot = 0; slot < view->header->capacity_slots; slot++) {
-        uint32_t expected = VEMB_V16_WARM_SLOT_FREE;
-        if (atomic_compare_exchange_strong_explicit(&slots[slot].state,
-                                                    &expected,
-                                                    VEMB_V16_WARM_SLOT_FILLING,
-                                                    memory_order_acq_rel,
-                                                    memory_order_acquire)) {
+        uint64_t expected = atomic_load_explicit(&slots[slot].state_version,
+                                                 memory_order_acquire);
+        uint64_t seq = vemb_v16_warm_slot_seq(expected);
+        if (vemb_v16_warm_slot_state(expected) == VEMB_V16_WARM_SLOT_FREE &&
+            atomic_compare_exchange_strong_explicit(
+                &slots[slot].state_version, &expected,
+                vemb_v16_warm_slot_pack(seq, VEMB_V16_WARM_SLOT_FILLING),
+                memory_order_acq_rel, memory_order_acquire)) {
             *slot_out = slot;
             return 0;
         }
@@ -223,8 +225,10 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     assert(storage->warm_region_count == 2);
     assert(storage->tlc->warm_region_count == 2);
     assert(storage->remote_meta_base != NULL);
-    assert(storage->remote_meta_entry_count == max_vectors);
-    assert(storage->remote_meta_bucket_count >= max_vectors * 2);
+    uint32_t derived_local_capacity =
+        warm_region_bytes / (uint32_t)(sizeof(float) * dim);
+    assert(storage->remote_meta_entry_count == derived_local_capacity);
+    assert(storage->remote_meta_bucket_count >= derived_local_capacity * 2);
     assert(storage->tlc->remote_meta_view == &storage->remote_meta_view);
     assert(vemb_v16_tlc_find_region(storage->tlc, 101) != NULL);
     assert(vemb_v16_tlc_find_region(storage->tlc, 202) != NULL);

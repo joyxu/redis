@@ -2,6 +2,7 @@
 #define __TLC_CORE_H
 
 #include "vemb_v16_warm_region_layout.h"
+#include "tlc_warm_allocator.h"
 #include "vemb_v16_protocol.h"
 #include "tlc_cold.h"
 
@@ -123,6 +124,9 @@ typedef struct tlc_core_region_stats {
 } tlc_core_region_stats_t;
 
 typedef struct tlc_core_stats {
+    uint64_t warm_local_capacity_slots;
+    uint64_t warm_allocated_slots;
+    uint64_t warm_free_slots;
     uint64_t warm_region_count;
     uint64_t warm_region_full_count;
     uint64_t warm_alloc_local;
@@ -130,6 +134,7 @@ typedef struct tlc_core_stats {
     uint64_t warm_alloc_fallback;
     uint64_t warm_alloc_cold_spill;
     uint64_t warm_alloc_fail;
+    uint64_t warm_alloc_oom;
     uint64_t warm_eviction_success;
     uint64_t warm_eviction_fail;
     uint64_t warm_same_key_overwrite;

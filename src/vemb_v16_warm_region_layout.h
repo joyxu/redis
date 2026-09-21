@@ -9,7 +9,7 @@
 
 #define VEMB_V16_WARM_REGION_LAYOUT_MAGIC 0x5631414cu /* V1AL */
 #define VEMB_V16_WARM_REGION_LAYOUT_INITIALIZING 0x56314149u /* V1AI */
-#define VEMB_V16_WARM_REGION_LAYOUT_VERSION 1u
+#define VEMB_V16_WARM_REGION_LAYOUT_VERSION 2u
 #define VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX 256u
 #define VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT 64u
 
@@ -30,22 +30,33 @@ typedef enum vemb_v16_warm_slot_cold_state {
 } vemb_v16_warm_slot_cold_state_t;
 
 typedef struct vemb_v16_warm_slot_meta {
-    _Atomic uint32_t state;
-    uint32_t region_id;
-    uint32_t local_slot;
-    uint32_t bytes;
+    /* low 3 bits: slot state; bits 3..: seqlock version (odd = writing) */
+    _Atomic uint64_t state_version;
     _Atomic uint64_t owner_generation;
-    _Atomic uint64_t write_seq;
     uint64_t key_hash;
     uint64_t key_fingerprint;
-    _Atomic uint64_t last_access_ns;
-    _Atomic uint32_t clock_bit;
-    _Atomic uint32_t cold_state;
 } vemb_v16_warm_slot_meta_t;
 
 _Static_assert(sizeof(vemb_v16_warm_slot_meta_t) ==
-                   VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT,
-               "vemb_v16_warm_slot_meta_t must be one aligned UB cacheline");
+                   32u,
+               "vemb_v16_warm_slot_meta_t must be 32 bytes");
+
+#define VEMB_V16_WARM_SLOT_STATE_MASK UINT64_C(0x7)
+#define VEMB_V16_WARM_SLOT_SEQ_SHIFT 3u
+
+static inline uint32_t vemb_v16_warm_slot_state(uint64_t state_version) {
+    return (uint32_t)(state_version & VEMB_V16_WARM_SLOT_STATE_MASK);
+}
+
+static inline uint64_t vemb_v16_warm_slot_seq(uint64_t state_version) {
+    return state_version >> VEMB_V16_WARM_SLOT_SEQ_SHIFT;
+}
+
+static inline uint64_t vemb_v16_warm_slot_pack(uint64_t seq,
+                                                uint32_t state) {
+    return (seq << VEMB_V16_WARM_SLOT_SEQ_SHIFT) |
+           ((uint64_t)state & VEMB_V16_WARM_SLOT_STATE_MASK);
+}
 
 /*
  * Shared warm-region layout:
