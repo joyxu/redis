@@ -36,10 +36,6 @@
 #endif
 
 #define VEMB_V16_SDK_MAX_ENDPOINTS 16
-#define VEMB_V16_SDK_COPY_SAMPLE_MASK 1023u
-#ifndef VEMB_V16_SDK_TRACE
-#define VEMB_V16_SDK_TRACE 0
-#endif
 /* Encoded request buffer — large enough for any op:
  *   24 (base) + 4 (vector_bytes) + 128 (key) +
  *   VEMB_V16_MAX_DIM*sizeof(float) (vector).
@@ -48,6 +44,7 @@
                                    VEMB_V16_MAX_DIM * sizeof(float) + 64u)
 
 void sve_streaming_load_f32(const void *src, void *dst, size_t size);
+void sve_streaming_load(const void *src, void *dst, size_t size);
 
 /* Encode req using the compact wire format and write it as a VEMB_V16_NET_REQUEST
  * frame. Returns 0 on success, -1 on error. */
@@ -127,6 +124,7 @@ static vemb_v16_transport_poll_result_t sdk_tcp_poll(
 static vemb_v16_transport_resource_state_t sdk_tcp_check_resource(
     vemb_v16_data_channel_t *channel);
 static int sdk_tcp_fence(vemb_v16_data_channel_t *channel);
+static sdk_ub_channel_t *sdk_ub_state(const vemb_v16_data_channel_t *channel);
 static int sdk_ub_open_owner_channel(
     vemb_v16_data_channel_t *channel,
     const vemb_v16_transport_open_spec_t *spec);
@@ -283,6 +281,25 @@ typedef struct sdk_bootstrap_seed {
     uint16_t port;
 } sdk_bootstrap_seed_t;
 
+typedef struct {
+    uint64_t submitted;
+    uint64_t completed;
+    uint64_t ok;
+    uint64_t not_found;
+    uint64_t errors;
+    uint64_t retries;
+    uint64_t v1_requests;
+    uint64_t v2_items;
+    uint64_t v2_frames;
+    uint64_t fallback_v1;
+    uint64_t channel_reopen;
+    uint64_t handle_region_count;
+    uint64_t materialize_ok;
+    uint64_t materialize_fail;
+    uint64_t materialize_bytes;
+    uint64_t pending_peak;
+} sdk_owner_stats_t;
+
 struct vemb_v16_client {
     uint32_t dim;
     uint32_t req_id;
@@ -330,11 +347,8 @@ struct vemb_v16_client {
         owner_sessions[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     uint8_t owner_session_inited[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     sdk_owner_v2_t owner_v2[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
-    vemb_v16_client_owner_stats_t
+    sdk_owner_stats_t
         owner_stats[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
-    vemb_v16_client_owner_region_stats_t
-        owner_region_stats[VEMB_V16_CLIENT_OWNER_REGION_STATS_MAX];
-    uint32_t owner_region_stats_count;
     struct vemb_v16_client_handle_session *handle_session;
     struct vemb_v16_client_vector_session *vector_session;
 
@@ -349,103 +363,23 @@ struct vemb_v16_client {
      * descriptor through a reused owner slot. */
     sdk_backend_t   *last_handle_channel;
     uint64_t        last_handle_generation;
-    uint32_t        last_handle_owner_id;
     uint32_t        last_handle_region_id;
 
 };
 
-static vemb_v16_client_owner_stats_t *sdk_owner_stats(
-    vemb_v16_client_t *client, uint32_t owner_id) {
+static inline sdk_owner_stats_t *sdk_owner_stats(
+    vemb_v16_client_t *client, uint32_t owner_id)
+{
     assert(owner_id < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS);
     return &client->owner_stats[owner_id];
 }
 
-static void sdk_owner_stats_note_pending_peak(vemb_v16_client_t *client,
-                                              uint32_t owner_id,
-                                              uint64_t pending) {
-    vemb_v16_client_owner_stats_t *stats = sdk_owner_stats(client, owner_id);
+static inline void sdk_owner_stats_note_pending_peak(
+    vemb_v16_client_t *client, uint32_t owner_id, uint64_t pending)
+{
+    sdk_owner_stats_t *stats = sdk_owner_stats(client, owner_id);
     if (stats->pending_peak < pending)
         stats->pending_peak = pending;
-}
-
-static uint64_t sdk_owner_pending_current(const vemb_v16_client_t *client,
-                                          uint32_t owner_id) {
-    const sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    return v2->l0 ? vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
-}
-
-static uint32_t sdk_owner_active_groups_current(
-        const vemb_v16_client_t *client, uint32_t owner_id) {
-    const sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    if (!v2->l0)
-        return 0;
-    vemb_v16_cli_l0_stats_t stats;
-    vemb_v16_cli_l0_get_stats(v2->l0, &stats);
-    return stats.active_groups;
-}
-
-static vemb_v16_client_owner_region_stats_t *sdk_owner_region_stats(
-        vemb_v16_client_t *client, uint32_t owner_id, uint32_t region_id,
-        int create) {
-    for (uint32_t i = 0; i < client->owner_region_stats_count; i++) {
-        vemb_v16_client_owner_region_stats_t *stats =
-            &client->owner_region_stats[i];
-        if (stats->owner_id == owner_id && stats->region_id == region_id)
-            return stats;
-    }
-    if (!create || client->owner_region_stats_count >=
-                       VEMB_V16_CLIENT_OWNER_REGION_STATS_MAX)
-        return NULL;
-    vemb_v16_client_owner_region_stats_t *stats =
-        &client->owner_region_stats[client->owner_region_stats_count++];
-    *stats = (vemb_v16_client_owner_region_stats_t){
-        .owner_id = owner_id,
-        .region_id = region_id,
-    };
-    return stats;
-}
-
-static void sdk_owner_region_note_handle(vemb_v16_client_t *client,
-                                         uint32_t owner_id,
-                                         uint32_t region_id) {
-    vemb_v16_client_owner_region_stats_t *stats =
-        sdk_owner_region_stats(client, owner_id, region_id, 1);
-    if (stats)
-        stats->handle_count++;
-}
-
-static int sdk_owner_region_read_warm_vector(
-        vemb_v16_client_t *client, uint32_t owner_id, uint32_t region_id,
-        sdk_backend_t *backend, uint64_t offset, uint32_t bytes, void *out,
-        uint32_t out_cap) {
-    vemb_v16_client_owner_region_stats_t *stats =
-        sdk_owner_region_stats(client, owner_id, region_id, 1);
-    uint64_t copy_index = stats ? stats->copy_count++ : 0;
-    if (stats)
-        stats->copy_bytes += bytes;
-    int sample = stats && (copy_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
-    uint64_t start_ns = sample ? vemb_v16_monotonic_ns() : 0;
-    int rc = sdk_backend_read_warm_vector(backend, region_id, offset, bytes,
-                                          out, out_cap);
-    if (sample) {
-        uint64_t latency_ns = vemb_v16_monotonic_ns() - start_ns;
-        stats->copy_sample_count++;
-        stats->copy_latency_ns_sum += latency_ns;
-        if (stats->copy_latency_ns_min == 0 ||
-            latency_ns < stats->copy_latency_ns_min)
-            stats->copy_latency_ns_min = latency_ns;
-        if (latency_ns > stats->copy_latency_ns_max)
-            stats->copy_latency_ns_max = latency_ns;
-        uint32_t bucket = 0;
-        uint64_t bucket_value = latency_ns;
-        while (bucket_value > 1 &&
-               bucket + 1 < VEMB_V16_CLIENT_COPY_LATENCY_BUCKETS) {
-            bucket_value >>= 1;
-            bucket++;
-        }
-        stats->copy_latency_ns_buckets[bucket]++;
-    }
-    return rc;
 }
 
 static void sdk_format_owner_ring(char *out, size_t out_cap,
@@ -1054,7 +988,6 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
             !sdk_topology_rings_equal(&old->standby_ring,
                                       &topology.standby_ring) ||
             old->endpoint_count != topology.endpoint_count;
-#if VEMB_V16_SDK_TRACE
         if (topology_changed || fetch_no <= 3 || fetch_no % 1000 == 0) {
             char active[128];
             char standby[128];
@@ -1073,7 +1006,6 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
                     active, standby, topology.endpoint_count, topology.flags,
                     topology_changed);
         }
-#endif
         vemb_v16_cluster_core_publish_topology(&client->cluster, &topology);
         client->topology_snapshot_id++;
         if (client->topology_snapshot_id == 0)
@@ -1474,13 +1406,11 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
         return 0;
     if (session->v2_state == VEMB_V16_OWNER_SESSION_V2_READY) {
         assert(v2->channel != NULL && v2->l0 != NULL);
-        sdk_owner_stats(client, owner_id)->v2_enable_ready_fast_count++;
         return 1;
     }
     if (session->v2_state != VEMB_V16_OWNER_SESSION_V1_ONLY)
         return 0;
 
-    sdk_owner_stats(client, owner_id)->v2_enable_reopen_count++;
     vemb_v16_owner_session_begin_reopen(session);
     if (!v2->channel) {
         v2->channel = vemb_v16_aeron_open_remote_batch_with_peer_view(
@@ -1499,7 +1429,6 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
         v2->max_batch_bytes = resources.max_batch_bytes;
         v2->next_batch_id = 1;
         v2->l0 = vemb_v16_cli_l0_create(1);
-        sdk_owner_stats(client, owner_id)->v2_enable_attach_count++;
     }
     vemb_v16_owner_session_v2_channel_ready(session);
     return 1;
@@ -1551,7 +1480,6 @@ static int ensure_owner_channel_slow(vemb_v16_client_t *client,
             &sdk_ub_data_transport_ops : &sdk_tcp_data_transport_ops;
 
     sdk_backend_t *b = &client->owner_channels[owner_id];
-    int was_inited = client->owner_channel_inited[owner_id];
     const vemb_v16_client_topology_t *topology =
         vemb_v16_cluster_core_topology(&client->cluster);
     /* A topology epoch alone does not close an endpoint-stable channel. On
@@ -1643,12 +1571,9 @@ static int ensure_owner_channel_slow(vemb_v16_client_t *client,
         return -1;
     }
     client->owner_channel_inited[owner_id] = 1;
-    if (was_inited)
-        sdk_owner_stats(client, owner_id)->channel_reopen++;
     b->resource_checked_topology_epoch = topology->current_topology_epoch;
-    client->owner_channel_snapshot_id[owner_id] =
-        client->topology_snapshot_id;
     vemb_v16_cluster_core_owner_channel_opened(&client->cluster, owner_id);
+    sdk_owner_stats(client, owner_id)->channel_reopen++;
     fprintf(stderr,
             "[sdk] owner channel ready owner=%u channel=%llu endpoint=%s:%u "
             "transport=%s generation=%llu\n",
@@ -1696,21 +1621,6 @@ enum sdk_handle_session_request_state {
 typedef struct sdk_handle_session_request {
     vemb_v16_cluster_operation_t operation;
     uint64_t caller_cookie;
-    uint64_t submit_ns;
-    uint64_t drive_sessions_start_ns;
-    uint64_t slot_poll_start_ns;
-    uint64_t l0_enqueue_ns;
-    uint64_t route_start_ns;
-    uint64_t route_done_ns;
-    uint64_t channel_start_ns;
-    uint64_t channel_end_ns;
-    uint64_t owner_path_start_ns;
-    uint64_t owner_path_end_ns;
-    uint64_t v2_enable_start_ns;
-    uint64_t v2_enable_end_ns;
-    uint64_t l0_submit_start_ns;
-    uint64_t l0_submit_end_ns;
-    uint64_t response_poll_ns;
     uint32_t owner_id;
     uint32_t l0_entry_id;
     uint32_t l0_generation;
@@ -1720,6 +1630,7 @@ typedef struct sdk_handle_session_request {
     uint8_t state;
     uint8_t l0_leader;
     uint8_t force_v1;
+    uint32_t route_next;
     char key[VEMB_V16_MAX_KEY_LEN];
     char key2[VEMB_V16_MAX_KEY_LEN];
 } sdk_handle_session_request_t;
@@ -1730,6 +1641,7 @@ struct vemb_v16_client_handle_session {
         deadlines[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     sdk_handle_session_request_t requests[SDK_HANDLE_SESSION_MAX_PENDING];
     uint32_t active_requests;
+    uint32_t route_head;
     /* per-owner 在途 batch 数: publish 时 +1, consume response 时 -1.
      * 为 0 时跳过 v2_poll 避免无效 NC ring 读 (owner=1 ~50-100us/次) */
     uint32_t v2_batches_outstanding[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
@@ -1742,7 +1654,6 @@ typedef struct sdk_handle_session_fanout {
     const vemb_v16_resp_t *response;
     vemb_v16_client_handle_completion_cb cb;
     void *priv;
-    uint64_t response_poll_ns;
     uint32_t completed;
 } sdk_handle_session_fanout_t;
 
@@ -1763,13 +1674,6 @@ static int sdk_handle_session_finish(
     if (request->state == SDK_HANDLE_SESSION_REQUEST_FREE)
         return 0;
 
-    vemb_v16_client_owner_stats_t *owner_stats =
-        sdk_owner_stats(session->client, request->owner_id);
-    uint64_t callback_sample_index = owner_stats->callback_sample_index++;
-    int callback_sample =
-        (callback_sample_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
-    uint64_t finish_start_ns = callback_sample ? vemb_v16_monotonic_ns() : 0;
-
     vemb_v16_pipeline_resp_t completion = {
         .status = response->status == VEMB_V16_STATUS_OK ? 0 :
             response->status == VEMB_V16_STATUS_NOT_FOUND ? 1 : -1,
@@ -1780,27 +1684,23 @@ static int sdk_handle_session_finish(
         .score = response->score,
     };
     uint64_t caller_cookie = request->caller_cookie;
-    uint64_t submit_ns = request->submit_ns;
-    uint64_t response_poll_ns = request->response_poll_ns;
-    owner_stats->completed++;
-    if (response->status == VEMB_V16_STATUS_OK)
-        owner_stats->ok++;
-    else if (response->status == VEMB_V16_STATUS_NOT_FOUND)
-        owner_stats->not_found++;
-    else
-        owner_stats->errors++;
     if (response->status == VEMB_V16_STATUS_OK &&
         response->op == VEMB_V16_OP_VEMB_HANDLE) {
-        owner_stats->handle_region_count++;
-        sdk_owner_region_note_handle(session->client, request->owner_id,
-                                     response->region_id);
         sdk_backend_t *backend =
             &session->client->owner_channels[request->owner_id];
         session->client->last_handle_channel = backend;
         session->client->last_handle_generation = backend->generation;
-        session->client->last_handle_owner_id = request->owner_id;
         session->client->last_handle_region_id = response->region_id;
     }
+    sdk_owner_stats_t *stats =
+        sdk_owner_stats(session->client, request->owner_id);
+    stats->completed++;
+    if (response->status == VEMB_V16_STATUS_OK)
+        stats->ok++;
+    else if (response->status == VEMB_V16_STATUS_NOT_FOUND)
+        stats->not_found++;
+    else
+        stats->errors++;
     vemb_v16_cluster_core_complete(&session->client->cluster,
                                    &request->operation, response->status);
     *request = (sdk_handle_session_request_t){
@@ -1808,72 +1708,8 @@ static int sdk_handle_session_finish(
         .l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY,
     };
     session->active_requests--;
-    uint64_t callback_start_ns = callback_sample ?
-        vemb_v16_monotonic_ns() : 0;
     if (cb)
         cb(priv, caller_cookie, &completion);
-    if (callback_sample) {
-        uint64_t callback_ns = vemb_v16_monotonic_ns() - callback_start_ns;
-        uint64_t submit_to_callback_ns = callback_start_ns - submit_ns;
-        uint64_t finish_ns = callback_start_ns - finish_start_ns;
-        owner_stats->callback_sample_count++;
-        owner_stats->callback_ns_sum += callback_ns;
-        if (owner_stats->callback_ns_min == 0 ||
-            callback_ns < owner_stats->callback_ns_min)
-            owner_stats->callback_ns_min = callback_ns;
-        if (callback_ns > owner_stats->callback_ns_max)
-            owner_stats->callback_ns_max = callback_ns;
-        owner_stats->submit_to_callback_ns_sum += submit_to_callback_ns;
-        if (owner_stats->submit_to_callback_ns_min == 0 ||
-            submit_to_callback_ns < owner_stats->submit_to_callback_ns_min)
-            owner_stats->submit_to_callback_ns_min = submit_to_callback_ns;
-        if (submit_to_callback_ns > owner_stats->submit_to_callback_ns_max)
-            owner_stats->submit_to_callback_ns_max = submit_to_callback_ns;
-        owner_stats->finish_sample_count++;
-        owner_stats->finish_ns_sum += finish_ns;
-        if (owner_stats->finish_ns_min == 0 ||
-            finish_ns < owner_stats->finish_ns_min)
-            owner_stats->finish_ns_min = finish_ns;
-        if (finish_ns > owner_stats->finish_ns_max)
-            owner_stats->finish_ns_max = finish_ns;
-        if (response_poll_ns != 0) {
-            uint64_t response_to_finish_ns = finish_start_ns -
-                response_poll_ns;
-            uint64_t response_to_callback_ns = callback_start_ns -
-                response_poll_ns;
-            owner_stats->response_to_finish_sample_count++;
-            owner_stats->response_to_finish_ns_sum += response_to_finish_ns;
-            if (owner_stats->response_to_finish_ns_min == 0 ||
-                response_to_finish_ns < owner_stats->response_to_finish_ns_min)
-                owner_stats->response_to_finish_ns_min = response_to_finish_ns;
-            if (response_to_finish_ns > owner_stats->response_to_finish_ns_max)
-                owner_stats->response_to_finish_ns_max = response_to_finish_ns;
-            owner_stats->response_to_callback_sample_count++;
-            owner_stats->response_to_callback_ns_sum += response_to_callback_ns;
-            if (owner_stats->response_to_callback_ns_min == 0 ||
-                response_to_callback_ns <
-                    owner_stats->response_to_callback_ns_min)
-                owner_stats->response_to_callback_ns_min =
-                    response_to_callback_ns;
-            if (response_to_callback_ns >
-                owner_stats->response_to_callback_ns_max)
-                owner_stats->response_to_callback_ns_max =
-                    response_to_callback_ns;
-            uint64_t submit_to_response_poll_ns = response_poll_ns - submit_ns;
-            owner_stats->submit_to_response_poll_sample_count++;
-            owner_stats->submit_to_response_poll_ns_sum +=
-                submit_to_response_poll_ns;
-            if (owner_stats->submit_to_response_poll_ns_min == 0 ||
-                submit_to_response_poll_ns <
-                    owner_stats->submit_to_response_poll_ns_min)
-                owner_stats->submit_to_response_poll_ns_min =
-                    submit_to_response_poll_ns;
-            if (submit_to_response_poll_ns >
-                owner_stats->submit_to_response_poll_ns_max)
-                owner_stats->submit_to_response_poll_ns_max =
-                    submit_to_response_poll_ns;
-        }
-    }
     return 1;
 }
 
@@ -1890,27 +1726,14 @@ static int sdk_handle_session_apply_response(
         return sdk_handle_session_finish(session, request_id, response, cb,
                                          priv);
 
-    sdk_owner_stats(session->client, request->owner_id)->retries++;
-
-#if VEMB_V16_SDK_TRACE
-    if (request->operation.operation_id <= 8 ||
-        request->operation.operation_id % 1024 == 0) {
-        fprintf(stderr,
-                "[sdk] handle requeue op=%llu request=%u status=%u action=%u "
-                "old_owner=%u epoch=%llu attempts=%u\n",
-                (unsigned long long)request->operation.operation_id,
-                request_id, response->status, action,
-                request->operation.target_owner,
-                (unsigned long long)request->operation.topology_epoch,
-                request->operation.attempts);
-    }
-#endif
-
     request->state = SDK_HANDLE_SESSION_REQUEST_ROUTE;
     request->l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY;
     request->l0_generation = 0;
     request->l0_leader = 0;
     request->force_v1 = 1;
+    sdk_owner_stats(session->client, request->owner_id)->retries++;
+    request->route_next = session->route_head;
+    session->route_head = request_id;
     if (action == VEMB_V16_CLUSTER_RESPONSE_REFRESH)
         session->topology_refresh_pending = 1;
     return 0;
@@ -1921,8 +1744,6 @@ static void sdk_handle_session_finish_fanout(void *priv,
 {
     sdk_handle_session_fanout_t *fanout = priv;
     assert(request_id < SDK_HANDLE_SESSION_MAX_PENDING);
-    fanout->session->requests[request_id].response_poll_ns =
-        fanout->response_poll_ns;
     fanout->completed += sdk_handle_session_apply_response(
         fanout->session, (uint32_t)request_id, fanout->response, fanout->cb,
         fanout->priv);
@@ -1942,6 +1763,8 @@ static void sdk_handle_session_requeue_fanout(void *priv,
     /* This group was stopped by topology/migration before v2 publication.
      * Its next core-selected route must use the permanent UB v1 channel. */
     request->force_v1 = 1;
+    request->route_next = session->route_head;
+    session->route_head = (uint32_t)request_id;
 }
 
 static uint32_t sdk_handle_session_find_v1_request(
@@ -1982,24 +1805,11 @@ static void sdk_handle_session_deadline_after_progress(
     vemb_v16_client_handle_session_t *session, uint32_t owner_id)
 {
     sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
-    vemb_v16_cli_deadline_t *deadline = &session->deadlines[owner_id];
-    uint64_t old_deadline_ns = deadline->deadline_ns;
     uint32_t pending = v2->l0 ?
         vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
     vemb_v16_cli_deadline_after_progress(
-        deadline, pending, deadline->delay_ns ? vemb_v16_monotonic_ns() : 0);
-    if (old_deadline_ns == 0 && deadline->deadline_ns != 0)
-        sdk_owner_stats(session->client, owner_id)->v2_deadline_set_count++;
-}
-
-static void sdk_handle_session_deadline_new_leader(
-    vemb_v16_client_t *client, vemb_v16_cli_deadline_t *deadline,
-    uint32_t owner_id, uint64_t now_ns)
-{
-    uint64_t old_deadline_ns = deadline->deadline_ns;
-    vemb_v16_cli_deadline_on_new_leader(deadline, now_ns);
-    if (old_deadline_ns == 0 && deadline->deadline_ns != 0)
-        sdk_owner_stats(client, owner_id)->v2_deadline_set_count++;
+        &session->deadlines[owner_id], pending,
+        session->deadlines[owner_id].delay_ns ? vemb_v16_monotonic_ns() : 0);
 }
 
 static int sdk_handle_session_submit_v1(
@@ -2035,9 +1845,9 @@ static int sdk_handle_session_submit_v1(
     };
     if (sdk_backend_submit(backend, &submission) != 0)
         return -1;
-    sdk_owner_stats(session->client, route->owner_id)->v1_requests++;
     request->owner_id = route->owner_id;
     request->state = SDK_HANDLE_SESSION_REQUEST_V1;
+    sdk_owner_stats(session->client, route->owner_id)->v1_requests++;
     return 0;
 }
 
@@ -2091,11 +1901,7 @@ static int sdk_handle_session_submit_l0_group_v1(
 
 static int sdk_handle_session_flush_owner(
     vemb_v16_client_handle_session_t *session, uint32_t owner_id,
-    vemb_v16_client_handle_completion_cb cb, void *priv, int allow_v1_fallback,
-    uint64_t deadline_poll_enter_ns, uint64_t deadline_check_start_ns,
-    uint64_t deadline_check_end_ns, uint64_t deadline_set_ns,
-    uint64_t deadline_target_ns,
-    uint64_t deadline_due_ns, uint64_t flush_enter_ns)
+    vemb_v16_client_handle_completion_cb cb, void *priv, int allow_v1_fallback)
 {
     vemb_v16_owner_session_t *owner_session =
         &session->client->owner_sessions[owner_id];
@@ -2103,33 +1909,14 @@ static int sdk_handle_session_flush_owner(
     if (!v2->l0 || !v2->channel ||
         owner_session->v2_state != VEMB_V16_OWNER_SESSION_V2_READY)
         return 0;
-    vemb_v16_client_owner_stats_t *stats =
-        sdk_owner_stats(session->client, owner_id);
-    uint64_t flush_index = stats->v2_flush_calls++;
-    int sample_flush = (flush_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
 
     for (;;) {
         vemb_v16_cli_l0_batch_draft_t draft;
-        uint64_t prepare_start_ns = sample_flush ?
-            vemb_v16_monotonic_ns() : 0;
         int prepared = vemb_v16_cli_l0_prepare_batch(
             v2->l0, 0, v2->effective_batch_size, v2->max_batch_bytes,
             &draft);
-        uint64_t prepare_ns = sample_flush ?
-            vemb_v16_monotonic_ns() - prepare_start_ns : 0;
-        if (sample_flush) {
-            stats->v2_prepare_sample_count++;
-            stats->v2_prepare_ns_sum += prepare_ns;
-            if (stats->v2_prepare_ns_min == 0 ||
-                prepare_ns < stats->v2_prepare_ns_min)
-                stats->v2_prepare_ns_min = prepare_ns;
-            if (prepare_ns > stats->v2_prepare_ns_max)
-                stats->v2_prepare_ns_max = prepare_ns;
-        }
-        if (prepared == -2) {
-            sdk_owner_stats(session->client, owner_id)->v2_flush_l0_backpressure++;
+        if (prepared == -2)
             return 0; /* published-frame backpressure; wait for poll() */
-        }
         if (prepared < 0)
             return -1;
         if (prepared == 0) {
@@ -2146,30 +1933,15 @@ static int sdk_handle_session_flush_owner(
 
         session->v2_batches_outstanding[owner_id]++; /* publish 前先计入, 失败再回退 */
         uint64_t batch_id = sdk_handle_session_next_batch_id(v2);
-        uint64_t publish_start_ns = sample_flush ?
-            vemb_v16_monotonic_ns() : 0;
         int publish_rc = vemb_v16_aeron_batch_publish_handle_at_epoch(
             v2->channel, batch_id, draft.identity.topology_epoch,
             draft.keys, draft.key_lens, draft.item_count);
-        uint64_t publish_ns_duration = sample_flush ?
-            vemb_v16_monotonic_ns() - publish_start_ns : 0;
-        if (sample_flush) {
-            stats->v2_publish_sample_count++;
-            stats->v2_publish_ns_sum += publish_ns_duration;
-            if (stats->v2_publish_ns_min == 0 ||
-                publish_ns_duration < stats->v2_publish_ns_min)
-                stats->v2_publish_ns_min = publish_ns_duration;
-            if (publish_ns_duration > stats->v2_publish_ns_max)
-                stats->v2_publish_ns_max = publish_ns_duration;
-        }
         if (publish_rc == RING_ERR_FULL) {
-            session->v2_batches_outstanding[owner_id]--; /* publish 失败, 回退 */
-            sdk_owner_stats(session->client, owner_id)->v2_publish_ring_full++;
+            session->v2_batches_outstanding[owner_id]--;
             return 0;
         }
         if (publish_rc != RING_OK) {
-            session->v2_batches_outstanding[owner_id]--; /* publish 失败, 回退 */
-            sdk_owner_stats(session->client, owner_id)->v2_publish_errors++;
+            session->v2_batches_outstanding[owner_id]--;
             if (!allow_v1_fallback)
                 return -1;
             for (uint32_t i = 0; i < draft.item_count; i++)
@@ -2178,9 +1950,6 @@ static int sdk_handle_session_flush_owner(
             sdk_handle_session_deadline_after_progress(session, owner_id);
             continue;
         }
-
-        uint64_t publish_ns = vemb_v16_monotonic_ns();
-#if VEMB_V16_SDK_TRACE
         if (batch_id <= 8 || batch_id % 1024 == 0) {
             fprintf(stderr,
                     "[sdk] handle v2 batch submitted owner=%u batch=%llu "
@@ -2191,176 +1960,14 @@ static int sdk_handle_session_flush_owner(
                     (unsigned long long)vemb_v16_aeron_batch_channel_id(
                         v2->channel));
         }
-#endif
         assert(vemb_v16_cli_l0_publish_batch(v2->l0, &draft, batch_id) == 0);
-        vemb_v16_cli_l0_set_batch_publish_ns(
-            v2->l0, 0, batch_id, publish_ns);
-        if (sample_flush)
-            stats->v2_prepare_to_publish_ns_sum +=
-                (publish_ns - prepare_start_ns);
-        for (uint32_t i = 0; i < draft.item_count; i++) {
-            sdk_handle_session_request_t *request =
-                &session->requests[draft.entry_ids[i]];
-            uint64_t sample_index = stats->submit_to_publish_sample_index++;
-            if (request->submit_ns != 0 &&
-                (sample_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0) {
-                uint64_t submit_to_publish_ns = publish_ns -
-                    request->submit_ns;
-                stats->submit_to_publish_sample_count++;
-                stats->submit_to_publish_ns_sum += submit_to_publish_ns;
-                if (stats->submit_to_publish_ns_min == 0 ||
-                    submit_to_publish_ns < stats->submit_to_publish_ns_min)
-                    stats->submit_to_publish_ns_min = submit_to_publish_ns;
-                if (submit_to_publish_ns > stats->submit_to_publish_ns_max)
-                    stats->submit_to_publish_ns_max = submit_to_publish_ns;
-                if (request->l0_enqueue_ns >= request->submit_ns) {
-                    stats->submit_to_l0_sample_count++;
-                    stats->submit_to_l0_ns_sum +=
-                        request->l0_enqueue_ns - request->submit_ns;
-                }
-                if (request->route_start_ns >= request->submit_ns) {
-                    stats->submit_to_route_start_sample_count++;
-                    stats->submit_to_route_start_ns_sum +=
-                        request->route_start_ns - request->submit_ns;
-                }
-                if (request->drive_sessions_start_ns != 0 &&
-                    request->drive_sessions_start_ns >= request->submit_ns) {
-                    stats->submit_to_drive_start_sample_count++;
-                    stats->submit_to_drive_start_ns_sum +=
-                        request->drive_sessions_start_ns - request->submit_ns;
-                }
-                if (request->slot_poll_start_ns >=
-                        request->drive_sessions_start_ns &&
-                    request->slot_poll_start_ns != 0 &&
-                    request->drive_sessions_start_ns != 0) {
-                    stats->drive_start_to_slot_poll_sample_count++;
-                    stats->drive_start_to_slot_poll_ns_sum +=
-                        request->slot_poll_start_ns -
-                        request->drive_sessions_start_ns;
-                }
-                if (request->route_start_ns >= request->slot_poll_start_ns &&
-                    request->slot_poll_start_ns != 0) {
-                    stats->slot_poll_to_route_start_sample_count++;
-                    stats->slot_poll_to_route_start_ns_sum +=
-                        request->route_start_ns - request->slot_poll_start_ns;
-                }
-                if (request->route_done_ns >= request->route_start_ns) {
-                    stats->route_duration_sample_count++;
-                    stats->route_duration_ns_sum +=
-                        request->route_done_ns - request->route_start_ns;
-                }
-                if (request->l0_submit_start_ns >= request->route_done_ns) {
-                    stats->route_to_l0_start_sample_count++;
-                    stats->route_to_l0_start_ns_sum +=
-                        request->l0_submit_start_ns - request->route_done_ns;
-                }
-                if (request->l0_submit_end_ns >= request->l0_submit_start_ns) {
-                    stats->l0_submit_duration_sample_count++;
-                    stats->l0_submit_duration_ns_sum +=
-                        request->l0_submit_end_ns - request->l0_submit_start_ns;
-                }
-                if (request->channel_start_ns >= request->route_done_ns) {
-                    stats->route_to_channel_start_sample_count++;
-                    stats->route_to_channel_start_ns_sum +=
-                        request->channel_start_ns - request->route_done_ns;
-                }
-                if (request->channel_end_ns >= request->channel_start_ns) {
-                    stats->channel_duration_sample_count++;
-                    stats->channel_duration_ns_sum +=
-                        request->channel_end_ns - request->channel_start_ns;
-                }
-                if (request->owner_path_start_ns >= request->channel_end_ns) {
-                    stats->channel_to_path_start_sample_count++;
-                    stats->channel_to_path_start_ns_sum +=
-                        request->owner_path_start_ns - request->channel_end_ns;
-                }
-                if (request->owner_path_end_ns >= request->owner_path_start_ns) {
-                    stats->owner_path_duration_sample_count++;
-                    stats->owner_path_duration_ns_sum +=
-                        request->owner_path_end_ns - request->owner_path_start_ns;
-                }
-                if (request->l0_submit_start_ns >= request->owner_path_end_ns) {
-                    stats->owner_path_to_l0_start_sample_count++;
-                    stats->owner_path_to_l0_start_ns_sum +=
-                        request->l0_submit_start_ns - request->owner_path_end_ns;
-                }
-                if (request->v2_enable_end_ns >= request->v2_enable_start_ns &&
-                    request->v2_enable_start_ns != 0) {
-                    stats->v2_enable_duration_sample_count++;
-                    stats->v2_enable_duration_ns_sum +=
-                        request->v2_enable_end_ns - request->v2_enable_start_ns;
-                }
-                if (deadline_set_ns != 0) {
-                    if (deadline_set_ns >= request->l0_enqueue_ns) {
-                        stats->l0_to_deadline_set_sample_count++;
-                        stats->l0_to_deadline_set_ns_sum +=
-                            deadline_set_ns - request->l0_enqueue_ns;
-                    } else {
-                        stats->deadline_set_to_l0_sample_count++;
-                        stats->deadline_set_to_l0_ns_sum +=
-                            request->l0_enqueue_ns - deadline_set_ns;
-                    }
-                    if (deadline_due_ns >= deadline_set_ns) {
-                        stats->deadline_set_to_due_sample_count++;
-                        stats->deadline_set_to_due_ns_sum +=
-                            deadline_due_ns - deadline_set_ns;
-                    }
-                }
-                if (deadline_target_ns != 0 &&
-                    deadline_due_ns >= deadline_target_ns) {
-                    stats->deadline_target_to_due_sample_count++;
-                    stats->deadline_target_to_due_ns_sum +=
-                        deadline_due_ns - deadline_target_ns;
-                }
-                if (deadline_poll_enter_ns != 0 &&
-                    deadline_check_start_ns >= deadline_poll_enter_ns) {
-                    stats->deadline_poll_to_check_sample_count++;
-                    stats->deadline_poll_to_check_ns_sum +=
-                        deadline_check_start_ns - deadline_poll_enter_ns;
-                }
-                if (deadline_target_ns != 0 &&
-                    deadline_check_start_ns >= deadline_target_ns) {
-                    stats->deadline_target_to_check_sample_count++;
-                    stats->deadline_target_to_check_ns_sum +=
-                        deadline_check_start_ns - deadline_target_ns;
-                    stats->deadline_target_to_poll_check_sample_count++;
-                    stats->deadline_target_to_poll_check_ns_sum +=
-                        deadline_check_start_ns - deadline_target_ns;
-                }
-                if (deadline_target_ns != 0 &&
-                    deadline_target_ns >= request->l0_enqueue_ns &&
-                    request->l0_enqueue_ns != 0) {
-                    stats->l0_enqueue_to_deadline_target_sample_count++;
-                    stats->l0_enqueue_to_deadline_target_ns_sum +=
-                        deadline_target_ns - request->l0_enqueue_ns;
-                }
-                if (deadline_check_end_ns >= deadline_check_start_ns &&
-                    deadline_check_start_ns != 0) {
-                    stats->deadline_check_duration_sample_count++;
-                    stats->deadline_check_duration_ns_sum +=
-                        deadline_check_end_ns - deadline_check_start_ns;
-                }
-                if (deadline_due_ns != 0 &&
-                    deadline_due_ns >= request->l0_enqueue_ns) {
-                    stats->l0_to_deadline_due_sample_count++;
-                    stats->l0_to_deadline_due_ns_sum +=
-                        deadline_due_ns - request->l0_enqueue_ns;
-                    if (flush_enter_ns >= deadline_due_ns) {
-                        stats->deadline_due_to_flush_sample_count++;
-                        stats->deadline_due_to_flush_ns_sum +=
-                            flush_enter_ns - deadline_due_ns;
-                    }
-                }
-                if (flush_enter_ns != 0 && publish_ns >= flush_enter_ns) {
-                    stats->flush_to_publish_sample_count++;
-                    stats->flush_to_publish_ns_sum +=
-                        publish_ns - flush_enter_ns;
-                }
-            }
-        }
-        stats->v2_frames++;
-        stats->v2_items += draft.item_count;
         vemb_v16_owner_session_v2_batch_published(owner_session);
+        {
+            sdk_owner_stats_t *stats =
+                sdk_owner_stats(session->client, owner_id);
+            stats->v2_frames++;
+            stats->v2_items += draft.item_count;
+        }
         sdk_handle_session_deadline_after_progress(session, owner_id);
     }
 }
@@ -2371,10 +1978,14 @@ static uint32_t sdk_handle_session_fail_routes(
 {
     vemb_v16_resp_t error = sdk_handle_session_error_response();
     uint32_t callbacks = 0;
-    for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
-        if (session->requests[i].state == SDK_HANDLE_SESSION_REQUEST_ROUTE)
-            callbacks += sdk_handle_session_finish(session, i, &error, cb,
-                                                   priv);
+    uint32_t cur = session->route_head;
+    session->route_head = SDK_HANDLE_SESSION_NO_ENTRY;
+    while (cur != SDK_HANDLE_SESSION_NO_ENTRY) {
+        uint32_t next = session->requests[cur].route_next;
+        session->requests[cur].route_next = SDK_HANDLE_SESSION_NO_ENTRY;
+        callbacks += sdk_handle_session_finish(session, cur, &error, cb,
+                                               priv);
+        cur = next;
     }
     return callbacks;
 }
@@ -2397,74 +2008,44 @@ static int sdk_handle_session_refresh_topology(
 
 static uint32_t sdk_handle_session_route_requests(
     vemb_v16_client_handle_session_t *session,
-    vemb_v16_client_handle_completion_cb cb, void *priv,
-    uint64_t drive_sessions_start_ns, uint64_t slot_poll_start_ns)
+    vemb_v16_client_handle_completion_cb cb, void *priv)
 {
     uint32_t callbacks = 0;
     if (sdk_handle_session_refresh_topology(session, cb, priv,
                                             &callbacks) != 0)
         return callbacks;
 
-    for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
+    uint32_t cur = session->route_head;
+    session->route_head = SDK_HANDLE_SESSION_NO_ENTRY;
+    while (cur != SDK_HANDLE_SESSION_NO_ENTRY) {
+        uint32_t i = cur;
         sdk_handle_session_request_t *request = &session->requests[i];
-        if (request->state != SDK_HANDLE_SESSION_REQUEST_ROUTE)
-            continue;
+        uint32_t next = request->route_next;
+        request->route_next = SDK_HANDLE_SESSION_NO_ENTRY;
 
-        request->drive_sessions_start_ns = drive_sessions_start_ns;
-        request->slot_poll_start_ns = slot_poll_start_ns;
-        request->route_start_ns = vemb_v16_monotonic_ns();
         vemb_v16_cluster_route_t route;
         vemb_v16_cluster_prepare_result_t prepared =
             vemb_v16_cluster_core_prepare(&session->client->cluster,
                                           &request->operation, &route);
-        request->route_done_ns = vemb_v16_monotonic_ns();
-#if VEMB_V16_SDK_TRACE
-        if (request->operation.operation_id <= 8 ||
-            request->operation.operation_id % 1024 == 0) {
-            const vemb_v16_client_topology_t *topology =
-                vemb_v16_cluster_core_topology(&session->client->cluster);
-            fprintf(stderr,
-                    "[sdk] handle route op=%llu request=%u prepared=%u "
-                    "owner=%u epoch=%llu attempts=%u force_v1=%u "
-                    "topology_epoch=%llu active_count=%u endpoint_count=%u\n",
-                    (unsigned long long)request->operation.operation_id,
-                    i, prepared, prepared == VEMB_V16_CLUSTER_PREPARE_READY ?
-                        route.owner_id : UINT32_MAX,
-                    prepared == VEMB_V16_CLUSTER_PREPARE_READY ?
-                        (unsigned long long)route.topology_epoch : 0ull,
-                    request->operation.attempts, request->force_v1,
-                    (unsigned long long)topology->current_topology_epoch,
-                    topology->active_ring.owner_count,
-                    topology->endpoint_count);
-        }
-#endif
         if (prepared == VEMB_V16_CLUSTER_PREPARE_NEEDS_TOPOLOGY) {
             session->topology_refresh_pending = 1;
+            request->route_next = next;
+            session->route_head = cur;
             return callbacks;
         }
         if (prepared == VEMB_V16_CLUSTER_PREPARE_RETRY_EXHAUSTED) {
             vemb_v16_resp_t error = sdk_handle_session_error_response();
             callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                    priv);
+            cur = next;
             continue;
         }
-        request->channel_start_ns = vemb_v16_monotonic_ns();
         int channel_rc = ensure_owner_channel(session->client, route.owner_id);
-        request->channel_end_ns = vemb_v16_monotonic_ns();
-#if VEMB_V16_SDK_TRACE
-        if (request->operation.operation_id <= 8 ||
-            request->operation.operation_id % 1024 == 0) {
-            fprintf(stderr,
-                    "[sdk] handle route decision op=%llu owner=%u "
-                    "channel_rc=%d\n",
-                    (unsigned long long)request->operation.operation_id,
-                    route.owner_id, channel_rc);
-        }
-#endif
         if (channel_rc != 0) {
             vemb_v16_resp_t error = sdk_handle_session_error_response();
             callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                    priv);
+            cur = next;
             continue;
         }
         route.owner_channel_generation =
@@ -2472,22 +2053,19 @@ static uint32_t sdk_handle_session_route_requests(
 
         request->owner_id = route.owner_id;
         sdk_owner_stats(session->client, route.owner_id)->submitted++;
-        int v2_enabled = 0;
-        if (!request->force_v1 && route.request_flags == 0) {
-            request->v2_enable_start_ns = vemb_v16_monotonic_ns();
-            v2_enabled = sdk_owner_v2_enable(session->client, route.owner_id);
-            request->v2_enable_end_ns = vemb_v16_monotonic_ns();
-        }
-        if (request->force_v1 || route.request_flags != 0 || !v2_enabled) {
+        sdk_owner_stats_note_pending_peak(session->client, route.owner_id,
+                                          session->active_requests);
+        if (request->force_v1 || route.request_flags != 0 ||
+            !sdk_owner_v2_enable(session->client, route.owner_id)) {
             if (sdk_handle_session_submit_v1(session, i, &route) != 0) {
                 vemb_v16_resp_t error = sdk_handle_session_error_response();
                 callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                        priv);
             }
+            cur = next;
             continue;
         }
 
-        request->owner_path_start_ns = vemb_v16_monotonic_ns();
         vemb_v16_owner_session_identity_t identity = {
             .owner_id = route.owner_id,
             .topology_epoch = route.topology_epoch,
@@ -2498,24 +2076,21 @@ static uint32_t sdk_handle_session_route_requests(
         if (vemb_v16_owner_session_select_submit_path(owner_session,
                                                        &identity) !=
             VEMB_V16_OWNER_SESSION_SUBMIT_V2) {
-            request->owner_path_end_ns = vemb_v16_monotonic_ns();
             if (sdk_handle_session_submit_v1(session, i, &route) != 0) {
                 vemb_v16_resp_t error = sdk_handle_session_error_response();
                 callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                        priv);
             }
+            cur = next;
             continue;
         }
-        request->owner_path_end_ns = vemb_v16_monotonic_ns();
 
         sdk_owner_v2_t *v2 = &session->client->owner_v2[route.owner_id];
         uint32_t entry_id;
         uint32_t channel_index;
-        request->l0_submit_start_ns = vemb_v16_monotonic_ns();
         int submit = vemb_v16_cli_l0_submit_with_identity(
             v2->l0, request->key, request->key_len, request->operation.key_hash,
             i, &identity, &entry_id, &channel_index);
-        request->l0_submit_end_ns = vemb_v16_monotonic_ns();
         if (submit == VEMB_V16_CLI_L0_NEW_LEADER ||
             submit == VEMB_V16_CLI_L0_COALESCED_FOLLOWER) {
             const char *ignored_key;
@@ -2530,16 +2105,12 @@ static uint32_t sdk_handle_session_route_requests(
             request->l0_entry_id = entry_id;
             request->l0_generation = generation;
             request->l0_leader = submit == VEMB_V16_CLI_L0_NEW_LEADER;
-            request->l0_enqueue_ns = vemb_v16_monotonic_ns();
-            sdk_owner_stats_note_pending_peak(
-                session->client, route.owner_id,
-                vemb_v16_cli_l0_pending_item_count(v2->l0, 0));
             if (request->l0_leader)
-                sdk_handle_session_deadline_new_leader(
-                    session->client, &session->deadlines[route.owner_id],
-                    route.owner_id,
+                vemb_v16_cli_deadline_on_new_leader(
+                    &session->deadlines[route.owner_id],
                     session->deadlines[route.owner_id].delay_ns ?
                         vemb_v16_monotonic_ns() : 0);
+            cur = next;
             continue;
         }
 
@@ -2549,6 +2120,7 @@ static uint32_t sdk_handle_session_route_requests(
             callbacks += sdk_handle_session_finish(session, i, &error, cb,
                                                    priv);
         }
+        cur = next;
     }
     return callbacks;
 }
@@ -2611,20 +2183,6 @@ static uint32_t sdk_handle_session_poll_v2(
             sdk_handle_session_v2_failed(session, owner_id, cb, priv);
             return callbacks;
         }
-        uint64_t response_poll_ns = vemb_v16_monotonic_ns();
-        uint64_t publish_ns = vemb_v16_cli_l0_get_batch_publish_ns(
-            v2->l0, 0, batch_id);
-        if (publish_ns != 0 &&
-            (batch_id & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0) {
-            vemb_v16_client_owner_stats_t *stats =
-                sdk_owner_stats(session->client, owner_id);
-            uint64_t publish_to_response_poll_ns = response_poll_ns -
-                publish_ns;
-            stats->v2_batch_timing_sample_count++;
-            stats->v2_publish_to_response_poll_ns_sum +=
-                publish_to_response_poll_ns;
-            stats->v2_response_wait_ns_sum += publish_to_response_poll_ns;
-        }
 
         /* 消费了一个 batch response, 在途计数递减 */
         if (session->v2_batches_outstanding[owner_id] > 0)
@@ -2681,7 +2239,6 @@ static uint32_t sdk_handle_session_poll_v2(
                 .response = &response,
                 .cb = cb,
                 .priv = priv,
-                .response_poll_ns = response_poll_ns,
             };
             if (vemb_v16_cli_l0_finish(v2->l0, &completion,
                                         sdk_handle_session_finish_fanout,
@@ -2701,6 +2258,8 @@ static uint32_t sdk_handle_session_poll_v1(
     sdk_backend_t *backend = &session->client->owner_channels[owner_id];
     if (backend->ops != &sdk_ub_data_transport_ops || !sdk_backend_ready(backend))
         return 0;
+    if (sdk_ub_state(backend)->pending_count == 0)
+        return 0;
 
     uint32_t callbacks = 0;
     for (;;) {
@@ -2715,7 +2274,6 @@ static uint32_t sdk_handle_session_poll_v1(
             continue;
         sdk_handle_session_request_t *request = &session->requests[request_id];
         if (request->l0_entry_id == SDK_HANDLE_SESSION_NO_ENTRY) {
-            request->response_poll_ns = vemb_v16_monotonic_ns();
             callbacks += sdk_handle_session_apply_response(
                 session, request_id, &completion.response, cb, priv);
             continue;
@@ -2731,7 +2289,6 @@ static uint32_t sdk_handle_session_poll_v1(
             .response = &completion.response,
             .cb = cb,
             .priv = priv,
-            .response_poll_ns = vemb_v16_monotonic_ns(),
         };
         if (v2->l0 && vemb_v16_cli_l0_finish(
                 v2->l0, &l0_completion, sdk_handle_session_finish_fanout,
@@ -2769,6 +2326,7 @@ vemb_v16_client_handle_session_t *vemb_v16_client_handle_session_create(
     if (delay_ns)
         monotonicInit();
     session->client = client;
+    session->route_head = SDK_HANDLE_SESSION_NO_ENTRY;
     for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++)
         session->requests[i].l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY;
     for (uint32_t owner = 0;
@@ -2802,17 +2360,18 @@ int vemb_v16_client_handle_session_submit(
     sdk_handle_session_request_t *request = &session->requests[request_id];
     *request = (sdk_handle_session_request_t){
         .caller_cookie = caller_cookie,
-        .submit_ns = vemb_v16_monotonic_ns(),
         .key_len = (uint16_t)key_len,
         .op = VEMB_V16_OP_VEMB_HANDLE,
         .state = SDK_HANDLE_SESSION_REQUEST_ROUTE,
         .l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY,
+        .route_next = session->route_head,
     };
     memcpy(request->key, key, key_len);
     vemb_v16_cluster_operation_init(
         &session->client->cluster, &request->operation,
         vemb_v16_xxh3_64_str(request->key, request->key_len));
     session->active_requests++;
+    session->route_head = request_id;
     return 0;
 }
 
@@ -2850,6 +2409,7 @@ int vemb_v16_client_handle_session_submit_vsim_key_key(
         .force_v1 = 1,
         .state = SDK_HANDLE_SESSION_REQUEST_ROUTE,
         .l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY,
+        .route_next = session->route_head,
     };
     memcpy(request->key, key1, key_len);
     memcpy(request->key2, key2, key2_len);
@@ -2857,6 +2417,7 @@ int vemb_v16_client_handle_session_submit_vsim_key_key(
         &session->client->cluster, &request->operation,
         vemb_v16_xxh3_64_str(request->key, request->key_len));
     session->active_requests++;
+    session->route_head = request_id;
     return 0;
 }
 
@@ -2866,8 +2427,7 @@ int vemb_v16_client_handle_session_flush(
     RETURN_IF(session->closing, -1);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
-        if (sdk_handle_session_flush_owner(session, owner, NULL, NULL, 0,
-                                           0, 0, 0, 0, 0, 0, 0) != 0)
+        if (sdk_handle_session_flush_owner(session, owner, NULL, NULL, 0) != 0)
             return -1;
     }
     return 0;
@@ -2877,125 +2437,20 @@ int vemb_v16_client_handle_session_poll(
     vemb_v16_client_handle_session_t *session,
     vemb_v16_client_handle_completion_cb cb, void *priv)
 {
-    return vemb_v16_client_handle_session_poll_at(session, cb, priv, 0);
-}
-
-int vemb_v16_client_handle_session_poll_at(
-    vemb_v16_client_handle_session_t *session,
-    vemb_v16_client_handle_completion_cb cb, void *priv,
-    uint64_t drive_sessions_start_ns)
-{
     RETURN_IF(session->closing, -1);
-    uint64_t slot_poll_start_ns = vemb_v16_monotonic_ns();
     uint32_t callbacks = 0;
-    callbacks += sdk_handle_session_route_requests(
-        session, cb, priv, drive_sessions_start_ns, slot_poll_start_ns);
+    callbacks += sdk_handle_session_route_requests(session, cb, priv);
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
         sdk_owner_v2_t *v2 = &session->client->owner_v2[owner];
-        if (!v2->l0 && !session->client->owner_channel_inited[owner])
-            continue;
-        vemb_v16_client_owner_stats_t *owner_stats =
-            sdk_owner_stats(session->client, owner);
-        uint64_t poll_index = owner_stats->poll_calls++;
-        int sample_poll = (poll_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
-        uint64_t poll_start_ns = sample_poll ? vemb_v16_monotonic_ns() : 0;
-        uint64_t flush_start_ns = sample_poll ? poll_start_ns : 0;
-        uint64_t flush_ns = 0;
-        uint64_t v2_start_ns = 0;
-        uint64_t v2_ns = 0;
-        uint64_t v1_start_ns = 0;
-        uint64_t v1_ns = 0;
-        uint32_t owner_callbacks_before = callbacks;
-        uint32_t pending_items = v2->l0 ?
-            vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
-        uint32_t pending_bytes = v2->l0 ?
-            vemb_v16_cli_l0_pending_frame_bytes(v2->l0, 0) : 0;
-        int sample_deadline = (poll_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
-        uint64_t deadline_poll_enter_ns = sample_deadline ? poll_start_ns : 0;
-        uint64_t deadline_check_start_ns = sample_deadline ?
-            vemb_v16_monotonic_ns() : 0;
-        int deadline_due = v2->l0 && vemb_v16_cli_deadline_flush_due(
-            &session->deadlines[owner], pending_items,
+        if (v2->l0 && vemb_v16_cli_deadline_flush_due(
+                &session->deadlines[owner],
+                vemb_v16_cli_l0_pending_item_count(v2->l0, 0),
                 session->deadlines[owner].delay_ns ?
-                    vemb_v16_monotonic_ns() : 0);
-        uint64_t deadline_check_end_ns = sample_deadline ?
-            vemb_v16_monotonic_ns() : 0;
-        if (deadline_due) {
-            vemb_v16_client_owner_stats_t *stats =
-                sdk_owner_stats(session->client, owner);
-            int flush_full = pending_items >= v2->effective_batch_size ||
-                (v2->max_batch_bytes != 0 &&
-                 pending_bytes >= v2->max_batch_bytes);
-            if (flush_full)
-                stats->v2_flush_full++;
-            if (session->deadlines[owner].delay_ns == 0)
-                stats->v2_flush_eager++;
-            else if (!flush_full)
-                stats->v2_flush_deadline++;
-            uint64_t deadline_set_ns =
-                session->deadlines[owner].deadline_set_ns;
-            uint64_t deadline_target_ns =
-                session->deadlines[owner].deadline_ns;
-            uint64_t deadline_due_ns = vemb_v16_monotonic_ns();
-            uint64_t flush_enter_ns = vemb_v16_monotonic_ns();
-            if (session->deadlines[owner].deadline_set_ns != 0) {
-                stats->v2_deadline_due_count++;
-                stats->v2_deadline_age_ns_sum += deadline_due_ns -
-                    session->deadlines[owner].deadline_set_ns;
-                uint64_t due_to_flush_ns = flush_enter_ns - deadline_due_ns;
-                stats->v2_deadline_due_to_flush_ns_sum += due_to_flush_ns;
-                if (stats->v2_deadline_due_to_flush_ns_min == 0 ||
-                    due_to_flush_ns < stats->v2_deadline_due_to_flush_ns_min)
-                    stats->v2_deadline_due_to_flush_ns_min = due_to_flush_ns;
-                if (due_to_flush_ns > stats->v2_deadline_due_to_flush_ns_max)
-                    stats->v2_deadline_due_to_flush_ns_max = due_to_flush_ns;
-            }
-            if (sample_poll)
-                flush_start_ns = flush_enter_ns;
-            (void)sdk_handle_session_flush_owner(session, owner, cb, priv, 1,
-                                                  deadline_poll_enter_ns,
-                                                  deadline_check_start_ns,
-                                                  deadline_check_end_ns,
-                                                  deadline_set_ns,
-                                                  deadline_target_ns,
-                                                  deadline_due_ns,
-                                                  flush_enter_ns);
-            if (sample_poll)
-                flush_ns = vemb_v16_monotonic_ns() - flush_start_ns;
-        }
-        if (sample_poll)
-            v2_start_ns = vemb_v16_monotonic_ns();
+                    vemb_v16_monotonic_ns() : 0))
+            (void)sdk_handle_session_flush_owner(session, owner, cb, priv, 1);
         callbacks += sdk_handle_session_poll_v2(session, owner, cb, priv);
-        if (sample_poll)
-            v2_ns = vemb_v16_monotonic_ns() - v2_start_ns;
-        if (sample_poll)
-            v1_start_ns = vemb_v16_monotonic_ns();
         callbacks += sdk_handle_session_poll_v1(session, owner, cb, priv);
-        if (sample_poll)
-            v1_ns = vemb_v16_monotonic_ns() - v1_start_ns;
-        uint32_t owner_callbacks = callbacks - owner_callbacks_before;
-        owner_stats->poll_callbacks += owner_callbacks;
-        if (owner_callbacks > owner_stats->callback_count_per_poll_max)
-            owner_stats->callback_count_per_poll_max = owner_callbacks;
-        if (owner_callbacks == 0)
-            owner_stats->poll_empty++;
-        if (sample_poll) {
-            uint64_t poll_latency_ns = vemb_v16_monotonic_ns() - poll_start_ns;
-            owner_stats->poll_latency_sample_count++;
-            owner_stats->poll_latency_ns_sum += poll_latency_ns;
-            owner_stats->poll_flush_sample_count++;
-            owner_stats->poll_flush_ns_sum += flush_ns;
-            owner_stats->poll_v2_sample_count++;
-            owner_stats->poll_v2_ns_sum += v2_ns;
-            owner_stats->poll_v1_sample_count++;
-            owner_stats->poll_v1_ns_sum += v1_ns;
-            if (owner_stats->poll_latency_ns_min == 0 ||
-                poll_latency_ns < owner_stats->poll_latency_ns_min)
-                owner_stats->poll_latency_ns_min = poll_latency_ns;
-            if (poll_latency_ns > owner_stats->poll_latency_ns_max)
-                owner_stats->poll_latency_ns_max = poll_latency_ns;
-        }
     }
     return (int)callbacks;
 }
@@ -3118,17 +2573,15 @@ static int sdk_vector_session_finish(
         .region_id = response->region_id,
     };
     uint64_t caller_cookie = request->caller_cookie;
-    vemb_v16_client_owner_stats_t *owner_stats = NULL;
-    if (request->state != SDK_VECTOR_SESSION_REQUEST_CACHE) {
-        owner_stats = sdk_owner_stats(session->client, request->owner_id);
-        owner_stats->completed++;
-        if (response->status == VEMB_V16_STATUS_OK)
-            owner_stats->ok++;
-        else if (response->status == VEMB_V16_STATUS_NOT_FOUND)
-            owner_stats->not_found++;
-        else
-            owner_stats->errors++;
-    }
+    sdk_owner_stats_t *stats =
+        sdk_owner_stats(session->client, request->owner_id);
+    stats->completed++;
+    if (response->status == VEMB_V16_STATUS_OK)
+        stats->ok++;
+    else if (response->status == VEMB_V16_STATUS_NOT_FOUND)
+        stats->not_found++;
+    else
+        stats->errors++;
     vemb_v16_cluster_core_complete(&session->client->cluster,
                                    &request->operation, response->status);
     *request = (sdk_vector_session_request_t){
@@ -3155,12 +2608,11 @@ static int sdk_vector_session_apply_response(
         return sdk_vector_session_finish(session, request_id, response, vector,
                                          cb, priv);
 
-    sdk_owner_stats(session->client, request->owner_id)->retries++;
-
     request->state = SDK_VECTOR_SESSION_REQUEST_ROUTE;
     request->l0_entry_id = SDK_VECTOR_SESSION_NO_ENTRY;
     request->l0_generation = 0;
     request->l0_leader = 0;
+    sdk_owner_stats(session->client, request->owner_id)->retries++;
     if (action == VEMB_V16_CLUSTER_RESPONSE_REFRESH)
         session->topology_refresh_pending = 1;
     return 0;
@@ -3252,8 +2704,8 @@ static int sdk_vector_session_submit_v1(
     }
     request->vector = vector;
     request->owner_id = route->owner_id;
-    sdk_owner_stats(session->client, route->owner_id)->v1_requests++;
     request->state = SDK_VECTOR_SESSION_REQUEST_V1;
+    sdk_owner_stats(session->client, route->owner_id)->v1_requests++;
     return 0;
 }
 
@@ -3396,6 +2848,8 @@ static uint32_t sdk_vector_session_route_requests(
             session->client->cluster.owner_channels[route.owner_id].generation;
         request->owner_id = route.owner_id;
         sdk_owner_stats(session->client, route.owner_id)->submitted++;
+        sdk_owner_stats_note_pending_peak(session->client, route.owner_id,
+                                          session->active_requests);
         /* ASK is a one-shot route supplied by cluster_core. Its redirect flag
          * is wire-visible, so it must not be reconstructed through L0. */
         if (route.request_flags != 0) {
@@ -3436,9 +2890,6 @@ static uint32_t sdk_vector_session_route_requests(
             request->l0_entry_id = entry_id;
             request->l0_generation = generation;
             request->l0_leader = submit == VEMB_V16_CLI_L0_NEW_LEADER;
-            sdk_owner_stats_note_pending_peak(
-                session->client, route.owner_id,
-                vemb_v16_cli_l0_pending_item_count(l0, 0));
             continue;
         }
 
@@ -3459,47 +2910,29 @@ static void sdk_vector_session_materialize(
     if (response->status != VEMB_V16_STATUS_OK)
         return;
 
-    if (response->op == VEMB_V16_OP_VEMB_HANDLE) {
-        sdk_owner_stats(session->client, owner_id)->handle_region_count++;
-        sdk_owner_region_note_handle(session->client, owner_id,
-                                     response->region_id);
-    }
-
     uint32_t expected_bytes = session->client->dim * sizeof(float);
     if (response->vector_bytes != expected_bytes) {
-        sdk_owner_stats(session->client, owner_id)->materialize_fail++;
         *response = sdk_vector_session_error_response();
         return;
     }
     if (response->op != session->client->vector_read_op) {
-        sdk_owner_stats(session->client, owner_id)->materialize_fail++;
         *response = sdk_vector_session_error_response();
         return;
     }
     if (session->client->vector_read_op == VEMB_V16_OP_VEMB_INLINE) {
-        if (inline_bytes != expected_bytes) {
-            sdk_owner_stats(session->client, owner_id)->materialize_fail++;
+        if (inline_bytes != expected_bytes)
             *response = sdk_vector_session_error_response();
-        } else {
-            vemb_v16_client_owner_stats_t *stats =
-                sdk_owner_stats(session->client, owner_id);
-            stats->materialize_ok++;
-            stats->materialize_bytes += inline_bytes;
-        }
         return;
     }
-    if (sdk_owner_region_read_warm_vector(
-            session->client, owner_id, response->region_id,
-            &session->client->owner_channels[owner_id],
+    sdk_owner_stats(session->client, owner_id)->submitted++;
+    if (sdk_backend_read_warm_vector(
+            &session->client->owner_channels[owner_id], response->region_id,
             response->vector_offset, response->vector_bytes, request->vector,
             expected_bytes) != 0) {
-        sdk_owner_stats(session->client, owner_id)->materialize_fail++;
+        sdk_owner_stats(session->client, owner_id)->errors++;
         *response = sdk_vector_session_error_response();
     } else {
-        vemb_v16_client_owner_stats_t *stats =
-            sdk_owner_stats(session->client, owner_id);
-        stats->materialize_ok++;
-        stats->materialize_bytes += response->vector_bytes;
+        sdk_owner_stats(session->client, owner_id)->ok++;
     }
 }
 
@@ -3895,11 +3328,7 @@ static int client_execute_with_redirect(
                 out_resp->op == VEMB_V16_OP_VEMB_HANDLE) {
                 client->last_handle_channel = target;
                 client->last_handle_generation = target->generation;
-                client->last_handle_owner_id = route.owner_id;
                 client->last_handle_region_id = out_resp->region_id;
-                sdk_owner_stats(client, route.owner_id)->handle_region_count++;
-                sdk_owner_region_note_handle(client, route.owner_id,
-                                             out_resp->region_id);
             }
             vemb_v16_cluster_core_complete(&client->cluster, &operation,
                                            out_resp->status);
@@ -4063,11 +3492,6 @@ static int sdk_owner_v2_execute_handle_batch(
         return 0;
     if (publish_rc != RING_OK)
         return 0;
-    vemb_v16_client_owner_stats_t *owner_stats =
-        sdk_owner_stats(client, owner);
-    owner_stats->v2_frames++;
-    owner_stats->v2_items += group_count;
-#if VEMB_V16_SDK_TRACE
     if (batch_id <= 8 || batch_id % 1024 == 0) {
         fprintf(stderr,
                 "[sdk] handle v2 batch submitted owner=%u batch=%llu "
@@ -4077,7 +3501,6 @@ static int sdk_owner_v2_execute_handle_batch(
                 (unsigned long long)vemb_v16_aeron_batch_channel_id(
                     v2->channel));
     }
-#endif
     vemb_v16_owner_session_v2_batch_published(session);
 
     vemb_v16_resp_t responses[VEMB_V16_BATCH_REQUEST_SIZE_MAX];
@@ -4111,7 +3534,6 @@ static int sdk_owner_v2_execute_handle_batch(
     }
 
     int stop_v2 = response_epoch != submit_epoch;
-#if VEMB_V16_SDK_TRACE
     if (response_epoch != submit_epoch || batch_id <= 8 || batch_id % 1024 == 0) {
         fprintf(stderr,
                 "[sdk] handle v2 batch response owner=%u batch=%llu "
@@ -4122,7 +3544,6 @@ static int sdk_owner_v2_execute_handle_batch(
                 (unsigned long long)response_epoch,
                 response_epoch == submit_epoch);
     }
-#endif
     for (uint32_t i = 0; i < group_count; i++) {
         uint32_t entry = group_indices[i];
         vemb_v16_resp_t response = responses[i];
@@ -4373,7 +3794,6 @@ static int client_pipeline_execute_with_redirect(
                         group_cursor = group_count;
                         break;
                     }
-                    sdk_owner_stats(client, owner)->v1_requests++;
                     inflight[inflight_count++] = src_idx;
                     group_cursor++;
                 }
@@ -4994,6 +4414,7 @@ int vemb_v16_client_ping(vemb_v16_client_t *c)
                                            VEMB_V16_STATUS_ERR);
             return -1;
         }
+
         vemb_v16_transport_completion_t completion;
         if (sdk_backend_poll(target, VEMB_V16_TRANSPORT_WAIT_FOREVER,
                              &completion) != VEMB_V16_TRANSPORT_POLL_COMPLETION ||
@@ -5209,21 +4630,31 @@ void vemb_v16_client_get_fanout_stats(const vemb_v16_client_t *client,
 
 void vemb_v16_client_get_owner_stats(
     const vemb_v16_client_t *client,
-    vemb_v16_client_owner_stats_snapshot_t *out) {
+    vemb_v16_client_owner_stats_snapshot_t *out)
+{
     assert(out != NULL);
     out->owner_count = VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS;
-    memcpy(out->owners, client->owner_stats, sizeof(out->owners));
+    _Static_assert(sizeof(sdk_owner_stats_t) ==
+                   offsetof(vemb_v16_client_owner_stats_t, pending_current),
+                   "internal/public stats layout mismatch");
     for (uint32_t owner = 0;
-         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++)
-        out->owners[owner].pending_current =
-            sdk_owner_pending_current(client, owner);
-    for (uint32_t owner = 0;
-         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++)
-        out->owners[owner].active_groups_current =
-            sdk_owner_active_groups_current(client, owner);
-    out->owner_region_count = client->owner_region_stats_count;
-    memcpy(out->owner_regions, client->owner_region_stats,
-           sizeof(out->owner_regions));
+         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
+        memcpy(&out->owners[owner], &client->owner_stats[owner],
+               sizeof(sdk_owner_stats_t));
+        out->owners[owner].pending_current = 0;
+        out->owners[owner].active_groups_current = 0;
+    }
+    if (client->handle_session) {
+        for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
+            const sdk_handle_session_request_t *r =
+                &client->handle_session->requests[i];
+            if (r->state != 0) {
+                out->owners[r->owner_id].pending_current++;
+                if (r->state == 2)
+                    out->owners[r->owner_id].active_groups_current++;
+            }
+        }
+    }
 }
 
 int vemb_v16_client_read_vector(vemb_v16_client_t *c,
@@ -5239,9 +4670,9 @@ int vemb_v16_client_read_vector(vemb_v16_client_t *c,
     RETURN_IF(channel == NULL || !sdk_backend_ready(channel) ||
               channel->generation != c->last_handle_generation ||
               channel->ops != &sdk_ub_data_transport_ops, -1);
-    return sdk_owner_region_read_warm_vector(
-        c, c->last_handle_owner_id, c->last_handle_region_id, channel, offset,
-        bytes, out_vector, out_cap * sizeof(*out_vector));
+    return sdk_backend_read_warm_vector(
+        channel, c->last_handle_region_id, offset, bytes, out_vector,
+        out_cap * sizeof(*out_vector));
 }
 
 /* ------------------------------------------------------------------ */
@@ -5910,20 +5341,18 @@ static void vemb_v16_aeron_batch_unmap(
     ch->response_arena_mapping = NULL;
 }
 
-/* Close the server channel synchronously before local mappings disappear.
- * The caller may still unmap/free after an I/O error, but a successful return
- * means the server has completed its channel lifecycle cleanup. */
-static int vemb_v16_aeron_notify_close(const char *endpoint,
-                                       uint64_t channel_id) {
-    if (!endpoint || !endpoint[0]) return -1;
+/* Best-effort server-side close notification. Errors are swallowed
+ * because the rings are already unmapped locally by the caller. */
+static void vemb_v16_aeron_notify_close(const char *endpoint,
+                                        uint64_t channel_id) {
+    if (!endpoint || !endpoint[0]) return;
     int fd = vemb_v16_aeron_control_connect(endpoint);
-    if (fd < 0) return -1;
-    int rc = vemb_v16_aeron_tcp_status_control(fd,
-                                               VEMB_V16_NET_CLOSE_CHANNEL,
-                                               channel_id,
-                                               NULL);
+    if (fd < 0) return;
+    vemb_v16_aeron_tcp_status_control(fd,
+                                      VEMB_V16_NET_CLOSE_CHANNEL,
+                                      channel_id,
+                                      NULL);
     close(fd);
-    return rc;
 }
 
 static vemb_v16_transport_resource_state_t
@@ -6133,14 +5562,8 @@ vemb_v16_aeron_batch_channel_t *vemb_v16_aeron_open_remote_batch(
 }
 
 void vemb_v16_aeron_batch_close(vemb_v16_aeron_batch_channel_t *ch) {
-    int close_rc = vemb_v16_aeron_notify_close(ch->control_endpoint,
-                                               ch->channel_id);
-    if (close_rc != 0) {
-        fprintf(stderr,
-                "[sdk] aeron batch close: server cleanup ACK failed cid=%llu rc=%d\n",
-                (unsigned long long)ch->channel_id, close_rc);
-    }
     vemb_v16_aeron_batch_unmap(ch);
+    vemb_v16_aeron_notify_close(ch->control_endpoint, ch->channel_id);
     free(ch);
 }
 
@@ -6208,8 +5631,7 @@ int vemb_v16_aeron_batch_publish_handle(
 int vemb_v16_aeron_batch_poll_response(
     vemb_v16_aeron_batch_channel_t *ch, uint64_t *batch_id,
     uint64_t *topology_epoch, vemb_v16_resp_t *entries) {
-    assert(batch_id != NULL && topology_epoch != NULL &&
-           entries != NULL);
+    assert(batch_id != NULL && topology_epoch != NULL && entries != NULL);
     batch_desc_t desc;
     int peek = batch_desc_peek(ch->response_descriptor_ring, &desc);
     RETURN_IF(!peek, 0);
@@ -6225,10 +5647,17 @@ int vemb_v16_aeron_batch_poll_response(
         return 0;
     }
     batch_response_view_t response;
-    const uint8_t *frame = ch->response_arena + (desc.start % ch->max_batch_bytes);
-    /* A local CC mapping can observe the published descriptor before a
-     * reused remote-NC arena line becomes readable. Keep the descriptor at
-     * head and retry instead of consuming valid work and disabling v2. */
+    const uint8_t *nc_frame = ch->response_arena + (desc.start % ch->max_batch_bytes);
+    uint8_t local_frame[VEMB_V16_BATCH_RESPONSE_HEADER_BYTES +
+                        VEMB_V16_BATCH_REQUEST_SIZE_MAX *
+                            (sizeof(uint16_t) + VEMB_V16_AERON_RESP_WIRE_MAX_LEN)];
+    const uint8_t *frame;
+    if (desc.bytes <= sizeof(local_frame)) {
+        sve_streaming_load(nc_frame, local_frame, desc.bytes);
+        frame = local_frame;
+    } else {
+        frame = nc_frame;
+    }
     int decode_rc = batch_response_decode(&response, entries, frame, desc.bytes);
     if (decode_rc != 0 || response.batch_id != desc.batch_id ||
         response.item_count != desc.item_count ||
@@ -6512,13 +5941,6 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
 }
 
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
-    int close_rc = vemb_v16_aeron_notify_close(ch->control_endpoint,
-                                               ch->desc.channel_id);
-    if (close_rc != 0) {
-        fprintf(stderr,
-                "[sdk] aeron close: server cleanup ACK failed cid=%llu rc=%d\n",
-                (unsigned long long)ch->desc.channel_id, close_rc);
-    }
     for (uint32_t i = 0; i < ch->warm_count; i++) {
         if (ch->warm[i].valid && ch->warm[i].mapping_addr) {
             munmap(ch->warm[i].mapping_addr, ch->warm[i].mapping_bytes);
@@ -6537,6 +5959,7 @@ void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
     else
         vemb_v16_aeron_ring_close(ch->resp_ring,
                                    ch->desc.response_ring_slot_size);
+    vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);
     free(ch);
 }
 
