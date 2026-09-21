@@ -5226,6 +5226,10 @@ void vemb_v16_client_get_owner_stats(
            sizeof(out->owner_regions));
 }
 
+static sdk_backend_t *sdk_client_channel_for_region(
+        vemb_v16_client_t *client, uint32_t region_id,
+        sdk_backend_t *preferred);
+
 int vemb_v16_client_read_vector(vemb_v16_client_t *c,
                                 uint64_t offset,
                                 uint32_t bytes,
@@ -5239,9 +5243,16 @@ int vemb_v16_client_read_vector(vemb_v16_client_t *c,
     RETURN_IF(channel == NULL || !sdk_backend_ready(channel) ||
               channel->generation != c->last_handle_generation ||
               channel->ops != &sdk_ub_data_transport_ops, -1);
+    /* A location's region_id is cluster-global: warm_put may spill a key
+     * into a peer's warm region, so the returned region can belong to an
+     * owner other than the one the serving channel maps. Resolve the
+     * region against every mapped channel; the serving channel is
+     * preferred when it maps the region itself. */
+    sdk_backend_t *region_channel = sdk_client_channel_for_region(
+        c, c->last_handle_region_id, channel);
     return sdk_owner_region_read_warm_vector(
-        c, c->last_handle_owner_id, c->last_handle_region_id, channel, offset,
-        bytes, out_vector, out_cap * sizeof(*out_vector));
+        c, c->last_handle_owner_id, c->last_handle_region_id, region_channel,
+        offset, bytes, out_vector, out_cap * sizeof(*out_vector));
 }
 
 /* ------------------------------------------------------------------ */
@@ -6745,6 +6756,36 @@ int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
 static sdk_ub_channel_t *sdk_ub_state(const vemb_v16_data_channel_t *channel)
 {
     return channel->state;
+}
+
+/* [region-resolve] used by vemb_v16_client_read_vector */
+static int sdk_backend_maps_region(sdk_backend_t *backend,
+                                   uint32_t region_id) {
+    if (backend->ops != &sdk_ub_data_transport_ops ||
+        !sdk_backend_ready(backend))
+        return 0;
+    vemb_v16_aeron_channel_t *ch = sdk_ub_state(backend)->aeron;
+    if (!ch)
+        return 0;
+    for (uint32_t i = 0; i < ch->warm_count; i++) {
+        if (ch->warm[i].valid && ch->warm[i].region_id == region_id)
+            return 1;
+    }
+    return 0;
+}
+
+static sdk_backend_t *sdk_client_channel_for_region(
+        vemb_v16_client_t *client, uint32_t region_id,
+        sdk_backend_t *preferred) {
+    if (preferred && sdk_backend_maps_region(preferred, region_id))
+        return preferred;
+    for (uint32_t i = 0; i < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; i++) {
+        sdk_backend_t *backend = &client->owner_channels[i];
+        if (backend != preferred &&
+            sdk_backend_maps_region(backend, region_id))
+            return backend;
+    }
+    return preferred;
 }
 
 static int sdk_ub_pending_reserve(sdk_ub_channel_t *state)

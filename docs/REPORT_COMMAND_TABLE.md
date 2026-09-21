@@ -105,6 +105,7 @@ for OP in VEMB VSIM_2KEY; do
         SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
         CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
         SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
+        CLIENT_PEER_VIEW_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_ub_peer_view_112_to_111_xnode_aeron.yaml \
             bash scripts/run_aeron_cross_node_flamegraph.sh
     done
 done
@@ -166,6 +167,7 @@ for i in $(seq 0 6); do
     SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
     CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
     SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
+    CLIENT_PEER_VIEW_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_ub_peer_view_112_to_111_xnode_aeron.yaml \
         bash scripts/run_aeron_cross_node_flamegraph.sh
 done
 # baseline 12 实例【HW01 执行】
@@ -266,8 +268,8 @@ DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v
 ```bash
 # hpc TCP 扩容【HW01 执行】(脚本需内网直连 192.168.1.x:22, Mac 只走 frp 转发口不可达；默认 PIO=21 SNW=21)
 PIO=21 SNW=21 bash scripts/hpc_redis_scaleout_throughput.sh
-# hpc Aeron 扩容【本地 Mac 执行】
-REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis PIO=21 SNW=21 bash benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh
+# hpc Aeron 扩容【本地 Mac 执行】（client 固定在 HW01/111 上，绑 96-191 核）
+REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis PIO=21 SNW=21 bash scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh
 # 原生 redis cluster 扩容【HW01 执行】⚠️ HW05 失联，待恢复
 N_INIT=3 N_FINAL=4 RAW=1 TEST_TIME=60 CLIENTS=200 THREADS=16 IO_THREADS=4 VECTORS_PER_VSET=6250 bash benchmark/run_redis_cluster_scaleout_vemb.sh
 ```
@@ -306,6 +308,93 @@ OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 PIO=2 SNW=2 bash benchmark/vemb_v
 
 ---
 
-## 8. 环境备注
+## 8. COLD 层影响对比（VEMB 读 64x1x32）
+
+```bash
+# 本地回环 cold on【HW01 执行】
+RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VEMB TS=64 CS=1 PIPELINE=32 COLD_DIR=/root/gqs/cold_data/vemb64 bash scripts/run_aeron_best.sh
+
+# 跨节点 cluster cold on【本地 Mac 执行】
+REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis HPC_REDIS_COLD_DIR=/root/gqs/cold_data/xnode300 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+```
+
+产物：`perf/aeron_sweep/<run-id>/summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`。
+
+## 9. HA 功能性回归（双机主备）【本地 Mac 执行】
+
+runner 自动同步远端并构建；要求双节点空闲、VIP 未被占用。按 9.1 → 9.4 顺序执行，前一项失败不进入下一项。
+
+### 9.1 keepalived 一次性部署（仅首次或配置变更）
+
+```bash
+scripts/deploy_keepalived_ha.sh --all --vip 192.168.90.202/24 --install-deps deploy
+scripts/deploy_keepalived_ha.sh --all --vip 192.168.90.202/24 check
+# 部署后保持 stopped，由 9.4 的 runner 启动，不要手工 start
+```
+
+成功输出：
+
+```text
+node=111 config=valid
+node=112 config=valid
+```
+
+### 9.2 HA Replica UB 数据面回归
+
+```bash
+HA_REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis bash benchmark/tlc_ha_replica_ub_111_to_112.sh
+```
+
+成功输出（末尾 `TODO: ...` 为脚本固定提示，非失败）：
+
+```text
+visibility 111_to_112: PASS
+visibility 112_to_111: PASS
+tlc_ha_replica_ub_111_to_112: PASS (visibility, replication, append ACK, heartbeat, async apply)
+tlc_ha_replica_ub_111_to_112: PASS (111 -> 112 snapshot chunks)
+tlc_ha_replica_ub_111_to_112: PASS (111 -> 112 checkpoint install)
+tlc_ha_replica_ub_111_to_112: PASS (M5 resync tail, handoff, H + 1)
+tlc_ha_replica_ub_111_to_112: PASS (M5 timeout and abort cleanup)
+tlc_ha_replica_ub_111_to_112: PASS (M6 automatic GAP -> AOF repair)
+tlc_ha_replica_ub_111_to_112: PASS (M6 automatic retention -> snapshot)
+tlc_ha_replica_ub_111_to_112: PASS (M7 retention soft compact)
+tlc_ha_replica_ub_111_to_112: PASS (M7 retention hard pressure abort)
+tlc_ha_replica_ub_111_to_112: PASS (persistent follower COLD recovery)
+tlc_ha_replica_ub_111_to_112: PASS (manual AOF replay after follower restart)
+```
+
+### 9.3 Redis TCP/SDK 固定角色回归
+
+```bash
+HA_REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis bash benchmark/tlc_ha_redis_tcp_111_to_112.sh
+```
+
+成功输出（默认 10000 事件 → events=10004）：
+
+```text
+PASS: Redis TCP SDK -> Leader -> Replica UB -> Follower TCP SDK (10004 events)
+PASS: Follower COLD recovery after reset WARM region
+artifacts: <HA_REMOTE_DIR>/benchmark/results/tlc_ha_redis_tcp/<RUN_ID> (on 111 and 112)
+```
+
+### 9.4 Aeron/UB 一主一备 failover（keepalived/VIP 真实切主）
+
+```bash
+# 正向（须先完成 9.1；反向等正向 runner 退出后再执行）
+HA_REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis bash benchmark/tlc_ha_aeron_failover_111_to_112.sh
+
+# 反向
+INITIAL_NODE=112 CLIENT_NODE=112 \
+  HA_REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis \
+  bash benchmark/tlc_ha_aeron_failover_111_to_112.sh
+```
+
+成功输出（最后一行；反向时 active/standby 对调）：
+
+```text
+tlc_ha_aeron_failover_111_to_112: PASS active_owner=1 standby_owner=0 run=<RUN_ID>
+```
+
+## 10. 环境备注
 
 - HW05 失联影响：原生 4 节点 cluster（§3）与原生扩容（§4），待管理员恢复后执行对应标注命令。

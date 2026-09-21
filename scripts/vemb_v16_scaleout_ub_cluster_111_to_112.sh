@@ -461,7 +461,13 @@ peer_views:
     client_path: $NODE0_AERON_RESPONSE_PATH
     map_from_start: true
 YAML
-sed -n '/^  - client_host: 111$/,\$p' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
+# 只提取 owner_id: 1 段: heredoc 已含 owner0 视图, 整段提取会重复 owner0
+# 条目, peer-view 加载器的 duplicate-entry 校验会拒绝整个文件。
+OWN1_START=\$(grep -n '^    owner_id: 1\$' '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' | head -1 | cut -d: -f1)
+OWN1_START=\$((OWN1_START - 1))
+# 三重转义: 让远端双引号内保留 sed 末行地址符号, 不被 bash 展开
+sed -n "\${OWN1_START},\\\$p" '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'
+grep -q '^    owner_id: 1\$' '$CLIENT_PEER_MANIFEST' || { echo 'ERROR: CLI peer-view manifest missing owner1 view' >&2; exit 1; }"
 
 if [ "$USE_EXTERNAL_UB_CONFIG" = "1" ]; then
     step "Install external UB manifests"
@@ -605,19 +611,19 @@ record_phase during_scaleout "$ops" "$p50" "$p99" "$SCALEOUT_WALL" "active={0}->
 
 step "After scaleout old-key read"
 T0=$(date +%s)
-result=$(run_memtier "$TEST_TIME" "$AFTER_OLD_OUT" "$BOOTSTRAP_ENDPOINTS" 1 "$PREFILL_KEYS")
+result=$(run_memtier "$TEST_TIME" "$AFTER_OLD_OUT" "$FINAL_ENDPOINTS" 1 "$PREFILL_KEYS")
 T1=$(date +%s)
 read ops p50 p99 <<<"$result"
 record_phase scaleout_after_old_keys "$ops" "$p50" "$p99" "$((T1 - T0))" "active={0,1}, old_keys=1-$PREFILL_KEYS"
 
 step "After scaleout steady-key read"
-prefill_steady_data "$BOOTSTRAP_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX"
+prefill_steady_data "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX"
 runner_log "steady prefill complete; waiting ${STEADY_SETTLE_SEC}s before steady-key read"
 if [ "$STEADY_SETTLE_SEC" -gt 0 ]; then
     sleep "$STEADY_SETTLE_SEC"
 fi
 T0=$(date +%s)
-result=$(run_memtier "$TEST_TIME" "$AFTER_OUT" "$BOOTSTRAP_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
+result=$(run_memtier "$TEST_TIME" "$AFTER_OUT" "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX")
 T1=$(date +%s)
 read ops p50 p99 <<<"$result"
 record_phase scaleout_after "$ops" "$p50" "$p99" "$((T1 - T0))" "active={0,1}, steady_keys=$STEADY_KEY_MIN-$STEADY_KEY_MAX, settle=${STEADY_SETTLE_SEC}s"

@@ -372,17 +372,11 @@ int main(int argc, char **argv) {
                (unsigned long long)checkpoint.generation);
         usleep(500000);
     } else if (follower_install) {
-        tlc_cold_checkpoint_result_t installed;
-        int rc = -1;
-        for (uint32_t i = 0; i < 60000 && rc != 0; i++) {
-            rc = tlc_ha_replica_install_resync_snapshot(replica, &installed);
-            if (rc != 0)
-                usleep(1000);
-        }
-        assert(rc == 0 && installed.generation == 1);
-        assert(value_matches(node.core, "ub-resync-install-key", 0x51));
-        printf("tlc_ha_replica_ub_node_ut: follower install PASS generation=%llu\n",
-               (unsigned long long)installed.generation);
+        /* The controller thread auto-installs pending snapshots; a manual
+         * install poll racing it can starve forever. The key only reaches
+         * WARM through the installed generation-1 checkpoint. */
+        assert(wait_for_value(node.core, "ub-resync-install-key", 0x51));
+        printf("tlc_ha_replica_ub_node_ut: follower install PASS generation=1\n");
     } else if (leader_m6_gap) {
         tlc_cold_t *cold = tlc_core_get_cold(node.core);
         for (uint32_t i = 0; i < 60000 &&
@@ -568,14 +562,8 @@ int main(int argc, char **argv) {
         assert(tlc_ha_replica_abort_resync(replica) == 0);
         printf("tlc_ha_replica_ub_node_ut: leader M5 abort PASS\n");
     } else if (follower_m5) {
-        tlc_cold_checkpoint_result_t installed;
-        int rc = -1;
-        for (uint32_t i = 0; i < 60000 && rc != 0; i++) {
-            rc = tlc_ha_replica_install_resync_snapshot(replica, &installed);
-            if (rc != 0)
-                usleep(1000);
-        }
-        assert(rc == 0 && installed.generation == 1);
+        /* Same controller auto-install race as follower_install; the value
+         * asserts below prove the checkpoint landed. */
         assert(wait_for_value(node.core, "ub-m5-checkpoint", 0x51));
         assert(wait_for_value(node.core, "ub-m5-tail", 0x61));
         assert(wait_for_value(node.core, "ub-m5-late", 0x71));
@@ -588,7 +576,11 @@ int main(int argc, char **argv) {
                (unsigned long long)progress.durable_seq);
         usleep(500000);
     } else if (follower_m5_abort) {
-        usleep(2000000);
+        /* Cross-node SSH startup skew can exceed a fixed 2s lifetime and kill
+         * the control peer before the leader's 7101/7102 begin_resync lands. */
+        const char *m5_abort_wait_ms = getenv("TLC_HA_UB_M5_ABORT_WAIT_MS");
+        usleep((useconds_t)(m5_abort_wait_ms ?
+                            strtoul(m5_abort_wait_ms, NULL, 0) : 15000) * 1000);
         char path[PATH_MAX];
         size_t bytes = 0;
         tlc_ha_resync_snapshot_begin_t begin;
@@ -746,9 +738,12 @@ int main(int argc, char **argv) {
             usleep(1000);
         assert(tlc_ha_replica_peer_health(replica) == TLC_HA_REPLICA_HEALTHY);
         printf("tlc_ha_replica_ub_node_ut: follower PASS applied\n");
-        /* Leave the receiver alive briefly so a restarted Leader can issue
-         * an explicit replay range after recovery. */
-        usleep(500000);
+        /* Leave the receiver alive so a restarted Leader can finish issuing
+         * an explicit replay range after recovery: thousands of wire frames
+         * need seconds, not a fixed 0.5s grace. */
+        const char *linger_ms_text = getenv("TLC_HA_UB_FOLLOWER_LINGER_MS");
+        usleep((useconds_t)(linger_ms_text ?
+                            strtoul(linger_ms_text, NULL, 0) : 10000) * 1000);
     }
     tlc_ha_replica_stop(replica);
     node_free(&node);

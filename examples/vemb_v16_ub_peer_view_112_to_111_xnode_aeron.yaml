@@ -1,0 +1,120 @@
+# Cross-node Aeron perf lane for CLI@112 reading owner 0@111.
+# Pairs with examples/vemb_v16_warm_regions_111_xnode_aeron.yaml: the server
+# keeps request/response on 111 dev3/dev6 (client 7/2) and places warm on
+# 111 dev4, whose 112-side Import is dev8. dev8 is the HA Replica RX device
+# on 112, so this lane must not run while HA is deployed.
+# Owner 1 (local failover target) entries mirror the committed HA view.
+version: 1
+peer_views:
+  - client_host: 112
+    owner_id: 1
+    resource_role: v1_request_ring
+    resource_id: owner112-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: v1_response_ring
+    resource_id: owner112-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: warm_region
+    resource_id: owner112-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev3
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: v2_request_descriptor
+    resource_id: owner112-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: v2_request_arena
+    resource_id: owner112-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev1
+    client_path: /dev/obmm_shmdev1
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: v2_response_descriptor
+    resource_id: owner112-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 1
+    resource_role: v2_response_arena
+    resource_id: owner112-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev2
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v1_request_ring
+    resource_id: owner111-v1-request
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v1_response_ring
+    resource_id: owner111-v1-response
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: warm_region
+    resource_id: owner111-warm
+    generation: 1
+    provider_path: /dev/obmm_shmdev4
+    client_path: /dev/obmm_shmdev8
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_request_descriptor
+    resource_id: owner111-v2-request-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_request_arena
+    resource_id: owner111-v2-request-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev3
+    client_path: /dev/obmm_shmdev7
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_response_descriptor
+    resource_id: owner111-v2-response-descriptor
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
+  - client_host: 112
+    owner_id: 0
+    resource_role: v2_response_arena
+    resource_id: owner111-v2-response-arena
+    generation: 1
+    provider_path: /dev/obmm_shmdev6
+    client_path: /dev/obmm_shmdev2
+    map_from_start: true
