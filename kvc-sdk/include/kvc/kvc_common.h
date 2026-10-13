@@ -54,8 +54,11 @@ typedef struct {
  * region 提供者类型
  * ------------------------------------------------------------------------- */
 typedef enum {
-    KVC_PROVIDER_DEVICE = 0,  /* /dev/obmm_shmdevN 字符设备（UB 本地/远端内存） */
+    KVC_PROVIDER_DEVICE = 0,  /* /dev/obmm_shmdevN 字符设备（UB 本地/远端内存，
+                                 预置静态段） */
     KVC_PROVIDER_ANON   = 1,  /* 匿名 mmap（单机回环 / 测试用） */
+    KVC_PROVIDER_UBME   = 2,  /* ubme 动态段: owner 按需 export / reader 按名
+                                 发现 + import，不依赖预置设备（ABI v3 新增） */
 } kvc_provider_t;
 
 /* region 打开标志 */
@@ -71,15 +74,35 @@ typedef enum {
  *   - block_size 为 512 的倍数（与 Mooncake 写路径 value_size 对齐要求一致）
  *   - bytes 为 block_size 的整数倍
  *   - bytes >= region header + 至少 1 个 slot
+ *   - provider=DEVICE: device_path 非空; mmap_offset 为 0（整设备一个 region）
+ *   - provider=UBME: seg_name 非空，mmap_offset 为 0; owner(CREATE) 经
+ *     ubme ctx export 动态段（bytes 按 2MiB 向上取整，实际值以
+ *     kvc_region_meta.region_bytes 为准）; reader(无 CREATE) 必须填
+ *     attach/import 所得的本地设备路径 local_path
  * ------------------------------------------------------------------------- */
 typedef struct {
     uint32_t      region_id;      /* 全局唯一，对应 Mooncake segment_id */
-    kvc_provider_t provider;      /* DEVICE / ANON */
+    kvc_provider_t provider;      /* DEVICE / ANON / UBME */
     char          device_path[96];/* provider=DEVICE 时有效, 如 /dev/obmm_shmdev1 */
-    uint64_t      mmap_offset;    /* 设备内偏移（多 region 共用一个 shmdev 时错开） */
+    uint64_t      mmap_offset;    /* 设备内偏移（多 region 共用一个 shmdev 时错开;
+                                     DEVICE 现仅支持 0, UBME 恒 0） */
     uint64_t      bytes;          /* region 总字节数 */
     uint32_t      block_size;     /* 定长 block = KV page size */
     uint32_t      flags;          /* KVC_REGION_* 组合 */
+    /* ---- 以下为 UBME 专属（ABI v3 尾部追加; provider=UBME 时有效） ---- */
+    char          seg_name[64];   /* 收敛段名（kvc_seg_name 生成; owner 的
+                                     export 名 = reader 的发现匹配名） */
+    char          local_path[96]; /* reader: attach/import 返回的本地设备路径 */
+    uint32_t      ubme_node_id;   /* ubme ctx 节点 id（owner CREATE / reader
+                                     首次 attach 时初始化 ctx 用） */
+    uint16_t      ubme_tcp_port;  /* ctx mesh 监听端口; 0 = 内核自动分配
+                                     （纯出向 mesh 的 reader） */
+    uint16_t      ubme_pad0;      /* 填充，保持 8 字节对齐 */
+    char          ubme_peers[256];/* "id:ip:port:cna,..."（本节点视角）;
+                                     cna 裸值按十进制（/proc/mami/udm/udevice
+                                     口径，如 "17"），"0x" 前缀按十六进制
+                                     （如 "0x11"，同一节点）——喂错进制会把
+                                     decoder 指到不存在的节点 */
 } kvc_region_config_t;
 
 /* ---------------------------------------------------------------------------

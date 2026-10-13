@@ -23,8 +23,15 @@ CORE_SRC  = core/layout/kvc_layout.c core/ub/kvc_ub.c
 SERVER_SRC = $(CORE_SRC) server/kvc_server.c
 CLIENT_SRC = $(SERVER_SRC) client/kvc_client.c
 
+# ubme seam（provider=UBME 的动态段支撑; dlopen 合作方 libubme.so，
+# 缺运行时的环境上 UBME provider 初始化显性失败，DEVICE/ANON 不受影响）
+SEAM_OBJ = build/ubme_seam.o
+SERVER_OBJ = $(SERVER_SRC:.c=.o) $(SEAM_OBJ)
+CLIENT_OBJ = $(CLIENT_SRC:.c=.o) $(SEAM_OBJ)
+LDLIBS += -ldl
+
 HDRS = $(wildcard include/kvc/*.h) core/layout/kvc_layout.h core/ub/kvc_ub.h \
-       server/kvc_region_internal.h
+       core/ub/ubme_seam.h server/kvc_region_internal.h
 
 .PHONY: all check clean tools
 
@@ -42,14 +49,18 @@ build/headers_check: tests/headers_check.c $(wildcard include/kvc/*.h)
 libs: build/libkvc_server.a build/libkvc_server.so \
       build/libkvc_client.a build/libkvc_client.so
 
-build/libkvc_server.a: $(SERVER_SRC:.c=.o)
+build/libkvc_server.a: $(SERVER_OBJ)
 	$(AR) rcs $@ $^
-build/libkvc_server.so: $(SERVER_SRC:.c=.o)
+build/libkvc_server.so: $(SERVER_OBJ)
 	$(CC) -shared -o $@ $^ $(LDLIBS)
-build/libkvc_client.a: $(CLIENT_SRC:.c=.o)
+build/libkvc_client.a: $(CLIENT_OBJ)
 	$(AR) rcs $@ $^
-build/libkvc_client.so: $(CLIENT_SRC:.c=.o)
+build/libkvc_client.so: $(CLIENT_OBJ)
 	$(CC) -shared -o $@ $^ $(LDLIBS)
+
+build/ubme_seam.o: core/ub/ubme_seam.c core/ub/ubme_seam.h $(HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
 %.o: %.c $(HDRS)
 	@mkdir -p $(dir $@)

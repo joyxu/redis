@@ -23,8 +23,11 @@ typedef struct kvc_region kvc_region_t;          /* opaque: 已映射的 region 
 
 /* ABI 版本协商（A6）: 接入方初始化时立即调用，与编译期 KVC_ABI_VERSION
  * 不符即拒绝使用（运行时链接的 .so 可能与编译头文件版本错配；几何/身份
- * 协议跨版本不兼容，宁拒不错）。 */
-#define KVC_ABI_VERSION 2u
+ * 协议跨版本不兼容，宁拒不错）。
+ * v3: 新增 KVC_PROVIDER_UBME（ubme 动态段 provider，静态 DEVICE 保留），
+ *     kvc_region_config_t 尾部追加 UBME 字段，kvc_region_meta_t 追加
+ *     region_bytes。 */
+#define KVC_ABI_VERSION 3u
 uint32_t kvc_api_version(void);
 
 /* region 几何元数据（master 构建 allocator 视图 / 对外上报用） */
@@ -34,6 +37,7 @@ typedef struct {
     uint32_t capacity_slots;   /* 数据区可容纳的 slot 数 */
     uint64_t data_off;         /* 数据区在 region 内的字节偏移（slot 元数据表之后） */
     uint64_t data_bytes;       /* 数据区字节数 = capacity_slots * block_size */
+    uint64_t region_bytes;     /* region 总字节（UBME owner 为 2MiB 对齐实际值） */
 } kvc_region_meta_t;
 
 /* ---------------------------------------------------------------------------
@@ -44,6 +48,11 @@ typedef struct {
  * 或匿名内存；KVC_REGION_CREATE 时初始化 region header（魔数/版本/容量/
  * block_size）与 slot 状态表（全部 FREE）。幂等重开（无 CREATE）则校验
  * 已有 header 与 cfg 一致，不一致返回 KVC_ESTALE。
+ * provider=UBME: CREATE 角色 = ubme ctx 初始化 + export 动态段（seg_name，
+ * 2MiB 对齐，实际尺寸见 meta.region_bytes）并从零初始化头/表，段名已存在
+ * （双 owner/重复创建）返回 NULL; 非 CREATE 角色（reader）= 映射
+ * cfg.local_path（attach/import 所得）并校验 header，语义同
+ * kvc_region_open_remote。动态段不跨进程重启持久（见 1b 节）。
  * 前置条件: cfg 满足 kvc_common.h 所列约束。 */
 kvc_region_t *kvc_region_open_local(const kvc_region_config_t *cfg);
 
@@ -52,6 +61,55 @@ kvc_region_t *kvc_region_open_local(const kvc_region_config_t *cfg);
  * device_path/mmap_offset（握手复用 core/net）；P1 提供完整 attach 流程。
  * 前置条件: cfg 描述的是 peer 侧同一 region 的几何参数。 */
 kvc_region_t *kvc_region_open_remote(const kvc_region_config_t *cfg);
+
+/* ---------------------------------------------------------------------------
+ * 1b. UBME 动态段生命周期（provider=UBME; ABI v3 新增）
+ *
+ * 语义契约: 动态段不跨进程死亡——owner 优雅退出（kvc_owner_shutdown）=
+ * munmap + unexport + journal 删除; kill -9 残留由下一个 ubme ctx 启动
+ * 时的 journal sweep 回收。因此 UBME region 的 slot 表不跨 owner 重启
+ * 持久，owner 重启 = 新段从零初始化（KVC 是缓存介质，数据可回源重建）。
+ * ------------------------------------------------------------------------- */
+
+/* 本进程 owner region（open_local(UBME, CREATE) 成功时登记）。
+ * 同进程的驱逐执行端直接复用该句柄，无需第二映射; 非 owner 进程返回 NULL。 */
+kvc_region_t *kvc_owner_region(void);
+
+/* owner 段名收敛规则（跨进程契约）: "kvc_seg_h" + 16 位十六进制
+ * kvc_identity_hash(owner_host)。owner 与读者各自从 hostname 推导——
+ * owner 用自己注册给 master 的 local_hostname，读者用 master 元数据
+ * replica 的 transport_endpoint host; 两侧一致即精确命中。 */
+void kvc_seg_name(char out[64], const char *owner_host);
+
+/* reader 侧 ubme ctx 初始化（幂等; tcp_port 传 0 = 内核自动分配，
+ * reader 纯出向 mesh 连接）。peers_spec "id:ip:port:cna,..."（本节点
+ * 视角）; cna 裸值按十进制（/proc/mami/udm/udevice 口径），"0x" 前缀
+ * 按十六进制——见 ubme_seam.h 的进制告警。 */
+int kvc_ubme_init(uint32_t node_id, uint16_t tcp_port, const char *peers_spec);
+
+/* 发现 + attach owner 段: 按完整段名（kvc_seg_name 产出）经 mesh 发现
+ * 其所在节点并 import（同机 journal 复用优先），返回本地设备路径。
+ * timeout_ms 覆盖 PULL 等待。 */
+int kvc_region_attach_ubme(const char *seg_name, uint32_t timeout_ms,
+                           char *out_path, size_t out_cap);
+
+/* 解除 attach（owner 重启重 attach 前必须调用，否则本进程旧 import 记录
+ * 会让 journal 复用命中已死的 /dev 节点）。前置条件: 调用方已对该段的
+ * 映射 kvc_region_close。 */
+int kvc_region_detach_ubme(const char *seg_name);
+
+/* import 段陈旧探测（非破坏）: 任一已 attach 段的对端离线/掉线后重上线
+ * （mesh 心跳/重上线闩锁）返回 1——owner 重启的可靠信号（新段=新 epoch，
+ * 旧段被 watch 也永远不变，epoch 单独检测不到）。无 mesh（纯同机复用）
+ * 恒返回 0，该形态下 owner 重启的陈旧窗口由 poscache TTL 与 master 元数
+ * 据兜底。 */
+int kvc_ubme_imports_stale(void);
+
+/* 优雅关停: 关闭并 munmap 本进程 owner region（若有），随后 unexport
+ * 本进程全部动态段并删除 journal 记录（reader 进程等价 ctx shutdown）。
+ * 调用时机: 已解除对段数据区的一切子映射（Mooncake segment ptr 释放后），
+ * obmm 拒绝 unexport 有 live mapping 的段。 */
+void kvc_owner_shutdown(void);
 
 /* 关闭 region（仅 munmap 本进程映射，不影响其他持有者；slot 表内容留存于
  * 共享内存中，重开后状态延续）。 */

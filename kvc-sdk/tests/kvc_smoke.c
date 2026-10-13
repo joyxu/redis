@@ -1,9 +1,14 @@
 /* kvc_smoke.c — P0 端到端语义测试
  *
  * 用法:
- *   ./kvc_smoke                          # 匿名内存（单机语义）
+ *   ./kvc_smoke                                    # 匿名内存（单机语义）
  *   ./kvc_smoke <device> <bytes> <block> [region_id]
  *       例: ./kvc_smoke /dev/obmm_shmdev1 $((1<<30)) 4096 1
+ *   ./kvc_smoke ubme <seg_name> <bytes> <block> [region_id]
+ *       例: ./kvc_smoke ubme kvc_seg_o0 $((1<<30)) 4096 1
+ *       env: KVC_UBME_NODE_ID/KVC_UBME_TCP_PORT/KVC_UBME_PEERS（owner ctx）
+ *            KVC_SMOKE_KEEP=1 结束后不 shutdown（模拟 kill -9 泄漏，留给
+ *            下个进程的 init sweep 回收; kvc_ubme_clean.sh 清场）
  *
  * 流程: open_local(CREATE) → allocator 分配 → mark_writing → 写数据 →
  *       mark_ready → client 侧 read_handle/deref_handle 校验 → 状态机边界用例
@@ -11,12 +16,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "kvc/kvc_client.h"
 #include "../core/layout/kvc_layout.h"
+#include "../core/ub/ubme_seam.h"
 #include "kvc/kvc_server.h"
 
 static int failures = 0;
+
+/* base+suf 拼接（memcpy，绕开 snprintf 的运行时截断告警；调用方保证
+ * base 长度合理，截断则丢弃尾部）。 */
+static void seg_suf(char out[UBME_SEAM_NAME_MAX], const char *base,
+                    const char *suf)
+{
+    size_t n = strlen(base);
+    size_t sl = strlen(suf);
+    if (n + sl >= UBME_SEAM_NAME_MAX)
+        n = UBME_SEAM_NAME_MAX - sl - 1;
+    memcpy(out, base, n);
+    memcpy(out + n, suf, sl + 1);
+}
 
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
@@ -37,7 +57,23 @@ int main(int argc, char **argv)
     cfg.bytes = 1u << 20;
     cfg.flags = KVC_REGION_CREATE;
 
-    if (argc >= 4) {
+    if (argc >= 5 && strcmp(argv[1], "ubme") == 0) {
+        cfg.provider = KVC_PROVIDER_UBME;
+        snprintf(cfg.seg_name, sizeof(cfg.seg_name), "%s", argv[2]);
+        cfg.bytes = strtoull(argv[3], NULL, 0);
+        cfg.block_size = (uint32_t)strtoul(argv[4], NULL, 0);
+        cfg.ubme_node_id = getenv("KVC_UBME_NODE_ID")
+                               ? (uint32_t)strtoul(getenv("KVC_UBME_NODE_ID"),
+                                                   NULL, 0)
+                               : 0;
+        cfg.ubme_tcp_port = getenv("KVC_UBME_TCP_PORT")
+                                ? (uint16_t)strtoul(getenv("KVC_UBME_TCP_PORT"),
+                                                    NULL, 0)
+                                : 7393;
+        if (getenv("KVC_UBME_PEERS"))
+            snprintf(cfg.ubme_peers, sizeof(cfg.ubme_peers), "%s",
+                     getenv("KVC_UBME_PEERS"));
+    } else if (argc >= 4) {
         cfg.provider = KVC_PROVIDER_DEVICE;
         snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", argv[1]);
         cfg.bytes = strtoull(argv[2], NULL, 0);
@@ -46,16 +82,22 @@ int main(int argc, char **argv)
     } else {
         cfg.provider = KVC_PROVIDER_ANON;
     }
-    if (argc >= 5)
+    if (cfg.provider == KVC_PROVIDER_UBME && argc >= 6)
+        cfg.region_id = (uint32_t)strtoul(argv[5], NULL, 0);
+    if (cfg.provider == KVC_PROVIDER_DEVICE && argc >= 5)
         cfg.region_id = (uint32_t)strtoul(argv[4], NULL, 0);
 
-    printf("region: provider=%d path=%s bytes=%llu block=%u id=%u\n",
-           cfg.provider, cfg.device_path, (unsigned long long)cfg.bytes,
-           cfg.block_size, cfg.region_id);
+    printf("region: provider=%d seg=%s path=%s bytes=%llu block=%u id=%u\n",
+           cfg.provider, cfg.seg_name, cfg.device_path,
+           (unsigned long long)cfg.bytes, cfg.block_size, cfg.region_id);
 
-    /* 1. 建 region */
+    /* 1. 建 region（失败即中止: 后续用例都解引用 r, 继续跑只会段错误） */
     kvc_region_t *r = kvc_region_open_local(&cfg);
     CHECK(r != NULL, "open_local(CREATE)");
+    if (!r) {
+        printf("== SMOKE FAILED (region open, see early FAIL) ==\n");
+        return 1;
+    }
 
     kvc_region_meta_t meta;
     CHECK(kvc_region_meta(r, &meta) == KVC_OK && meta.capacity_slots > 0,
@@ -71,7 +113,7 @@ int main(int argc, char **argv)
 
     /* 2. slot 分配器（master 视角，纯位图） */
     kvc_region_meta_t mview = {meta.region_id, meta.block_size,
-                               meta.capacity_slots, 0, 0};
+                               meta.capacity_slots, 0, 0, 0};
     kvc_slot_allocator_t *alloc = kvc_slot_allocator_create(&mview);
     CHECK(alloc != NULL, "allocator create");
     uint32_t slot = 0;
@@ -136,13 +178,28 @@ int main(int argc, char **argv)
           "re-mark_writing after invalidate (master restart reuse)");
     CHECK(kvc_slot_allocator_free(alloc, slot) == KVC_OK, "allocator free");
 
-    /* 6. 非 CREATE 重开校验（仅共享设备有意义：匿名重开是全新零内存，
+    /* 6. 非 CREATE 重开校验（仅共享介质有意义：匿名重开是全新零内存，
      *    validate 必然失败——那是正确行为） */
     if (cfg.provider == KVC_PROVIDER_DEVICE) {
         kvc_region_config_t cfg2 = cfg;
         cfg2.flags &= ~KVC_REGION_CREATE;
         kvc_region_t *r2 = kvc_region_open_local(&cfg2);
         CHECK(r2 != NULL, "reopen (validate geometry)");
+        if (r2)
+            kvc_region_close(r2);
+    } else if (cfg.provider == KVC_PROVIDER_UBME) {
+        /* reader 语义重开: segment_path → local_path validate（同进程即
+         * owner 本人，路径是 CC export，O_RDWR 直过） */
+        kvc_region_config_t cfg2 = cfg;
+        cfg2.flags &= ~KVC_REGION_CREATE;
+        cfg2.bytes = meta.region_bytes;   /* validate 以 2MiB 对齐实际值为准 */
+        char segpath[96];
+        CHECK(ubme_seam_segment_path(cfg.seg_name, segpath,
+                                     sizeof(segpath)) == 0,
+              "segment_path (export registered)");
+        snprintf(cfg2.local_path, sizeof(cfg2.local_path), "%s", segpath);
+        kvc_region_t *r2 = kvc_region_open_local(&cfg2);
+        CHECK(r2 != NULL, "reopen (validate geometry, O_SYNC reader)");
         if (r2)
             kvc_region_close(r2);
     } else {
@@ -152,10 +209,12 @@ int main(int argc, char **argv)
     kvc_region_set_destroy(set);   /* 会 close r */
     kvc_slot_allocator_destroy(alloc);
 
-    /* ============ P1 用例（重新建 region） ============ */
+    /* ============ P1 用例（重新建 region; UBME 用后缀段名开新段） ============ */
     printf("--- P1 ---\n");
     kvc_region_config_t cfg3 = cfg;
     cfg3.flags |= KVC_REGION_CREATE;
+    if (cfg.provider == KVC_PROVIDER_UBME)
+        seg_suf(cfg3.seg_name, cfg.seg_name, "~p1");
     kvc_region_t *r3 = kvc_region_open_local(&cfg3);
     CHECK(r3 != NULL, "P1: fresh region");
 
@@ -205,7 +264,7 @@ int main(int argc, char **argv)
     kvc_region_meta(r3, &m3);
     kvc_slot_allocator_t *a3 = kvc_slot_allocator_create(
         &(kvc_region_meta_t){m3.region_id, m3.block_size, m3.capacity_slots,
-                              0, 0});
+                              0, 0, 0});
     CHECK(kvc_slot_allocator_rebuild(a3, r3) == KVC_OK &&
           kvc_slot_allocator_used(a3) == 4,
           "allocator rebuild from states: used=4");
@@ -225,6 +284,8 @@ int main(int argc, char **argv)
     printf("--- T0-1 identity ---\n");
     kvc_region_config_t cfg4 = cfg;
     cfg4.flags |= KVC_REGION_CREATE;
+    if (cfg.provider == KVC_PROVIDER_UBME)
+        seg_suf(cfg4.seg_name, cfg.seg_name, "~t01");
     kvc_region_t *r4 = kvc_region_open_local(&cfg4);
     CHECK(r4 != NULL, "T0-1: fresh region");
 
@@ -269,10 +330,41 @@ int main(int argc, char **argv)
                   geo.region_id == cfg.region_id &&
                   geo.data_bytes == kvc_region_data_bytes(r4),
               "probe_identity: geometry + identity from header page");
+    } else if (cfg.provider == KVC_PROVIDER_UBME) {
+        kvc_region_meta_t geo;
+        uint64_t ph = 0;
+        uint32_t pe = 0;
+        char segpath[96];
+        if (ubme_seam_segment_path(cfg4.seg_name, segpath,
+                                  sizeof(segpath)) != 0) {
+            printf("  FAIL probe_identity: segment_path\n");
+            failures++;
+        } else {
+            int rc = kvc_region_probe_identity(segpath, 0, cfg.flags &
+                                                       ~KVC_REGION_CREATE,
+                                               &geo, &ph, &pe);
+            CHECK(rc == KVC_OK && ph == hid && pe == 2 &&
+                      geo.block_size == cfg.block_size &&
+                      geo.region_id == cfg.region_id &&
+                      geo.data_bytes == kvc_region_data_bytes(r4),
+                  "probe_identity: geometry + identity from header page");
+        }
     } else {
         printf("  skip probe_identity (anon provider)\n");
     }
     kvc_region_close(r4);
+
+    /* UBME 收尾: KVC_SMOKE_HOLD_SEC=N 先保持进程存活 N 秒（owner 活着，
+     * kvc_probe 才能经 journal 复用观察）; KVC_SMOKE_KEEP=1 跳过 shutdown
+     * （模拟 kill -9 泄漏，下个进程 init sweep 回收）; 默认 unexport 全部
+     * 段（unexport 前所有 region 映射已随 set_destroy/close 解除）。 */
+    if (cfg.provider == KVC_PROVIDER_UBME) {
+        const char *hold = getenv("KVC_SMOKE_HOLD_SEC");
+        if (hold && atoi(hold) > 0)
+            sleep((unsigned)atoi(hold));
+        if (getenv("KVC_SMOKE_KEEP") == NULL)
+            ubme_seam_shutdown();
+    }
 
     printf(failures ? "== SMOKE FAILED (%d) ==\n" : "== SMOKE PASSED ==\n",
            failures);

@@ -20,9 +20,17 @@ region 物理层：shmdev 的 open/mmap/close + O_SYNC fallback。
 ## 注意
 
 - `src/vemb_v16_ub_bridge.{h,c}`（libubme 动态 region 管理）**已不在仓库**。
-  动态 export/import 管理属 P1+，届时直接对接 `/root/jxw/ubme` 的 libubme 或 obmmctl。
-- P0 的 region 参数（device_path/mmap_offset）由接入方静态给出（manifest 方式，
-  与 hpc-redis `examples/vemb_v16_warm_regions_*.yaml` 同构）。
+  动态 export/import 管理自 ABI v3 起以 `ubme_seam.[ch]`（本目录）提供：
+  KVC_PROVIDER_UBME 动态段 provider，进程内唯一 dlopen(libubme.so) 点
+  （合作方运行时缺位时 UBME provider 初始化显性失败，DEVICE/ANON 不受
+  影响；license 不允许 vendor 合作方源码，只做运行时绑定）。
+- 静态路径（KVC_PROVIDER_DEVICE）的 region 参数（device_path/mmap_offset）
+  由接入方静态给出（manifest 方式，与 hpc-redis
+  `examples/vemb_v16_warm_regions_*.yaml` 同构），行为不变。
+- 动态段语义: 段不跨进程死亡——owner 优雅退出（kvc_owner_shutdown）=
+  munmap + unexport + journal 删除; kill -9 残留由下一个 ubme ctx 的
+  journal sweep 回收。跑 UBME 用例前若有崩溃残留，先执行
+  `tests/kvc_ubme_clean.sh` 清场。
 
 ## ⚠️ 平台硬约束（HW01/HW02 实测 + 维护者确认）
 

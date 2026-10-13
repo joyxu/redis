@@ -5,10 +5,12 @@
  */
 #include "kvc_region_internal.h"
 #include "kvc_ub.h"
+#include "ubme_seam.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * 前置条件检查（最高外部边界，只在此处做）
@@ -24,7 +26,15 @@ static int cfg_check(const kvc_region_config_t *cfg)
     if (cfg->provider == KVC_PROVIDER_DEVICE &&
         (cfg->device_path[0] == '\0' || cfg->mmap_offset != 0))
         return KVC_EINVAL;   /* P0: 设备内偏移仅支持 0（整设备一个 region） */
-    if (cfg->provider != KVC_PROVIDER_DEVICE && cfg->provider != KVC_PROVIDER_ANON)
+    if (cfg->provider == KVC_PROVIDER_UBME) {
+        if (cfg->seg_name[0] == '\0' || cfg->mmap_offset != 0)
+            return KVC_EINVAL;
+        if (!(cfg->flags & KVC_REGION_CREATE) &&
+            cfg->local_path[0] == '\0')
+            return KVC_EINVAL;   /* reader 必须填 attach/import 所得本地路径 */
+    }
+    if (cfg->provider != KVC_PROVIDER_DEVICE && cfg->provider != KVC_PROVIDER_ANON &&
+        cfg->provider != KVC_PROVIDER_UBME)
         return KVC_EINVAL;
     return KVC_OK;
 }
@@ -32,28 +42,119 @@ static int cfg_check(const kvc_region_config_t *cfg)
 /* ---------------------------------------------------------------------------
  * region 生命周期
  * ------------------------------------------------------------------------- */
+static kvc_region_t *g_owner_region;   /* 进程内 owner region（驱逐执行端复用） */
+
+kvc_region_t *kvc_owner_region(void)
+{
+    return g_owner_region;
+}
+
+void kvc_seg_name(char out[64], const char *owner_host)
+{
+    uint64_t h = kvc_identity_hash(owner_host ? owner_host : "");
+    snprintf(out, 64, "kvc_seg_h%016llx", (unsigned long long)h);
+}
+
+int kvc_ubme_init(uint32_t node_id, uint16_t tcp_port, const char *peers_spec)
+{
+    return ubme_seam_init(node_id, tcp_port, peers_spec) == 0 ? KVC_OK
+                                                             : KVC_ENODEV;
+}
+
+int kvc_region_attach_ubme(const char *seg_name, uint32_t timeout_ms,
+                           char *out_path, size_t out_cap)
+{
+    if (!seg_name || !seg_name[0])
+        return KVC_EINVAL;
+    /* mesh 建联等待: ctx 刚 init 时 mesh 握手异步进行中，冷启动的按名发现
+     * 会空手而归（journal 复用未命中时）。有界重试: attach 失败且配置了
+     * peers → 500ms 后再试，直到成功或耗尽 timeout_ms; 同机复用形态（无
+     * peers）一次即判，不空转。 */
+    for (uint32_t waited = 0;; waited += 500) {
+        if (ubme_seam_attach_segment(seg_name, timeout_ms, out_path,
+                                     out_cap) == 0)
+            return KVC_OK;
+        if (ubme_seam_peer_ids(NULL, 0) == 0 || waited + 500 > timeout_ms)
+            break;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 500 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "[kvc-attach] %s: attach failed (journal reuse + "
+                    "mesh find + PULL import)\n",
+            seg_name);
+    return KVC_ENOENT;
+}
+
+int kvc_region_detach_ubme(const char *seg_name)
+{
+    if (!seg_name || !seg_name[0])
+        return KVC_EINVAL;
+    return ubme_seam_detach_segment(seg_name) == 0 ? KVC_OK : KVC_ENOENT;
+}
+
+int kvc_ubme_imports_stale(void)
+{
+    return ubme_seam_imports_stale();
+}
+
+void kvc_owner_shutdown(void)
+{
+    if (g_owner_region)
+        kvc_region_close(g_owner_region);   /* munmap 全 region + 清 owner 登记 */
+    ubme_seam_shutdown();
+}
+
 static kvc_region_t *region_open(const kvc_region_config_t *cfg, int create)
 {
     if (cfg_check(cfg) != KVC_OK)
         return NULL;
 
     void *base;
-    if (cfg->provider == KVC_PROVIDER_DEVICE)
+    uint64_t region_bytes = cfg->bytes;
+    if (cfg->provider == KVC_PROVIDER_DEVICE) {
         base = kvc_map_memory(cfg->device_path, cfg->mmap_offset, cfg->bytes,
                               cfg->flags);
-    else
+    } else if (cfg->provider == KVC_PROVIDER_UBME) {
+        if (create) {
+            /* owner: ctx（幂等）+ export 动态段（2MiB 对齐，实际尺寸为
+             * 布局权威——段不跨进程重启，头/表从零初始化）。 */
+            char path[UBME_SEAM_PATH_MAX];
+            uint64_t actual = 0;
+            if (ubme_seam_init(cfg->ubme_node_id, cfg->ubme_tcp_port,
+                               cfg->ubme_peers) != 0)
+                return NULL;
+            if (ubme_seam_create_segment(cfg->seg_name, cfg->bytes, path,
+                                         sizeof(path), &actual) != 0)
+                return NULL;
+            region_bytes = actual;
+            base = kvc_map_memory(path, 0, region_bytes, cfg->flags);
+            if (!base) {
+                /* mmap 失败回滚 export, 不留半截段 */
+                ubme_seam_detach_segment(cfg->seg_name);
+                return NULL;
+            }
+        } else {
+            /* reader: 映射 attach/import 所得本地设备路径。同机 journal
+             * 复用节点是 owner 的 CC export（O_RDWR 直过，cached 正确）；
+             * 跨节点 NC import 节点 O_RDWR 被拒(EPERM)后回退 O_SYNC
+             * （实测路径）。两者统一走 FALLBACK 语义。 */
+            base = kvc_map_memory(cfg->local_path, 0, region_bytes,
+                                  cfg->flags | KVC_REGION_O_SYNC_FALLBACK);
+        }
+    } else {
         base = kvc_map_memory(NULL, 0, cfg->bytes, 0);
+    }
     if (!base)
         return NULL;
 
     uint32_t capacity;
     uint64_t data_off;
-    if (kvc_layout_solve(cfg->bytes, cfg->block_size, &capacity, &data_off) != 0)
+    if (kvc_layout_solve(region_bytes, cfg->block_size, &capacity, &data_off) != 0)
         goto fail;
 
-    if (create ? kvc_layout_init(base, cfg->bytes, cfg->region_id,
+    if (create ? kvc_layout_init(base, region_bytes, cfg->region_id,
                                  cfg->block_size) != 0
-               : kvc_layout_validate(base, cfg->bytes, cfg->region_id,
+               : kvc_layout_validate(base, region_bytes, cfg->region_id,
                                      cfg->block_size) != 0)
         goto fail;
 
@@ -61,13 +162,19 @@ static kvc_region_t *region_open(const kvc_region_config_t *cfg, int create)
     if (!r)
         goto fail;
     r->cfg = *cfg;
+    r->cfg.bytes = region_bytes;   /* UBME create: 写回 2MiB 对齐实际值 */
     r->base = base;
     r->capacity_slots = capacity;
     r->data_off = data_off;
+    if (create && cfg->provider == KVC_PROVIDER_UBME)
+        g_owner_region = r;
     return r;
 
 fail:
-    kvc_unmap_memory(base, cfg->bytes);
+    kvc_unmap_memory(base, region_bytes);
+    if (cfg->provider == KVC_PROVIDER_UBME)
+        /* 布局失败: 回滚本段的 export/import 持有, 不留孤儿段 */
+        ubme_seam_detach_segment(cfg->seg_name);
     return NULL;
 }
 
@@ -86,6 +193,8 @@ void kvc_region_close(kvc_region_t *region)
 {
     if (!region)
         return;
+    if (region == g_owner_region)
+        g_owner_region = NULL;
     kvc_unmap_memory(region->base, region->cfg.bytes);
     free(region);
 }
@@ -99,6 +208,7 @@ int kvc_region_meta(const kvc_region_t *region, kvc_region_meta_t *out)
     out->capacity_slots = region->capacity_slots;
     out->data_off = region->data_off;
     out->data_bytes = (uint64_t)region->capacity_slots * region->cfg.block_size;
+    out->region_bytes = region->cfg.bytes;
     return KVC_OK;
 }
 
@@ -487,6 +597,7 @@ int kvc_region_probe_identity(const char *device_path, uint64_t mmap_offset,
     geo_out->capacity_slots = h->capacity_slots;
     geo_out->data_off = h->data_off;
     geo_out->data_bytes = (uint64_t)h->capacity_slots * h->block_size;
+    geo_out->region_bytes = h->region_bytes;
     *epoch_out = __atomic_load_n(&h->owner_epoch, __ATOMIC_ACQUIRE);
     *host_id = h->owner_host_id;
 out:
