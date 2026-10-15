@@ -13,14 +13,15 @@ NODE0_SSH_PORT="${NODE0_SSH_PORT:-8111}"
 NODE1_SSH_HOST="${NODE1_SSH_HOST:-43.154.145.18}"
 NODE1_SSH_PORT="${NODE1_SSH_PORT:-8112}"
 SSH_USER="${SSH_USER:-root}"
-REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
+REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 
 SERVER_PORT="${SERVER_PORT:-6397}"
 COORD_PORT="${COORD_PORT:-7397}"
 DIM="${DIM:-300}"
-MAX_VECTORS="${MAX_VECTORS:-65536}"
-PREFILL_KEYS="${PREFILL_KEYS:-10000}"
+# MAX_VECTORS 必须覆盖存活 key 总数（prefill + steady，见下方 STEADY_KEY_MAX 校验）。
+MAX_VECTORS="${MAX_VECTORS:-262144}"
+PREFILL_KEYS="${PREFILL_KEYS:-100000}"
 STEADY_KEYS="${STEADY_KEYS:-$PREFILL_KEYS}"
 STEADY_KEY_MIN="${STEADY_KEY_MIN:-$((PREFILL_KEYS + 1))}"
 STEADY_KEY_MAX="${STEADY_KEY_MAX:-$((PREFILL_KEYS + STEADY_KEYS))}"
@@ -195,7 +196,8 @@ cleanup() {
         printf 'P7 failed; remote artifacts remain in %s\n' "$REMOTE_RESULT_DIR" >&2
     fi
 }
-trap cleanup EXIT
+# trap 需在 ssh_run/remote_stop_pid/runner_log 全部定义之后再挂，早退路径
+# 才能正常走清理而不是炸 "command not found"。
 
 for setting in SERVER_PORT COORD_PORT DIM MAX_VECTORS PREFILL_KEYS STEADY_KEYS \
                TEST_TIME BG_TIME_SCALEOUT STEADY_SETTLE_SEC PIPELINE BATCH_MAX_DELAY_US MEMTIER_T MEMTIER_C PIO SNW \
@@ -210,12 +212,15 @@ done
 [ "$SERVER_PORT" -gt 0 ] && [ "$SERVER_PORT" -le 65535 ] || die "invalid SERVER_PORT"
 [ "$COORD_PORT" -gt 0 ] && [ "$COORD_PORT" -le 65535 ] || die "invalid COORD_PORT"
 [ "$DIM" -gt 0 ] || die "DIM must be positive"
-[ "$MAX_VECTORS" -ge "$PREFILL_KEYS" ] || die "MAX_VECTORS must cover PREFILL_KEYS"
+[ "$MAX_VECTORS" -ge "$STEADY_KEY_MAX" ] || die "MAX_VECTORS must cover STEADY_KEY_MAX ($STEADY_KEY_MAX)"
 [ "$CUTOVER_EPOCH" -gt "$MIGRATION_EPOCH" ] || die "CUTOVER_EPOCH must exceed MIGRATION_EPOCH"
 case "$KEEP_SERVERS" in 0|1) ;; *) die "KEEP_SERVERS must be 0 or 1" ;; esac
 case "$ARCHIVE_LOCAL" in 0|1) ;; *) die "ARCHIVE_LOCAL must be 0 or 1" ;; esac
-[ "$NODE0_SSH_HOST" != "$NODE0_HOST" ] || die "NODE0_SSH_HOST must be the Mac-facing endpoint"
-[ "$NODE1_SSH_HOST" != "$NODE1_HOST" ] || die "NODE1_SSH_HOST must be the Mac-facing endpoint"
+# SSH 管理面与数据面同 IP 合法（节点本机发起的 runner）。Mac 经公网转发口
+# 管理时应显式设 NODE0_SSH_HOST/NODE1_SSH_HOST 为转发口，此处只提示不拦截。
+if [ "$NODE0_SSH_HOST" = "$NODE0_HOST" ] || [ "$NODE1_SSH_HOST" = "$NODE1_HOST" ]; then
+    printf 'NOTE: SSH endpoint equals data-plane host (node-local launch)\n' >&2
+fi
 
 mkdir -p "$LOCAL_RESULT_DIR"
 RUNNER_LOG="$LOCAL_RESULT_DIR/runner.log"
@@ -231,6 +236,7 @@ printf 'run_id=%s\nnode0_ssh=%s:%s\nnode1_ssh=%s:%s\nnode0_data=%s\nnode1_data=%
     "$MEMTIER_T" "$MEMTIER_C" "$PIPELINE" \
     >"$LOCAL_RESULT_DIR/run.conf"
 printf 'steady_settle_sec=%s\n' "$STEADY_SETTLE_SEC" >>"$LOCAL_RESULT_DIR/run.conf"
+trap cleanup EXIT
 
 summary_row() {
     printf '%-32s %-15s %-10s %-10s %-8s %s\n' "$@"
@@ -508,7 +514,9 @@ run_memtier_bg() {
 
 parse_bg_out() {
     local totals i
-    for i in $(seq 1 15); do
+    # 64t×4c×32p 双 owner 收尾（在途排空 + 通道关闭握手）可能远超 15s，
+    # Totals 迟到不等于失败；窗口放宽到 60s。
+    for i in $(seq 1 60); do
         totals=$(ssh_run "$NODE0_HOST" "grep '^Totals' '$DURING_OUT' | tail -1")
         [ -n "$totals" ] && break
         sleep 1

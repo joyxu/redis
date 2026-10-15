@@ -20,6 +20,9 @@
 #   TEST_TIME=10 OP_TYPE=VSIM bash ...                       # smoke
 #   SERVERS_ONLY="baseline" OP_TYPE=VEMB bash ...            # 只跑 baseline
 #   TS="64" CS="4" PS="32" OP_TYPE=VEMB bash ...             # 单档
+#   PROFILE=1 SERVERS_ONLY=hpc TS="64" CS="4" PS="32" \
+#       HPC_PIO=3 HPC_SNW=3 SERVER_HOST=192.168.90.111 \
+#       OP_TYPE=VEMB bash ...                                # 单档 + perf/火焰图
 #
 # 命令对照 (跟 run_vemb_local_loopback_sweep.sh 完全一致):
 #   OP_TYPE   | hpc memtier (VEMB V16)                    | baseline memtier (RESP3)
@@ -89,6 +92,18 @@ esac
 BASELINE_IO_THREADS=${BASELINE_IO_THREADS:-4}
 HPC_PIO=${HPC_PIO:-2}
 HPC_SNW=${HPC_SNW:-2}
+
+# === profiling (口径对齐 scripts/run_aeron_cross_node_flamegraph.sh) ===
+# PROFILE=1 时 hpc 档位采 perf + 出火焰图 (server 全 TID + client memtier);
+# baseline 不采。PROFILE_TIERS 空格分隔 t64_c4_p32 样式, 空 = 全部档。
+PROFILE=${PROFILE:-0}
+PROFILE_TIERS=${PROFILE_TIERS:-}
+SERVER_FLAME_DURATION=${SERVER_FLAME_DURATION:-25}
+FREQ=${FREQ:-99}
+EVENT=${EVENT:-cycles}
+FLAMEGRAPH_DIR=${FLAMEGRAPH_DIR:-/root/FlameGraph}
+CLIENT_FLAMEGRAPH_DIR=${CLIENT_FLAMEGRAPH_DIR:-/root/FlameGraph}
+REQUIRE_VEMB_THREAD_SAMPLES=${REQUIRE_VEMB_THREAD_SAMPLES:-1}
 
 # === CPU 绑核 (SERVER 端) ===
 BASELINE_SERVER_CPUSET=${BASELINE_SERVER_CPUSET:-31-38}
@@ -314,6 +329,9 @@ op_type=$1; t=$2; c=$3; p=$4; test_time=$5
 host=$6; port=$7; dim=$8; prefix=$9; kmin=${10}; kmax=${11}
 fixed_vec="${12}"; memtier=${13}; out_file=${14}; is_hpc="${15:-0}"
 kp="${16:-R}"; zipf_s="${17:-}"
+perf_out="${18:-}"; perf_freq="${19:-99}"; perf_event="${20:-cycles}"
+[ "$zipf_s" = "-" ] && zipf_s=""
+[ "$perf_out" = "-" ] && perf_out=""
 [ "$zipf_s" = "-" ] && zipf_s=""
 
 # 用数组传参, 避免 eval/嵌套引号问题
@@ -363,9 +381,97 @@ cmd+=(--key-prefix="$prefix" --key-minimum="$kmin" --key-maximum="$kmax")
 
 # memtier needs time to drain in-flight requests after test_time (e.g. baseline
 # VADD at high in-flight counts drains slowly), so keep a generous headroom.
-timeout -k 5 $((test_time + 60)) "${cmd[@]}" > "$out_file" 2>&1 || true
+# perf 包在 timeout 外层: timeout 兜底杀 memtier 时 perf 正常收尾落盘.
+if [ -n "$perf_out" ]; then
+    perf record -F "$perf_freq" -g -e "$perf_event" -o "$perf_out" -- \
+        timeout -k 5 $((test_time + 60)) "${cmd[@]}" > "$out_file" 2>&1 || true
+else
+    timeout -k 5 $((test_time + 60)) "${cmd[@]}" > "$out_file" 2>&1 || true
+fi
 BENCH_EOF
     ssh "$CLIENT" "chmod +x /tmp/$BENCH_HELPER_NAME" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# profiling helpers (server 本地 / client 经 ssh; 口径对齐 aeron flamegraph 脚本)
+find_hpc_pid() {  # 按端口扫 /proc cmdline, 与 snapshot_jiffies 同一匹配规则
+    local pid
+    for pid in $(pgrep -x redis-server); do
+        if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -Eq ":${SERVER_PORT}\$|:${SERVER_PORT} "; then
+            echo "$pid"; return 0
+        fi
+    done
+    return 1
+}
+
+profile_enabled_for_tier() {  # server_type t c p
+    [ "$PROFILE" = "1" ] || return 1
+    [ "$1" = "hpc" ] || return 1
+    if [ -n "$PROFILE_TIERS" ]; then
+        local tag="t$2_c$3_p$4"
+        [[ " $PROFILE_TIERS " == *" $tag "* ]] || return 1
+    fi
+    return 0
+}
+
+profile_server_start() {  # run_dir — 绑 server 全部 TID (不漏 supernode worker)
+    local run=$1 pid io sn tids
+    pid=$(find_hpc_pid) || { log "FAIL: [prof] hpc server pid not found (port $SERVER_PORT)"; exit 1; }
+    ps -T -p "$pid" -o tid=,comm= >"$run/server.threads.txt"
+    # TCP 模式不创建 vemb-io-/vemb-sn- 线程 (aeron proxy 专属); 计数仅记录.
+    # perf 绑定全部 TID, TCP 下 vemb 工作落在 redis I/O 线程, 同样被采到.
+    io=$(grep -c 'vemb-io-' "$run/server.threads.txt" || true)
+    sn=$(grep -c 'vemb-sn-' "$run/server.threads.txt" || true)
+    log "    [prof] server threads total=$(wc -l <"$run/server.threads.txt") vemb_io=$io vemb_sn=$sn (tcp 预期为 0)"
+    tids=$(awk '{ printf "%s%s", sep, $1; sep="," }' "$run/server.threads.txt")
+    nohup perf record -F "$FREQ" -g -e "$EVENT" --tid "$tids" \
+        -o "$run/server.perf.data" -- sleep "$SERVER_FLAME_DURATION" \
+        >"$run/server.perf.log" 2>&1 &
+    echo $! >"$run/server.perf.pid"
+    log "    [prof] server perf started dur=${SERVER_FLAME_DURATION}s io=$io sn=$sn pid=$(cat "$run/server.perf.pid")"
+}
+
+profile_server_finish() {  # run_dir — 等 perf 结束 → script → collapse → svg + 样本校验
+    local run=$1 perf_pid
+    perf_pid=$(cat "$run/server.perf.pid")
+    for _ in $(seq 1 100); do kill -0 "$perf_pid" 2>/dev/null || break; sleep 0.1; done
+    ! kill -0 "$perf_pid" 2>/dev/null || { log "FAIL: [prof] server perf still running"; exit 1; }
+    perf script -i "$run/server.perf.data" >"$run/server.perf.script"
+    grep -q '\[kernel.kallsyms\]' "$run/server.perf.script" || { log "FAIL: [prof] no kernel symbols in server samples"; exit 1; }
+    grep -q 'redis-server' "$run/server.perf.script" || { log "FAIL: [prof] no redis-server samples"; exit 1; }
+    if [ "$REQUIRE_VEMB_THREAD_SAMPLES" = "1" ]; then
+        # TCP 口径的 vemb 服务路径锚点 (proxy_submit_vemb 是 static, O3/LTO 下内联不可见)
+        grep -q 'vemb_v16_supernode_handle_vemb_job' "$run/server.perf.script" || { log "FAIL: [prof] no supernode vemb samples"; exit 1; }
+        grep -q 'proxy_io_epoll_thread_main' "$run/server.perf.script" || { log "FAIL: [prof] no proxy-io samples"; exit 1; }
+    fi
+    "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$run/server.perf.script" >"$run/server.collapsed.txt"
+    awk '{ sub(/^[^;]+;/, "all;redis-server;"); print }' \
+        "$run/server.collapsed.txt" >"$run/server.process.collapsed.txt"
+    "$FLAMEGRAPH_DIR/flamegraph.pl" \
+        --title "vemb-v16 cross-node tcp server ${run##*/}" \
+        --subtitle "all server TIDs user+kernel; event=${EVENT}@${FREQ}Hz; pio=${HPC_PIO} snw=${HPC_SNW}" \
+        "$run/server.process.collapsed.txt" >"$run/server.svg"
+    log "    [prof] server flamegraph -> $run/server.svg"
+}
+
+profile_client_finish() {  # run_dir remote_perf — client 侧出图后取回
+    local run=$1 rperf=$2
+    ssh "$CLIENT" bash -s -- "$rperf" "$CLIENT_FLAMEGRAPH_DIR" "$FREQ" "$EVENT" <<'CLIENT_FLAME_EOF'
+set -euo pipefail
+rperf=$1; fg=$2; freq=$3; event=$4
+[ -x "$fg/stackcollapse-perf.pl" ] && [ -x "$fg/flamegraph.pl" ]
+perf script -i "$rperf" >"$rperf.script"
+"$fg/stackcollapse-perf.pl" "$rperf.script" >"$rperf.collapsed"
+"$fg/flamegraph.pl" --title "vemb-v16 cross-node tcp client ${rperf##*/}" \
+    --subtitle "memtier client; event=${event}@${freq}Hz" \
+    "$rperf.collapsed" >"$rperf.svg"
+CLIENT_FLAME_EOF
+    scp -q "$CLIENT:$rperf" "$run/client.perf.data" || log "WARN: [prof] client.perf.data fetch failed"
+    scp -q "$CLIENT:$rperf.script" "$run/client.perf.script"
+    scp -q "$CLIENT:$rperf.collapsed" "$run/client.collapsed.txt"
+    scp -q "$CLIENT:$rperf.svg" "$run/client.svg"
+    ssh "$CLIENT" "rm -f $rperf $rperf.script $rperf.collapsed $rperf.svg" 2>/dev/null
+    log "    [prof] client flamegraph -> $run/client.svg"
 }
 
 # ----------------------------------------------------------------------------
@@ -379,7 +485,12 @@ run_one_config() {
     [ "$KEY_PATTERN" = "Z" ] && kp_tag="_zipf${ZIPF_S}"
     local raw_local="$RAWDIR/${server_type}_${OP_TYPE}_t${t}_c${c}_p${p}${kp_tag}.log"
     local raw_remote="/tmp/${OP_TYPE}_${server_type}_t${t}_c${c}_p${p}${kp_tag}.log"
-    log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s"
+    local prof=0
+    profile_enabled_for_tier "$server_type" $t $c $p && prof=1
+    local prof_dir="$OUTDIR/profile/${server_type}_t${t}_c${c}_p${p}${kp_tag}"
+    local perf_arg="-"
+    [ "$prof" = "1" ] && { mkdir -p "$prof_dir"; perf_arg="/tmp/${OP_TYPE}_${server_type}_t${t}_c${c}_p${p}.perf.data"; }
+    log "  [$server_type] OP=$OP_TYPE t=$t c=$c pipeline=$p time=${TEST_TIME}s$([ "$prof" = "1" ] && echo " [profiled]")"
 
     local client_memtier
     if [ "$server_type" = "hpc" ]; then
@@ -393,6 +504,9 @@ run_one_config() {
     rm -f "$sar_log"
     nohup sar -n DEV 1 $((TEST_TIME + 5)) > "$sar_log" 2>&1 &
     local sar_pid=$!
+
+    # === server perf 起 (memtier 前启动, 绑全 TID) ===
+    [ "$prof" = "1" ] && profile_server_start "$prof_dir"
 
     # === jiffies before (ut/st split) ===
     local jb_ut jb_st
@@ -411,8 +525,15 @@ run_one_config() {
     ssh "$CLIENT" "bash /tmp/$BENCH_HELPER_NAME \
             $OP_TYPE $t $c $p $TEST_TIME \
             $SERVER_HOST $SERVER_PORT $DIM $prefix $kmin $kmax \
-            '$FIXED_VECTOR' $client_memtier $raw_remote $is_hpc_arg $KEY_PATTERN $zipf_arg" 2>&1
+            '$FIXED_VECTOR' $client_memtier $raw_remote $is_hpc_arg $KEY_PATTERN $zipf_arg \
+            $perf_arg $FREQ $EVENT" 2>&1
     ssh "$CLIENT" "cat $raw_remote" > "$raw_local" 2>/dev/null || true
+
+    # === server/client 火焰图 (workload 结束后生成) ===
+    if [ "$prof" = "1" ]; then
+        profile_server_finish "$prof_dir"
+        profile_client_finish "$prof_dir" "$perf_arg"
+    fi
 
     # === jiffies after (ut/st split) ===
     local ja_ut ja_st
@@ -480,6 +601,18 @@ ssh "$CLIENT" "test -x $CLIENT_BASELINE_MEMTIER && test -x $CLIENT_HPC_MEMTIER" 
     $CLIENT_BASELINE_MEMTIER
     $CLIENT_HPC_MEMTIER"; exit 1; }
 log "  ssh ok, memtier ok"
+
+# profiling preflight: 两端工具 + 火焰窗口必须落在测试窗口内
+if [ "$PROFILE" = "1" ]; then
+    command -v perf >/dev/null || { log "ERROR: PROFILE=1 needs perf on SERVER"; exit 1; }
+    [ -x "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" ] && [ -x "$FLAMEGRAPH_DIR/flamegraph.pl" ] \
+        || { log "ERROR: PROFILE=1 needs FlameGraph at $FLAMEGRAPH_DIR"; exit 1; }
+    ssh "$CLIENT" "command -v perf >/dev/null && test -x $CLIENT_FLAMEGRAPH_DIR/stackcollapse-perf.pl && test -x $CLIENT_FLAMEGRAPH_DIR/flamegraph.pl" 2>/dev/null \
+        || { log "ERROR: PROFILE=1 needs perf + FlameGraph on CLIENT ($CLIENT_FLAMEGRAPH_DIR)"; exit 1; }
+    [ "$SERVER_FLAME_DURATION" -lt "$TEST_TIME" ] \
+        || { log "ERROR: SERVER_FLAME_DURATION=$SERVER_FLAME_DURATION must be < TEST_TIME=$TEST_TIME"; exit 1; }
+    log "  profiling enabled: server_flame=${SERVER_FLAME_DURATION}s@${FREQ} event=$EVENT tiers=${PROFILE_TIERS:-all}"
+fi
 
 # 部署 bench helper (一次性, 不是每档都传)
 log "deploying bench helper to $CLIENT..."

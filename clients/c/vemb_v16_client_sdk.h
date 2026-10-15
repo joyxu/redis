@@ -502,6 +502,15 @@ void vemb_v16_client_get_owner_stats(
  * are rejected before topology or data I/O. A live session is exclusive with
  * the synchronous keyed APIs on its client because both own that client's
  * owner channels and core state.
+ *
+ * One client may host several handle sessions (bounded internally). They share
+ * the client's channels, topology and core state but keep independent request
+ * pools, L0 aggregators and completion callbacks. All sessions of a client
+ * must be driven from the same thread: a shared v2 channel is a single
+ * producer/consumer pair, and any session's poll() may route responses that
+ * another session published. close() drains the session's published batches;
+ * closing a session whose responses have not arrived yet risks failing the
+ * shared channel for the surviving sessions (they then requeue onto v1).
  */
 typedef struct vemb_v16_client_handle_session
     vemb_v16_client_handle_session_t;

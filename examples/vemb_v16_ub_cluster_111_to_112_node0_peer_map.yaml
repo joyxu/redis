@@ -18,8 +18,8 @@ remote_meta_views:
     provider: ub
     path: /dev/obmm_shmdev16
     mmap_offset: 268435456
-    entries: 65536
-    buckets: 131072
+    entries: 131072
+    buckets: 262144
 
 ub_rpc_peers:
   - owner_id: 1

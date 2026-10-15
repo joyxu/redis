@@ -329,13 +329,17 @@ step "RESULT: 见 $LOCAL_RESULT_DIR/summary.tsv"
 # ── P7: archive (压缩传输, 避免外网长连接裸流假死) ─────────────────────────
 if [ "$ARCHIVE_LOCAL" = "1" ]; then
     step "P7: archive artifacts (compressed)"
+    # memtier 退出后仍有 atexit 统计在写 .out, 立即 tar 会撞
+    # "file changed as we read it"(rc=1) 把好跑误标 FAILED: 先等落笔,
+    # 并容忍该类警告(传输内容完整)。
+    sleep 3
     for entry in "node0:$NODE0_SSH_HOST:$NODE0_SSH_PORT" "node1:$NODE1_SSH_HOST:$NODE1_SSH_PORT"; do
         name=${entry%%:*}
         rest=${entry#*:}
         host=${rest%%:*}
         port=${rest##*:}
         mkdir -p "$LOCAL_RESULT_DIR/$name"
-        ssh -p "$port" "${SSH_USER}@$host" "cd '$REMOTE_RESULT_DIR' && tar czf - ." | tar xzf - -C "$LOCAL_RESULT_DIR/$name"
+        ssh -p "$port" "${SSH_USER}@$host" "cd '$REMOTE_RESULT_DIR' && tar --warning=no-file-changed -czf - ." | tar xzf - -C "$LOCAL_RESULT_DIR/$name" || [ "$ARCHIVE_TAR_SOFT" = "1" ]
     done
 fi
 

@@ -181,10 +181,12 @@ struct vemb_v16_client_vector_session;
 
 typedef struct sdk_owner_v2 {
     vemb_v16_aeron_batch_channel_t *channel;
-    /* One L0 per routed owner. channel_count=1 is deliberate: the common
-     * core has already selected the owner before a key can enter this map. */
-    vemb_v16_cli_l0_t *l0;
-    uint64_t next_batch_id;
+    /* channel_count=1 is deliberate: the common core has already selected
+     * the owner before a key can enter this map. The L0 aggregator and batch
+     * id sequence live per handle session: a shared channel carries batches
+     * from every session, tagged by registry index. The synchronous pipeline
+     * is exclusive with sessions and keeps its own untagged sequence. */
+    uint64_t sync_next_batch_id;
     uint32_t effective_batch_size;
     uint32_t max_batch_bytes;
     /* A rejected ATTACH stays on v1 until topology changes or a channel
@@ -285,6 +287,13 @@ typedef struct sdk_bootstrap_seed {
     uint16_t port;
 } sdk_bootstrap_seed_t;
 
+/* A client driven by one thread may host several handle sessions: they share
+ * the client's channels and topology while keeping independent request pools,
+ * L0 aggregators and completion callbacks. The registry index doubles as the
+ * high bits of every v2 batch id the session publishes on a shared channel. */
+#define SDK_HANDLE_SESSIONS_MAX_PER_CLIENT 256u
+#define SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT 48
+
 struct vemb_v16_client {
     uint32_t dim;
     uint32_t req_id;
@@ -337,7 +346,9 @@ struct vemb_v16_client {
     vemb_v16_client_owner_region_stats_t
         owner_region_stats[VEMB_V16_CLIENT_OWNER_REGION_STATS_MAX];
     uint32_t owner_region_stats_count;
-    struct vemb_v16_client_handle_session *handle_session;
+    struct vemb_v16_client_handle_session
+        *handle_sessions[SDK_HANDLE_SESSIONS_MAX_PER_CLIENT];
+    uint32_t handle_session_count;
     struct vemb_v16_client_vector_session *vector_session;
 
     /* The manifest is client-local deployment state. It is intentionally
@@ -368,22 +379,6 @@ static void sdk_owner_stats_note_pending_peak(vemb_v16_client_t *client,
     vemb_v16_client_owner_stats_t *stats = sdk_owner_stats(client, owner_id);
     if (stats->pending_peak < pending)
         stats->pending_peak = pending;
-}
-
-static uint64_t sdk_owner_pending_current(const vemb_v16_client_t *client,
-                                          uint32_t owner_id) {
-    const sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    return v2->l0 ? vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
-}
-
-static uint32_t sdk_owner_active_groups_current(
-        const vemb_v16_client_t *client, uint32_t owner_id) {
-    const sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    if (!v2->l0)
-        return 0;
-    vemb_v16_cli_l0_stats_t stats;
-    vemb_v16_cli_l0_get_stats(v2->l0, &stats);
-    return stats.active_groups;
 }
 
 static vemb_v16_client_owner_region_stats_t *sdk_owner_region_stats(
@@ -1096,7 +1091,7 @@ static int fetch_topology_via_bootstrap_seeds(vemb_v16_client_t *client)
             /* L0/cache identity includes topology epoch even for TCP, where
              * the owner session deliberately remains V1_ONLY. */
             if (topology_changed || v2_quiesce) {
-                if (client->handle_session)
+                if (client->handle_session_count != 0)
                     sdk_handle_session_owner_quiesce(client, owner);
                 if (client->vector_session)
                     sdk_vector_session_owner_quiesce(client, owner);
@@ -1406,8 +1401,9 @@ int vemb_v16_client_set_ub_batch_request_size(
 
 void vemb_v16_client_destroy(vemb_v16_client_t *c)
 {
-    if (c->handle_session)
-        vemb_v16_client_handle_session_close(c->handle_session, NULL, NULL);
+    for (uint32_t s = 0; s < c->handle_session_count; s++)
+        vemb_v16_client_handle_session_close(c->handle_sessions[s], NULL,
+                                             NULL);
     if (c->vector_session)
         vemb_v16_client_vector_session_close(c->vector_session, NULL, NULL);
     /* Close data channels selected by topology. */
@@ -1421,6 +1417,8 @@ void vemb_v16_client_destroy(vemb_v16_client_t *c)
 /* v2 shares the owner resource-generation fence with v1. The synchronous
  * pipeline drains a frame inline; the event-loop session drains all published
  * frames before this close path is allowed to release either mapping. */
+static void sdk_handle_sessions_destroy_owner_l0(vemb_v16_client_t *client,
+                                                 uint32_t owner_id);
 static void sdk_owner_v2_stop(vemb_v16_client_t *client, uint32_t owner_id)
 {
     sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
@@ -1436,8 +1434,7 @@ static void sdk_owner_v2_stop(vemb_v16_client_t *client, uint32_t owner_id)
 
     if (v2->channel)
         vemb_v16_aeron_batch_close(v2->channel);
-    if (v2->l0)
-        vemb_v16_cli_l0_destroy(v2->l0);
+    sdk_handle_sessions_destroy_owner_l0(client, owner_id);
     *v2 = (sdk_owner_v2_t){0};
 }
 
@@ -1475,7 +1472,7 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
         session->v2_state == VEMB_V16_OWNER_SESSION_V2_DRAINING)
         return 0;
     if (session->v2_state == VEMB_V16_OWNER_SESSION_V2_READY) {
-        assert(v2->channel != NULL && v2->l0 != NULL);
+        assert(v2->channel != NULL);
         sdk_owner_stats(client, owner_id)->v2_enable_ready_fast_count++;
         return 1;
     }
@@ -1499,8 +1496,7 @@ static int sdk_owner_v2_enable(vemb_v16_client_t *client, uint32_t owner_id)
         vemb_v16_aeron_batch_get_resources(v2->channel, &resources);
         v2->effective_batch_size = resources.effective_batch_size;
         v2->max_batch_bytes = resources.max_batch_bytes;
-        v2->next_batch_id = 1;
-        v2->l0 = vemb_v16_cli_l0_create(1);
+        v2->sync_next_batch_id = 1;
         sdk_owner_stats(client, owner_id)->v2_enable_attach_count++;
     }
     vemb_v16_owner_session_v2_channel_ready(session);
@@ -1728,6 +1724,20 @@ typedef struct sdk_handle_session_request {
 
 struct vemb_v16_client_handle_session {
     vemb_v16_client_t *client;
+    /* Registry slot in client->handle_sessions[]; tags this session's batch
+     * ids on the shared per-owner channels. */
+    uint32_t client_session_index;
+    /* Per-owner L0 aggregator (lazy, created on first v2 submit once the
+     * owner channel reaches V2_READY). Session-owned so close/abort only
+     * touches this session's in-flight groups. */
+    vemb_v16_cli_l0_t
+        *l0[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+    uint64_t v2_next_batch_seq[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+    /* Completion callbacks are recorded at poll entry: a shared channel is
+     * drained by whichever session polls first, and cross-session responses
+     * must complete through their owner's callback pair. */
+    vemb_v16_client_handle_completion_cb poll_cb;
+    void *poll_priv;
     vemb_v16_cli_deadline_t
         deadlines[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     sdk_handle_session_request_t requests[SDK_HANDLE_SESSION_MAX_PENDING];
@@ -1747,6 +1757,41 @@ typedef struct sdk_handle_session_fanout {
     uint64_t response_poll_ns;
     uint32_t completed;
 } sdk_handle_session_fanout_t;
+
+static uint64_t sdk_owner_pending_current(const vemb_v16_client_t *client,
+                                          uint32_t owner_id) {
+    uint64_t pending = 0;
+    for (uint32_t s = 0; s < client->handle_session_count; s++)
+        if (client->handle_sessions[s]->l0[owner_id])
+            pending += vemb_v16_cli_l0_pending_item_count(
+                client->handle_sessions[s]->l0[owner_id], 0);
+    return pending;
+}
+
+static uint32_t sdk_owner_active_groups_current(
+        const vemb_v16_client_t *client, uint32_t owner_id) {
+    uint32_t active_groups = 0;
+    for (uint32_t s = 0; s < client->handle_session_count; s++) {
+        const vemb_v16_cli_l0_t *l0 =
+            client->handle_sessions[s]->l0[owner_id];
+        if (!l0)
+            continue;
+        vemb_v16_cli_l0_stats_t stats;
+        vemb_v16_cli_l0_get_stats(l0, &stats);
+        active_groups += stats.active_groups;
+    }
+    return active_groups;
+}
+
+static void sdk_handle_sessions_destroy_owner_l0(vemb_v16_client_t *client,
+                                                 uint32_t owner_id) {
+    for (uint32_t s = 0; s < client->handle_session_count; s++) {
+        if (client->handle_sessions[s]->l0[owner_id]) {
+            vemb_v16_cli_l0_destroy(client->handle_sessions[s]->l0[owner_id]);
+            client->handle_sessions[s]->l0[owner_id] = NULL;
+        }
+    }
+}
 
 static vemb_v16_resp_t sdk_handle_session_error_response(void)
 {
@@ -1946,14 +1991,24 @@ static void sdk_handle_session_requeue_fanout(void *priv,
     request->force_v1 = 1;
 }
 
+/* v1 responses arrive on the client's shared owner channel; the owning
+ * session is found by operation id across the registry. */
 static uint32_t sdk_handle_session_find_v1_request(
-    const vemb_v16_client_handle_session_t *session, uint64_t operation_id)
+    vemb_v16_client_t *client, uint64_t operation_id,
+    vemb_v16_client_handle_session_t **out_session)
 {
-    for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
-        const sdk_handle_session_request_t *request = &session->requests[i];
-        if (request->state == SDK_HANDLE_SESSION_REQUEST_V1 &&
-            request->operation.operation_id == operation_id)
-            return i;
+    for (uint32_t s = 0; s < client->handle_session_count; s++) {
+        vemb_v16_client_handle_session_t *session =
+            client->handle_sessions[s];
+        for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
+            const sdk_handle_session_request_t *request =
+                &session->requests[i];
+            if (request->state == SDK_HANDLE_SESSION_REQUEST_V1 &&
+                request->operation.operation_id == operation_id) {
+                *out_session = session;
+                return i;
+            }
+        }
     }
     return SDK_HANDLE_SESSION_NO_ENTRY;
 }
@@ -1972,22 +2027,28 @@ static uint32_t sdk_handle_session_find_l0_leader(
     return SDK_HANDLE_SESSION_NO_ENTRY;
 }
 
-static uint64_t sdk_handle_session_next_batch_id(sdk_owner_v2_t *v2)
+/* Batch ids ride a shared channel: the registry index in the high bits lets
+ * any session's poll route a response back to the publishing session's L0.
+ * The low bits stay a per-session per-owner monotonic sequence. */
+static uint64_t sdk_handle_session_next_batch_id(
+    vemb_v16_client_handle_session_t *session, uint32_t owner_id)
 {
-    uint64_t batch_id = v2->next_batch_id++;
-    if (batch_id == 0)
-        batch_id = v2->next_batch_id++;
-    return batch_id;
+    uint64_t seq = (session->v2_next_batch_seq[owner_id] + 1u) &
+        ((UINT64_C(1) << SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT) - 1u);
+    if (seq == 0)
+        seq = 1;
+    session->v2_next_batch_seq[owner_id] = seq;
+    return ((uint64_t)session->client_session_index <<
+            SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT) | seq;
 }
 
 static void sdk_handle_session_deadline_after_progress(
     vemb_v16_client_handle_session_t *session, uint32_t owner_id)
 {
-    sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
     vemb_v16_cli_deadline_t *deadline = &session->deadlines[owner_id];
     uint64_t old_deadline_ns = deadline->deadline_ns;
-    uint32_t pending = v2->l0 ?
-        vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
+    uint32_t pending = session->l0[owner_id] ?
+        vemb_v16_cli_l0_pending_item_count(session->l0[owner_id], 0) : 0;
     vemb_v16_cli_deadline_after_progress(
         deadline, pending, deadline->delay_ns ? vemb_v16_monotonic_ns() : 0);
     if (old_deadline_ns == 0 && deadline->deadline_ns != 0)
@@ -2047,22 +2108,22 @@ static int sdk_handle_session_submit_l0_group_v1(
     vemb_v16_client_handle_session_t *session, uint32_t owner_id,
     uint32_t entry_id, vemb_v16_client_handle_completion_cb cb, void *priv)
 {
-    sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
+    vemb_v16_cli_l0_t *l0 = session->l0[owner_id];
     const char *key;
     uint16_t key_len;
     uint32_t generation;
     uint8_t state;
-    assert(v2->l0 != NULL);
-    assert(vemb_v16_cli_l0_get_group(v2->l0, entry_id, &key, &key_len,
+    assert(l0 != NULL);
+    assert(vemb_v16_cli_l0_get_group(l0, entry_id, &key, &key_len,
                                       &generation, &state) == 0);
     assert(state == VEMB_V16_CLI_L0_GROUP_PENDING_SEND);
     uint32_t leader = sdk_handle_session_find_l0_leader(session, owner_id,
                                                          entry_id);
     assert(leader != SDK_HANDLE_SESSION_NO_ENTRY);
     vemb_v16_owner_session_identity_t identity;
-    vemb_v16_cli_l0_get_group_identity(v2->l0, entry_id, &identity);
+    vemb_v16_cli_l0_get_group_identity(l0, entry_id, &identity);
     assert(identity.owner_id == owner_id);
-    assert(vemb_v16_cli_l0_mark_fallback_v1(v2->l0, entry_id) == 0);
+    assert(vemb_v16_cli_l0_mark_fallback_v1(l0, entry_id) == 0);
     sdk_owner_stats(session->client, owner_id)->fallback_v1++;
 
     vemb_v16_cluster_route_t route = {
@@ -2086,7 +2147,7 @@ static int sdk_handle_session_submit_l0_group_v1(
         .cb = cb,
         .priv = priv,
     };
-    (void)vemb_v16_cli_l0_finish(v2->l0, &completion,
+    (void)vemb_v16_cli_l0_finish(l0, &completion,
                                   sdk_handle_session_finish_fanout, &fanout);
     return -1;
 }
@@ -2102,7 +2163,8 @@ static int sdk_handle_session_flush_owner(
     vemb_v16_owner_session_t *owner_session =
         &session->client->owner_sessions[owner_id];
     sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
-    if (!v2->l0 || !v2->channel ||
+    vemb_v16_cli_l0_t *l0 = session->l0[owner_id];
+    if (!l0 || !v2->channel ||
         owner_session->v2_state != VEMB_V16_OWNER_SESSION_V2_READY)
         return 0;
     vemb_v16_client_owner_stats_t *stats =
@@ -2115,7 +2177,7 @@ static int sdk_handle_session_flush_owner(
         uint64_t prepare_start_ns = sample_flush ?
             vemb_v16_monotonic_ns() : 0;
         int prepared = vemb_v16_cli_l0_prepare_batch(
-            v2->l0, 0, v2->effective_batch_size, v2->max_batch_bytes,
+            l0, 0, v2->effective_batch_size, v2->max_batch_bytes,
             &draft);
         uint64_t prepare_ns = sample_flush ?
             vemb_v16_monotonic_ns() - prepare_start_ns : 0;
@@ -2147,7 +2209,7 @@ static int sdk_handle_session_flush_owner(
         }
 
         session->v2_batches_outstanding[owner_id]++; /* publish 前先计入, 失败再回退 */
-        uint64_t batch_id = sdk_handle_session_next_batch_id(v2);
+        uint64_t batch_id = sdk_handle_session_next_batch_id(session, owner_id);
         uint64_t publish_start_ns = sample_flush ?
             vemb_v16_monotonic_ns() : 0;
         int publish_rc = vemb_v16_aeron_batch_publish_handle_at_epoch(
@@ -2183,7 +2245,9 @@ static int sdk_handle_session_flush_owner(
 
         uint64_t publish_ns = vemb_v16_monotonic_ns();
 #if VEMB_V16_SDK_TRACE
-        if (batch_id <= 8 || batch_id % 1024 == 0) {
+        uint64_t batch_seq = batch_id &
+            ((UINT64_C(1) << SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT) - 1u);
+        if (batch_seq <= 8 || batch_seq % 1024 == 0) {
             fprintf(stderr,
                     "[sdk] handle v2 batch submitted owner=%u batch=%llu "
                     "items=%u epoch=%llu channel=%llu\n",
@@ -2194,9 +2258,8 @@ static int sdk_handle_session_flush_owner(
                         v2->channel));
         }
 #endif
-        assert(vemb_v16_cli_l0_publish_batch(v2->l0, &draft, batch_id) == 0);
-        vemb_v16_cli_l0_set_batch_publish_ns(
-            v2->l0, 0, batch_id, publish_ns);
+        assert(vemb_v16_cli_l0_publish_batch(l0, &draft, batch_id) == 0);
+        vemb_v16_cli_l0_set_batch_publish_ns(l0, 0, batch_id, publish_ns);
         if (sample_flush)
             stats->v2_prepare_to_publish_ns_sum +=
                 (publish_ns - prepare_start_ns);
@@ -2510,12 +2573,14 @@ static uint32_t sdk_handle_session_route_requests(
         }
         request->owner_path_end_ns = vemb_v16_monotonic_ns();
 
-        sdk_owner_v2_t *v2 = &session->client->owner_v2[route.owner_id];
+        if (!session->l0[route.owner_id])
+            session->l0[route.owner_id] = vemb_v16_cli_l0_create(1);
+        vemb_v16_cli_l0_t *l0 = session->l0[route.owner_id];
         uint32_t entry_id;
         uint32_t channel_index;
         request->l0_submit_start_ns = vemb_v16_monotonic_ns();
         int submit = vemb_v16_cli_l0_submit_with_identity(
-            v2->l0, request->key, request->key_len, request->operation.key_hash,
+            l0, request->key, request->key_len, request->operation.key_hash,
             i, &identity, &entry_id, &channel_index);
         request->l0_submit_end_ns = vemb_v16_monotonic_ns();
         if (submit == VEMB_V16_CLI_L0_NEW_LEADER ||
@@ -2525,7 +2590,7 @@ static uint32_t sdk_handle_session_route_requests(
             uint32_t generation;
             uint8_t ignored_state;
             assert(channel_index == 0);
-            assert(vemb_v16_cli_l0_get_group(v2->l0, entry_id, &ignored_key,
+            assert(vemb_v16_cli_l0_get_group(l0, entry_id, &ignored_key,
                                               &ignored_key_len, &generation,
                                               &ignored_state) == 0);
             request->state = SDK_HANDLE_SESSION_REQUEST_L0;
@@ -2535,7 +2600,7 @@ static uint32_t sdk_handle_session_route_requests(
             request->l0_enqueue_ns = vemb_v16_monotonic_ns();
             sdk_owner_stats_note_pending_peak(
                 session->client, route.owner_id,
-                vemb_v16_cli_l0_pending_item_count(v2->l0, 0));
+                vemb_v16_cli_l0_pending_item_count(l0, 0));
             if (request->l0_leader)
                 sdk_handle_session_deadline_new_leader(
                     session->client, &session->deadlines[route.owner_id],
@@ -2555,11 +2620,14 @@ static uint32_t sdk_handle_session_route_requests(
     return callbacks;
 }
 
-static void sdk_handle_session_v2_failed(
-    vemb_v16_client_handle_session_t *session, uint32_t owner_id,
-    vemb_v16_client_handle_completion_cb cb, void *priv)
+/* A shared v2 channel is client-scoped: any integrity failure aborts every
+ * session's L0 on that owner (through each owner's stored callback) and
+ * tears the channel down; requests requeue onto v1 after a topology
+ * refresh. */
+static void sdk_handle_session_v2_failed(vemb_v16_client_t *client,
+                                          uint32_t owner_id)
 {
-    sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
+    sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
     fprintf(stderr,
             "[sdk] owner v2 handle path failed owner=%u channel=%llu; "
             "abort batch and request topology refresh\n",
@@ -2571,30 +2639,41 @@ static void sdk_handle_session_v2_failed(
         .status = VEMB_V16_STATUS_STALE_TOPOLOGY,
         .op = VEMB_V16_OP_VEMB_HANDLE,
     };
-    sdk_handle_session_fanout_t fanout = {
-        .session = session,
-        .response = &stale,
-        .cb = cb,
-        .priv = priv,
-    };
-    if (v2->l0)
-        vemb_v16_cli_l0_abort_all(v2->l0,
-                                   sdk_handle_session_finish_fanout, &fanout);
+    for (uint32_t s = 0; s < client->handle_session_count; s++) {
+        vemb_v16_client_handle_session_t *session =
+            client->handle_sessions[s];
+        if (!session->l0[owner_id])
+            continue;
+        sdk_handle_session_fanout_t fanout = {
+            .session = session,
+            .response = &stale,
+            .cb = session->poll_cb,
+            .priv = session->poll_priv,
+        };
+        vemb_v16_cli_l0_abort_all(session->l0[owner_id],
+                                   sdk_handle_session_finish_fanout,
+                                   &fanout);
+        vemb_v16_cli_l0_destroy(session->l0[owner_id]);
+        session->l0[owner_id] = NULL;
+        session->topology_refresh_pending = 1;
+    }
     vemb_v16_owner_session_abort_v2_batches(
-        &session->client->owner_sessions[owner_id]);
+        &client->owner_sessions[owner_id]);
     if (v2->channel)
         vemb_v16_aeron_batch_close(v2->channel);
-    vemb_v16_cli_l0_destroy(v2->l0);
     *v2 = (sdk_owner_v2_t){0};
-    session->topology_refresh_pending = 1;
 }
 
+/* The channel is shared by every handle session of the client. Any session
+ * with outstanding batches drains the whole response ring and routes each
+ * response to the publishing session through the batch id tag; sessions
+ * with nothing outstanding skip the NC read. */
 static uint32_t sdk_handle_session_poll_v2(
-    vemb_v16_client_handle_session_t *session, uint32_t owner_id,
-    vemb_v16_client_handle_completion_cb cb, void *priv)
+    vemb_v16_client_handle_session_t *session, uint32_t owner_id)
 {
-    sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
-    if (!v2->channel || !v2->l0)
+    vemb_v16_client_t *client = session->client;
+    sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
+    if (!v2->channel)
         return 0;
     /* 无在途 batch: response ring 不可能有新数据, 跳过 NC 读 */
     if (session->v2_batches_outstanding[owner_id] == 0)
@@ -2610,16 +2689,34 @@ static uint32_t sdk_handle_session_poll_v2(
         if (count == 0)
             return callbacks;
         if (count < 0) {
-            sdk_handle_session_v2_failed(session, owner_id, cb, priv);
+            sdk_handle_session_v2_failed(client, owner_id);
+            return callbacks;
+        }
+        uint32_t batch_session_index = (uint32_t)(
+            batch_id >> SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT);
+        vemb_v16_client_handle_session_t *batch_session =
+            batch_session_index < client->handle_session_count ?
+                client->handle_sessions[batch_session_index] : NULL;
+        vemb_v16_cli_l0_t *l0 =
+            batch_session ? batch_session->l0[owner_id] : NULL;
+        if (!l0) {
+            fprintf(stderr,
+                    "[sdk] handle v2 batch unknown session owner=%u "
+                    "batch=%llu index=%u response_count=%d\n",
+                    owner_id, (unsigned long long)batch_id,
+                    batch_session_index, count);
+            sdk_handle_session_v2_failed(client, owner_id);
             return callbacks;
         }
         uint64_t response_poll_ns = vemb_v16_monotonic_ns();
+        uint64_t batch_seq = batch_id &
+            ((UINT64_C(1) << SDK_HANDLE_SESSION_BATCH_ID_TAG_SHIFT) - 1u);
         uint64_t publish_ns = vemb_v16_cli_l0_get_batch_publish_ns(
-            v2->l0, 0, batch_id);
+            l0, 0, batch_id);
         if (publish_ns != 0 &&
-            (batch_id & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0) {
+            (batch_seq & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0) {
             vemb_v16_client_owner_stats_t *stats =
-                sdk_owner_stats(session->client, owner_id);
+                sdk_owner_stats(client, owner_id);
             uint64_t publish_to_response_poll_ns = response_poll_ns -
                 publish_ns;
             stats->v2_batch_timing_sample_count++;
@@ -2628,15 +2725,15 @@ static uint32_t sdk_handle_session_poll_v2(
             stats->v2_response_wait_ns_sum += publish_to_response_poll_ns;
         }
 
-        /* 消费了一个 batch response, 在途计数递减 */
-        if (session->v2_batches_outstanding[owner_id] > 0)
-            session->v2_batches_outstanding[owner_id]--;
+        /* 消费了一个 batch response, 发布 session 的在途计数递减 */
+        if (batch_session->v2_batches_outstanding[owner_id] > 0)
+            batch_session->v2_batches_outstanding[owner_id]--;
 
         vemb_v16_owner_session_identity_t identity;
         uint32_t expected_count = vemb_v16_cli_l0_batch_item_count(
-            v2->l0, 0, batch_id);
+            l0, 0, batch_id);
         if (expected_count == 0 || count != (int)expected_count ||
-            vemb_v16_cli_l0_get_batch_identity(v2->l0, 0, batch_id,
+            vemb_v16_cli_l0_get_batch_identity(l0, 0, batch_id,
                                                 &identity) != 0) {
             fprintf(stderr,
                     "[sdk] handle v2 batch identity failure owner=%u "
@@ -2644,13 +2741,13 @@ static uint32_t sdk_handle_session_poll_v2(
                     "response_epoch=%llu\n",
                     owner_id, (unsigned long long)batch_id, count,
                     expected_count, (unsigned long long)response_epoch);
-            sdk_handle_session_v2_failed(session, owner_id, cb, priv);
+            sdk_handle_session_v2_failed(client, owner_id);
             return callbacks;
         }
 
         int stale_epoch = response_epoch != identity.topology_epoch;
 #if VEMB_V16_SDK_TRACE
-        if (stale_epoch || batch_id <= 8 || batch_id % 1024 == 0) {
+        if (stale_epoch || batch_seq <= 8 || batch_seq % 1024 == 0) {
             fprintf(stderr,
                     "[sdk] handle v2 batch response owner=%u batch=%llu "
                     "items=%d expected=%u submit_epoch=%llu "
@@ -2662,14 +2759,14 @@ static uint32_t sdk_handle_session_poll_v2(
         }
 #endif
         vemb_v16_owner_session_t *owner_session =
-            &session->client->owner_sessions[owner_id];
+            &client->owner_sessions[owner_id];
         if (stale_epoch)
             (void)vemb_v16_owner_session_begin_quiesce(owner_session);
         for (uint32_t item = 0; item < expected_count; item++) {
             vemb_v16_cli_l0_completion_t completion;
-            if (vemb_v16_cli_l0_resolve_response(v2->l0, 0, batch_id, item,
+            if (vemb_v16_cli_l0_resolve_response(l0, 0, batch_id, item,
                                                   &completion) != 1) {
-                sdk_handle_session_v2_failed(session, owner_id, cb, priv);
+                sdk_handle_session_v2_failed(client, owner_id);
                 return callbacks;
             }
             vemb_v16_resp_t response = responses[item];
@@ -2679,13 +2776,13 @@ static uint32_t sdk_handle_session_poll_v2(
                 response.status == VEMB_V16_STATUS_MOVED)
                 (void)vemb_v16_owner_session_begin_quiesce(owner_session);
             sdk_handle_session_fanout_t fanout = {
-                .session = session,
+                .session = batch_session,
                 .response = &response,
-                .cb = cb,
-                .priv = priv,
+                .cb = batch_session->poll_cb,
+                .priv = batch_session->poll_priv,
                 .response_poll_ns = response_poll_ns,
             };
-            if (vemb_v16_cli_l0_finish(v2->l0, &completion,
+            if (vemb_v16_cli_l0_finish(l0, &completion,
                                         sdk_handle_session_finish_fanout,
                                         &fanout) == 0)
                 callbacks += fanout.completed;
@@ -2697,10 +2794,10 @@ static uint32_t sdk_handle_session_poll_v2(
 }
 
 static uint32_t sdk_handle_session_poll_v1(
-    vemb_v16_client_handle_session_t *session, uint32_t owner_id,
-    vemb_v16_client_handle_completion_cb cb, void *priv)
+    vemb_v16_client_handle_session_t *session, uint32_t owner_id)
 {
-    sdk_backend_t *backend = &session->client->owner_channels[owner_id];
+    vemb_v16_client_t *client = session->client;
+    sdk_backend_t *backend = &client->owner_channels[owner_id];
     if (backend->ops != &sdk_ub_data_transport_ops || !sdk_backend_ready(backend))
         return 0;
     if (sdk_ub_state(backend)->pending_count == 0)
@@ -2713,32 +2810,34 @@ static uint32_t sdk_handle_session_poll_v1(
             sdk_backend_poll(backend, 0, &completion);
         if (poll_result != VEMB_V16_TRANSPORT_POLL_COMPLETION)
             return callbacks;
+        vemb_v16_client_handle_session_t *v1_session = NULL;
         uint32_t request_id = sdk_handle_session_find_v1_request(
-            session, completion.operation_id);
+            client, completion.operation_id, &v1_session);
         if (request_id == SDK_HANDLE_SESSION_NO_ENTRY)
             continue;
-        sdk_handle_session_request_t *request = &session->requests[request_id];
+        sdk_handle_session_request_t *request = &v1_session->requests[request_id];
         if (request->l0_entry_id == SDK_HANDLE_SESSION_NO_ENTRY) {
             request->response_poll_ns = vemb_v16_monotonic_ns();
             callbacks += sdk_handle_session_apply_response(
-                session, request_id, &completion.response, cb, priv);
+                v1_session, request_id, &completion.response,
+                v1_session->poll_cb, v1_session->poll_priv);
             continue;
         }
 
-        sdk_owner_v2_t *v2 = &session->client->owner_v2[owner_id];
+        vemb_v16_cli_l0_t *l0 = v1_session->l0[owner_id];
         vemb_v16_cli_l0_completion_t l0_completion = {
             .entry_id = request->l0_entry_id,
             .generation = request->l0_generation,
         };
         sdk_handle_session_fanout_t fanout = {
-            .session = session,
+            .session = v1_session,
             .response = &completion.response,
-            .cb = cb,
-            .priv = priv,
+            .cb = v1_session->poll_cb,
+            .priv = v1_session->poll_priv,
             .response_poll_ns = vemb_v16_monotonic_ns(),
         };
-        if (v2->l0 && vemb_v16_cli_l0_finish(
-                v2->l0, &l0_completion, sdk_handle_session_finish_fanout,
+        if (l0 && vemb_v16_cli_l0_finish(
+                l0, &l0_completion, sdk_handle_session_finish_fanout,
                 &fanout) == 0)
             callbacks += fanout.completed;
     }
@@ -2747,13 +2846,15 @@ static uint32_t sdk_handle_session_poll_v1(
 static void sdk_handle_session_owner_quiesce(
     vemb_v16_client_t *client, uint32_t owner_id)
 {
-    vemb_v16_client_handle_session_t *session = client->handle_session;
-    sdk_owner_v2_t *v2 = &client->owner_v2[owner_id];
-    if (v2->l0)
-        vemb_v16_cli_l0_drain_pending(v2->l0,
-                                      sdk_handle_session_requeue_fanout,
-                                      session);
-    vemb_v16_cli_deadline_clear(&session->deadlines[owner_id]);
+    for (uint32_t s = 0; s < client->handle_session_count; s++) {
+        vemb_v16_client_handle_session_t *session =
+            client->handle_sessions[s];
+        if (session->l0[owner_id])
+            vemb_v16_cli_l0_drain_pending(session->l0[owner_id],
+                                          sdk_handle_session_requeue_fanout,
+                                          session);
+        vemb_v16_cli_deadline_clear(&session->deadlines[owner_id]);
+    }
     vemb_v16_owner_session_t *owner_session =
         &client->owner_sessions[owner_id];
     if (owner_session->v2_state == VEMB_V16_OWNER_SESSION_V2_QUIESCING)
@@ -2765,7 +2866,9 @@ vemb_v16_client_handle_session_t *vemb_v16_client_handle_session_create(
     const vemb_v16_client_handle_session_options_t *options)
 {
     RETURN_IF(client->vector_read_op != VEMB_V16_OP_VEMB_HANDLE ||
-              client->handle_session || client->vector_session, NULL);
+              client->handle_session_count >=
+                  SDK_HANDLE_SESSIONS_MAX_PER_CLIENT ||
+              client->vector_session, NULL);
     vemb_v16_client_handle_session_t *session = calloc(1, sizeof(*session));
     assert(session != NULL);
     uint64_t delay_ns = options ?
@@ -2773,12 +2876,13 @@ vemb_v16_client_handle_session_t *vemb_v16_client_handle_session_create(
     if (delay_ns)
         monotonicInit();
     session->client = client;
+    session->client_session_index = client->handle_session_count;
     for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++)
         session->requests[i].l0_entry_id = SDK_HANDLE_SESSION_NO_ENTRY;
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++)
         vemb_v16_cli_deadline_init(&session->deadlines[owner], delay_ns);
-    client->handle_session = session;
+    client->handle_sessions[client->handle_session_count++] = session;
     return session;
 }
 
@@ -2890,6 +2994,8 @@ int vemb_v16_client_handle_session_poll_at(
     uint64_t drive_sessions_start_ns)
 {
     RETURN_IF(session->closing, -1);
+    session->poll_cb = cb;
+    session->poll_priv = priv;
     uint64_t slot_poll_start_ns = vemb_v16_monotonic_ns();
     uint32_t callbacks = 0;
     callbacks += sdk_handle_session_route_requests(
@@ -2911,15 +3017,15 @@ int vemb_v16_client_handle_session_poll_at(
         uint64_t v1_start_ns = 0;
         uint64_t v1_ns = 0;
         uint32_t owner_callbacks_before = callbacks;
-        uint32_t pending_items = v2->l0 ?
-            vemb_v16_cli_l0_pending_item_count(v2->l0, 0) : 0;
-        uint32_t pending_bytes = v2->l0 ?
-            vemb_v16_cli_l0_pending_frame_bytes(v2->l0, 0) : 0;
+        uint32_t pending_items = session->l0[owner] ?
+            vemb_v16_cli_l0_pending_item_count(session->l0[owner], 0) : 0;
+        uint32_t pending_bytes = session->l0[owner] ?
+            vemb_v16_cli_l0_pending_frame_bytes(session->l0[owner], 0) : 0;
         int sample_deadline = (poll_index & VEMB_V16_SDK_COPY_SAMPLE_MASK) == 0;
         uint64_t deadline_poll_enter_ns = sample_deadline ? poll_start_ns : 0;
         uint64_t deadline_check_start_ns = sample_deadline ?
             vemb_v16_monotonic_ns() : 0;
-        int deadline_due = v2->l0 && vemb_v16_cli_deadline_flush_due(
+        int deadline_due = session->l0[owner] && vemb_v16_cli_deadline_flush_due(
             &session->deadlines[owner], pending_items,
                 session->deadlines[owner].delay_ns ?
                     vemb_v16_monotonic_ns() : 0);
@@ -2970,12 +3076,12 @@ int vemb_v16_client_handle_session_poll_at(
         }
         if (sample_poll)
             v2_start_ns = vemb_v16_monotonic_ns();
-        callbacks += sdk_handle_session_poll_v2(session, owner, cb, priv);
+        callbacks += sdk_handle_session_poll_v2(session, owner);
         if (sample_poll)
             v2_ns = vemb_v16_monotonic_ns() - v2_start_ns;
         if (sample_poll)
             v1_start_ns = vemb_v16_monotonic_ns();
-        callbacks += sdk_handle_session_poll_v1(session, owner, cb, priv);
+        callbacks += sdk_handle_session_poll_v1(session, owner);
         if (sample_poll)
             v1_ns = vemb_v16_monotonic_ns() - v1_start_ns;
         uint32_t owner_callbacks = callbacks - owner_callbacks_before;
@@ -3024,11 +3130,15 @@ void vemb_v16_client_handle_session_close(
 {
     RETURN_IF(session->closing);
     session->closing = 1;
+    /* Drain callbacks for this session complete through the explicit pair;
+     * other sessions keep their recorded poll pair. */
+    session->poll_cb = cb;
+    session->poll_priv = priv;
+    vemb_v16_client_t *client = session->client;
     vemb_v16_resp_t error = sdk_handle_session_error_response();
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
-        sdk_owner_v2_t *v2 = &session->client->owner_v2[owner];
-        if (!v2->l0)
+        if (!session->l0[owner])
             continue;
         sdk_handle_session_fanout_t fanout = {
             .session = session,
@@ -3036,16 +3146,42 @@ void vemb_v16_client_handle_session_close(
             .cb = cb,
             .priv = priv,
         };
-        vemb_v16_cli_l0_abort_all(v2->l0,
+        vemb_v16_cli_l0_abort_all(session->l0[owner],
                                    sdk_handle_session_finish_fanout, &fanout);
+        /* Published batches still own responses on the shared channel. Drain
+         * them before the registry drops this session's tag, or a late
+         * response would decode to the wrong session and tear the channel
+         * down for everyone. */
+        while (session->v2_batches_outstanding[owner] > 0 &&
+               sdk_handle_session_poll_v2(session, owner) > 0)
+            ;
+        if (session->v2_batches_outstanding[owner] != 0)
+            fprintf(stderr,
+                    "[sdk] handle session close with %u undrained v2 "
+                    "batches owner=%u; late responses will fail the shared "
+                    "channel and requeue onto v1\n",
+                    session->v2_batches_outstanding[owner], owner);
         vemb_v16_owner_session_abort_v2_batches(
-            &session->client->owner_sessions[owner]);
+            &client->owner_sessions[owner]);
     }
     for (uint32_t i = 0; i < SDK_HANDLE_SESSION_MAX_PENDING; i++) {
         if (session->requests[i].state != SDK_HANDLE_SESSION_REQUEST_FREE)
             (void)sdk_handle_session_finish(session, i, &error, cb, priv);
     }
-    session->client->handle_session = NULL;
+    uint32_t index = session->client_session_index;
+    assert(index < client->handle_session_count &&
+           client->handle_sessions[index] == session);
+    client->handle_sessions[index] =
+        client->handle_sessions[--client->handle_session_count];
+    if (index < client->handle_session_count)
+        client->handle_sessions[index]->client_session_index = index;
+    for (uint32_t owner = 0;
+         owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
+        if (session->l0[owner]) {
+            vemb_v16_cli_l0_destroy(session->l0[owner]);
+            session->l0[owner] = NULL;
+        }
+    }
     free(session);
 }
 
@@ -3618,7 +3754,7 @@ vemb_v16_client_vector_session_create_with_options(
     vemb_v16_client_t *client,
     const vemb_v16_client_vector_session_options_t *options)
 {
-    RETURN_IF(client->handle_session || client->vector_session, NULL);
+    RETURN_IF(client->handle_session_count != 0 || client->vector_session, NULL);
     vemb_v16_client_vector_session_t *session = calloc(1, sizeof(*session));
     assert(session != NULL);
     session->client = client;
@@ -3785,7 +3921,7 @@ static int client_execute_with_redirect(
         uint8_t *out_inline, uint32_t out_inline_cap,
         uint32_t *out_inline_bytes)
 {
-    RETURN_IF(client->handle_session || client->vector_session, -1);
+    RETURN_IF(client->handle_session_count != 0 || client->vector_session, -1);
     memset(out_resp, 0, sizeof(*out_resp));
     if (out_inline_bytes) *out_inline_bytes = 0;
 
@@ -4057,9 +4193,9 @@ static int sdk_owner_v2_execute_handle_batch(
         batch_key_lens[i] = (uint16_t)key_lens[entry];
     }
 
-    uint64_t batch_id = v2->next_batch_id++;
+    uint64_t batch_id = v2->sync_next_batch_id++;
     if (batch_id == 0)
-        batch_id = v2->next_batch_id++;
+        batch_id = v2->sync_next_batch_id++;
     int publish_rc = vemb_v16_aeron_batch_publish_handle_at_epoch(
         v2->channel, batch_id, submit_epoch, batch_keys, batch_key_lens,
         group_count);
@@ -4781,7 +4917,7 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
                                   uint32_t count,
                                   uint32_t max_inflight)
 {
-    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    RETURN_IF(c->handle_session_count != 0 || c->vector_session || count == 0, -1);
     assert(set_names != NULL && elem_names != NULL && vectors != NULL);
 
     /* Build combined keys + flat arrays for the engine. */
@@ -4826,7 +4962,8 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   uint32_t max_inflight)
 {
     RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_INLINE ||
-              c->handle_session || c->vector_session || count == 0, -1);
+              c->handle_session_count != 0 || c->vector_session ||
+              count == 0, -1);
     assert(set_names != NULL && elem_names != NULL && out_resps != NULL);
 
     /* Build combined keys + flat arrays for the engine. */
@@ -4901,7 +5038,8 @@ int vemb_v16_client_vemb_handle_pipeline(vemb_v16_client_t *c,
                                          uint32_t max_inflight)
 {
     RETURN_IF(c->vector_read_op != VEMB_V16_OP_VEMB_HANDLE ||
-              c->handle_session || c->vector_session || count == 0, -1);
+              c->handle_session_count != 0 || c->vector_session ||
+              count == 0, -1);
     assert(set_names != NULL && elem_names != NULL && out_resps != NULL);
 
     char combined_keys[count][VEMB_V16_MAX_KEY_LEN];
@@ -5124,7 +5262,7 @@ int vemb_v16_client_set_ha_endpoint(vemb_v16_client_t *client,
 
 int vemb_v16_client_reconnect(vemb_v16_client_t *client)
 {
-    if (client->handle_session || client->vector_session)
+    if (client->handle_session_count != 0 || client->vector_session)
         return -1;
 
     /* A failed UB poll already closes the broken owner channel. Explicit
@@ -5197,14 +5335,20 @@ void vemb_v16_client_get_fanout_stats(const vemb_v16_client_t *client,
     *out = (vemb_v16_fanout_stats_t){0};
     for (uint32_t owner = 0;
          owner < VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS; owner++) {
-        const vemb_v16_cli_l0_t *l0 = NULL;
-        if (client->handle_session)
-            l0 = client->owner_v2[owner].l0;
-        else if (client->vector_session)
-            l0 = client->vector_session->l0[owner];
-        if (l0) {
+        for (uint32_t s = 0; s < client->handle_session_count; s++) {
+            const vemb_v16_cli_l0_t *l0 =
+                client->handle_sessions[s]->l0[owner];
+            if (!l0)
+                continue;
             vemb_v16_cli_l0_stats_t stats;
             vemb_v16_cli_l0_get_stats(l0, &stats);
+            out->leaders += stats.new_leader_groups;
+            out->followers += stats.coalesced_followers;
+        }
+        if (client->vector_session && client->vector_session->l0[owner]) {
+            vemb_v16_cli_l0_stats_t stats;
+            vemb_v16_cli_l0_get_stats(client->vector_session->l0[owner],
+                                      &stats);
             out->leaders += stats.new_leader_groups;
             out->followers += stats.coalesced_followers;
         }
@@ -5271,7 +5415,7 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
                                   float *out_scores,
                                   uint32_t max_inflight)
 {
-    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    RETURN_IF(c->handle_session_count != 0 || c->vector_session || count == 0, -1);
     assert(set_names != NULL && elem_names != NULL && query_vector != NULL &&
            out_scores != NULL);
 
@@ -5325,7 +5469,7 @@ int vemb_v16_client_vsim_key_key_pipeline(vemb_v16_client_t *c,
                                           float *out_scores,
                                           uint32_t max_inflight)
 {
-    RETURN_IF(c->handle_session || c->vector_session || count == 0, -1);
+    RETURN_IF(c->handle_session_count != 0 || c->vector_session || count == 0, -1);
     assert(set_names != NULL && elem1_names != NULL && elem2_names != NULL &&
            out_scores != NULL);
 

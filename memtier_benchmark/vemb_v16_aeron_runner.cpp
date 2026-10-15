@@ -122,6 +122,9 @@ struct common_core_worker {
     std::atomic<bool> *stop;
     std::vector<common_core_slot> slots;
     size_t next_slot;
+    /* Handle-session mode shares one client (channels/topology/cluster
+     * state) across the worker's slots; sessions stay per slot. */
+    vemb_v16_client_t *shared_client;
 };
 
 static uint64_t common_core_completion_sample_start(
@@ -398,20 +401,20 @@ static void common_core_close_slot(common_core_slot *slot)
             slot->vector_session, common_core_vector_completion, slot);
         slot->vector_session = NULL;
     }
-    if (slot->client) {
+    if (slot->client && slot->client != slot->worker->shared_client) {
         vemb_v16_client_destroy(slot->client);
-        slot->client = NULL;
     }
+    slot->client = NULL;
 }
 
-static int common_core_prepare_slot(common_core_slot *slot)
+static vemb_v16_client_t *common_core_prepare_client(
+    common_core_worker *worker)
 {
-    common_core_worker *worker = slot->worker;
-    slot->client = vemb_v16_client_create(
+    vemb_v16_client_t *client = vemb_v16_client_create(
         worker->seeds->data(), (int)worker->seeds->size(),
         worker->cfg->vemb_v16_dim, 10000, VEMB_V16_TRANSPORT_AERON);
-    if (!slot->client)
-        return -1;
+    if (!client)
+        return NULL;
 
     /* Every Aeron deployment uses the client-side peer-view resolver. A
      * same-host manifest has identical provider/client paths; it is not a
@@ -421,24 +424,43 @@ static int common_core_prepare_slot(common_core_slot *slot)
         !worker->cfg->vemb_v16_ub_peer_view_client_host ||
         !worker->cfg->vemb_v16_ub_peer_view_client_host[0] ||
         vemb_v16_client_configure_ub_peer_view(
-            slot->client, worker->cfg->vemb_v16_ub_peer_view_manifest,
+            client, worker->cfg->vemb_v16_ub_peer_view_manifest,
             worker->cfg->vemb_v16_ub_peer_view_client_host) != 0) {
         fprintf(stderr,
                 "vemb_v16 aeron runner: peer-view manifest and client host are required\n");
-        return -1;
+        vemb_v16_client_destroy(client);
+        return NULL;
     }
     if (vemb_v16_client_set_ub_batch_request_size(
-            slot->client, worker->cfg->vemb_v16_batch_request_size) != 0 ||
-        vemb_v16_client_topology_refresh(slot->client) != 0) {
-        return -1;
+            client, worker->cfg->vemb_v16_batch_request_size) != 0 ||
+        vemb_v16_client_topology_refresh(client) != 0) {
+        vemb_v16_client_destroy(client);
+        return NULL;
     }
     vemb_v16_client_set_retry_budget(
-        slot->client, worker->cfg->vemb_v16_topology_retry_limit);
+        client, worker->cfg->vemb_v16_topology_retry_limit);
+    return client;
+}
 
-    if (!common_core_pure_read(worker->cfg) &&
-        !common_core_key_key_session(worker->cfg))
-        return 0;
+static int common_core_prepare_slot(common_core_slot *slot)
+{
+    common_core_worker *worker = slot->worker;
     if (worker->use_handle_session) {
+        /* Channel-per-worker reuse: all of one worker's connections share a
+         * single client (owner channels, topology, cluster state) while
+         * keeping an independent handle session per slot. The worker thread
+         * is the single producer/consumer of the shared rings. Channel
+         * count scales with threads, not connections. */
+        if (!worker->shared_client) {
+            worker->shared_client = common_core_prepare_client(worker);
+            if (!worker->shared_client)
+                return -1;
+        }
+        slot->client = worker->shared_client;
+
+        if (!common_core_pure_read(worker->cfg) &&
+            !common_core_key_key_session(worker->cfg))
+            return 0;
         if (vemb_v16_client_prepare_active_owner_channels(slot->client) != 0)
             return -1;
         vemb_v16_client_handle_session_options_t options = {
@@ -448,6 +470,13 @@ static int common_core_prepare_slot(common_core_slot *slot)
             slot->client, &options);
         return slot->handle_session ? 0 : -1;
     }
+
+    slot->client = common_core_prepare_client(worker);
+    if (!slot->client)
+        return -1;
+    if (!common_core_pure_read(worker->cfg) &&
+        !common_core_key_key_session(worker->cfg))
+        return 0;
 
     vemb_v16_client_vector_session_options_t options = {
         .cache_mode = worker->cfg->vemb_v16_l1_entries ?
@@ -1470,9 +1499,13 @@ static void *common_core_worker_main(void *arg)
             common_core_run_sync_ops(worker, deadline_ns);
     }
 
+    vemb_v16_client_t *stats_dumped_client = NULL;
     for (std::vector<common_core_slot>::iterator it = worker->slots.begin();
          it != worker->slots.end(); ++it) {
-        if (it->client) {
+        if (it->client && it->client != stats_dumped_client) {
+            /* Slots sharing the worker client carry the same aggregate
+             * counters; dump each distinct client exactly once. */
+            stats_dumped_client = it->client;
             vemb_v16_logical_stats_t logical;
             vemb_v16_redirect_stats_t redirects;
             vemb_v16_fanout_stats_t fanout;
@@ -1894,6 +1927,10 @@ static void *common_core_worker_main(void *arg)
             }
         }
         common_core_close_slot(&*it);
+    }
+    if (worker->shared_client) {
+        vemb_v16_client_destroy(worker->shared_client);
+        worker->shared_client = NULL;
     }
 
     struct timeval end;
