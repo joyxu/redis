@@ -87,7 +87,7 @@ start_owner() {
     if [[ "$reset" == "1" ]]; then
         reset_arg="--reset-warm-regions"
     fi
-    ssh_run "${host}" "cd ${REMOTE_DIR} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${host} --tcp-port ${port} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${manifest} ${reset_arg} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${log} 2>&1 </dev/null"
+    ssh_run "${host}" "cd ${REMOTE_DIR} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${host} --tcp-port ${port} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${manifest} ${reset_arg} --dim ${DIM} --loglevel notice >${log} 2>&1 </dev/null"
 }
 
 assert_topology() {

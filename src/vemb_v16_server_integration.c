@@ -412,9 +412,6 @@ int vemb_v16_server_integration_init(void) {
         return -1;
     }
     uint32_t dim = (uint32_t)server.vemb_v16_dim;
-    uint32_t max_vectors = server.vemb_v16_max_vectors > 0
-        ? (uint32_t)server.vemb_v16_max_vectors
-        : VEMB_V16_DEFAULT_MAX_VECTORS;
 
     if (!server.vemb_v16_warm_regions_manifest ||
         !server.vemb_v16_warm_regions_manifest[0]) {
@@ -424,8 +421,7 @@ int vemb_v16_server_integration_init(void) {
     }
 
     serverLog(LL_NOTICE,
-              "VEMB V16 integration init: dim=%u max_vectors=%u",
-              dim, max_vectors);
+              "VEMB V16 integration init: dim=%u", dim);
 
     vemb_v16_warm_regions_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
@@ -457,7 +453,6 @@ int vemb_v16_server_integration_init(void) {
     if (vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                    dim,
                                                    dim * sizeof(float),
-                                                   max_vectors,
                                                    &manifest) != 0) {
         serverLog(LL_WARNING, "vemb_v16_storage_ctx_create_from_manifest failed");
         return -1;
@@ -465,7 +460,6 @@ int vemb_v16_server_integration_init(void) {
 
     if (vemb_v16_proxy_create(&server.vemb_v16_proxy,
                               dim,
-                              max_vectors,
                               storage,
                               &manifest) != 0) {
         serverLog(LL_WARNING, "vemb_v16_proxy_create failed");

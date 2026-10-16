@@ -166,14 +166,14 @@ reset_node0_arg=""
 if [[ "${RESET_NODE0}" == "1" ]]; then
     reset_node0_arg="--reset-warm-regions"
 fi
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE0_LOG} ${PREFILL_OUT} ${LIVE_WRITE_OUT} ${LIVE_WRITE_PID} ${LIVE_WRITE_RC} ${COORD_OUT} ${COORD_ERR} ${POST_WRITE_OUT} ${POST_READ_OUT} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE0_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE0_MANIFEST} ${reset_node0_arg} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE0_LOG} 2>&1 </dev/null"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE0_LOG} ${PREFILL_OUT} ${LIVE_WRITE_OUT} ${LIVE_WRITE_PID} ${LIVE_WRITE_RC} ${COORD_OUT} ${COORD_ERR} ${POST_WRITE_OUT} ${POST_READ_OUT} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE0_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE0_MANIFEST} ${reset_node0_arg} --dim ${DIM} --loglevel notice >${NODE0_LOG} 2>&1 </dev/null"
 
 step "Start node1 from manifest"
 reset_node1_arg=""
 if [[ "${RESET_NODE1}" == "1" ]]; then
     reset_node1_arg="--reset-warm-regions"
 fi
-ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE1_LOG} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE1_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE1_MANIFEST} ${reset_node1_arg} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE1_LOG} 2>&1 </dev/null"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE1_LOG} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE1_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE1_MANIFEST} ${reset_node1_arg} --dim ${DIM} --loglevel notice >${NODE1_LOG} 2>&1 </dev/null"
 
 sleep 2
 

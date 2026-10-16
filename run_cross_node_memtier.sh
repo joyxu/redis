@@ -152,7 +152,6 @@ ssh "$HW01" bash -s << REMOTE_EOF
         --port $SERVER_PORT --bind 0.0.0.0 --protected-mode no \
         --dir /tmp/redis-cross-node --save '' --appendonly no \
         --vemb-v16-enabled yes --vemb-v16-dim $BENCH_DIM \
-        --vemb-v16-max-vectors 131072 \
         --vemb-v16-warm-regions-manifest $CODE_DIR/hpc-redis/$MANIFEST_FILE \
         --vemb-v16-reset-warm-regions yes \
         --vemb-v16-proxy-io-threads ${PIO:-32} --vemb-v16-supernode-workers ${SNW:-64} \

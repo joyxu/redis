@@ -788,7 +788,7 @@ TCP 和 Aeron 的成本模型不同，因此 HPC-Redis Server 不强行使用单
 - TCP 跨主机路径使用 `VEMB_INLINE` 返回完整 vector payload，确保“读成功”等价于 client 已拿到 300 维向量。
 - Aeron 路径使用 handle/mmap 语义，response 只返回 region/offset/bytes，payload 保留在可共享的 UB warm region 中。
 
-该设计避免把 handle-only QPS 误当成完整 payload QPS，同时让 Aeron 高吞吐路径避开 1200B response payload 回传。性能记录中，TCP mixed inline 代表完整 payload 交付能力，Aeron mixed 代表 handle/mmap 语义下的数据面上限，两者口径清晰可比。当前实验使用共享映射实现，后续 Aeron transport 可扩展到跨机 channel，并继续保留请求/响应批处理和 handle 交付语义。
+该设计避免把 handle-only QPS 误当成完整 payload QPS，同时让 Aeron 高吞吐路径避开 1200B response payload 回传。性能记录中，TCP mixed inline 代表完整 payload 交付能力，Aeron mixed 代表 handle/mmap 语义下的数据面上限。下表先记录同机共享映射结果；本节后半部分说明已实现的跨机 UB batch channel、batch-agg，以及包含真实远端 payload 读取的跨机结果。
 
 benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避免把 TCP handle-only 路径的结果误读为跨主机完整 payload 交付能力。
 
@@ -801,7 +801,7 @@ benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避
 | Aeron cache / 热点 key | 10000 | `TEST_TIME=3 TS=64 CS=4 PS=32 PIO=21 SNW=21` | 52,698,357.15 | 0.13499 | 0.103 | 8.255 | 35.60 | 1,480,291 |
 | Aeron cache / 热点 key | 10000 | `TEST_TIME=3 TS=64 CS=4 PS=32 PIO=12 SNW=12` | 47,829,140.94 | 0.16401 | 0.159 | 8.191 | 22.96 | 2,083,151 |
 
-与 TCP inline baseline 相比，Aeron normal 的吞吐为 `4.10x`，Aeron cache 的吞吐为 `4.49x`；`ops/core` 分别为 TCP 的 `2.20x` 和 `2.66x`。原因不是简单地增加 worker，而是 Aeron 路径绕开了 TCP socket 的协议栈和完整 payload 回写：此前 TCP server-only 火焰图中，`writev` 占 `31.48%`、`recv` 占 `21.84%`，这两个用户态 I/O 接口合计超过一半的主要采样权重，反映出请求接收和 1200B 响应发送的固定成本。Aeron 使用共享内存 ring 传递请求和 handle，client 通过 mmap 读取 payload，server 侧不再为每个响应调用 TCP `writev`，请求入口也不再以 TCP `recv` 作为主要数据通道；对应热点转为 `vemb_v16_aeron_poll_shm_requests`、`vemb_v16_proxy_handle_request_ptr_batch_internal` 和 `vemb_v16_aeron_publish_response_batch`。因此，Aeron 解决的是高吞吐场景下 TCP `writev`/`recv` 协议栈成为瓶颈的问题；后续扩展到跨机 channel 后，仍可沿用这条批量 ring + handle 的优化路径。当前 TCP inline 仅作为完整 payload 跨机交付基线，不能把 handle/mmap 的 QPS 直接当作完整 payload 的跨机交付能力。
+与 TCP inline baseline 相比，Aeron normal 的吞吐为 `4.10x`，Aeron cache 的吞吐为 `4.49x`；`ops/core` 分别为 TCP 的 `2.20x` 和 `2.66x`。原因不是简单地增加 worker，而是 Aeron 路径绕开了 TCP socket 的协议栈和完整 payload 回写：此前 TCP server-only 火焰图中，`writev` 占 `31.48%`、`recv` 占 `21.84%`，这两个用户态 I/O 接口合计超过一半的主要采样权重，反映出请求接收和 1200B 响应发送的固定成本。Aeron 使用共享内存 ring 传递请求和 handle，client 通过 mmap 读取 payload，server 侧不再为每个响应调用 TCP `writev`，请求入口也不再以 TCP `recv` 作为主要数据通道；对应热点转为 `vemb_v16_aeron_poll_shm_requests`、`vemb_v16_proxy_handle_request_ptr_batch_internal` 和 `vemb_v16_aeron_publish_response_batch`。因此，Aeron 解决的是高吞吐场景下 TCP `writev`/`recv` 协议栈成为瓶颈的问题；跨机 channel 继续沿用这条批量 ring + handle 的优化路径，具体设计和实测见下文。当前 TCP inline 仅作为完整 payload 跨机交付基线，不能把 handle/mmap 的 QPS 直接当作完整 payload 的跨机交付能力。
 
 #### Aeron 火焰图热点函数表
 
@@ -825,7 +825,175 @@ benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避
 
 `PIO=12/SNW=12` retry2 实验显示，Aeron 在接近目标吞吐时确实需要更少的 server worker：相比 `21:21`，CPU 使用量从 `35.60` 降到 `22.96` cores，下降约 `35.5%`；吞吐仍保持 `47.83M ops/sec`，只比 `52.70M ops/sec` 低约 `9.2%`；`ops/core` 则从 `1,480,291` 升至 `2,083,151`，提升约 `40.7%`。相对于 TCP baseline，`12:12` Aeron 的吞吐为 `4.08x`，`ops/core` 为 `3.74x`。这说明 Aeron 通过共享内存 ring 和 handle/mmap 绕开 TCP `writev`/`recv` 固定成本后，可以用更少核心维持高吞吐，并获得更高的单核处理效率；但 `21:21` 仍是本轮测试的绝对吞吐峰值，`12:12` 是核心效率与总吞吐之间的折中点。两组测试的 `TEST_TIME=3` 较短，retry2 的 p99 为 `8.191 ms`，尾延迟仍需长时间测试确认。
 
-这张表体现了 transport 返回语义分流的性能边界：TCP inline 需要把 1200B payload 放进 response，适合作为完整 payload 交付 baseline；Aeron 通过 handle/mmap 避免 payload 回包，数据面吞吐和单位 CPU 效率都显著更高，代表共享映射语义下的上限，并为后续跨机 Aeron 扩展保留接口空间。
+这张表体现了同机 transport 返回语义分流的性能边界：TCP inline 需要把 1200B payload 放进 response；Aeron 通过 handle/mmap 避免 payload 回包，数据面吞吐和单位 CPU 效率都显著更高。跨机沿用 handle 交付语义，但 UB 帧发布和远端 payload 读取会增加成本，需要结合下面的 batch 设计和跨机实验单独分析。
+
+#### 跨机 batch channel 与 batch-agg 的优化设计
+
+跨机 Aeron 的优化目标是在保持完整向量读取语义的基础上，降低 UB 交付路径的单位请求开销。为此，系统采用 batch channel 和 batch-agg 两项互补机制：batch channel 将多个 key 的请求与响应合并为批量帧，均摊跨机发布和同步成本；batch-agg 在 CLI 端合并相同 key 的在途并发读，减少实际访问 Server 的请求数。
+
+##### 跨机 UB 增加的开销
+
+同机 Aeron 通过本机共享映射访问请求、响应和 warm payload；跨机部署中，相同的 mmap 访问需要经过 UB 传输与远端内存访问。根据[跨节点进度文档](VEMB_V16_AERON_CROSS_NODE_PROGRESS_20260728.md) 第 `21.6` 节，请求路径为 client NC write 到 server CC read，响应路径为 server NC write 到 client CC read，向量读取则由 client 访问远端 warm region 的 NC view。跨机链路的数据搬运由底层 UB DMA 完成，Server CPU 通过 ring 轮询感知请求与完成状态，并承担帧编解码、descriptor/commit 发布和 head/tail 更新等控制工作。因此，UB 将 TCP 的 socket 协议栈处理成本转化为轮询与发布成本；每次 UB 控制信息访问及同步仍具有固定开销，适合通过 batch 均摊。client 的 handle 解引用和 1200B payload 读取则构成数据访问开销。
+
+历史受控实验进一步表明远端 payload 读取具有显著成本：上述进度文档第 `5.4` 节中，实际向量读取吞吐约为 `5.22M QPS`，省略 handle 解引用与 vector copy 的诊断配置约为 `12.75M QPS`。这一对照反映了远端数据访问对端到端吞吐的影响。因此，跨机优化需要同时减少重复的帧级操作和同 key 请求，并在批量发布中保持正确的数据可见性。
+
+##### batch channel：通过批量交付均摊 UB 成本
+
+batch channel 将多个 key 封装为一个请求帧，并将对应的 status/handle 汇集为一个响应帧，使帧编码、UB 数据发布、commit 和游标同步由多个请求共同承担。以 32 个不同 key 为例，逐项交付所需的 32 次请求帧发布可合并为一次，响应端也采用批量返回。向量内容仍保存在 warm region，由 client 根据 handle 读取。这一设计将优化重点集中于每个请求重复发生的交付与同步开销。
+
+批量帧可能覆盖多个 UB cache line，因此发布过程需要满足 happens-before 一致性要求，即 `frame body -> commit -> descriptor/tail 发布 -> consumer 校验后消费`。CPU 的 release/acquire 顺序与 UB 层的可见性保障共同建立发布依赖，使接收端获得与本轮提交对应的完整帧。相关跨 cache line 可见性问题及 UB 层修复见进度文档第 `21.19` 节；协议保留提交校验与暂不可见时的重试，以保证批量交付的正确性。
+
+请求路径可以概括为：
+
+```text
+CLI 收到多个 VEMB_HANDLE 调用
+    -> 按 key 计算 owner，选择已 ATTACH 的 v2 batch channel
+    -> 收集可发送请求，建立 batch_id / item_index 到原始 caller 的关联
+    -> 编码完整 frame body，写入 client NC 中可能跨多个 cacheline 的数据
+    -> 以 release / UB 可见性顺序发布 commit，使 body happens-before commit
+    -> commit 可见后再发布 descriptor/tail，通知 Server 有完整 batch 可读
+    -> Server acquire descriptor/tail，校验 commit 与帧边界后才消费 body；暂不可见则重试
+    -> Server 批量定位各 key，并返回对应 status/handle
+    -> Server 按 body -> commit -> descriptor/tail 顺序发布 batch response
+    -> client acquire descriptor/tail，校验 commit 后读取并关联完整 response
+    -> 按 batch_id / item_index 还原每个请求及其原始 caller
+    -> 校验 handle 与 region 信息，读取远端 WARM payload
+    -> 向对应 caller 完成逻辑请求
+```
+
+##### batch-agg：在 CLI 端合并同 key 并发读
+
+batch-agg 在同一 CLI session 内，将路由身份一致的同 key 在途请求聚合为一个 leader 和多个 follower，仅由 leader 访问 Server。成功响应返回后，CLI 根据 leader 的 handle 只读取一次远端 WARM payload，再将同一 vector view 与响应状态同步分发给 leader 和 followers；各 caller 仍按自己的请求身份完成回调，followers 不再单独读取远端 payload。例如，32 个同 key 的并发读可合并为一次 Server 定位、一次 handle 返回和一次远端 payload 读取，从而减少重复的 UB 请求/响应、远端读取、server job 和 TLC lookup。group 的生命周期覆盖请求未完成阶段，终态响应到达后释放，相同 key 的后续读取重新建立请求。
+
+请求路径可以概括为：
+
+```text
+CLI 收到并发 VEMB_HANDLE 调用
+    -> 按 key 路由到 owner，并确认拓扑稳定、epoch 与 v2 channel 有效
+    -> 在当前 session 的 in-flight 索引中按 key 和路由身份查找 group
+       -> 找到同 key group：登记 caller 为 follower，不创建新的 Server item
+       -> 未找到 group：创建 leader，保存 key、caller 身份和等待者
+    -> 将各 group 的 leader 收集成 batch，经 client NC 发布到 v2 channel
+    -> poll response ring，并按 batch_id / item_index 找回对应 leader group
+    -> 成功响应时校验 handle/region，由 leader 只执行一次远端 WARM payload 读取；失败响应跳过 payload 读取
+    -> 先从 in-flight 索引移除已完成 group，再将 status 和成功时读取的同一 vector view 同步分发给 leader 与 followers
+    -> 各 caller 按自己的 req_id / caller_cookie 完成回调；followers 复用 leader 已读取的 payload，不再远端读取
+    -> 回调期内消费或复制借用的 vector view，fan-out 返回后回收 payload buffer 与 group
+    -> 之后到达的同 key 调用建立新的 leader
+```
+
+两项机制分别作用于批量交付和重复请求消除：多个不同 key 可以共享一个 batch frame，多个相同 key 的并发读可以共享一个 server item。client pipeline 为组帧提供在途请求；batch size 决定一次交付承载的 item 数，两者共同影响固定成本摊薄程度与尾延迟。
+
+```mermaid
+flowchart TB
+    A["CLI 并发读"] --> B["batch-agg：同 key 在途聚合"]
+    B --> C["batch channel：多个 key 批量交付"]
+    C --> D["Server 定位与批量 handle 返回"]
+    D --> E["leader 单次远端 payload 读取"]
+    E --> F["同一 vector view fan-out<br/>各 caller 按原身份回调"]
+```
+
+#### 跨机 Uniform 与 Zipf 实验
+
+实验采用双机部署：server 为 `192.168.90.111`（cpuset `0-15`，16 cores），client 为 `192.168.90.112`（cpuset `96-191`）。向量维度 `DIM=300`，payload 为 1200B；TCP 与 UB batch=1/32 的主要对照采用 `100,000` keys、Uniform `R:R` 分布，另补充 `10,000` keys 的 Uniform 结果，以及 `100,000` keys、Zipf `Z:Z`（指数 `1.2`）的 batch=32 结果。客户端配置为 `THREADS=64`、`CLIENTS=4`、`pipeline=32`。Aeron 测试时长为 `30s`，火焰图采样时长为 `25s`，client L1 cache 关闭，`max-delay-us=0`。
+
+TCP 采用 inline response 交付完整向量；UB Aeron 返回 handle，由 client 读取远端 warm payload。四组 Aeron 均完成全部逻辑请求的向量物化，`materialized_fail/status_err/status_notfound/unmatched` 均为 `0`，因此吞吐指标对应完整向量读取。CPU 指标采用 `cores = core_ut + core_st + si`，分别统计 Redis 进程的 user/system core-equivalent 与 server CPU 集合上的 softirq；`ops/core/sec` 评价服务端处理效率。下表未单独标注分布的各行均为 Uniform。
+
+| 模式 | 参数 | ops/sec | p50/ms | p99/ms | cores(si) | ops/core/sec | profile |
+| --- | --- | ---: | ---: | ---: | --- | ---: | --- |
+| TCP | PIO:SNW=3:3, KEYS=100,000 | 3,051,180 | 2.591 | 4.447 | 5.47(0.91) | 557,803 | [server.svg](../perf/20261013_153724/profile/hpc_t64_c4_p32/server.svg) |
+| TCP | PIO:SNW=21:21, KEYS=100,000 | 4,066,938 | 1.983 | 3.711 | 7.16(1.30) | 568,008 | [server.svg](../perf/20261013_154240/profile/hpc_t64_c4_p32/server.svg) |
+| Aeron | PIO:SNW=3:3, KEYS=100,000, batch=1 | 523,151 | 0.727 | 0.863 | 5.22(0.014) | 100,276 | [server.svg](../perf/p3_s3_svr0-15_uniform_20261013_150203/server/server.svg) |
+| Aeron | PIO:SNW=3:3, KEYS=100,000, batch=32 | 8,014,805 | 0.679 | 1.463 | 5.45(0.018) | 1,471,276 | [server.svg](../perf/p3_s3_svr0-15_uniform_20261012_221654/server/server.svg) |
+| Aeron（10K 工作集） | PIO:SNW=3:3, KEYS=10,000, batch=32 | 8,265,166 | 0.863 | 1.047 | 5.31(0.013) | 1,556,617 | [server.svg](../perf/p3_s3_svr0-15_uniform_20261014_092608/server/server.svg) |
+| Aeron（Zipf=1.2） | PIO:SNW=3:3, KEYS=100,000, batch=32 | 9,317,643 | 0.735 | 0.927 | 4.80(0.010) | 1,940,114 | [server.svg](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/server/server.svg) |
+
+其中，`batch=1` 的 Redis process CPU 为 `5.203387` cores，softirq 为 `0.013700` cores，合计 `5.217087` cores。`10K/batch=32` 采用 `20261014_092608` 轮数据，工作集由 [client metadata](../perf/p3_s3_svr0-15_uniform_20261014_092608/client/client.meta.txt) 和 [server metadata](../perf/p3_s3_svr0-15_uniform_20261014_092608/server/server.meta.txt) 确认；[Redis process CPU](../perf/p3_s3_svr0-15_uniform_20261014_092608/server/server.cpu.process.tsv) 为 `5.296396` cores，加 softirq `0.013300` 后为 `5.309696` cores，对应 `1,556,617 ops/core/sec`。该轮 CPU 集合非空闲总量为 `5.462200` cores，统计范围与本表的进程 CPU 加 softirq 口径不同。
+
+四组 Aeron 使用相同的 client/server 二进制，server 构建参数 `PROXY_REQUEST_BATCH/PROXY_RESPONSE_BATCH/PROXY_QUEUE_BATCH` 均为 `32`。`100K` Uniform batch 对照的实验变量为 client batch size 与 server batch-request-size 的协商配置，评价批量交付粒度从 `1` 到 `32` 的端到端效果；`10K` Uniform 组观察较小工作集下的性能与热点分布，`100K` Zipf 组观察热点访问下 batch-agg 的同 key 聚合效果。
+
+##### 跨机两端火焰图热点函数表
+
+火焰图占比根据各轮 `cycles` 折叠栈的采样权重计算。server 采样覆盖所有 Redis TID 的用户态和内核态，client 独立采样，两端分别归一化。业务函数采用包含子调用的 inclusive 占比，worker 自身采用 self 占比，即采样栈终止于该 worker 的权重；inclusive 父子项存在重叠。编译器生成的 `constprop`、`lto_priv` 后缀省略，client 路由函数的范围包含子调用及 LTO 内联工作。
+
+| 采样端 | 热点函数 | 100K Uniform / batch=1 | 100K Uniform / batch=32 | 10K Uniform / batch=32 | 100K Zipf=1.2 / batch=32 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| server | PIO worker 自身（`proxy_io_pool_thread_main`，self） | 13.30% | 10.53% | 8.11% | 10.29% |
+| server | SuperNode worker 自身（`supernode_pool_thread_main`，self） | 20.85% | 0.92% | 4.54% | 5.90% |
+| server | `vemb_v16_aeron_poll_shm_requests` | 12.55% | 17.89% | 19.47% | 16.71% |
+| server | `vemb_v16_proxy_handle_batch_request` | 3.01% | 6.70% | 7.73% | 7.22% |
+| server | `drain_completions` | 30.52% | 19.40% | 24.78% | 31.38% |
+| server | `vemb_v16_aeron_publish_batch_response` | 29.34% | 16.52% | 21.92% | 28.78% |
+| server | `drain_shard_queues` | 18.74% | 47.60% | 37.71% | 30.81% |
+| server | `vemb_v16_supernode_handle_vemb_job` | 2.54% | 38.46% | 26.05% | 18.40% |
+| server | `vemb_v16_tlc_get_handle_stable_read` | 2.30% | 36.00% | 23.30% | 15.87% |
+| server | `tlc_core_get_warm_location_raw` | 2.23% | 34.63% | 21.79% | 14.46% |
+| client | `sdk_handle_session_route_requests` | 91.12% | 19.91% | 57.31% | 50.94% |
+| client | `sve_streaming_load_f32` | 2.19% | 53.49% | 18.11% | 18.42% |
+
+采样资料：`100K/batch=1` [server SVG](../perf/p3_s3_svr0-15_uniform_20261013_150203/server/server.svg)、[client SVG](../perf/p3_s3_svr0-15_uniform_20261013_150203/client/client.svg)、[server collapsed](../perf/p3_s3_svr0-15_uniform_20261013_150203/server/server.collapsed.txt)、[client collapsed](../perf/p3_s3_svr0-15_uniform_20261013_150203/client/client.collapsed.txt)；`100K/batch=32` [server SVG](../perf/p3_s3_svr0-15_uniform_20261012_221654/server/server.svg)、[client SVG](../perf/p3_s3_svr0-15_uniform_20261012_221654/client/client.svg)、[server collapsed](../perf/p3_s3_svr0-15_uniform_20261012_221654/server/server.collapsed.txt)、[client collapsed](../perf/p3_s3_svr0-15_uniform_20261012_221654/client/client.collapsed.txt)；`10K/batch=32` [server SVG](../perf/p3_s3_svr0-15_uniform_20261014_092608/server/server.svg)、[client SVG](../perf/p3_s3_svr0-15_uniform_20261014_092608/client/client.svg)、[server collapsed](../perf/p3_s3_svr0-15_uniform_20261014_092608/server/server.collapsed.txt)、[client collapsed](../perf/p3_s3_svr0-15_uniform_20261014_092608/client/client.collapsed.txt)。
+
+`100K Zipf=1.2/batch=32` 采样：[server SVG](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/server/server.svg)、[client SVG](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/client/client.svg)、[server collapsed](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/server/server.collapsed.txt)、[client collapsed](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/client/client.collapsed.txt)。
+
+##### TCP 与 UB：从协议栈处理转向 ring 轮询
+
+TCP 路径需要由 Server CPU 执行 `writev/recv` 及其下层协议栈，完成向量响应发送与请求接收。UB 路径的跨机数据搬运由底层 DMA 完成，Server CPU 的通信侧工作主要转为 ring 轮询、帧处理和状态发布。两条路径在 server 火焰图上的对照如下：
+
+| server 采样项 | [TCP 3:3](../perf/20261013_153724/profile/hpc_t64_c4_p32/server.svg) | [TCP 21:21](../perf/20261013_154240/profile/hpc_t64_c4_p32/server.svg) | [UB 3:3 / batch=32](../perf/p3_s3_svr0-15_uniform_20261012_221654/server/server.svg) |
+| --- | ---: | ---: | ---: |
+| `writev`（inclusive） | 22.44% | 28.00% | 0.00% |
+| `recv`（inclusive） | 4.54% | 5.99% | 0.00% |
+| `vemb_v16_aeron_poll_shm_requests`（inclusive） | — | — | 17.89% |
+| PIO worker 自身（self） | 0.91% | 2.88% | 10.53% |
+| `vemb_v16_supernode_handle_vemb_job`（inclusive） | 18.35% | 33.29% | 38.46% |
+
+TCP 原始采样：[3:3 process collapsed](../perf/20261013_153724/profile/hpc_t64_c4_p32/server.process.collapsed.txt)、[21:21 process collapsed](../perf/20261013_154240/profile/hpc_t64_c4_p32/server.process.collapsed.txt)；UB 采样见前表。TCP `3:3` 的 `writev/recv` 调用链占 `26.98%`，`21:21` 占 `33.99%`，反映 socket I/O 与协议栈的显著 CPU 成本。UB 的业务数据路径中，这两条调用链由 ring poll 和发布路径替代，softirq 也由 TCP `3:3` 的 `0.91` 降至 `0.0182` cores，下降约 `98.0%`。DMA 搬运在硬件侧执行，火焰图呈现的是 CPU 侧的轮询、控制和业务执行开销。
+
+UB 火焰图中，轮询成本既体现于 `vemb_v16_aeron_poll_shm_requests`，也体现于 PIO worker 框上方未继续展开子调用的区域。该区域对应 worker 的 self 采样，包含 channel 扫描、内联状态检查、同步及空转；batch=32 下 PIO self 占 `10.53%`。图中整片背景空白表示该高度没有更深调用，其轮询含义需要结合下方 worker 与调用路径识别。`poll_shm_requests` 的 inclusive 范围还包含解码和任务提交，可据此同时观察轮询成本与请求接入工作。
+
+同一 `3:3` 配比下，UB batch=32 的 SuperNode job 执行占比由 TCP 的 `18.35%` 升至 `38.46%`，其中 UB stable-read 为 `36.00%`、TLC lookup 为 `34.63%`，表明 CPU 工作分布更多集中于实际 key 定位和请求执行。与此一致，吞吐由 `3.051M` 升至 `8.015M ops/sec`，达到 `2.63x`；server CPU 由 `5.47` 到 `5.45` cores，基本持平，`ops/core` 达到 `2.64x`。p50 和 p99 分别降低 `73.8%` 与 `67.1%`。火焰图与单位 CPU 吞吐共同表明，UB 在支付轮询成本的同时，减少了 TCP 协议栈处理，使更多 CPU 时间用于有效请求。
+
+TCP 增加至 `21:21` 后，吞吐提高 `33.3%`，CPU 增加 `30.9%`，`ops/core` 提高 `1.8%`。UB `3:3/batch=32` 相较 TCP `21:21` 仍达到 `1.97x` 吞吐和 `2.59x` 的 `ops/core`，server CPU 减少 `23.9%`。这一对照进一步说明，数据交付方式与通信侧 CPU 成本的改善是本组性能收益的重要来源。
+
+##### UB batch=1/32：均摊 UB 访问与发布成本
+
+在相同 UB transport、`3:3` worker、`100K` Uniform 工作集和 `pipeline=32` 条件下，每个请求都需要访问 ring 状态、检查 descriptor、发布帧及同步 commit/head/tail。batch=1 将这些动作逐项执行；batch=32 由一帧内的多个 item 共享，降低每个逻辑请求分摊的 UB 访问与同步开销。
+
+批处理计数来自 [100K/batch=1 workload](../perf/p3_s3_svr0-15_uniform_20261013_150203/client/client.workload.log)、[100K/batch=32 workload](../perf/p3_s3_svr0-15_uniform_20261012_221654/client/client.workload.log)、[10K/batch=32 workload](../perf/p3_s3_svr0-15_uniform_20261014_092608/client/client.workload.log) 和 [100K Zipf=1.2/batch=32 workload](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/client/client.workload.log)。各轮汇总 64 个 worker 的 256 份 owner/session 最终记录，并与 worker 完成记录交叉验证；下表为完整原始日志累计值，吞吐与延迟沿用 benchmark 汇总。
+
+| 配置 | 逻辑完成数 | v2 items | v2 request frames | items/frame |
+| --- | ---: | ---: | ---: | ---: |
+| 100K Uniform / batch=1 | 16,567,176 | 16,562,351 | 16,562,351 | 1.000 |
+| 100K Uniform / batch=32 | 251,637,087 | 251,597,944 | 7,863,659 | 31.995 |
+| 10K Uniform / batch=32 | 258,888,421 | 258,487,067 | 8,090,265 | 31.950 |
+| 100K Zipf=1.2 / batch=32 | 292,571,161 | 220,052,570 | 9,142,853 | 24.068 |
+
+`100K Uniform` 对照的实际组帧率由 `1.000` 增至 `31.995 items/frame`，每百万逻辑读取的 request frame 数由约 `999,709` 降至 `31,250`，减少 `96.87%`；响应端也采用一帧返回多个结果。这使 UB descriptor/commit 发布和游标同步的次数得到压缩。对应吞吐由 `0.523M` 升至 `8.015M ops/sec`，达到 `15.32x`，`ops/core` 达到 `14.67x`，server CPU 增幅为 `4.4%`。相同程序在相近 CPU 下完成更多请求，验证了 batch 对单位请求 UB 访问成本的摊薄效果。
+
+server 火焰图中，response publish 占比由 `29.34%` 降至 `16.52%`，PIO worker self 由 `13.30%` 降至 `10.53%`，SuperNode worker self 由 `20.85%` 降至 `0.92%`；SuperNode job 执行由 `2.54%` 升至 `38.46%`，TLC lookup 由 `2.23%` 升至 `34.63%`。这些变化表明，逐项 UB 交付的高频发布与状态检查得到均摊，批量供给也减少了执行线程的空转，使 CPU 资源转向有效执行。`poll_shm_requests` 的 inclusive 占比由 `12.55%` 升至 `17.89%`，与吞吐增长及批量解码/提交工作增加共同出现；其权重包含请求处理，反映的是总采样分布中的相对占比。
+
+client 火焰图中，路由/提交链路由 `91.12%` 降至 `19.91%`，SVE load 升至 `53.49%`，其中约 `53.46%` 位于实际 payload 读取路径。批处理后，开销重心从逐项提交和 UB 状态交互转向远端向量读取。每个逻辑请求仍读取 1200B payload，`8.015M QPS` 对应约 `9.62GB/s` 的应用层逻辑读取量，说明帧级开销均摊后，实际数据访问成为下一阶段的主要优化对象。
+
+延迟结果体现了批量交付的性能折中：p50 由 `0.727ms` 降至 `0.679ms`，改善 `6.6%`；p99 由 `0.863ms` 升至 `1.463ms`，增加 `69.5%`。两轮均采用 `max-delay-us=0`，帧内结果收齐与高负载排队可能共同影响尾延迟。当前对照验证了 batch=32 对 UB 访问成本和吞吐的优化效果，参数选择仍需结合尾延迟目标。
+
+在 `10K` 工作集下，batch=32 的实际组帧率为 `31.950 items/frame`，仍接近每帧 32 个 item；完成的 `258,888,421` 次逻辑读取均成功物化向量。相较 `100K Uniform/batch=32`，吞吐由 `8.015M` 升至 `8.265M ops/sec`，提高 `3.12%`；server CPU 降低 `2.53%`，`ops/core` 由 `1.471M` 升至 `1.557M`，提高 `5.80%`。p99 由 `1.463ms` 降至 `1.047ms`，降低 `28.4%`，p50 则由 `0.679ms` 升至 `0.863ms`。该组结果补充表明，batch channel 在较小 Uniform 工作集下保持了接近满帧的交付效率与 `8M ops/sec` 以上的完整向量读取吞吐。
+
+对应火焰图中，`10K` 组的 TLC lookup 与 stable-read 占比分别为 `21.79%`、`23.30%`，低于 `100K Uniform` 组的 `34.63%`、`36.00%`；response publish 占比则由 `16.52%` 升至 `21.92%`，PIO worker self 为 `8.11%`。client 路由/提交链路占 `57.31%`，SVE load 占 `18.11%`，其中约 `18.08%` 位于实际 payload 读取路径。结合单位 CPU 吞吐的提升，这一分布显示较小工作集下服务端定位路径的相对权重降低，帧发布及客户端路由的相对权重提高；各项占比反映本轮采样中的 CPU 工作分布，批量粒度的收益仍由前述 `100K Uniform` 受控对照量化。
+
+##### batch-agg：Zipf 热点访问下的同 key 聚合收益
+
+Zipf 实验采用 `20261014_143303` 轮数据，[client metadata](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/client/client.meta.txt) 和 [server metadata](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/server/server.meta.txt) 确认工作集为 `100K`、分布指数为 `1.2`，其余 worker、pipeline、batch size 与 `100K Uniform/batch=32` 组一致。client L1 cache 关闭，热点 key 的同 session 在途并发读通过 batch-agg 共享一次 Server 请求。定义 `fanout = (leaders + followers) / leaders`，其中 leader 对应实际发送的 server item，follower 对应共享该请求的逻辑读取；重复 Server 请求消除比例为 `followers / (leaders + followers) = 1 - 1 / fanout`。
+
+| 100K / batch=32 分布 | 逻辑完成数 | leaders / server items | followers | fanout | 重复 Server 请求消除比例 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Uniform | 251,637,087 | 251,597,944 | 39,143 | 1.000156 | 0.016% |
+| Zipf=1.2 | 292,571,161 | 220,052,570 | 72,518,591 | 1.329551 | 24.79% |
+
+聚合计数采用与前述帧计数一致的完整日志口径。Zipf 的 workload summary 记录 `283,456,313` 次逻辑完成；两条 worker 最终记录因日志行拼接未计入该汇总，按全部 64 个 worker 的日志标记恢复后为 `292,571,161`，与 owner/session 计数一致，fanout 均舍入为 `1.329551`。该值表明一次 Server 请求平均服务约 `1.33` 次逻辑读取，约 `24.79%` 的重复 Server 请求由在途聚合消除。Zipf 下每帧平均 `24.068` 个 server item，对应约 `32` 次逻辑读取，体现了 batch channel 的批量交付与 batch-agg 的同 key 合并共同作用：前者均摊帧级 UB 成本，后者减少帧内实际执行的 key 定位请求。
+
+性能方面，Zipf 吞吐达到 `9.318M ops/sec`，相较 `100K Uniform/batch=32` 提高 `16.26%`；[Redis process CPU](../perf/p3_s3_svr0-15_zipf1.2_20261014_143303/server/server.cpu.process.tsv) 为 `4.792227` cores，加 softirq `0.010400` 后为 `4.802627` cores，较 Uniform 降低 `11.84%`；`ops/core` 从 `1.471M` 升至 `1.940M`，提高 `31.87%`。p99 从 `1.463ms` 降至 `0.927ms`，降低 `36.6%`，p50 则从 `0.679ms` 升至 `0.735ms`。逻辑读取均完成向量物化，错误、物化失败及 unmatched 均为 `0`。
+
+server 火焰图中，SuperNode job、stable-read 和 TLC lookup 的占比分别由 Uniform 的 `38.46%`、`36.00%`、`34.63%` 降至 Zipf 的 `18.40%`、`15.87%`、`14.46%`，与实际 Server 请求数量减少及热点定位局部性改善相一致；response publish 的相对占比由 `16.52%` 升至 `28.78%`，显示定位路径减轻后，CPU 工作分布更多集中于完成发布。访问分布变化下的吞吐与 CPU 差异体现同 key 聚合和热点局部性的综合收益，leader/follower 计数则直接量化了 batch-agg 消除重复 Server 访问的效果。
 
 ## 5 扩容设计
 
@@ -917,3 +1085,170 @@ hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容�
 迁移任务需要暴露 range/shard 级进度、snapshot 数量、delta 数量、stale/retry/redirect 计数、source fence 命中、target apply 失败和 SOURCE_GC 完成状态。扩容压测应同时观察 proxy backlog、job shard queue、completion ring、region full/fallback、bitmap lock/unlock 时间和 remote lookup 延迟，确认瓶颈来自迁移控制面还是常规数据面。
 
 如果 target apply 失败或新 epoch 无法稳定服务，`topo_ctl CLI` 可以停止发布新的 route epoch，并让旧 epoch 的用户 SDK/CLI 继续访问 source；已经进入 `CUTOVER` 的 range 需要按迁移状态机恢复 source 可读状态或完成 target 接管。回滚/恢复流程必须以 owner_generation 和 key version 为准，不能只依赖用户 SDK/CLI 的本地路由配置。
+
+## 6 COLD & HA 设计
+
+推荐特征服务既需要持续更新向量，也需要在进程重启、在线内存重建或服务节点故障后恢复数据与访问能力。COLD & HA 围绕这两类需求组织：COLD 通过每个副本本地的逻辑 AOF 和 checkpoint 保存可恢复状态，HA 通过 Leader/Follower 异步复制维持第二份在线数据，并由 Keepalived 管理服务入口与角色切换。正常读取和相似度计算仍沿 `location cache + WARM slot` 路径执行，恢复、复制和入口切换在独立的后台与控制面路径中完成。
+
+本章综合 [COLD/HA 与 LVS/F5 方案](./VEMB_V16_COLD_HA_LVS_F5_DESIGN.md)、[COLD 实施计划](./TLC_COLD_IMPLEMENTATION_PLAN.md)、[双副本架构](./TLC_2X3_HA_ARCHITECTURE.md)、[HA 数据同步设计](./TLC_HA_DATA_SYNC_DESIGN.md)、[跨节点重同步设计](./TLC_HA_CROSS_NODE_RESYNC_DESIGN.md)和 [Keepalived 故障切换回归](./TLC_HA_KEEPALIVED_FAILOVER_REGRESSION_PLAN.md)，结合当前代码描述本地持久化、异步复制和故障接管流程。实施计划中的阶段记录保留了原始进度快照；本章的实现状态、写入确认、复制进度和切换条件以当前代码及真机回归记录为准。
+
+### 6.1 双副本部署与职责划分
+
+每组业务数据由一对 HPC-Redis 实例承载：Leader 接收业务写入，Follower 接收复制事件并重建自身的 key metadata 和 WARM 数据。两个实例分别维护本地 COLD 目录、在线 WARM region 和复制进度。部署多个 Node group 时，可组成 `2 × N` 的双副本布局，各组独立复制与切换；每个实例只维护本组的固定本地/peer 身份与标量进度。
+
+| 组件 | 主要职责 | 数据与状态边界 |
+| --- | --- | --- |
+| SuperNode / TLC Core | 执行业务读写，维护 key version、tombstone、location cache 和 WARM 发布 | 业务写入受 HA write fence 和原有拓扑/迁移规则约束 |
+| 本地 COLD | AOF append、group commit、checkpoint、恢复重放和日志回收 | 每个副本拥有独立日志与持久化进度，保存逻辑 key/value 状态 |
+| HA Replica runtime | 批量事件复制、进度交换、AOF 补传和 snapshot resync | 按 `seq`、`ha_term`、固定 peer 身份与连接 epoch 校验复制流 |
+| Keepalived / notify hook | 健康检测、VIP 漂移、调用 `HA PROMOTE/DEMOTE/FENCE` | 入口位置与内部写门分别管理，角色转换由 Replica runtime 执行 |
+| 用户 SDK / CLI | 访问服务入口，重建连接并按当前 owner 建立 Aeron 映射 | 切换后重新获取 channel、region 描述和有效 handle |
+
+```mermaid
+flowchart LR
+    C["用户 SDK / CLI"] --> V["服务 VIP"]
+    V --> P["Leader<br/>Proxy / SuperNode / TLC"]
+    subgraph A["副本 A"]
+        P --> WA["WARM / key metadata"]
+        P --> CA["本地 COLD<br/>AOF + checkpoint"]
+        RA["HA Replica runtime"]
+        CA -. "append event" .-> RA
+    end
+    subgraph B["副本 B"]
+        RB["HA Replica runtime"] --> CB["本地 COLD<br/>AOF + checkpoint"]
+        RB --> WB["Follower<br/>WARM / key metadata"]
+    end
+    RA -->|"UB：事件 / snapshot / tail"| RB
+    RB -->|"UB：accepted ACK"| RA
+    RA <-->|"TCP：角色 / 进度 / resync 控制"| RB
+    K["Keepalived<br/>健康检测 / VIP / notify"] -. "入口切换" .-> V
+    K -. "HA 角色命令" .-> RA
+    K -. "HA 角色命令" .-> RB
+```
+
+客户端入口、Replica 控制面与 Replica 数据面具有独立职责。VIP 直接绑定在当前服务节点的网卡上；Replica TCP 控制连接使用两端的固定地址，UB ring 负责批量事件、checkpoint 分块、AOF tail 和 ACK 传输。复制过程不经过 VIP，因而入口漂移与副本恢复可以分别推进。
+
+### 6.2 写入与本地持久化数据流
+
+业务写入进入 TLC Core 后，先校验写门及 key 的拓扑、版本和迁移状态，再在对应 key-meta shard 的保护下构造逻辑事件。`PUT` 事件包含 key、完整向量、下一 key version、`ha_term`、`topology_epoch` 和 metadata shard；`DEL` 事件包含 key 及删除版本。COLD 接口复制事件内容，使后台持久化与复制始终使用独立的数据快照，避免依赖后续可能被覆盖或复用的 WARM slot。
+
+多个 worker 将事件提交到有界 append queue，由本副本唯一的 AOF writer 分配连续 `seq`，写入带长度、版本及 checksum 的日志记录。当前业务写路径采用 `TLC_COLD_ACK_ACCEPTED`：等待本地 AOF append 成功后，才写入或覆盖 WARM payload、发布 key metadata/location cache，或推进删除版本与 tombstone，最后返回业务结果。AOF append 失败时不发布该次在线更新；若 AOF 已接受但 WARM 发布失败，请求返回失败，日志事件保留供恢复与重试处理。
+
+append 完成后分出两条后台路径：flush coordinator 按事件数量或等待时间执行批量 `fsync`，推进本地 `durable_seq`；append sink 将事件交给 Replica 发送队列，异步发送到 Follower。业务成功返回不等待 Follower，因此跨节点复制延迟主要体现为 replication lag。
+
+```mermaid
+flowchart TB
+    R["VADD / VREM"] --> G["TLC：write fence / epoch / key 状态校验"]
+    G --> E["构造并复制 PUT / DEL 逻辑事件"]
+    E --> Q["有界 append queue"] --> A["唯一 AOF writer<br/>分配 seq / append / checksum"]
+    A -->|"accepted"| W["更新 WARM 与 key metadata<br/>发布 location 或 tombstone"]
+    W --> OK["返回业务结果"]
+    A --> F["后台 group commit / fsync"] --> D["本地 durable_seq 推进"]
+    A -. "append sink" .-> SQ["Replica 批量发送队列 / AOF 补读"]
+    SQ --> UB["UB EVENTS"] --> FA["Follower 本地 AOF append"]
+    FA --> ACK["accepted ACK"]
+    FA --> FF["后台 fsync<br/>Follower durable_seq 推进"]
+    FA --> AP["异步 apply<br/>重建 WARM / metadata<br/>applied_seq 推进"]
+```
+
+写入确认分为三个明确边界：`accepted` 表示日志已 append；`durable` 表示对应日志已完成本地 `fsync`；业务成功还要求在线状态发布完成。COLD 同时提供 `TLC_COLD_ACK_DURABLE` 等待接口，但当前业务路径和普通 Replica 接收路径采用 accepted 确认，durable 进度由后台刷盘独立推进。
+
+### 6.3 Checkpoint、重启恢复与日志回收
+
+AOF 保存有序变化，checkpoint 保存可直接加载的状态基线，两者共同控制恢复时间与磁盘容量。TLC Core 按 metadata shard 依次捕获 key、版本、tombstone、迁移元数据及有效向量内容，并记录各 shard 的 `captured_seq`。各 shard 捕获时刻可以不同，形成 fuzzy checkpoint；generation 的 `checkpoint_seq` 取各 shard 捕获边界的最小值，恢复时则保留每个 shard 各自的重放边界。
+
+checkpoint 采用不可变 generation 文件与 manifest 发布。文件内容和 checksum 完成校验、刷盘及原子 rename 后，再更新并刷盘 manifest，使重启始终依据已发布的 generation 加载状态。恢复过程中先校验 AOF 的 framing、checksum 和序号连续性；末尾未完成记录按恢复规则截断，日志中间损坏或序号断裂则停止恢复。存在有效 checkpoint 时加载基线，再按各 shard 的 `captured_seq` 重放后续事件；完整 AOF 仍可作为无有效 checkpoint 时的恢复来源。
+
+```mermaid
+flowchart TB
+    S["启动 / WARM 重建"] --> A["扫描本地 AOF<br/>校验 checksum 与连续 seq"]
+    A --> C{"存在有效 checkpoint？"}
+    C -->|"是"| L["加载 manifest 对应 generation<br/>恢复 key / version / tombstone / payload"]
+    L --> T["按 captured_seq 重放各 shard 的后续事件"]
+    C -->|"否"| R["从完整 AOF 重放"]
+    T --> W["重建 WARM / key metadata / location cache"]
+    R --> W
+    W --> H["按 HA 角色进入 BACKUP 或服务状态<br/>继续复制 / 等待外部角色控制"]
+```
+
+恢复和复制应用重新在本地 WARM 分配位置，持久化文件保存的是逻辑数据及版本，物理 slot/handle 随在线区域重建而重新生成。用户客户端随后依据当前 owner 的 region 描述取得新的 handle，并沿用第 3 章的 slot 状态、`write_seq` 和 `owner_generation` 校验规则。
+
+日志回收以有效 checkpoint 覆盖本地恢复区间为前提，同时维护 `seq -> segment/offset` 索引。HA 后台 retention maintenance 根据保留窗口推进 checkpoint、segment seal 和 compact；重同步会话对所需 AOF tail 建立 retention pin。落后副本的增量起点超出保留窗口时，进入 checkpoint resync；会话长期停滞或保留空间承压时中止会话，再建立新的恢复基线，控制历史日志的长期占用。
+
+### 6.4 异步复制、补传与全量重同步
+
+普通复制以 Leader 已 append 的逻辑 AOF 事件为来源，按连续 `seq` 和批量大小编码到 UB ring。Follower 在 wire 入口校验身份、连接 epoch、任期、事件形状与 checksum，使用 Leader 原始 `seq` 追加到自己的 COLD AOF；相同序号与内容的重复记录按幂等规则处理，缺口或冲突进入修复流程。正常接收后返回 accepted ACK，再由独立 apply worker 顺序更新 Follower 的 key version、tombstone、WARM 和 location cache。
+
+Leader 分别记录 `peer_accepted_seq`、`peer_durable_seq` 和 `peer_applied_seq`。普通 UB ACK 更新接收进度，TCP heartbeat 交换 durable/applied 等状态；heartbeat 用于进度与存活观测，故障检测和切主触发由 Keepalived 承担。Follower 的刷盘与在线 apply 可以独立推进，接收确认、落盘完成和可读取状态分别通过对应指标判断。
+
+发送队列是有界缓冲，本地 AOF 是补传来源。队列满时记录最早未入队的 `replay_from_seq`，由 sender 稍后从 AOF 补读；控制连接恢复后，结合 peer durable 进度重放尚未确认的区间。该设计将复制背压转换为可观测的 lag，同时用重复校验处理重发，避免业务线程等待远端副本追平。
+
+当 AOF 区间已被回收、事件发生不可修复的 GAP/CONFLICT，或副本需要整体重建时，执行 snapshot resync。Leader 固定有效 checkpoint 与 durable boundary，并 pin 必需的 AOF tail；checkpoint 经 UB 分块传输，Follower 逐块校验并写入临时 artifact，完成全量 checksum、`fsync` 和原子发布后才安装。安装在受控的 fenced 状态下排空旧 ingress/apply，清理旧 COLD/在线状态，并在原 runtime 中导入新的 checkpoint，再持久化和应用有序 tail。
+
+```mermaid
+flowchart TB
+    X["断线 / 队列溢出 / 复制缺口"] --> R{"所需 AOF 区间仍保留且一致？"}
+    R -->|"是"| I["从 AOF 批量补传<br/>Follower 去重 / append / apply"]
+    R -->|"否"| S["固定 checkpoint 与 durable boundary<br/>pin 所需 AOF tail"]
+    S --> B["UB 分块传输 snapshot<br/>校验并发布完整 artifact"]
+    B --> F["Follower fenced 安装<br/>排空旧任务 / 重建 COLD 与 WARM"]
+    F --> T["传输有序 tail<br/>持久化并按 shard 边界 apply"]
+    T --> H{"Follower durable / applied 已到边界？"}
+    H -->|"否"| T
+    H -->|"是"| N{"Leader durable boundary 是否前进？"}
+    N -->|"是"| T
+    N -->|"否"| C["HANDOFF_COMMIT / ACK<br/>释放 pin 与普通发送 gate"]
+    C --> E["从 H + 1 恢复普通 EVENTS"]
+    I --> E
+```
+
+重同步的收口条件是 Follower 的 durable 与 applied 同时到达选定边界 `H`。Leader 若又有新的 durable tail，则继续下一轮追赶；边界收敛后，通过 `HANDOFF_COMMIT/ACK` 将复制流切回普通 EVENTS，并补发收口期间的新事件。此处 handoff 表示复制模式切换，业务 owner 的提升仍由独立的 HA 角色转换完成。
+
+### 6.5 VIP 切换、角色转换与写入隔离
+
+服务入口采用 Keepalived VRRP 管理。健康脚本检查 Redis `PING` 和 `HA STATE`，配置通过连续失败/恢复阈值抑制探测抖动，并以 `nopreempt` 避免原节点恢复后立即抢回 VIP。`notify_master` 调用 `HA PROMOTE`，`notify_backup` 调用 `HA DEMOTE`，`notify_fault` 调用 `HA FENCE`。notify 结果保存到状态文件，失败转换可以查询并重试。
+
+VIP 位置决定流量入口，Replica runtime 的 write fence 与 `ha_term` 决定本实例的写入状态。Follower 平时保持业务写门关闭，继续接收复制。提升时先关闭写门，等待本地 `applied_seq >= durable_seq` 并排空角色转换相关的在途任务，再以 `max(local_term, peer_term) + 1` 推进任期，持久化 owner metadata 和 `takeover_seq`，切换到 `LEADER/MASTER` 并发送 `LEADER_ANNOUNCE`。转换成功后才重新开放写门；peer 不可达时公告延后发送。apply lag 超时时保留 Follower 及关闭的业务写门，允许继续追平并重试；内部转换失败则保持隔离状态。
+
+```mermaid
+flowchart TB
+    D["健康检查失败 / VRRP 入口切换"] --> V["VIP 漂移<br/>notify MASTER 调用 HA PROMOTE"]
+    V --> F["候选副本关闭业务写门"]
+    F --> A{"本地 durable 前缀已 apply<br/>且转换任务已排空？"}
+    A -->|"等待超时 / 失败"| X["保持写门关闭<br/>追平重试或进入 FAULT / FENCED"]
+    A -->|"是"| T["推进 ha_term<br/>持久化 owner metadata / takeover_seq"]
+    T --> L["转为 LEADER / MASTER<br/>发送或延后 LEADER_ANNOUNCE"]
+    L --> O["转换成功：开放业务写门"]
+    O --> C["客户端重建连接<br/>Aeron 重新 ATTACH 与映射 WARM"]
+    C --> R["恢复业务访问"]
+    P["旧 Leader 恢复"] --> B["DEMOTE / 新任期角色协调<br/>保持 FOLLOWER 业务写门关闭"]
+    B --> S["本地恢复 + AOF repair / snapshot resync"]
+    S --> H["BACKUP：追平当前 Leader<br/>不抢占 VIP"]
+```
+
+旧 Leader 恢复后依据新任期与角色公告进入 Follower 恢复流程，通过 AOF repair 或 checkpoint/tail resync 修复数据谱系，再回到 BACKUP。日志与 checkpoint 中的任期、持久化 owner metadata、事件序号及内容校验共同限制旧连接、旧任期事件和冲突尾部的继续应用。
+
+客户端连接也需要随入口与 owner 更新。TCP 客户端在旧连接失效后重连服务入口；Aeron 客户端经 HA endpoint 建立新的 ATTACH，按新 owner 的本地/远端 UB view 重建 request/response ring 与 WARM 映射，再获取有效 handle。已有 channel、共享映射与 handle 的生命周期不能由 VIP 漂移单独延续，客户端恢复与服务端角色转换共同完成业务访问切换。
+
+### 6.6 持久性边界与扩容协同
+
+当前写入与复制采用本地 accepted 确认、后台刷盘及跨节点异步复制。进程或机器重启时，已完成本地 `fsync` 的前缀是持久性保证；其后的完整 accepted 记录可在恢复扫描中保留，但尚未刷盘的尾部仍有丢失窗口。Leader 整体不可恢复并由 Follower 接管时，Leader 已 durable、Follower 尚未 durable 的区间也可能丢失。例如 Leader `durable_seq=1000`、Follower `durable_seq=980` 时，`981..1000` 是尚未在第二副本形成持久保障的尾部。
+
+因此，两副本共同持久化的观测边界可表示为 `min(leader durable_seq, follower durable_seq)`，而提升条件 `applied_seq >= durable_seq` 保证候选副本自己的持久化前缀已反映到在线状态；它并不表示候选副本已经取得故障 Leader 的全部已确认写入。该语义对应当前异步双副本实现，与早期 COLD/HA 草案中的 Paxos/witness 多数派提交具有不同的写入确认边界。现有 Keepalived 部署按单节点故障、无双向网络隔离的模型运行；更强的网络分区容错需要外部 fencing 或仲裁机制维持唯一写 owner，单独的 VIP 与本地任期递增不提供该仲裁能力。
+
+HA 与第 5 章扩容控制处理不同层次的变化：`ha_term` 表达副本角色和写入任期，`topology_epoch` 表达 key 路由与迁移版本，`key_version` 和 tombstone 表达 key 的逻辑状态，`owner_generation/write_seq` 则校验 WARM 位置与发布状态。COLD event 与 checkpoint 保留相应的逻辑版本及迁移元数据，恢复、复制应用和用户读取继续遵循原有版本规则。扩容完成条件仍由 migration outbox、barrier、lease 与拓扑发布确定；HA 接管条件由本地恢复、复制进度、write fence 与角色转换确定。
+
+### 6.7 实现对应与验证
+
+| 实现位置 | 已落地的职责 |
+| --- | --- |
+| [tlc_cold.c](../src/tlc_cold.c) / [tlc_cold.h](../src/tlc_cold.h) | 有界 AOF queue、唯一 writer、group commit、连续序号与校验、checkpoint 原子发布、replay、retention pin 和 compact |
+| [tlc_core.c](../src/tlc_core.c) | 先 append 后在线发布的 PUT/DEL、write fence、checkpoint 状态捕获、WARM 重建及复制/重同步应用 |
+| [tlc_ha_replica.c](../src/tlc_ha_replica.c) / [tlc_ha_replica.h](../src/tlc_ha_replica.h) | TCP 控制面与 UB 数据面、事件批量复制、accepted/durable/applied 进度、AOF 补传、artifact 安装、tail handoff 与角色转换 |
+| [vemb_v16_storage.c](../src/vemb_v16_storage.c) / [vemb_v16_server_integration.c](../src/vemb_v16_server_integration.c) | 通过 `HPC_REDIS_COLD_DIR` 启用持久化，通过 `HPC_REDIS_HA_ROLE` 及 peer/ring 配置启动 HA，暴露 `HA STATE/PROGRESS/PROMOTE/DEMOTE/FENCE` |
+| [ha_healthcheck.sh](../scripts/ha_healthcheck.sh) / [ha_notify.sh](../scripts/ha_notify.sh) / [Keepalived 模板](../scripts/keepalived_hpc_redis.conf.in) | 健康检测、VIP 状态通知、角色命令、notify 结果记录与重试、失败撤销入口及 `nopreempt` |
+| [C SDK](../clients/c/vemb_v16_client_sdk.c) / [HA Aeron 回归](../benchmark/tlc_ha_aeron_failover_111_to_112.sh) | HA endpoint 访问、按 owner 建立 ATTACH/UB view，以及切换后的 channel 重建与 handle 读取验证 |
+
+运行时通过 `HA STATE` 观察 role、HA state、`ha_term` 与 fenced 状态，通过 `HA PROGRESS` 观察 appended、durable、applied 和 peer 三类进度。Replica 日志补充 `replay_from_seq`、retention、resync 会话与角色转换结果；notify 状态文件补充入口控制命令的执行结果。结合本地刷盘 lag、peer durable lag、Follower apply lag 和会话进度，可以区分持久化、传输、应用与入口切换的延迟来源。
+
+现有 [COLD 单元测试](../benchmark/tlc_cold_ut.c)、[Replica 单元测试](../benchmark/tlc_ha_replica_ut.c)及 [跨进程测试](../benchmark/tlc_ha_replica_process_ut.c)覆盖日志损坏/序号缺口、checkpoint 发布与 compact 故障、重复复制、自动 GAP/retention resync、连接恢复及 promote apply-lag 门控。[2026-09-09/10 真机回归记录](./TLC_HA_KEEPALIVED_FAILOVER_REGRESSION_PLAN.md)进一步验证了 111/112 上的完整链路：固定角色测试完成 `1004` 个事件并在 Follower 重启、WARM reset 后再次读取校验；Keepalived 测试完成 VIP 漂移、提升、旧节点降级与 `nopreempt`；Aeron 双向 owner 重选与 ATTACH/VADD 均为 `fail=0`，切主前后 HANDLE 读取均为 `ok=4 fail=0`、`read_bytes=256`。旧 Leader 恢复回归还确认 Follower `durable_seq=applied_seq=16`、新 Leader `appended_seq=peer_durable_seq=peer_applied_seq=16`，体现入口切换、在线状态恢复与持久化复制进度最终收敛。

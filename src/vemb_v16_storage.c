@@ -338,7 +338,8 @@ static int manifest_push_region(vemb_v16_warm_regions_manifest_t *manifest,
                                 const vemb_v16_manifest_region_t *region) {
     RETURN_IF(manifest->region_count >= VEMB_V16_MAX_MANIFEST_REGIONS, -1);
     RETURN_IF(!region->path[0] || region->value_size == 0 ||
-              region->region_bytes < region->value_size, -1);
+              region->region_bytes < region->value_size ||
+              region->region_bytes / region->value_size > UINT32_MAX, -1);
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         RETURN_IF(manifest->regions[i].region_id == region->region_id, -1);
     }
@@ -435,8 +436,13 @@ static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
         *bytes = vemb_v16_remote_meta_layout_bytes_for_sets(*set_count,
                                                             *ways);
     } else {
-        *entry_count = requested_entry_count ?
-            requested_entry_count : storage->max_vectors;
+        uint64_t slots = 0;
+        for (uint32_t i = 0; i < storage->local_manifest_region_count; i++) {
+            const vemb_v16_manifest_region_t *region = &storage->local_manifest_regions[i];
+            slots += region->region_bytes / region->value_size;
+        }
+        RETURN_IF(!requested_entry_count && slots > VEMB_V16_MAX_POWER_U32 / 2u, -1);
+        *entry_count = requested_entry_count ? requested_entry_count : (uint32_t)slots;
         *bucket_count = requested_bucket_count ?
             requested_bucket_count :
             vemb_v16_pow2_ceil_u32((uint64_t)(*entry_count) * 2u);
@@ -971,7 +977,6 @@ static int storage_attach_ub_rpc_peer_config(
 static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
                                              const vemb_v16_manifest_region_t *src) {
     RETURN_IF(src->region_id == 0 || !src->path[0], -1);
-    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB, -1);
     RETURN_IF(storage_has_region_id(storage, src->region_id), 0);
     RETURN_IF(storage->warm_region_count >= VEMB_V16_MAX_MANIFEST_REGIONS, -1);
 
@@ -992,33 +997,47 @@ static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
                                                      capacity_slots) != 0,
                   -1);
     }
-    RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
-                                          src->backend_type,
-                                          src->cache_policy,
-                                          src->path,
-                                          src->mmap_offset,
-                                          allocator_layout_bytes +
-                                              (size_t)src->region_bytes) != 0,
-              -1);
-    RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
-                                            &storage->warm_data_mappings[i],
-                                            allocator_layout_bytes,
-                                            src->region_id,
-                                            src->backend_type,
-                                            src->path,
-                                            src->mmap_offset +
-                                                allocator_layout_bytes,
-                                            src->value_size,
-                                            src->region_bytes,
-                                            src->home_ub_node_id,
-                                            src->is_local,
-                                            src->weight ? src->weight : 1) != 0,
-              -1);
+    size_t payload_offset = src->backend_type == VEMB_V16_REGION_UB ?
+        allocator_layout_bytes : 0;
+    if (vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
+                                     src->backend_type,
+                                     src->cache_policy,
+                                     src->path,
+                                     src->mmap_offset,
+                                     payload_offset + (size_t)src->region_bytes) != 0)
+        goto fail;
+    if (vemb_v16_warm_provider_attach(&storage->warm_providers[i],
+                                      &storage->warm_data_mappings[i],
+                                      payload_offset,
+                                      src->region_id,
+                                      src->backend_type,
+                                      src->path,
+                                      src->mmap_offset + payload_offset,
+                                      src->value_size,
+                                      src->region_bytes,
+                                      src->home_ub_node_id,
+                                      src->is_local,
+                                      src->weight ? src->weight : 1) != 0)
+        goto fail;
+    vemb_v16_mapped_region_t *layout = &storage->warm_data_mappings[i];
+    if (src->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
+        char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
+        if (vemb_v16_warm_region_layout_name_from_region_path(
+                src->path, src->region_id, layout_name, sizeof(layout_name)) != 0)
+            goto fail;
+        layout = &storage->warm_allocator_mappings[i];
+        if (vemb_v16_mapped_region_open(layout, src->backend_type,
+                                         VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+                                         layout_name, 0, allocator_layout_bytes) != 0 ||
+            warm_region_layout_ensure_initialized(layout, src->region_id,
+                                                   capacity_slots, src->value_size,
+                                                   src->region_bytes) != 0)
+            goto fail;
+    }
     vemb_v16_tlc_warm_region_t warm_region = storage->warm_providers[i].region;
-    warm_region.slot_meta = warm_slot_meta_from_mapping(
-        &storage->warm_data_mappings[i],
-        capacity_slots);
-    RETURN_IF(vemb_v16_tlc_attach_warm_region(storage->tlc, &warm_region) != 0, -1);
+    warm_region.slot_meta = warm_slot_meta_from_mapping(layout, capacity_slots);
+    if (vemb_v16_tlc_attach_warm_region(storage->tlc, &warm_region) != 0)
+        goto fail;
     storage->warm_region_count++;
     serverLog(LL_NOTICE,
               "vemb_v16 runtime warm region attached: local_owner=%u peer_owner=%u region_id=%u backend=%u path=%s bytes=%llu",
@@ -1029,6 +1048,12 @@ static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
               src->path,
               (unsigned long long)src->region_bytes);
     return 0;
+
+fail:
+    vemb_v16_warm_provider_close(&storage->warm_providers[i]);
+    vemb_v16_mapped_region_close(&storage->warm_allocator_mappings[i]);
+    vemb_v16_mapped_region_close(&storage->warm_data_mappings[i]);
+    return -1;
 }
 
 // Attach cached peer-view mapping for one owner into runtime state.
@@ -1698,19 +1723,19 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
 int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                               uint32_t vector_dim,
                                               uint32_t vector_stride,
-                                              uint32_t max_vectors,
                                               const vemb_v16_warm_regions_manifest_t *manifest) {
     RETURN_IF(!out || !manifest ||
               vector_dim == 0 || vector_stride == 0 ||
               vector_dim > VEMB_V16_MAX_DIM ||
               vector_stride != vector_dim * sizeof(float) ||
-              max_vectors == 0 || manifest->region_count == 0 ||
+              manifest->region_count == 0 ||
               manifest->region_count > VEMB_V16_MAX_MANIFEST_REGIONS, -1);
 
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
         RETURN_IF(region->value_size != vector_stride ||
-                  region->region_bytes < region->value_size, -1);
+                  region->region_bytes < region->value_size ||
+                  region->region_bytes / region->value_size > UINT32_MAX, -1);
     }
 
     vemb_v16_storage_ctx_t *storage = zcalloc(sizeof(*storage));
@@ -1726,7 +1751,6 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     }
     storage->vector_dim = vector_dim;
     storage->vector_stride = vector_stride;
-    storage->max_vectors = max_vectors;
     storage->local_owner_id = manifest->has_local_ub_node_id ?
         manifest->local_ub_node_id : 0;
     atomic_init(&storage->current_topology_epoch, 0);
@@ -1929,14 +1953,12 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
 
     if (vemb_v16_tlc_create(&storage->tlc,
                             storage->vector_dim,
-                            storage->max_vectors,
                             warm_regions,
                             storage->warm_region_count,
                             storage->local_region_weight) != 0) {
         serverLog(LL_WARNING,
-                  "vemb_v16 tlc create failed: dim=%u max_vectors=%u regions=%u",
+                  "vemb_v16 tlc create failed: dim=%u regions=%u",
                   storage->vector_dim,
-                  storage->max_vectors,
                   storage->warm_region_count);
         goto err;
     }
@@ -2053,6 +2075,9 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
 
     vemb_v16_warm_provider_t *provider = storage->warm_providers ?
         &storage->warm_providers[0] : &storage->warm_provider;
+    /* Legacy single-region field; never use the aggregate to size one mapping. */
+    desc->max_vectors = (uint32_t)(provider->region.region_bytes /
+                                    provider->region.value_size);
     desc->warm_region_id = provider->region.region_id;
     desc->warm_backend_type = provider->region.backend_type;
     desc->warm_region_bytes = provider->region.region_bytes;
@@ -2868,7 +2893,7 @@ static int storage_auto_mark_migrating_for_topology(
         return 0;
     }
 
-    uint32_t cursor = 0;
+    tlc_core_key_cursor_t cursor = {0};
     int done = 0;
     uint32_t marked = 0;
     uint32_t skipped = 0;
@@ -2983,7 +3008,8 @@ static int peer_view_region_desc_to_manifest(
         const vemb_v16_peer_view_region_desc_t *src,
         uint32_t local_owner_id) {
     RETURN_IF(!dst || !src || src->region_id == 0 || !src->path[0] ||
-              src->value_size == 0 || src->region_bytes < src->value_size,
+              src->value_size == 0 || src->region_bytes < src->value_size ||
+              src->region_bytes / src->value_size > UINT32_MAX,
               -1);
     manifest_region_defaults(dst, src->value_size);
     dst->region_id = src->region_id;
@@ -3057,6 +3083,7 @@ int vemb_v16_storage_store_peer_view_map(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_peer_view_map_req_t *req,
         vemb_v16_peer_view_map_resp_t *resp) {
+    *resp = (vemb_v16_peer_view_map_resp_t){.status = VEMB_V16_STATUS_ERR};
     if (req->ub_rpc_timeout_ms)
         storage->ub_rpc_timeout_ms = req->ub_rpc_timeout_ms;
 

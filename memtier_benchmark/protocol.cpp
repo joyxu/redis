@@ -1306,8 +1306,8 @@ int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_l
 /////////////////////////////////////////////////////////////////////////
 
 
-vemb_v16_protocol::vemb_v16_protocol(uint32_t dim, uint32_t max_vectors)
-    : m_channel_id(0), m_req_id(1), m_dim(dim), m_max_vectors(max_vectors),
+vemb_v16_protocol::vemb_v16_protocol(uint32_t dim)
+    : m_channel_id(0), m_req_id(1), m_dim(dim),
       m_handle_mode(false),
       m_warm_mapping_addr(NULL), m_warm_mapping_bytes(0),
       m_warm_mapped_addr(NULL), m_warm_region_bytes(0),
@@ -1447,7 +1447,7 @@ void vemb_v16_protocol::set_dim(uint32_t dim)
 
 abstract_protocol* vemb_v16_protocol::clone(void)
 {
-    vemb_v16_protocol *p = new vemb_v16_protocol(m_dim, m_max_vectors);
+    vemb_v16_protocol *p = new vemb_v16_protocol(m_dim);
     p->set_handle_mode(m_handle_mode);
     p->set_vsim_mode(m_vsim_mode);
     p->set_vsim_key_key_mode(m_vsim_key_key_mode);

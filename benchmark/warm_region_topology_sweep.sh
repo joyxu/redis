@@ -67,7 +67,6 @@ start_server() {
     ${SRV_BIND} ./src/redis-server \
         --port ${PORT} --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim ${DIM} \
-        --vemb-v16-max-vectors 1048576 \
         --vemb-v16-warm-regions-manifest ${manifest} \
         --vemb-v16-reset-warm-regions yes \
         ${aeron_args} \

@@ -15,7 +15,7 @@ if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
     cd /root/gqs/codespace/UnifiedBus/hpc-redis
     ./src/redis-server \
       --port 6379 --vemb-v16-enabled yes --vemb-v16-dim 300 \
-      --vemb-v16-max-vectors 131072 --vemb-v16-warm-regions-manifest /root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111.yaml \
+      --vemb-v16-warm-regions-manifest /root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111.yaml \
       --vemb-v16-proxy-io-threads 32 \
       --vemb-v16-supernode-workers 64 \
       --daemonize yes --loglevel notice

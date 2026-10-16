@@ -461,7 +461,6 @@ start_hpc_0() {
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $HPC_MANIFEST_0 \
@@ -482,7 +481,6 @@ start_hpc_1() {
             --io-threads $BASELINE_IO_THREADS --io-threads-do-reads yes \
             --vemb-v16-enabled yes \
             --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $HPC_MANIFEST_1 \

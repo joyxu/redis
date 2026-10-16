@@ -47,7 +47,6 @@ static void node_init(test_node_t *node, uint32_t region_id,
     };
     tlc_core_config_t core_config = {
         .value_size = VALUE_SIZE,
-        .warm_capacity = SLOT_COUNT,
         .hot_capacity = 16,
         .warm_regions = &warm,
         .warm_region_count = 1,

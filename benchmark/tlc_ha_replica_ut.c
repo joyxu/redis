@@ -138,7 +138,6 @@ static void node_init_with_retention(test_node_t *node, uint32_t region_id,
     };
     tlc_core_config_t core_config = {
         .value_size = VALUE_SIZE,
-        .warm_capacity = SLOT_COUNT,
         .hot_capacity = 32,
         .warm_regions = &warm,
         .warm_region_count = 1,
@@ -682,6 +681,9 @@ static void run_network_test(void) {
     assert(tlc_core_put(leader.core, tail_key, strlen(tail_key), tail_hash,
                         tail_value, sizeof(tail_value), &warm_slot) == 0);
     assert(wait_for_cold_durable(leader.cold, 2));
+    /* Session 5002 installed a raw artifact without a control request.
+     * A newer session must discard that pending handshake and install its own
+     * snapshot before replaying this tail. */
     assert(tlc_ha_replica_begin_resync(leader_replica, 5003, 5, 32768) == 0);
 
     const char *late_key = "m5-late-key";

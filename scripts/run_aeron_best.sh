@@ -542,7 +542,6 @@ start_local_server() {
     env "${cold_env[@]}" taskset -c "$SERVER_MASK" $REDIS \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-        --vemb-v16-max-vectors $MAX_VECTORS \
         --vemb-v16-warm-regions-manifest "$MANIFEST" \
         --vemb-v16-reset-warm-regions yes \
         --vemb-v16-transport "$SERVER_TRANSPORT" \

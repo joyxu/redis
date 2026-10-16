@@ -46,8 +46,7 @@ static void node_init(test_node_t *node, uint32_t region_id,
         .slot_meta = node->slot_meta,
     };
     tlc_core_config_t core_config = {
-        .value_size = VALUE_SIZE, .warm_capacity = SLOT_COUNT,
-        .hot_capacity = 16, .warm_regions = &warm, .warm_region_count = 1,
+        .value_size = VALUE_SIZE, .hot_capacity = 16, .warm_regions = &warm, .warm_region_count = 1,
         .local_region_weight = 1,
     };
     assert(tlc_core_create(&node->core, &core_config) == 0);

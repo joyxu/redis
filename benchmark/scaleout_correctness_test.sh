@@ -45,7 +45,7 @@ start_server() {  # $1=host  $2=manifest
     if [ "$host" = "$HW01" ]; then
         numactl -N 0 -l taskset -c 0-95 $HPC/src/redis-server \
             --port $PORT --bind 0.0.0.0 --protected-mode no \
-            --vemb-v16-enabled yes --vemb-v16-dim $DIM --vemb-v16-max-vectors 131072 \
+            --vemb-v16-enabled yes --vemb-v16-dim $DIM \
             --vemb-v16-warm-regions-manifest "$manifest" \
             --vemb-v16-reset-warm-regions yes \
             --vemb-v16-proxy-io-threads 16 --vemb-v16-supernode-workers 32 \
@@ -53,7 +53,7 @@ start_server() {  # $1=host  $2=manifest
     else
         ssh root@$host "numactl -N 0 -l taskset -c 0-95 $HPC/src/redis-server \
             --port $PORT --bind 0.0.0.0 --protected-mode no \
-            --vemb-v16-enabled yes --vemb-v16-dim $DIM --vemb-v16-max-vectors 131072 \
+            --vemb-v16-enabled yes --vemb-v16-dim $DIM \
             --vemb-v16-warm-regions-manifest $manifest \
             --vemb-v16-reset-warm-regions yes \
             --vemb-v16-proxy-io-threads 16 --vemb-v16-supernode-workers 32 \

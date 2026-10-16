@@ -9,6 +9,10 @@
 #include <stdint.h>
 
 #define TLC_CORE_DEFAULT_HOT_CAPACITY 65536u
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+/* Diagnostic worker-thread snapshot; reads only the calling thread's counters. */
+void tlc_core_log_lookup_diagnostics(uint32_t worker_id);
+#endif
 #ifndef TLC_CORE_ALLOW_LRU_EVICTION
 #define TLC_CORE_ALLOW_LRU_EVICTION 0
 #endif
@@ -101,6 +105,13 @@ typedef struct tlc_core_migration_snapshot {
     char key[VEMB_V16_MAX_KEY_LEN];
 } tlc_core_migration_snapshot_t;
 
+/* WARM placement uses a region-wide free-slot pool, independent of key hash.
+ * slot_meta remains shared and live until destroy; FREE -> FILLING atomically
+ * arbitrates allocations across cores mapping the same region. Business writes
+ * for a key must be routed to its owner. Attach discovers existing READY slots;
+ * live shared reads can also discover subsequently published slots. Online
+ * release of occupied slots is not supported; HA reset requires fenced access.
+ */
 typedef struct tlc_core_warm_region_config {
     uint32_t region_id;
     uint32_t backend_type;
@@ -146,7 +157,6 @@ typedef struct tlc_core_stats {
 
 typedef struct tlc_core_config {
     uint32_t value_size;
-    uint32_t warm_capacity;
     uint32_t hot_capacity;
     const tlc_core_warm_region_config_t *warm_regions;
     uint32_t warm_region_count;
@@ -161,6 +171,8 @@ typedef int (*tlc_core_replica_event_sink_fn)(
 
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config);
 void tlc_core_destroy(tlc_core_t *core);
+/* Sum of physical slots in configured and published runtime regions. */
+uint64_t tlc_core_warm_capacity(const tlc_core_t *core);
 /* Must be called once, before concurrent writes begin; resolver_arg remains live. */
 int tlc_core_enable_cold(tlc_core_t *core,
                          const tlc_cold_config_t *cold_config);
@@ -364,8 +376,15 @@ int tlc_core_collect_migration_ranges(tlc_core_t *core,
                                       tlc_core_migration_range_ref_t *ranges,
                                       uint32_t max_ranges,
                                       uint32_t *range_count);
+/* Zero-initialize before a scan; valid across index growth, not HA reset.
+ * Records are append ordered. Concurrent writes in already-scanned shards are
+ * handled by the migration write protocol, not a global enumeration snapshot. */
+typedef struct tlc_core_key_cursor {
+    uint32_t shard_index;
+    uint32_t entry_index;
+} tlc_core_key_cursor_t;
 int tlc_core_collect_source_active_keys(tlc_core_t *core,
-                                        uint32_t *cursor,
+                                        tlc_core_key_cursor_t *cursor,
                                         tlc_core_migration_key_ref_t *keys,
                                         uint32_t max_keys,
                                         uint32_t *key_count,

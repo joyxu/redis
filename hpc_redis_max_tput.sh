@@ -129,7 +129,6 @@ start_server() {
             --warm-regions-manifest "$MANIFEST" \
             --reset-warm-regions \
             --dim $DIM \
-            --max-vectors 131072 \
             --loglevel notice >"$logfile" 2>&1 &
         SERVER_PID=$!
         echo "$SERVER_PID" > "$PIDFILE"
@@ -140,7 +139,6 @@ start_server() {
         $PIN_S ./src/redis-server \
             --port $PORT --bind 0.0.0.0 --protected-mode no \
             --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors 131072 \
             --vemb-v16-warm-regions-manifest "$MANIFEST" \
             --vemb-v16-reset-warm-regions yes \
             --vemb-v16-proxy-io-threads $pio --vemb-v16-supernode-workers $snw \

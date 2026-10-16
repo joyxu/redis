@@ -212,7 +212,6 @@ protected:
     uint64_t m_channel_id;
     uint32_t m_req_id;
     uint32_t m_dim;
-    uint32_t m_max_vectors;
     bool m_handle_mode;
 
     /* warm region (mmap'd once per connection), aligned with benchmark */
@@ -241,8 +240,7 @@ protected:
     uint8_t m_next_request_flags;
 
 public:
-    vemb_v16_protocol(uint32_t dim = 0,
-                      uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS);
+    vemb_v16_protocol(uint32_t dim = 0);
     virtual ~vemb_v16_protocol();
     virtual abstract_protocol* clone(void);
 

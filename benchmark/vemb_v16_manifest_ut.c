@@ -218,10 +218,11 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(storage->warm_region_count == 2);
     assert(storage->tlc->warm_region_count == 2);
+    assert(tlc_core_warm_capacity(storage->tlc->core) ==
+           2u * (warm_region_bytes / (dim * sizeof(float))));
     assert(storage->remote_meta_base != NULL);
     assert(storage->remote_meta_entry_count == max_vectors);
     assert(storage->remote_meta_bucket_count >= max_vectors * 2);
@@ -232,6 +233,7 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     memset(&desc, 0, sizeof(desc));
     vemb_v16_storage_fill_channel_desc(storage, &desc);
     assert(desc.warm_region_count == 2);
+    assert(desc.max_vectors == warm_region_bytes / (dim * sizeof(float)));
     assert(desc.warm_regions[0].region_id == 101);
     assert(desc.warm_regions[1].region_id == 202);
     assert(!strcmp(desc.warm_regions[0].path, shm1));
@@ -345,7 +347,6 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&first,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(first->remote_meta_is_mapped == 1);
     assert(first->remote_meta_base == first->remote_meta_mapping.mapped_addr);
@@ -370,7 +371,6 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&second,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(second->remote_meta_is_mapped == 1);
     vemb_v16_remote_meta_handle_t remote_handle = {0};
@@ -476,7 +476,6 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(storage->remote_meta_owner_view_count == 2);
     assert(storage->remote_meta_owner_views[0].owner_id == 1);
@@ -655,7 +654,6 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(storage->ub_rpc != NULL);
     assert(manifest_ut_active_owner_snapshot(storage)->owner_hash_node_count ==
@@ -875,12 +873,12 @@ static void test_peer_view_map_can_attach_local_region(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(storage->warm_region_count == 1);
     assert(storage->tlc->warm_region_count == 1);
     assert(vemb_v16_tlc_find_region(storage->tlc, 901) != NULL);
     assert(vemb_v16_tlc_find_region(storage->tlc, 902) == NULL);
+    assert(tlc_core_warm_capacity(storage->tlc->core) == slots);
 
     memset(&req, 0, sizeof(req));
     req.flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
@@ -903,6 +901,7 @@ static void test_peer_view_map_can_attach_local_region(void) {
     assert(resp.applied_region_count == 1);
     assert(storage->warm_region_count == 2);
     assert(vemb_v16_tlc_find_region(storage->tlc, 902) != NULL);
+    assert(tlc_core_warm_capacity(storage->tlc->core) == 2u * slots);
 
     {
         vemb_v16_channel_desc_t desc;
@@ -1001,7 +1000,6 @@ static void test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered(void) 
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(storage->ub_rpc != NULL);
     assert(storage->tlc->lookup_rpc == vemb_v16_ub_rpc_lookup);

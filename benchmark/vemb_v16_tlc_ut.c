@@ -6,6 +6,7 @@
 #include "../src/zmalloc.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -96,7 +97,7 @@ static void test_fuzzy_checkpoint_concurrent_writes(void) {
         .group_max_delay_us = 1000,
     };
     vemb_v16_tlc_t *tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
     pthread_t threads[WORKER_COUNT];
     fuzzy_checkpoint_writer_arg_t args[WORKER_COUNT];
@@ -129,7 +130,7 @@ static void test_fuzzy_checkpoint_concurrent_writes(void) {
     recovered_warm.mapped_addr = recovered_region;
     recovered_warm.slot_meta = recovered_slot_meta;
     vemb_v16_tlc_t *recovered = NULL;
-    assert(vemb_v16_tlc_create(&recovered, 2, SLOT_COUNT,
+    assert(vemb_v16_tlc_create(&recovered, 2,
                                &recovered_warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
     for (uint32_t worker = 0; worker < WORKER_COUNT; worker++) {
@@ -199,7 +200,7 @@ static void test_checkpoint_aof_full_recovery_consistency(void) {
         .group_max_delay_us = 1000,
     };
     vemb_v16_tlc_t *tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
     const char *keys[] = {"recover:keep", "recover:update", "recover:delete"};
     const float initial[][2] = {{1, 2}, {3, 4}, {5, 6}};
@@ -243,7 +244,7 @@ static void test_checkpoint_aof_full_recovery_consistency(void) {
     warm.mapped_addr = recovered_region;
     warm.slot_meta = recovered_slot_meta;
     vemb_v16_tlc_t *recovered = NULL;
-    assert(vemb_v16_tlc_create(&recovered, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&recovered, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
     assert_recovered_value(recovered, keys[0], initial[0]);
     assert_recovered_value(recovered, keys[1], updated);
@@ -301,7 +302,7 @@ static void test_single_node_recovery_failure_blocks_startup(void) {
         .region_bytes = SLOT_COUNT * 2 * sizeof(float),
         .value_size = 2 * sizeof(float), .slot_meta = slot_meta};
     vemb_v16_tlc_t *tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, SLOT_COUNT, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
     vemb_v16_tlc_destroy(tlc);
     zfree(region);
@@ -332,7 +333,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
         .region_bytes = 4 * value_size, .value_size = value_size,
         .slot_meta = slot_meta};
     vemb_v16_tlc_t *tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
     vemb_v16_vector_handle_t handle;
     uint32_t warm_slot;
@@ -370,7 +371,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
     warm.mapped_addr = region;
     warm.slot_meta = slot_meta;
     tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
     vemb_v16_tlc_destroy(tlc);
     zfree(region);
@@ -388,7 +389,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
     warm.mapped_addr = region;
     warm.slot_meta = slot_meta;
     tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, 4, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
     const char *key2 = "strict-state-key-2";
     const float second_value[] = {5, 6};
@@ -414,7 +415,7 @@ static void test_recovery_strict_term_and_state_boundaries(void) {
     warm.region_bytes = value_size;
     warm.slot_meta = slot_meta;
     tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) != 0);
     assert(vemb_v16_tlc_recover_cold(tlc) != 0);
     vemb_v16_tlc_destroy(tlc);
@@ -536,14 +537,12 @@ static void tlc_ut_ensure_regions_slot_meta(
 
 static int tlc_ut_create(vemb_v16_tlc_t **out,
                          uint32_t vector_dim,
-                         uint32_t max_vectors,
                          vemb_v16_tlc_warm_region_t *warm_regions,
                          uint32_t warm_region_count,
                          uint32_t local_region_weight) {
     tlc_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
     return vemb_v16_tlc_create(out,
                                vector_dim,
-                               max_vectors,
                                warm_regions,
                                warm_region_count,
                                local_region_weight);
@@ -580,7 +579,7 @@ static void test_persistent_cold_write_order(void) {
         .group_max_delay_us = 1000,
     };
     vemb_v16_tlc_t *tlc = NULL;
-    assert(vemb_v16_tlc_create(&tlc, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&tlc, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(tlc, &cold_config) == 0);
     const char key[] = "m2-key";
     float value[2] = {1.0f, 2.0f};
@@ -622,7 +621,7 @@ static void test_persistent_cold_write_order(void) {
     tlc_cold_close(cold);
 
     vemb_v16_tlc_t *recovered = NULL;
-    assert(vemb_v16_tlc_create(&recovered, 2, 1, &warm, 1, 1) == 0);
+    assert(vemb_v16_tlc_create(&recovered, 2, &warm, 1, 1) == 0);
     assert(vemb_v16_tlc_enable_cold(recovered, &cold_config) == 0);
     tlc_core_key_migration_info_t info;
     assert(tlc_core_get_migration_info(recovered->core,
@@ -648,6 +647,7 @@ static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
     memset(ring, 0, sizeof(*ring));
     ring->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    ring->cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
     snprintf(ring->path, sizeof(ring->path), "%s", path);
 }
 
@@ -723,28 +723,413 @@ static void test_put_get_handle(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 7, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 10);
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector), &handle, &warm_slot) == 0);
     assert(handle.region_id == 7);
     assert(handle.bytes == sizeof(vector));
-    assert(handle.local_slot == 0);
+    assert(handle.local_slot < max_vectors);
     assert(handle.owner_generation == 1);
-    assert(handle.offset == 0);
-    assert(warm_slot == 0);
-    assert(memcmp(region, vector, sizeof(vector)) == 0);
+    assert(handle.offset == (uint64_t)handle.local_slot * sizeof(vector));
+    assert(warm_slot == handle.local_slot);
+    assert(memcmp((uint8_t *)region + handle.offset, vector, sizeof(vector)) == 0);
+    uint32_t inserted_slot = warm_slot;
 
     memset(&handle, 0, sizeof(handle));
     warm_slot = 99;
     assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key), key_hash,
                                    &handle, &warm_slot) == 0);
     assert(handle.region_id == 7);
-    assert(handle.offset == 0);
-    assert(handle.local_slot == 0);
+    assert(handle.offset == (uint64_t)inserted_slot * sizeof(vector));
+    assert(handle.local_slot == inserted_slot);
     assert(handle.owner_generation == 1);
-    assert(warm_slot == 0);
+    assert(warm_slot == inserted_slot);
     vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_region_pool_full_capacity_and_cache_collisions(void) {
+    /* Opt-in hardware run resets only this explicitly selected UB range. */
+    const char *ub_path = getenv("TLC_UT_WARM_UB_PATH");
+    uint64_t ub_offset = 0;
+    if (ub_path) {
+        const char *offset = getenv("TLC_UT_WARM_UB_OFFSET");
+        assert(ub_path[0] && offset && offset[0] >= '0' && offset[0] <= '9');
+        char *end;
+        errno = 0;
+        ub_offset = strtoull(offset, &end, 10);
+        assert(errno == 0 && *end == '\0' && ub_offset != 0 &&
+               ub_offset % 4096u == 0 && ub_offset <= UINT64_MAX - 16384u);
+    }
+    const uint32_t capacities[] = {1, 7, 64, 65, 129};
+    for (uint32_t c = 0; c < sizeof(capacities) / sizeof(capacities[0]); c++) {
+        uint32_t count = capacities[c];
+        vemb_v16_mapped_region_t ub_mapping;
+        float *region;
+        vemb_v16_warm_slot_meta_t *slots;
+        if (ub_path) {
+            size_t layout_bytes = vemb_v16_warm_region_layout_bytes(count);
+            assert(vemb_v16_mapped_region_open(&ub_mapping,
+                       VEMB_V16_REGION_UB, VEMB_V16_UB_CACHE_POLICY_CACHEABLE,
+                       ub_path, ub_offset, layout_bytes + count * 2 * sizeof(float)) == 0);
+            slots = vemb_v16_warm_region_slot_meta(ub_mapping.mapped_addr);
+            region = (float *)(ub_mapping.mapped_addr + layout_bytes);
+        } else {
+            region = zcalloc_num(count, 2 * sizeof(float));
+            slots = zcalloc_num(count, sizeof(*slots));
+        }
+        char (*keys)[48] = zcalloc_num(count, sizeof(*keys));
+        uint64_t *hashes = zcalloc_num(count, sizeof(*hashes));
+        tlc_warm_location_t *locations = zcalloc_num(count, sizeof(*locations));
+        uint8_t *seen = zcalloc(count);
+        assert(region && slots && keys && hashes && locations && seen);
+        init_fuzzy_slot_meta(slots, count, 970);
+        tlc_core_warm_region_config_t warm = {
+            .region_id = 970,
+            .backend_type = ub_path ? VEMB_V16_REGION_UB : VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 1,
+            .weight = 1,
+            .value_size = 2 * sizeof(float),
+            .region_bytes = count * 2 * sizeof(float),
+            .mapped_addr = (uint8_t *)region,
+            .slot_meta = slots,
+        };
+        tlc_core_config_t config = {
+            .value_size = warm.value_size,
+            .hot_capacity = 1,
+            .warm_regions = &warm,
+            .warm_region_count = 1,
+        };
+        tlc_core_t *core;
+        assert(tlc_core_create(&core, &config) == 0);
+        /* All keys share both the old 8-way set and the cache probe window. */
+        uint32_t old_set_count = (count + 7u) / 8u;
+        uint32_t found = 0;
+        for (uint32_t candidate = 0; found < count; candidate++) {
+            char key[48];
+            snprintf(key, sizeof(key), "pool-collision:%u", candidate);
+            uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+            if (vemb_v16_mix32_u64(hash) % old_set_count != 0 ||
+                vemb_v16_hash_mask_u64(hash, 1023u) != 0)
+                continue;
+            strcpy(keys[found], key);
+            hashes[found] = hash;
+            float value[2] = {(float)found, (float)(found + 1000)};
+            assert(tlc_core_put_location_epoch(core, key, strlen(key), hash,
+                                                value, sizeof(value), 1, 1,
+                                                &locations[found]) == 0);
+            uint32_t slot = locations[found].local_slot;
+            assert(slot < count && !seen[slot]);
+            seen[slot] = 1;
+            if (found == 0 && count > 1) {
+                uint64_t seq = atomic_load_explicit(&slots[slot].write_seq,
+                                                     memory_order_acquire);
+                atomic_store_explicit(&slots[slot].write_seq, seq + 1,
+                                      memory_order_release);
+                tlc_warm_location_t retry;
+                assert(tlc_core_put_location_epoch(core, key, strlen(key), hash,
+                           value, sizeof(value), 1, 1, &retry) != 0);
+                atomic_store_explicit(&slots[slot].write_seq, seq,
+                                      memory_order_release);
+                for (uint32_t j = 0; j < count; j++) {
+                    assert(atomic_load_explicit(&slots[j].state,
+                               memory_order_acquire) ==
+                           (j == slot ? VEMB_V16_WARM_SLOT_READY :
+                                        VEMB_V16_WARM_SLOT_FREE));
+                }
+            }
+            found++;
+        }
+        if (count > 4) {
+            tlc_warm_location_t cached;
+            assert(tlc_core_get_cached_warm_location(core, keys[0],
+                       strlen(keys[0]), hashes[0], &cached) != 0);
+        }
+        /* Snapshot already holds the shard lock and must survive cache miss. */
+        tlc_core_migration_snapshot_t snapshot;
+        float actual[2];
+        assert(tlc_core_snapshot(core, keys[0], strlen(keys[0]), hashes[0],
+                                  1, 2, &snapshot, actual, sizeof(actual)) == 0);
+        assert(actual[0] == 0 && actual[1] == 1000);
+        for (uint32_t i = 0; i < count; i++) {
+            tlc_warm_location_t location;
+            assert(tlc_core_get_warm_location(core, keys[i], strlen(keys[i]),
+                                               hashes[i], &location) == 0);
+            assert(location.local_slot == locations[i].local_slot);
+            assert(tlc_core_copy_warm_location_value(core, hashes[i], &location,
+                       actual, sizeof(actual), 1024) == 0);
+            assert(actual[0] == (float)i && actual[1] == (float)(i + 1000));
+        }
+#if !TLC_CORE_ALLOW_LRU_EVICTION
+        const char *extra = "pool-full:extra";
+        tlc_warm_location_t location;
+        float value[2] = {-1, -2};
+        assert(tlc_core_put_location_epoch(core, extra, strlen(extra),
+                   vemb_v16_xxh3_64_str(extra, strlen(extra)), value,
+                   sizeof(value), 1, 1, &location) != 0);
+#endif
+        for (uint32_t i = 0; i < count; i++) {
+            tlc_warm_location_t location;
+            float value[2] = {(float)(i + 2000), (float)(i + 3000)};
+            assert(tlc_core_put_location_epoch(core, keys[i], strlen(keys[i]),
+                       hashes[i], value, sizeof(value), 2, 1, &location) == 0);
+            assert(location.local_slot == locations[i].local_slot);
+            assert(location.owner_generation == locations[i].owner_generation);
+            assert(memcmp(region + location.local_slot * 2, value,
+                          sizeof(value)) == 0);
+        }
+        assert(tlc_core_delete_with_epoch(core, keys[0], strlen(keys[0]),
+                                           hashes[0], 2, NULL) == 0);
+        tlc_warm_location_t resurrected;
+        float restored[2] = {9000, 9001};
+        assert(tlc_core_put_location_epoch(core, keys[0], strlen(keys[0]),
+                   hashes[0], restored, sizeof(restored), 3, 1,
+                   &resurrected) == 0);
+        assert(resurrected.local_slot == locations[0].local_slot);
+        for (uint32_t i = 0; i < count; i++)
+            assert(atomic_load_explicit(&slots[i].state, memory_order_acquire) ==
+                   VEMB_V16_WARM_SLOT_READY);
+        tlc_core_destroy(core);
+        /* Reattach the full region with no key_meta/location cache. */
+        assert(tlc_core_create(&core, &config) == 0);
+        for (uint32_t i = 0; i < count; i++) {
+            tlc_warm_location_t location;
+            assert(tlc_core_get_warm_location(core, keys[i], strlen(keys[i]),
+                                               hashes[i], &location) == 0);
+            assert(location.local_slot == locations[i].local_slot);
+            assert(tlc_core_copy_warm_location_value(core, hashes[i], &location,
+                       actual, sizeof(actual), 1024) == 0);
+            assert(actual[0] == (float)(i ? i + 2000 : 9000));
+            assert(actual[1] == (float)(i ? i + 3000 : 9001));
+            assert(tlc_core_put_location_epoch(core, keys[i], strlen(keys[i]),
+                       hashes[i], actual, sizeof(actual), 4, 1, &location) == 0);
+            assert(location.local_slot == locations[i].local_slot);
+        }
+        tlc_core_destroy(core);
+        printf("region pool full capacity: PASS slots=%u backend=%s\n",
+               count, ub_path ? "UB" : "memory");
+        zfree(seen);
+        zfree(locations);
+        zfree(hashes);
+        zfree(keys);
+        if (ub_path) {
+            vemb_v16_mapped_region_close(&ub_mapping);
+        } else {
+            zfree(slots);
+            zfree(region);
+        }
+    }
+}
+
+static void test_region_pool_sparse_payload_distribution(void) {
+    enum { SLOTS = 4096, KEYS = 256, QUARTERS = 4 };
+    float *region = zcalloc_num(SLOTS, 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *slots = zcalloc_num(SLOTS, sizeof(*slots));
+    init_fuzzy_slot_meta(slots, SLOTS, 976);
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 976, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .weight = 1, .value_size = 2 * sizeof(float),
+        .region_bytes = SLOTS * 2 * sizeof(float),
+        .mapped_addr = (uint8_t *)region, .slot_meta = slots,
+    };
+    tlc_core_config_t config = {
+        .value_size = warm.value_size, .hot_capacity = 1,
+        .warm_regions = &warm, .warm_region_count = 1,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    uint32_t occupancy[QUARTERS] = {0};
+    uint32_t slot_lanes[QUARTERS] = {0};
+    for (uint32_t i = 0; i < KEYS; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "sparse-pool:%u", i);
+        float value[2] = {(float)i, (float)(i + 1)};
+        uint32_t slot;
+        assert(tlc_core_put(core, key, strlen(key),
+                   vemb_v16_xxh3_64_str(key, strlen(key)),
+                   value, sizeof(value), &slot) == 0);
+        assert(slot < SLOTS);
+        assert(memcmp(region + slot * 2, value, sizeof(value)) == 0);
+        occupancy[slot / (SLOTS / QUARTERS)]++;
+        slot_lanes[(slot % 64u) / (64u / QUARTERS)]++;
+    }
+    /* Sparse workloads must use the region's address range, rather than all
+     * concentrating in a compact prefix of the shared UB payload. */
+    for (uint32_t i = 0; i < QUARTERS; i++) {
+        assert(occupancy[i] >= KEYS / (QUARTERS * 2));
+        assert(slot_lanes[i] >= KEYS / (QUARTERS * 2));
+    }
+    tlc_core_destroy(core);
+    zfree(slots);
+    zfree(region);
+    puts("region pool sparse payload distribution: PASS");
+}
+
+static void test_region_pool_aligned_preference_and_full_capacity(void) {
+    enum { SLOTS = 65, ALIGNED_SLOTS = 5 };
+    float payload[SLOTS][3] = {{0}};
+    vemb_v16_warm_slot_meta_t slots[SLOTS];
+    init_fuzzy_slot_meta(slots, SLOTS, 977);
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 977, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .weight = 1, .value_size = sizeof(payload[0]),
+        .region_bytes = sizeof(payload),
+        .mapped_addr = (uint8_t *)payload, .slot_meta = slots,
+    };
+    tlc_core_config_t config = {
+        .value_size = warm.value_size, .hot_capacity = 1,
+        .warm_regions = &warm, .warm_region_count = 1,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    uint8_t occupied[SLOTS] = {0};
+    for (uint32_t i = 0; i < SLOTS; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "aligned-pool:%u", i);
+        float value[3] = {(float)i, (float)(i + 1), (float)(i + 2)};
+        uint32_t slot;
+        /* Distinct hashes select the five aligned candidates before the
+         * remaining writes exercise unaligned slots and the partial word. */
+        assert(tlc_core_put(core, key, strlen(key), i, value, sizeof(value), &slot) == 0);
+        assert(slot < SLOTS && !occupied[slot]);
+        occupied[slot] = 1;
+        if (i < ALIGNED_SLOTS)
+            assert(((uint64_t)slot * sizeof(value)) % 64u == 0);
+        assert(memcmp(payload[slot], value, sizeof(value)) == 0);
+    }
+    float extra[3] = {0};
+    uint32_t slot;
+    assert(tlc_core_put(core, "aligned-overflow", 16, SLOTS,
+                        extra, sizeof(extra), &slot) != 0);
+    for (uint32_t i = 0; i < SLOTS; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "aligned-pool:%u", i);
+        tlc_warm_location_t location;
+        assert(tlc_core_get_warm_location(core, key, strlen(key), i, &location) == 0);
+        assert(location.local_slot < SLOTS);
+        assert(payload[location.local_slot][0] == (float)i);
+    }
+    tlc_core_destroy(core);
+    puts("region pool aligned preference and full capacity: PASS");
+}
+
+static void test_index_growth_and_stable_cursor(void) {
+    enum { SLOTS = 192, KEYS = 320 };
+    float *region = zcalloc_num(SLOTS, 2 * sizeof(float));
+    vemb_v16_warm_slot_meta_t *slots = zcalloc_num(SLOTS, sizeof(*slots));
+    assert(region && slots);
+    init_fuzzy_slot_meta(slots, SLOTS, 975);
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 975, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .weight = 1, .value_size = 2 * sizeof(float),
+        .region_bytes = SLOTS * 2 * sizeof(float),
+        .mapped_addr = (uint8_t *)region, .slot_meta = slots,
+    };
+    tlc_core_config_t config = {
+        .value_size = warm.value_size, .hot_capacity = 1,
+        .warm_regions = &warm, .warm_region_count = 1,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    assert(tlc_core_warm_capacity(core) == SLOTS);
+    char directory[] = "/tmp/tlc-index-growth-XXXXXX";
+    assert(mkdtemp(directory));
+    tlc_cold_config_t cold = {
+        .directory = directory, .segment_bytes = 65536,
+        .queue_capacity = 16, .group_max_entries = 8,
+        .group_max_delay_us = 1000,
+    };
+    assert(tlc_core_enable_cold(core, &cold) == 0);
+    char keys[KEYS][48];
+    uint64_t hashes[KEYS];
+    uint32_t found = 0;
+    uint32_t shard_mask = tlc_core_meta_shard_count(core) - 1u;
+    for (uint32_t candidate = 0; found < KEYS; candidate++) {
+        char key[48];
+        snprintf(key, sizeof(key), "index-growth:%u", candidate);
+        uint64_t hash = vemb_v16_xxh3_64(key, strlen(key));
+        if ((vemb_v16_mix32_u64(hash) & shard_mask) != 0)
+            continue;
+        strcpy(keys[found], key);
+        hashes[found++] = hash;
+    }
+    tlc_core_key_cursor_t cursor = {0};
+    tlc_core_migration_key_ref_t page[7];
+    uint8_t seen[SLOTS] = {0};
+    uint32_t collected = 0, count;
+    int done;
+    for (uint32_t i = 0; i < SLOTS; i++) {
+        float value[2] = {(float)i, (float)(i + 1000)};
+        tlc_warm_location_t location;
+        assert(tlc_core_put_location_epoch(core, keys[i], strlen(keys[i]),
+                   hashes[i], value, sizeof(value), 1, 1, &location) == 0);
+        if (i == 79) {
+            assert(tlc_core_collect_source_active_keys(core, &cursor, page,
+                       7, &count, &done) == 0);
+            assert(count == 7 && !done);
+            for (uint32_t j = 0; j < count; j++) {
+                assert(page[j].key_hash == hashes[j]);
+                seen[j] = 1;
+            }
+            collected = count;
+        }
+    }
+    /* Grow the same shard between pages; no key may move behind the cursor. */
+    do {
+        assert(tlc_core_collect_source_active_keys(core, &cursor, page,
+                   7, &count, &done) == 0);
+        for (uint32_t j = 0; j < count; j++) {
+            uint32_t i = 0;
+            while (i < SLOTS && hashes[i] != page[j].key_hash)
+                i++;
+            assert(i < SLOTS && !seen[i]);
+            seen[i] = 1;
+            collected++;
+        }
+    } while (!done);
+    assert(collected == SLOTS);
+    assert(tlc_core_delete_with_epoch(core, keys[0], strlen(keys[0]),
+                                      hashes[0], 1, NULL) == 0);
+    /* Replica tombstones require metadata even without resident payloads. */
+    for (uint32_t i = SLOTS; i < KEYS; i++) {
+        tlc_cold_event_input_t event = {
+            .topology_epoch = 1, .op = TLC_COLD_OP_DEL, .meta_shard_id = 0,
+            .version = 3, .key = keys[i], .key_len = strlen(keys[i]),
+        };
+        tlc_core_replica_apply_status_t status;
+        assert(tlc_core_apply_replica_event(core, &event, i - SLOTS + 1,
+                                             &status) == 0);
+        assert(status == TLC_CORE_REPLICA_APPLY_APPLIED);
+    }
+    tlc_cold_checkpoint_result_t checkpoint;
+    assert(tlc_core_publish_checkpoint(core, 1, 0, &checkpoint) == 0);
+    float tail[2] = {8000, 8001};
+    tlc_warm_location_t location;
+    assert(tlc_core_put_location_epoch(core, keys[1], strlen(keys[1]),
+               hashes[1], tail, sizeof(tail), 2, 1, &location) == 0);
+    tlc_core_destroy(core);
+    memset(slots, 0, SLOTS * sizeof(*slots));
+    init_fuzzy_slot_meta(slots, SLOTS, 975);
+    assert(tlc_core_create(&core, &config) == 0);
+    assert(tlc_core_enable_cold(core, &cold) == 0);
+    for (uint32_t i = 0; i < KEYS; i++) {
+        tlc_core_key_migration_info_t info;
+        assert(tlc_core_get_migration_info(core, keys[i], strlen(keys[i]),
+                                            hashes[i], &info) == 0);
+        assert(info.tombstone == (i == 0 || i >= SLOTS));
+        assert(info.key_version == (i >= SLOTS ? 3u : i <= 1 ? 2u : 1u));
+        if (info.tombstone)
+            continue;
+        float actual[2];
+        assert(tlc_core_copy_warm_location_value(core, hashes[i], &info.location,
+                   actual, sizeof(actual), 1024) == 0);
+        assert(actual[0] == (i == 1 ? 8000 : (float)i));
+        assert(actual[1] == (i == 1 ? 8001 : (float)(i + 1000)));
+    }
+    tlc_core_destroy(core);
+    zfree(slots);
+    zfree(region);
+    printf("dynamic key index: PASS skew, stable cursor, tombstones, checkpoint + tail\n");
 }
 
 static void test_overwrite_and_capacity(void) {
@@ -769,7 +1154,7 @@ static void test_overwrite_and_capacity(void) {
     uint64_t evicting_hash = vemb_v16_xxh3_64_str(evicting, strlen(evicting));
 
     init_test_allocator(&allocator, 0, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     fill_vector(first, dim, 1);
     fill_vector(second, dim, 100);
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
@@ -829,7 +1214,7 @@ static void test_eviction_rejects_stale_handle(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 6, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     fill_vector(first, dim, 11);
     fill_vector(second, dim, 22);
     assert(vemb_v16_tlc_put(tlc, key1, (uint32_t)strlen(key1), key1_hash,
@@ -882,7 +1267,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 42, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 200);
     assert(tlc_core_cold_append(tlc->core, key, (uint32_t)strlen(key), key_hash,
                                     vector, sizeof(vector)) == 0);
@@ -916,7 +1301,6 @@ static void test_disabled_cold_append_is_noop(void) {
     };
     tlc_core_config_t config = {
         .value_size = sizeof(vector),
-        .warm_capacity = max_vectors,
         .hot_capacity = 4,
         .warm_regions = &warm,
         .warm_region_count = 1,
@@ -967,7 +1351,6 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
     };
     tlc_core_config_t config = {
         .value_size = sizeof(vector),
-        .warm_capacity = max_vectors,
         .hot_capacity = 4,
         .warm_regions = &warm,
         .warm_region_count = 1,
@@ -1034,7 +1417,7 @@ static void test_hot_is_cache_only(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 5, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     for (uint32_t i = 0; i < max_vectors; i++) {
         snprintf(key, sizeof(key), "hot-cache:%u", i);
         fill_vector(vector, dim, i + 1);
@@ -1079,7 +1462,7 @@ static void test_prefill_distribution_stays_warm(void) {
 
     assert(region);
     init_test_allocator(&allocator, 19, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     for (uint32_t i = 0; i < prefill; i++) {
         make_key(key, sizeof(key), i);
         fill_vector(vector, dim, i);
@@ -1149,7 +1532,7 @@ static void *concurrent_worker(void *arg) {
 }
 
 static void test_concurrent_distinct_keys(void) {
-    enum { dim = 4, max_vectors = 1024, threads = 4, iterations = 24 };
+    enum { dim = 4, max_vectors = 1024, threads = 4, iterations = 256 };
     float region[dim * max_vectors];
     vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
@@ -1166,7 +1549,7 @@ static void test_concurrent_distinct_keys(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 11, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     for (int i = 0; i < threads; i++) {
         args[i] = (concurrent_arg_t){
             .tlc = tlc,
@@ -1180,6 +1563,123 @@ static void test_concurrent_distinct_keys(void) {
     for (int i = 0; i < threads; i++)
         assert(pthread_join(tids[i], NULL) == 0);
     vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_shared_region_pool_full_and_reattach(void) {
+    enum { dim = 4, writes = 260, prefilled = 7, slots = writes + prefilled,
+           threads = 4, iterations = writes / threads };
+    float region[dim * slots];
+    vemb_v16_warm_slot_meta_t slot_meta[slots];
+    vemb_v16_tlc_t *writers[2];
+    pthread_t tids[threads];
+    concurrent_arg_t args[threads];
+    memset(region, 0, sizeof(region));
+    memset(slot_meta, 0, sizeof(slot_meta));
+    init_fuzzy_slot_meta(slot_meta, slots, 11);
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 11,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .slot_meta = slot_meta,
+    };
+    assert(vemb_v16_tlc_create(&writers[0], dim, &warm, 1, 4) == 0);
+    uint8_t seen[slots] = {0};
+    uint32_t imported_busy_slot = UINT32_MAX;
+    for (uint32_t i = 0; i < prefilled; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "prefilled:%u", i);
+        float value[dim];
+        fill_vector(value, dim, i + 1000);
+        vemb_v16_vector_handle_t handle;
+        uint32_t slot;
+        assert(vemb_v16_tlc_put(writers[0], key, strlen(key),
+                   vemb_v16_xxh3_64_str(key, strlen(key)), value,
+                   sizeof(value), &handle, &slot) == 0);
+        seen[slot] = 1;
+        if (i == 0)
+            imported_busy_slot = slot;
+    }
+    assert(vemb_v16_tlc_create(&writers[1], dim, &warm, 1, 4) == 0);
+    /* A busy imported identity must not consume a second, still-free slot. */
+    uint64_t seq = atomic_load_explicit(&slot_meta[imported_busy_slot].write_seq,
+                                        memory_order_acquire);
+    atomic_store_explicit(&slot_meta[imported_busy_slot].write_seq, seq + 1, memory_order_release);
+    const char *busy_key = "prefilled:0";
+    float busy_value[dim] = {0};
+    vemb_v16_vector_handle_t busy_handle;
+    uint32_t busy_slot;
+    assert(vemb_v16_tlc_put(writers[1], busy_key, strlen(busy_key),
+               vemb_v16_xxh3_64_str(busy_key, strlen(busy_key)), busy_value,
+               sizeof(busy_value), &busy_handle, &busy_slot) != 0);
+    atomic_store_explicit(&slot_meta[imported_busy_slot].write_seq, seq, memory_order_release);
+    assert_region_stats(writers[0], 11, prefilled, 0);
+    for (uint32_t i = 0; i < threads; i++) {
+        args[i] = (concurrent_arg_t){
+            .tlc = writers[i % 2],
+            .tid = (int)i,
+            .iterations = iterations,
+            .dim = dim,
+            .max_vectors = slots,
+        };
+        assert(pthread_create(&tids[i], NULL, concurrent_worker, &args[i]) == 0);
+    }
+    for (uint32_t i = 0; i < threads; i++)
+        assert(pthread_join(tids[i], NULL) == 0);
+    uint32_t first_slot = UINT32_MAX;
+    uint64_t first_generation = 0;
+    for (uint32_t i = 0; i < writes; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "k:%u", i);
+        uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+        vemb_v16_vector_handle_t handle;
+        uint32_t slot;
+        assert(vemb_v16_tlc_get_handle(writers[(i / iterations) % 2], key,
+                   strlen(key), hash, &handle, &slot) == 0);
+        assert(slot < slots && !seen[slot]);
+        seen[slot] = 1;
+        float expected[dim];
+        fill_vector(expected, dim, i);
+        assert(memcmp(region + slot * dim, expected, sizeof(expected)) == 0);
+        if (i == 0) {
+            first_slot = slot;
+            first_generation = handle.owner_generation;
+        }
+    }
+    assert_region_stats(writers[0], 11, slots, 1);
+    assert_region_stats(writers[1], 11, slots, 1);
+    vemb_v16_tlc_t *attached;
+    assert(vemb_v16_tlc_create(&attached, dim, &warm, 1, 4) == 0);
+    const char *key = "k:0";
+    uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    vemb_v16_vector_handle_t handle;
+    uint32_t slot;
+    /* This reader attached before k:0 was published and has no key_meta for it. */
+    assert(vemb_v16_tlc_get_handle(writers[1], key, strlen(key), hash,
+                                    &handle, &slot) == 0);
+    assert(slot == first_slot);
+    assert(vemb_v16_tlc_get_handle(attached, key, strlen(key), hash,
+                                    &handle, &slot) == 0);
+    assert(slot == first_slot);
+    float updated[dim];
+    fill_vector(updated, dim, 9000);
+    assert(vemb_v16_tlc_put(attached, key, strlen(key), hash, updated,
+                             sizeof(updated), &handle, &slot) == 0);
+    assert(slot == first_slot && handle.owner_generation == first_generation);
+    assert(memcmp(region + slot * dim, updated, sizeof(updated)) == 0);
+    assert_region_stats(attached, 11, slots, 1);
+#if !TLC_CORE_ALLOW_LRU_EVICTION
+    const char *extra = "shared-pool:extra";
+    assert(vemb_v16_tlc_put(attached, extra, strlen(extra),
+               vemb_v16_xxh3_64_str(extra, strlen(extra)), updated,
+               sizeof(updated), &handle, &slot) != 0);
+#endif
+    vemb_v16_tlc_destroy(attached);
+    for (uint32_t i = 0; i < 2; i++)
+        vemb_v16_tlc_destroy(writers[i]);
 }
 
 static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
@@ -1219,7 +1719,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
     memset(region2, 0, sizeof(region2));
     init_test_allocator(&alloc1, 1, max_vectors);
     init_test_allocator(&alloc2, 2, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
+    assert(vemb_v16_tlc_create(&tlc, dim,
                                     regions, 2, 16) == 0);
     fill_vector(vector, dim, 500);
     for (uint32_t i = 0; i < 10000 && found < needed; i++) {
@@ -1278,7 +1778,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     memset(remote_region, 0, sizeof(remote_region));
     init_test_allocator(&local_alloc, 1, 1);
     init_test_allocator(&remote_alloc, 2, 4);
-    assert(vemb_v16_tlc_create(&tlc, dim, 5, regions, 2, 16) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, regions, 2, 16) == 0);
 
     fill_vector(first, dim, 10);
     fill_vector(second, dim, 20);
@@ -1357,7 +1857,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
 
     init_test_allocator(&alloc1, 10, 1);
     init_test_allocator(&alloc2, 20, 1);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
+    assert(vemb_v16_tlc_create(&tlc, dim,
                                     regions, 2, 8) == 0);
     fill_vector(vector, dim, 700);
     for (uint32_t i = 0; i < max_vectors; i++) {
@@ -1422,8 +1922,8 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 77, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc1, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&tlc2, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc1, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc2, dim, &warm, 1, 4) == 0);
 
     fill_vector(v1, dim, 1000);
     fill_vector(v2, dim, 2000);
@@ -1431,13 +1931,14 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
                             v1, sizeof(v1), &h1, &warm_slot) == 0);
     assert(h1.region_id == 77);
-    assert(h1.offset == 0);
-    assert(warm_slot == 0);
+    assert(warm_slot < max_vectors);
+    assert(h1.offset == (uint64_t)warm_slot * sizeof(v1));
     assert(vemb_v16_tlc_put(tlc2, key2, (uint32_t)strlen(key2), key2_hash,
                             v2, sizeof(v2), &h2, &warm_slot) == 0);
     assert(h2.region_id == 77);
-    assert(h2.offset == sizeof(v2));
-    assert(warm_slot == 1);
+    assert(warm_slot < max_vectors);
+    assert(h2.offset == (uint64_t)warm_slot * sizeof(v2));
+    assert(h2.offset != h1.offset);
     assert_region_stats(tlc1, 77, 2, 0);
 
     assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
@@ -1445,10 +1946,10 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
                             &warm_slot) == 0);
     assert(h3.region_id == h1.region_id);
     assert(h3.offset == h1.offset);
-    assert(warm_slot == 0);
+    assert(warm_slot == h1.local_slot);
     assert_region_stats(tlc1, 77, 2, 0);
-    assert(memcmp(region, overwrite, sizeof(overwrite)) == 0);
-    assert(memcmp(region + dim, v2, sizeof(v2)) == 0);
+    assert(memcmp((uint8_t *)region + h1.offset, overwrite, sizeof(overwrite)) == 0);
+    assert(memcmp((uint8_t *)region + h2.offset, v2, sizeof(v2)) == 0);
 
     vemb_v16_tlc_destroy(tlc2);
     vemb_v16_tlc_destroy(tlc1);
@@ -1483,7 +1984,7 @@ static void test_vsim_key2_lookup_local_source(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 88, max_vectors);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
 
     fill_vector(v1, dim, 100);
     fill_vector(v2, dim, 200);
@@ -1502,7 +2003,8 @@ static void test_vsim_key2_lookup_local_source(void) {
 
 
     assert(key2_handle.region_id == 88);
-    assert(key2_handle.offset == sizeof(v2));
+    assert(key2_handle.offset == handle.offset);
+    assert(memcmp((uint8_t *)region + key2_handle.offset, v2, sizeof(v2)) == 0);
     assert(key2_handle.bytes == sizeof(v2));
 
     source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
@@ -1579,8 +2081,8 @@ static void test_vsim_key2_lookup_remote_source(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
@@ -1661,7 +2163,7 @@ static void test_remote_meta_async_publish_flush(void) {
                                      remote_entries,
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(tlc, &meta, 8);
 
     fill_vector(vector, dim, 700);
@@ -1752,8 +2254,8 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
@@ -1890,8 +2392,8 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
@@ -2081,8 +2583,8 @@ static void test_vsim_key2_lookup_ub_ring_rpc_concurrent(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     vemb_v16_tlc_set_owner_resolver(reader,
@@ -2244,8 +2746,8 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                                           1) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
@@ -2422,8 +2924,8 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&owner, dim, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, &warm, 1, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
     assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
@@ -2563,9 +3065,9 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
                                      remote_buckets) ==
            VEMB_V16_REMOTE_META_OK);
 
-    assert(vemb_v16_tlc_create(&owner2, dim, max_vectors,
+    assert(vemb_v16_tlc_create(&owner2, dim,
                                &owner2_region, 1, 4) == 0);
-    assert(vemb_v16_tlc_create(&reader, dim, max_vectors,
+    assert(vemb_v16_tlc_create(&reader, dim,
                                reader_regions, 2, 4) == 0);
     vemb_v16_tlc_set_remote_meta_view(owner2, &owner2_meta, 8);
     vemb_v16_tlc_set_remote_meta_view(reader, &owner1_meta, 8);
@@ -2662,7 +3164,7 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
     init_test_allocator(&alloc0, 100, 1);
     init_test_allocator(&alloc1, 101, 1);
     init_test_allocator(&alloc_remote, 200, 4);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, regions, 3, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, regions, 3, 4) == 0);
     fill_vector(vector, dim, 4000);
 
     for (uint32_t i = 0; i < 3; i++) {
@@ -2733,7 +3235,8 @@ static void test_runtime_attach_remote_region_after_create(void) {
     local_alloc = init_test_allocator_with_slot_meta(local_alloc_backing, 300, 1);
     local.slot_meta = vemb_v16_warm_region_slot_meta(local_alloc);
     init_test_allocator(&remote_alloc, 301, 4);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &local, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, &local, 1, 4) == 0);
+    assert(tlc_core_warm_capacity(tlc->core) == 1);
     fill_vector(vector, dim, 9000);
 
     {
@@ -2753,6 +3256,7 @@ static void test_runtime_attach_remote_region_after_create(void) {
     }
 
     assert(vemb_v16_tlc_attach_warm_region(tlc, &remote) == 0);
+    assert(tlc_core_warm_capacity(tlc->core) == 5);
 
     {
         const char *key = "runtime-remote";
@@ -2823,13 +3327,11 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     init_test_allocator(&dest_allocator, 703, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                &dest_warm,
                                1,
                                4) == 0);
@@ -2983,7 +3485,6 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
     init_test_allocator(&allocator, 709, max_vectors);
     assert(vemb_v16_tlc_create(&tlc,
                                dim,
-                               max_vectors,
                                &warm,
                                1,
                                4) == 0);
@@ -3085,7 +3586,6 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
     init_test_allocator(&source_allocator, 711, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
@@ -3227,7 +3727,6 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
     init_test_allocator(&dest_allocator, 903, max_vectors);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                regions,
                                2,
                                4) == 0);
@@ -3297,7 +3796,8 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
                                    &handle,
                                    &warm_slot) == 0);
     assert(handle.region_id == 903);
-    assert(warm_slot == 0);
+    assert(warm_slot < 8);
+    assert(handle.offset == (uint64_t)warm_slot * sizeof(v1));
     assert(vemb_v16_tlc_vector_slice(dest,
                                      &handle,
                                      &stored,
@@ -3621,13 +4121,11 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
     init_test_allocator(&dest_allocator, 923, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                dest_regions,
                                2,
                                4) == 0);
@@ -3818,13 +4316,11 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
     init_test_allocator(&dest_allocator, 803, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                &dest_warm,
                                1,
                                4) == 0);
@@ -3929,6 +4425,10 @@ int main(void) {
     test_single_node_recovery_failure_blocks_startup();
     test_recovery_strict_term_and_state_boundaries();
     test_put_get_handle();
+    test_region_pool_full_capacity_and_cache_collisions();
+    test_region_pool_sparse_payload_distribution();
+    test_region_pool_aligned_preference_and_full_capacity();
+    test_index_growth_and_stable_cursor();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();
 #if TLC_CORE_ENABLE_COLD_LAYER
@@ -3942,6 +4442,7 @@ int main(void) {
     test_prefill_distribution_stays_warm();
 #endif
     test_concurrent_distinct_keys();
+    test_shared_region_pool_full_and_reattach();
     test_multi_region_local_full_fallback_and_overwrite();
     test_multi_region_all_full_evicts_committed_warm();
     test_shared_slot_meta_two_tlcs_unique_slots();
