@@ -1,5 +1,7 @@
 # VEMB v16 当前实现相对 HEAD 基线的变更审查
 
+> 历史审查：本文的 import index、在线发现扫描和 bitmap 搜索保留建议已被后续决策替代。`dev_alloc_v2` 以 [allocator v2 设计](VEMB_V16_WARM_ALLOC_V2_DESIGN.md) 为准：单 region 单 owner，顺序分配与回收栈，其他节点只读；不恢复 imported 查询。性能与 UT 最新记录见新设计文档。
+
 本文以基线 `e1166dc9e7ff69d069ad6252e31f62ef167e7e89` 为参照，审查当前工作树中与 WARM 容量、分配、索引和读取路径有关的改动。目标是判断哪些改动是“满载能力”的必要组成，哪些改动应该继续隔离验证，避免把性能实验误当成设计要求。
 
 ## 结论

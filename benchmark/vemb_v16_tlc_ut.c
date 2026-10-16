@@ -711,6 +711,7 @@ static void test_put_get_handle(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 7,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -886,25 +887,29 @@ static void test_region_pool_full_capacity_and_cache_collisions(void) {
                    hashes[0], restored, sizeof(restored), 3, 1,
                    &resurrected) == 0);
         assert(resurrected.local_slot == locations[0].local_slot);
+        assert(resurrected.owner_generation > locations[0].owner_generation);
+        assert(tlc_core_copy_warm_location_value(core, hashes[0], &locations[0],
+                   actual, sizeof(actual), 8) != 0);
         for (uint32_t i = 0; i < count; i++)
             assert(atomic_load_explicit(&slots[i].state, memory_order_acquire) ==
                    VEMB_V16_WARM_SLOT_READY);
         tlc_core_destroy(core);
-        /* Reattach the full region with no key_meta/location cache. */
+        /* A reader needs an explicit handle; attach never discovers keys. */
+        warm.is_local = 0;
         assert(tlc_core_create(&core, &config) == 0);
         for (uint32_t i = 0; i < count; i++) {
             tlc_warm_location_t location;
             assert(tlc_core_get_warm_location(core, keys[i], strlen(keys[i]),
-                                               hashes[i], &location) == 0);
-            assert(location.local_slot == locations[i].local_slot);
-            assert(tlc_core_copy_warm_location_value(core, hashes[i], &location,
+                                               hashes[i], &location) != 0);
+            const tlc_warm_location_t *known = i ? &locations[i] : &resurrected;
+            assert(tlc_core_copy_warm_location_value(core, hashes[i], known,
                        actual, sizeof(actual), 1024) == 0);
             assert(actual[0] == (float)(i ? i + 2000 : 9000));
             assert(actual[1] == (float)(i ? i + 3000 : 9001));
-            assert(tlc_core_put_location_epoch(core, keys[i], strlen(keys[i]),
-                       hashes[i], actual, sizeof(actual), 4, 1, &location) == 0);
-            assert(location.local_slot == locations[i].local_slot);
         }
+        tlc_warm_location_t rejected;
+        assert(tlc_core_put_location_epoch(core, keys[0], strlen(keys[0]),
+                   hashes[0], restored, sizeof(restored), 4, 1, &rejected) != 0);
         tlc_core_destroy(core);
         printf("region pool full capacity: PASS slots=%u backend=%s\n",
                count, ub_path ? "UB" : "memory");
@@ -921,8 +926,8 @@ static void test_region_pool_full_capacity_and_cache_collisions(void) {
     }
 }
 
-static void test_region_pool_sparse_payload_distribution(void) {
-    enum { SLOTS = 4096, KEYS = 256, QUARTERS = 4 };
+static void test_region_pool_sequential_allocation(void) {
+    enum { SLOTS = 4096, KEYS = 256 };
     float *region = zcalloc_num(SLOTS, 2 * sizeof(float));
     vemb_v16_warm_slot_meta_t *slots = zcalloc_num(SLOTS, sizeof(*slots));
     init_fuzzy_slot_meta(slots, SLOTS, 976);
@@ -938,8 +943,6 @@ static void test_region_pool_sparse_payload_distribution(void) {
     };
     tlc_core_t *core;
     assert(tlc_core_create(&core, &config) == 0);
-    uint32_t occupancy[QUARTERS] = {0};
-    uint32_t slot_lanes[QUARTERS] = {0};
     for (uint32_t i = 0; i < KEYS; i++) {
         char key[48];
         snprintf(key, sizeof(key), "sparse-pool:%u", i);
@@ -950,23 +953,16 @@ static void test_region_pool_sparse_payload_distribution(void) {
                    value, sizeof(value), &slot) == 0);
         assert(slot < SLOTS);
         assert(memcmp(region + slot * 2, value, sizeof(value)) == 0);
-        occupancy[slot / (SLOTS / QUARTERS)]++;
-        slot_lanes[(slot % 64u) / (64u / QUARTERS)]++;
-    }
-    /* Sparse workloads must use the region's address range, rather than all
-     * concentrating in a compact prefix of the shared UB payload. */
-    for (uint32_t i = 0; i < QUARTERS; i++) {
-        assert(occupancy[i] >= KEYS / (QUARTERS * 2));
-        assert(slot_lanes[i] >= KEYS / (QUARTERS * 2));
+        assert(slot == i);
     }
     tlc_core_destroy(core);
     zfree(slots);
     zfree(region);
-    puts("region pool sparse payload distribution: PASS");
+    puts("region pool sequential allocation: PASS");
 }
 
-static void test_region_pool_aligned_preference_and_full_capacity(void) {
-    enum { SLOTS = 65, ALIGNED_SLOTS = 5 };
+static void test_region_pool_odd_capacity(void) {
+    enum { SLOTS = 65 };
     float payload[SLOTS][3] = {{0}};
     vemb_v16_warm_slot_meta_t slots[SLOTS];
     init_fuzzy_slot_meta(slots, SLOTS, 977);
@@ -988,13 +984,11 @@ static void test_region_pool_aligned_preference_and_full_capacity(void) {
         snprintf(key, sizeof(key), "aligned-pool:%u", i);
         float value[3] = {(float)i, (float)(i + 1), (float)(i + 2)};
         uint32_t slot;
-        /* Distinct hashes select the five aligned candidates before the
-         * remaining writes exercise unaligned slots and the partial word. */
+        /* Odd capacity has no unreachable tail slots. */
         assert(tlc_core_put(core, key, strlen(key), i, value, sizeof(value), &slot) == 0);
         assert(slot < SLOTS && !occupied[slot]);
         occupied[slot] = 1;
-        if (i < ALIGNED_SLOTS)
-            assert(((uint64_t)slot * sizeof(value)) % 64u == 0);
+        assert(slot == i);
         assert(memcmp(payload[slot], value, sizeof(value)) == 0);
     }
     float extra[3] = {0};
@@ -1010,7 +1004,192 @@ static void test_region_pool_aligned_preference_and_full_capacity(void) {
         assert(payload[location.local_slot][0] == (float)i);
     }
     tlc_core_destroy(core);
-    puts("region pool aligned preference and full capacity: PASS");
+    puts("region pool odd capacity: PASS");
+}
+
+/* Deleting from an exhausted, earlier region must not strand its capacity. */
+static void test_recycled_slots_across_owned_regions(void) {
+    float payload[3][2][2] = {0};
+    vemb_v16_warm_slot_meta_t slots[3][2];
+    tlc_core_warm_region_config_t warm[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        init_fuzzy_slot_meta(slots[i], 2, 980 + i);
+        warm[i] = (tlc_core_warm_region_config_t){
+            .region_id = 980 + i, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = i < 2, .value_size = sizeof(payload[0][0]),
+            .region_bytes = sizeof(payload[0]), .mapped_addr = (uint8_t *)payload[i],
+            .slot_meta = slots[i],
+        };
+    }
+    tlc_core_config_t config = {
+        .value_size = sizeof(payload[0][0]), .hot_capacity = 1,
+        .warm_regions = warm, .warm_region_count = 3,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    tlc_warm_location_t old[4], replacement;
+    char keys[4][32];
+    uint64_t hashes[4];
+    float value[2] = {10, 11}, actual[2];
+    for (uint32_t i = 0; i < 4; i++) {
+        snprintf(keys[i], sizeof(keys[i]), "recycle-region:%u", i);
+        hashes[i] = vemb_v16_xxh3_64_str(keys[i], strlen(keys[i]));
+        assert(tlc_core_put_location_epoch(core, keys[i], strlen(keys[i]),
+                   hashes[i], value, sizeof(value), 1, 1, &old[i]) == 0);
+        assert(old[i].region_id == 980 + i / 2 && old[i].local_slot == i % 2);
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        assert(tlc_core_delete_with_epoch(core, keys[i], strlen(keys[i]),
+                                           hashes[i], 1, NULL) == 0);
+        assert(tlc_core_delete_with_epoch(core, keys[i], strlen(keys[i]),
+                                           hashes[i], 1, NULL) != 0);
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "replacement:%u", i);
+        assert(tlc_core_put_location_epoch(core, key, strlen(key),
+                   vemb_v16_xxh3_64_str(key, strlen(key)), value, sizeof(value),
+                   2, 1, &replacement) == 0);
+        assert(replacement.region_id == 980 && replacement.local_slot == 1 - i);
+        assert(replacement.owner_generation > old[1 - i].owner_generation);
+    }
+    for (uint32_t i = 0; i < 2; i++)
+        assert(tlc_core_copy_warm_location_value(core, hashes[i], &old[i],
+                   actual, sizeof(actual), 8) != 0);
+    assert(tlc_core_put_location_epoch(core, "overflow", 8,
+               vemb_v16_xxh3_64_str("overflow", 8), value, sizeof(value),
+               2, 1, &replacement) != 0);
+    for (uint32_t i = 0; i < 2; i++) {
+        assert(atomic_load_explicit(&slots[2][i].state, memory_order_acquire) ==
+               VEMB_V16_WARM_SLOT_FREE);
+        assert(payload[2][i][0] == 0 && payload[2][i][1] == 0);
+    }
+    tlc_core_destroy(core);
+    puts("recycled slots across owned regions: PASS");
+}
+
+/* Pure-log recovery may reuse occupied local memory, never reset a peer view. */
+static void test_cold_rebuild_preserves_peer_and_invalidates_old_handles(void) {
+    float payload[2][2] = {{0}, {80, 81}};
+    vemb_v16_warm_slot_meta_t slots[2];
+    init_fuzzy_slot_meta(&slots[0], 1, 985);
+    init_fuzzy_slot_meta(&slots[1], 1, 986);
+    const char *peer_key = "peer-owned";
+    uint64_t peer_hash = vemb_v16_xxh3_64_str(peer_key, strlen(peer_key));
+    slots[1].key_hash = peer_hash;
+    atomic_store(&slots[1].owner_generation, 17);
+    atomic_store(&slots[1].write_seq, 22);
+    atomic_store(&slots[1].state, VEMB_V16_WARM_SLOT_READY);
+    tlc_core_warm_region_config_t warm[2];
+    for (uint32_t i = 0; i < 2; i++)
+        warm[i] = (tlc_core_warm_region_config_t){
+            .region_id = 985 + i, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = i == 0, .value_size = sizeof(payload[0]),
+            .region_bytes = sizeof(payload[0]), .mapped_addr = (uint8_t *)payload[i],
+            .slot_meta = &slots[i],
+        };
+    tlc_core_config_t config = {
+        .value_size = sizeof(payload[0]), .hot_capacity = 1,
+        .warm_regions = warm, .warm_region_count = 2,
+    };
+    char directory[] = "/tmp/tlc-v2-rebuild-XXXXXX";
+    assert(mkdtemp(directory));
+    tlc_cold_config_t cold = {
+        .directory = directory, .segment_bytes = 4096, .queue_capacity = 8,
+        .group_max_entries = 4, .group_max_delay_us = 1000,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    assert(tlc_core_enable_cold(core, &cold) == 0);
+    const char *key = "local-rebuild";
+    uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    float value[2] = {50, 51}, actual[2];
+    tlc_warm_location_t old;
+    assert(tlc_core_put_location_epoch(core, key, strlen(key), hash, value,
+                                       sizeof(value), 1, 1, &old) == 0);
+    tlc_core_destroy(core); /* Flushes the accepted COLD event. */
+    assert(tlc_core_create(&core, &config) == 0);
+    assert(tlc_core_enable_cold(core, &cold) == 0);
+    for (uint32_t retry = 0; retry < 2; retry++) {
+        tlc_warm_location_t recovered;
+        assert(tlc_core_get_warm_location(core, key, strlen(key), hash, &recovered) == 0);
+        assert(recovered.owner_generation > old.owner_generation);
+        assert(tlc_core_copy_warm_location_value(core, hash, &old,
+                                                 actual, sizeof(actual), 8) != 0);
+        assert(tlc_core_copy_warm_location_value(core, hash, &recovered,
+                                                 actual, sizeof(actual), 8) == 0);
+        assert(memcmp(actual, value, sizeof(value)) == 0);
+        assert(payload[1][0] == 80 && payload[1][1] == 81);
+        assert(atomic_load(&slots[1].state) == VEMB_V16_WARM_SLOT_READY);
+        assert(atomic_load(&slots[1].owner_generation) == 17);
+        assert(atomic_load(&slots[1].write_seq) == 22);
+        assert(slots[1].key_hash == peer_hash);
+        assert(tlc_core_recover_cold(core) == 0);
+    }
+    tlc_core_destroy(core);
+    puts("COLD rebuild preserves peer and rejects old handles: PASS");
+}
+
+typedef struct recycle_worker_arg {
+    tlc_core_t *core;
+    uint32_t worker;
+} recycle_worker_arg_t;
+
+static void *recycle_worker(void *arg) {
+    recycle_worker_arg_t *worker = arg;
+    char key[32];
+    snprintf(key, sizeof(key), "recycle-worker:%u", worker->worker);
+    uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    for (uint32_t i = 0; i < 512; i++) {
+        float value[2] = {(float)i, (float)(i + 1000)};
+        tlc_warm_location_t location;
+        assert(tlc_core_put_location_epoch(worker->core, key, strlen(key), hash,
+                   value, sizeof(value), 1, 1, &location) == 0);
+        assert(tlc_core_delete_with_epoch(worker->core, key, strlen(key), hash,
+                                           1, NULL) == 0);
+    }
+    return NULL;
+}
+
+static void test_owner_concurrent_recycle(void) {
+    enum { WORKERS = 4 };
+    float payload[WORKERS][2] = {0};
+    vemb_v16_warm_slot_meta_t slots[WORKERS];
+    init_fuzzy_slot_meta(slots, WORKERS, 987);
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 987, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .value_size = sizeof(payload[0]),
+        .region_bytes = sizeof(payload), .mapped_addr = (uint8_t *)payload,
+        .slot_meta = slots,
+    };
+    tlc_core_config_t config = {
+        .value_size = sizeof(payload[0]), .hot_capacity = 1,
+        .warm_regions = &warm, .warm_region_count = 1,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    pthread_t threads[WORKERS];
+    recycle_worker_arg_t args[WORKERS];
+    for (uint32_t i = 0; i < WORKERS; i++) {
+        args[i] = (recycle_worker_arg_t){core, i};
+        assert(pthread_create(&threads[i], NULL, recycle_worker, &args[i]) == 0);
+    }
+    for (uint32_t i = 0; i < WORKERS; i++)
+        assert(pthread_join(threads[i], NULL) == 0);
+    for (uint32_t i = 0; i < WORKERS; i++) {
+        float value[2] = {(float)i, (float)(i + 1000)};
+        char key[32];
+        snprintf(key, sizeof(key), "refill:%u", i);
+        uint32_t slot;
+        assert(tlc_core_put(core, key, strlen(key),
+                   vemb_v16_xxh3_64_str(key, strlen(key)), value, sizeof(value), &slot) == 0);
+        assert(slot < WORKERS);
+    }
+    tlc_core_region_stats_t stats;
+    assert(tlc_core_get_region_stats(core, &stats, 1) == 1);
+    assert(stats.used_slots == WORKERS && stats.full);
+    tlc_core_destroy(core);
+    puts("owner concurrent recycle and full refill: PASS");
 }
 
 static void test_index_growth_and_stable_cursor(void) {
@@ -1141,6 +1320,7 @@ static void test_overwrite_and_capacity(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 0,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -1197,6 +1377,7 @@ static void test_eviction_rejects_stale_handle(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 6,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -1255,6 +1436,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 42,
         .backend_type = VEMB_V16_REGION_UB,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -1406,6 +1588,7 @@ static void test_hot_is_cache_only(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 5,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -1450,6 +1633,7 @@ static void test_prefill_distribution_stays_warm(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 19,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = (uint64_t)sizeof(*region) * dim * max_vectors,
         .value_size = dim * sizeof(float),
@@ -1541,6 +1725,7 @@ static void test_concurrent_distinct_keys(void) {
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 11,
         .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
@@ -1565,7 +1750,7 @@ static void test_concurrent_distinct_keys(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_shared_region_pool_full_and_reattach(void) {
+static void test_owner_region_pool_full_and_reader(void) {
     enum { dim = 4, writes = 260, prefilled = 7, slots = writes + prefilled,
            threads = 4, iterations = writes / threads };
     float region[dim * slots];
@@ -1603,8 +1788,9 @@ static void test_shared_region_pool_full_and_reattach(void) {
         if (i == 0)
             imported_busy_slot = slot;
     }
+    warm.is_local = 0;
     assert(vemb_v16_tlc_create(&writers[1], dim, &warm, 1, 4) == 0);
-    /* A busy imported identity must not consume a second, still-free slot. */
+    /* An owner overwrite blocked by an active slot writer must not allocate. */
     uint64_t seq = atomic_load_explicit(&slot_meta[imported_busy_slot].write_seq,
                                         memory_order_acquire);
     atomic_store_explicit(&slot_meta[imported_busy_slot].write_seq, seq + 1, memory_order_release);
@@ -1612,14 +1798,14 @@ static void test_shared_region_pool_full_and_reattach(void) {
     float busy_value[dim] = {0};
     vemb_v16_vector_handle_t busy_handle;
     uint32_t busy_slot;
-    assert(vemb_v16_tlc_put(writers[1], busy_key, strlen(busy_key),
+    assert(vemb_v16_tlc_put(writers[0], busy_key, strlen(busy_key),
                vemb_v16_xxh3_64_str(busy_key, strlen(busy_key)), busy_value,
                sizeof(busy_value), &busy_handle, &busy_slot) != 0);
     atomic_store_explicit(&slot_meta[imported_busy_slot].write_seq, seq, memory_order_release);
     assert_region_stats(writers[0], 11, prefilled, 0);
     for (uint32_t i = 0; i < threads; i++) {
         args[i] = (concurrent_arg_t){
-            .tlc = writers[i % 2],
+            .tlc = writers[0],
             .tid = (int)i,
             .iterations = iterations,
             .dim = dim,
@@ -1637,7 +1823,7 @@ static void test_shared_region_pool_full_and_reattach(void) {
         uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
         vemb_v16_vector_handle_t handle;
         uint32_t slot;
-        assert(vemb_v16_tlc_get_handle(writers[(i / iterations) % 2], key,
+        assert(vemb_v16_tlc_get_handle(writers[0], key,
                    strlen(key), hash, &handle, &slot) == 0);
         assert(slot < slots && !seen[slot]);
         seen[slot] = 1;
@@ -1657,16 +1843,22 @@ static void test_shared_region_pool_full_and_reattach(void) {
     uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
     vemb_v16_vector_handle_t handle;
     uint32_t slot;
-    /* This reader attached before k:0 was published and has no key_meta for it. */
+    /* Reader has no reverse index; owner must publish the handle. */
     assert(vemb_v16_tlc_get_handle(writers[1], key, strlen(key), hash,
-                                    &handle, &slot) == 0);
-    assert(slot == first_slot);
+                                    &handle, &slot) != 0);
     assert(vemb_v16_tlc_get_handle(attached, key, strlen(key), hash,
+                                    &handle, &slot) != 0);
+    assert(vemb_v16_tlc_get_handle(writers[0], key, strlen(key), hash,
                                     &handle, &slot) == 0);
     assert(slot == first_slot);
+    const uint8_t *reader_value;
+    uint32_t reader_bytes;
+    assert(vemb_v16_tlc_vector_slice(attached, &handle, &reader_value,
+                                      &reader_bytes) == 0);
+    assert(reader_bytes == sizeof(float) * dim);
     float updated[dim];
     fill_vector(updated, dim, 9000);
-    assert(vemb_v16_tlc_put(attached, key, strlen(key), hash, updated,
+    assert(vemb_v16_tlc_put(writers[0], key, strlen(key), hash, updated,
                              sizeof(updated), &handle, &slot) == 0);
     assert(slot == first_slot && handle.owner_generation == first_generation);
     assert(memcmp(region + slot * dim, updated, sizeof(updated)) == 0);
@@ -1762,7 +1954,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
         {
             .region_id = 2,
             .backend_type = VEMB_V16_REGION_UB,
-            .is_local = 0,
+            .is_local = 1,
             .weight = 1,
             .mapped_addr = remote_region,
             .region_bytes = sizeof(remote_region),
@@ -1843,7 +2035,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
         {
             .region_id = 20,
             .backend_type = VEMB_V16_REGION_UB,
-            .is_local = 0,
+            .is_local = 1,
             .weight = 1,
             .mapped_addr = region2,
             .region_bytes = sizeof(region2),
@@ -1897,7 +2089,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
+static void test_owner_allocator_and_readonly_peer(void) {
     enum { dim = 2, max_vectors = 4 };
     float region[dim * max_vectors];
     float v1[dim], v2[dim], overwrite[dim];
@@ -1923,6 +2115,7 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 77, max_vectors);
     assert(vemb_v16_tlc_create(&tlc1, dim, &warm, 1, 4) == 0);
+    warm.is_local = 0;
     assert(vemb_v16_tlc_create(&tlc2, dim, &warm, 1, 4) == 0);
 
     fill_vector(v1, dim, 1000);
@@ -1933,12 +2126,20 @@ static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     assert(h1.region_id == 77);
     assert(warm_slot < max_vectors);
     assert(h1.offset == (uint64_t)warm_slot * sizeof(v1));
-    assert(vemb_v16_tlc_put(tlc2, key2, (uint32_t)strlen(key2), key2_hash,
+    assert(vemb_v16_tlc_put(tlc1, key2, (uint32_t)strlen(key2), key2_hash,
                             v2, sizeof(v2), &h2, &warm_slot) == 0);
     assert(h2.region_id == 77);
     assert(warm_slot < max_vectors);
     assert(h2.offset == (uint64_t)warm_slot * sizeof(v2));
     assert(h2.offset != h1.offset);
+    const uint8_t *peer_value;
+    uint32_t peer_bytes;
+    assert(vemb_v16_tlc_vector_slice(tlc2, &h1, &peer_value, &peer_bytes) == 0);
+    assert(peer_bytes == sizeof(v1) && memcmp(peer_value, v1, sizeof(v1)) == 0);
+    assert(vemb_v16_tlc_put(tlc2, key2, strlen(key2), key2_hash,
+                            v2, sizeof(v2), &h3, &warm_slot) != 0);
+    assert_region_stats(tlc1, 77, 2, 0);
+
     assert_region_stats(tlc1, 77, 2, 0);
 
     assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
@@ -3167,7 +3368,7 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
     assert(vemb_v16_tlc_create(&tlc, dim, regions, 3, 4) == 0);
     fill_vector(vector, dim, 4000);
 
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i < 2; i++) {
         char key[32];
         vemb_v16_vector_handle_t handle = {0};
         uint32_t warm_slot = UINT32_MAX;
@@ -3181,25 +3382,23 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
         if (handle.region_id == 200)
             remote_writes++;
     }
-#if TLC_CORE_ALLOW_LRU_EVICTION
-    assert(local_writes == 3);
-    assert(remote_writes == 0);
-#else
-    assert(local_writes == 2);
-    assert(remote_writes == 1);
-#endif
+    assert(local_writes == 2 && remote_writes == 0);
+    vemb_v16_vector_handle_t rejected;
+    uint32_t rejected_slot;
+    const char *extra = "foreign-capacity";
+    assert(vemb_v16_tlc_put(tlc, extra, strlen(extra),
+               vemb_v16_xxh3_64_str(extra, strlen(extra)), vector,
+               sizeof(vector), &rejected, &rejected_slot) != 0);
     assert_region_stats(tlc, 100, 1, 1);
     assert_region_stats(tlc, 101, 1, 1);
-#if TLC_CORE_ALLOW_LRU_EVICTION
     assert_region_stats(tlc, 200, 0, 0);
-#else
-    assert_region_stats(tlc, 200, 1, 0);
-#endif
+    float zero[dim * 4] = {0};
+    assert(memcmp(remote, zero, sizeof(remote)) == 0);
 
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_runtime_attach_remote_region_after_create(void) {
+static void test_runtime_attach_owned_region_after_create(void) {
     enum { dim = 2, max_vectors = 8 };
     float local_region[dim];
     float remote_region[dim * 4];
@@ -3222,7 +3421,7 @@ static void test_runtime_attach_remote_region_after_create(void) {
     vemb_v16_tlc_warm_region_t remote = {
         .region_id = 301,
         .backend_type = VEMB_V16_REGION_UB,
-        .is_local = 0,
+        .is_local = 1,
         .weight = 1,
         .mapped_addr = remote_region,
         .region_bytes = sizeof(remote_region),
@@ -4426,8 +4625,11 @@ int main(void) {
     test_recovery_strict_term_and_state_boundaries();
     test_put_get_handle();
     test_region_pool_full_capacity_and_cache_collisions();
-    test_region_pool_sparse_payload_distribution();
-    test_region_pool_aligned_preference_and_full_capacity();
+    test_region_pool_sequential_allocation();
+    test_region_pool_odd_capacity();
+    test_recycled_slots_across_owned_regions();
+    test_cold_rebuild_preserves_peer_and_invalidates_old_handles();
+    test_owner_concurrent_recycle();
     test_index_growth_and_stable_cursor();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();
@@ -4442,10 +4644,10 @@ int main(void) {
     test_prefill_distribution_stays_warm();
 #endif
     test_concurrent_distinct_keys();
-    test_shared_region_pool_full_and_reattach();
+    test_owner_region_pool_full_and_reader();
     test_multi_region_local_full_fallback_and_overwrite();
     test_multi_region_all_full_evicts_committed_warm();
-    test_shared_slot_meta_two_tlcs_unique_slots();
+    test_owner_allocator_and_readonly_peer();
     test_vsim_key2_lookup_local_source();
     test_vsim_key2_lookup_remote_source();
     test_remote_meta_async_publish_flush();
@@ -4456,7 +4658,7 @@ int main(void) {
     test_vsim_key2_lookup_remote_meta_stale();
     test_vsim_key2_lookup_remote_owner_routing();
     test_shared_slot_meta_local_set_before_remote();
-    test_runtime_attach_remote_region_after_create();
+    test_runtime_attach_owned_region_after_create();
     test_migration_snapshot_apply_rejects_stale();
     test_put_with_epoch_rejects_stale_epoch();
     test_migration_source_cutover_rejects_old_owner_access();
