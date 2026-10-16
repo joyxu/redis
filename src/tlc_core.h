@@ -119,6 +119,9 @@ typedef struct tlc_core_warm_region_config {
     uint32_t is_local;
     uint32_t weight;
     uint32_t value_size;
+    /* Physical stride, >= value_size. Zero selects packed caller-owned buffers.
+     * Manifest providers always supply their computed 64B-aligned stride. */
+    uint64_t slot_stride_size;
     uint64_t region_bytes;
     uint8_t *mapped_addr;
     vemb_v16_warm_slot_meta_t *slot_meta;

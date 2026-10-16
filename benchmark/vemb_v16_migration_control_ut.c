@@ -180,7 +180,7 @@ static void create_test_ub_region_file(const char *path,
                                        uint32_t capacity_slots,
                                        uint32_t value_size) {
     size_t layout_bytes = vemb_v16_warm_region_layout_bytes(capacity_slots);
-    size_t total_bytes = layout_bytes + ((size_t)capacity_slots * value_size);
+    size_t total_bytes = layout_bytes + ((size_t)capacity_slots * vemb_v16_warm_slot_stride(value_size));
     int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
     assert(fd >= 0);
     assert(ftruncate(fd, (off_t)total_bytes) == 0);
@@ -190,7 +190,8 @@ static void create_test_ub_region_file(const char *path,
                                              path,
                                              0,
                                              region_id,
-                                             capacity_slots) == 0);
+                                             value_size,
+                                             (uint64_t)capacity_slots * vemb_v16_warm_slot_stride(value_size)) == 0);
 }
 
 static int wait_for_outbox_progress(vemb_v16_storage_ctx_t *storage,
@@ -1221,7 +1222,7 @@ static void test_proxy_migration_control_primitives(void) {
             max_vectors,
             max_vectors * 2,
             shm1,
-            (unsigned)(sizeof(float) * dim * max_vectors),
+            (unsigned)(vemb_v16_warm_slot_stride(dim * sizeof(float)) * max_vectors),
             (unsigned)(sizeof(float) * dim),
             req0_1,
             resp1_0,
@@ -1893,7 +1894,7 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
 }
 
 static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
-    enum { dim = 2, max_vectors = 4, slots = 2 };
+    enum { dim = 16, max_vectors = 4, slots = 2 };
     char manifest_path[128];
     char shm1[64];
     char combo_region[64];

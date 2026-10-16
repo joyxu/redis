@@ -9,9 +9,15 @@
 
 #define VEMB_V16_WARM_REGION_LAYOUT_MAGIC 0x5631414cu /* V1AL */
 #define VEMB_V16_WARM_REGION_LAYOUT_INITIALIZING 0x56314149u /* V1AI */
-#define VEMB_V16_WARM_REGION_LAYOUT_VERSION 1u
+#define VEMB_V16_WARM_REGION_LAYOUT_VERSION 2u
 #define VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX 256u
 #define VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT 64u
+
+/* value_size is the logical payload length; arithmetic is widened before rounding. */
+static inline uint64_t vemb_v16_warm_slot_stride(uint32_t value_size) {
+    return ((uint64_t)value_size + VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT - 1u) &
+           ~(uint64_t)(VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT - 1u);
+}
 
 #define VEMB_V16_WARM_REGION_SLOT_ACQUIRE_OK 0
 #define VEMB_V16_WARM_REGION_SLOT_ACQUIRE_FULL 1
@@ -58,7 +64,8 @@ typedef struct vemb_v16_warm_region_header {
     uint32_t capacity_slots;
     uint32_t value_size;
     uint64_t region_bytes;
-    uint8_t reserved[32];
+    uint64_t slot_stride_size;
+    uint8_t reserved[24];
 } vemb_v16_warm_region_header_t;
 
 _Static_assert(sizeof(vemb_v16_warm_region_header_t) ==
@@ -74,7 +81,8 @@ int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
                                       const char *path,
                                       uint64_t mmap_offset,
                                       uint32_t region_id,
-                                    uint32_t capacity_slots);
+                                      uint32_t value_size,
+                                      uint64_t region_bytes);
 size_t vemb_v16_warm_region_layout_bytes(uint32_t capacity_slots);
 vemb_v16_warm_slot_meta_t *vemb_v16_warm_region_slot_meta(void *base);
 #endif

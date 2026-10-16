@@ -69,11 +69,15 @@ int vemb_v16_warm_region_layout_name_from_region_path(const char *region_path,
 
 static void init_header(vemb_v16_warm_region_header_t *header,
                         uint32_t region_id,
-                        uint32_t capacity_slots) {
+                        uint32_t value_size, uint64_t region_bytes) {
+    uint32_t capacity_slots = (uint32_t)(region_bytes / vemb_v16_warm_slot_stride(value_size));
     memset(header, 0, sizeof(*header));
     header->region_id = region_id;
     header->capacity_slots = capacity_slots;
     header->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
+    header->value_size = value_size;
+    header->region_bytes = region_bytes;
+    header->slot_stride_size = vemb_v16_warm_slot_stride(value_size);
     init_slot_meta(header, region_id, capacity_slots);
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&header->magic,
@@ -86,8 +90,12 @@ int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
                                       const char *path,
                                       uint64_t mmap_offset,
                                       uint32_t region_id,
-                                      uint32_t capacity_slots) {
-    RETURN_IF(!path[0] || capacity_slots == 0, -1);
+                                      uint32_t value_size,
+                                      uint64_t region_bytes) {
+    RETURN_IF(!path[0] || !value_size ||
+              region_bytes < vemb_v16_warm_slot_stride(value_size) ||
+              region_bytes / vemb_v16_warm_slot_stride(value_size) > UINT32_MAX, -1);
+    uint32_t capacity_slots = (uint32_t)(region_bytes / vemb_v16_warm_slot_stride(value_size));
     backend_type = backend_type ? backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM)
         return warm_region_layout_unlink(path);
@@ -121,7 +129,7 @@ int vemb_v16_warm_region_layout_reset(uint32_t backend_type,
               header,
               region_id,
               capacity_slots);
-    init_header(header, region_id, capacity_slots);
+    init_header(header, region_id, value_size, region_bytes);
     vemb_v16_mapped_region_close(&region);
     return 0;
 }

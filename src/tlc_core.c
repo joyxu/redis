@@ -128,6 +128,7 @@ typedef struct tlc_core_warm_region_runtime {
     vemb_v16_warm_slot_meta_t *slot_meta;
     uint64_t region_bytes;
     uint8_t *mapped_addr;
+    uint64_t slot_stride_size;
     /* One owner core, shared by its worker threads; readers have no pool. */
     pthread_mutex_t alloc_mu;
     uint32_t alloc_mu_init;
@@ -350,11 +351,12 @@ static int warm_region_init_one(tlc_core_t *core,
                                 tlc_core_warm_region_runtime_t *dst,
                                 const tlc_core_warm_region_config_t *src,
                                 uint32_t region_index) {
+    uint64_t stride = src->slot_stride_size ? src->slot_stride_size : src->value_size;
     RETURN_IF(!src->mapped_addr || !src->slot_meta ||
               src->value_size != core->value_size ||
-              src->region_bytes < src->value_size,
+              stride < src->value_size || src->region_bytes < stride,
               -1);
-    uint64_t capacity_slots = src->region_bytes / src->value_size;
+    uint64_t capacity_slots = src->region_bytes / stride;
     RETURN_IF(capacity_slots > UINT32_MAX, -1);
     uint32_t weight = src->weight ? src->weight : 1u;
 
@@ -366,6 +368,7 @@ static int warm_region_init_one(tlc_core_t *core,
         .weight = weight,
         .value_size = src->value_size,
         .capacity_slots = (uint32_t)capacity_slots,
+        .slot_stride_size = stride,
         .slot_meta = src->slot_meta,
         .region_bytes = src->region_bytes,
         .mapped_addr = src->mapped_addr,
@@ -845,7 +848,7 @@ static void slot_write_payload(tlc_core_warm_region_runtime_t *region,
                                uint32_t value_size) {
     sve_streaming_load_f32(value,
                            region->mapped_addr +
-                               (uint64_t)local_slot * region->value_size,
+                               (uint64_t)local_slot * region->slot_stride_size,
                            value_size);
 }
 
@@ -865,7 +868,7 @@ static void fill_location_from_slot(const tlc_core_warm_region_runtime_t *region
         .region_index = region_index,
         .local_slot = local_slot,
         .bytes = slot_meta->bytes,
-        .offset = (uint64_t)local_slot * region->value_size,
+        .offset = (uint64_t)local_slot * region->slot_stride_size,
         .owner_generation = atomic_load_explicit(&slot_meta->owner_generation, memory_order_acquire),
     };
 }
@@ -984,7 +987,7 @@ static tlc_core_warm_verify_rc_t warm_slot_probe_status(
             .region_index = region_index,
             .local_slot = local_slot,
             .bytes = snapshot.bytes,
-            .offset = (uint64_t)local_slot * region->value_size,
+            .offset = (uint64_t)local_slot * region->slot_stride_size,
             .owner_generation = snapshot.owner_generation,
         };
     }
@@ -1025,7 +1028,7 @@ static int resolve_warm_region_for_location(
     RETURN_IF(!region ||
               location->local_slot >= region->capacity_slots ||
               location->offset !=
-                  (uint64_t)location->local_slot * region->value_size ||
+                  (uint64_t)location->local_slot * region->slot_stride_size ||
               location->bytes != region->value_size,
               -1);
     *region_out = region;
