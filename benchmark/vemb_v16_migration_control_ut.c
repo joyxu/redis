@@ -111,14 +111,12 @@ static void migration_ut_ensure_regions_slot_meta(
 
 static int migration_ut_create(vemb_v16_tlc_t **out,
                                uint32_t vector_dim,
-                               uint32_t max_vectors,
-                               vemb_v16_tlc_warm_region_t *warm_regions,
+                                     vemb_v16_tlc_warm_region_t *warm_regions,
                                uint32_t warm_region_count,
                                uint32_t local_region_weight) {
     migration_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
     return vemb_v16_tlc_create(out,
                                vector_dim,
-                               max_vectors,
                                warm_regions,
                                warm_region_count,
                                local_region_weight);
@@ -966,7 +964,6 @@ static void test_supernode_lookup_miss_classification(void) {
     fill_vector(value, dim, 9100);
     assert(vemb_v16_tlc_create(&tlc,
                                dim,
-                               max_vectors,
                                &warm,
                                1,
                                1) == 0);
@@ -1239,11 +1236,9 @@ static void test_proxy_migration_control_primitives(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(vemb_v16_proxy_create(&proxy,
                                  dim,
-                                 max_vectors,
                                  storage,
                                  &manifest) == 0);
 
@@ -1813,7 +1808,6 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
     init_test_allocator(&allocator, 911, max_vectors);
     assert(vemb_v16_tlc_create(&tlc,
                                dim,
-                               max_vectors,
                                &warm,
                                1,
                                4) == 0);
@@ -1960,11 +1954,9 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                      dim,
                                                      dim * sizeof(float),
-                                                     max_vectors,
                                                      &manifest) == 0);
     assert(vemb_v16_proxy_create(&proxy,
                                  dim,
-                                 max_vectors,
                                  storage,
                                  &manifest) == 0);
     assert(vemb_v16_proxy_enable_tcp(proxy, "127.0.0.1", 6399) == 0);
@@ -2116,13 +2108,11 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
     init_test_allocator(&target_allocator, 923, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&target,
                                dim,
-                               max_vectors,
                                target_regions,
                                2,
                                4) == 0);
@@ -2324,13 +2314,11 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
     init_test_allocator(&target_allocator, 933, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&target,
                                dim,
-                               max_vectors,
                                target_regions,
                                2,
                                4) == 0);
@@ -2561,13 +2549,11 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     init_test_allocator(&target_allocator, 943, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&target,
                                dim,
-                               max_vectors,
                                target_regions,
                                2,
                                4) == 0);
@@ -2807,13 +2793,11 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     init_test_allocator(&target_allocator, 947, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&target,
                                dim,
-                               max_vectors,
                                target_regions,
                                2,
                                4) == 0);
@@ -3223,13 +3207,11 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     init_test_allocator(&dest_allocator, 953, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                dest_regions,
                                2,
                                4) == 0);
@@ -3272,7 +3254,6 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                               NULL) == 0);
     assert(vemb_v16_proxy_create(&source_proxy,
                                  dim,
-                                 max_vectors,
                                  &source_storage,
                                  NULL) == 0);
 
@@ -5036,13 +5017,11 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
     init_test_allocator(&dest_allocator, 973, max_vectors);
     assert(vemb_v16_tlc_create(&source,
                                dim,
-                               max_vectors,
                                &source_warm,
                                1,
                                4) == 0);
     assert(vemb_v16_tlc_create(&dest,
                                dim,
-                               max_vectors,
                                dest_regions,
                                2,
                                4) == 0);

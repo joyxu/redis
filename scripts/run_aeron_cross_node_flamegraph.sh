@@ -8,11 +8,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-SERVER_NODE="${SERVER_NODE:-43.154.145.18}"
-CLIENT_NODE="${CLIENT_NODE:-43.154.145.18}"
+SERVER_NODE="${SERVER_NODE:-192.168.90.111}"
+CLIENT_NODE="${CLIENT_NODE:-192.168.90.112}"
 SSH_USER="${SSH_USER:-root}"
-SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-8111}}"
-CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-8112}}"
+SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-22}}"
+CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-22}}"
 SERVER_ROOT="${SERVER_ROOT:-/root/szz/codespace/hpc-redis}"
 CLIENT_ROOT="${CLIENT_ROOT:-/root/szz/codespace/hpc-redis}"
 FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
@@ -70,6 +70,7 @@ CLIENTS="${CLIENTS:-4}"
 PIPELINE="${PIPELINE:-32}"
 BATCH_REQUEST_SIZE="${BATCH_REQUEST_SIZE:-32}"
 BATCH_MAX_DELAY_US="${BATCH_MAX_DELAY_US:-0}"
+VEMB_V16_BATCH_DISABLE="${VEMB_V16_BATCH_DISABLE:-0}"
 L1_ENTRIES="${L1_ENTRIES:-0}"
 PROXY_REQUEST_BATCH="${PROXY_REQUEST_BATCH:-$BATCH_REQUEST_SIZE}"
 PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-$BATCH_REQUEST_SIZE}"
@@ -85,6 +86,11 @@ FREQ="${FREQ:-99}"
 EVENT="${EVENT:-cycles}"
 BUILD="${BUILD:-verify}"
 PROFILE="${PROFILE:-1}"
+SERVER_PMU="${SERVER_PMU:-0}"
+SERVER_PMU_EVENTS="${SERVER_PMU_EVENTS:-}"
+if [ -z "$SERVER_PMU_EVENTS" ]; then
+    SERVER_PMU_EVENTS='{cycles,instructions,cache-references,cache-misses}'
+fi
 KEEP_SERVER="${KEEP_SERVER:-0}"
 REQUIRE_VEMB_THREAD_SAMPLES="${REQUIRE_VEMB_THREAD_SAMPLES:-1}"
 MAX_FOREIGN_CPU_PCT="${MAX_FOREIGN_CPU_PCT:-10}"
@@ -154,13 +160,15 @@ Important environment variables:
   SERVER_RESERVED_UB_PATHS CLIENT_RESERVED_UB_PATHS
   CLIENT_PEER_VIEW_MANIFEST CLIENT_PEER_VIEW_HOST CLIENT_PEER_VIEW_OWNER_ID
   NUM_KEYS KEY_PATTERN=R:R|Z:Z ZIPF_S KEY_PREFIX (default item:) DIM MAX_VECTORS
-  THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US L1_ENTRIES
+  THREADS CLIENTS PIPELINE BATCH_REQUEST_SIZE BATCH_MAX_DELAY_US VEMB_V16_BATCH_DISABLE=0|1 L1_ENTRIES
   PROXY_REQUEST_BATCH PROXY_RESPONSE_BATCH PROXY_QUEUE_BATCH
   PIO SNW SERVER_CPU_MASK CLIENT_CPU_MASK
   TEST_TIME SERVER_FLAME_DURATION FREQ EVENT PROFILE=0|1
   MAX_FOREIGN_CPU_PCT MAX_FOREIGN_TOTAL_CPU_PCT MAX_FOREIGN_CPUSET_BUSY_PCT MAX_FOREIGN_RSS_MB
   KILL_OPENCODE=0|1 KILL_MUTAGEN=0|1
   BUILD=verify|build|skip PROFILE=0|1 KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
+  SERVER_PMU=0|1 (per-worker hardware counters; independent of PROFILE)
+  SERVER_PMU_EVENTS (perf event list; defaults to cycles/instructions/cache counters)
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
 
 BUILD=verify requires current O3/LTO/SVE build stamps. BUILD=build force-builds
@@ -272,6 +280,8 @@ fi
     die "BUILD must be verify, build, or skip"
 [ "$PROFILE" = 0 ] || [ "$PROFILE" = 1 ] ||
     die "PROFILE must be 0 or 1"
+[ "$SERVER_PMU" = 0 ] || [ "$SERVER_PMU" = 1 ] ||
+    die "SERVER_PMU must be 0 or 1"
 [ "$KEEP_SERVER" = 0 ] || [ "$KEEP_SERVER" = 1 ] ||
     die "KEEP_SERVER must be 0 or 1"
 [ "$REQUIRE_VEMB_THREAD_SAMPLES" = 0 ] || [ "$REQUIRE_VEMB_THREAD_SAMPLES" = 1 ] ||
@@ -280,6 +290,8 @@ fi
     die "KILL_OPENCODE must be 0 or 1"
 [ "$KILL_MUTAGEN" = 0 ] || [ "$KILL_MUTAGEN" = 1 ] ||
     die "KILL_MUTAGEN must be 0 or 1"
+[ "$VEMB_V16_BATCH_DISABLE" = 0 ] || [ "$VEMB_V16_BATCH_DISABLE" = 1 ] ||
+    die "VEMB_V16_BATCH_DISABLE must be 0 or 1"
 [ "$DRY_RUN" = 0 ] || [ "$DRY_RUN" = 1 ] || die "DRY_RUN must be 0 or 1"
 
 for value in "$PORT" "$DIM" "$MAX_VECTORS" "$NUM_KEYS" "$THREADS" "$CLIENTS" \
@@ -333,14 +345,14 @@ if [ -z "$RUN_ID" ]; then
 fi
 REMOTE_RUN_DIR="${REMOTE_RUN_DIR:-$REMOTE_TMP_ROOT/$RUN_ID}"
 LOCAL_ROOT="${LOCAL_ROOT:-$ROOT_DIR/perf/$RUN_ID}"
-run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_l1${L1_ENTRIES}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
+run_label="keys${NUM_KEYS}_${pattern_label}_d${DIM}_p${PIO}_s${SNW}_t${THREADS}_c${CLIENTS}_pipe${PIPELINE}_b${BATCH_REQUEST_SIZE}_bd${VEMB_V16_BATCH_DISABLE}_l1${L1_ENTRIES}_prb${PROXY_REQUEST_BATCH}_pob${PROXY_RESPONSE_BATCH}_pqb${PROXY_QUEUE_BATCH}_delay${BATCH_MAX_DELAY_US}us_test${TEST_TIME}s_flame${SERVER_FLAME_DURATION}s_run${RUN_ID}"
 
 mkdir -p "$LOCAL_ROOT/server" "$LOCAL_ROOT/client"
 
 status "cross-node flamegraph run: $RUN_ID"
 status "server=$SERVER_PEER:$SERVER_SSH_PORT:$SERVER_ROOT"
 status "client=$CLIENT_PEER:$CLIENT_SSH_PORT:$CLIENT_ROOT"
-status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
+status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE batch_disable=$VEMB_V16_BATCH_DISABLE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
 status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD profile=$PROFILE local=$LOCAL_ROOT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -557,7 +569,6 @@ cd "$root"
 setsid -f taskset -c "$cpu_mask" ./src/redis-server \
     --port "$port" --bind "$server_ip" --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim "$dim" \
-    --vemb-v16-max-vectors "$max_vectors" \
     --vemb-v16-warm-regions-manifest "$manifest" \
     --vemb-v16-reset-warm-regions yes \
     --vemb-v16-transport aeron \
@@ -688,6 +699,30 @@ else
     status "PROFILE=0; skipping server perf sampling"
 fi
 
+if [ "$SERVER_PMU" = 1 ]; then
+    status "starting per-worker server PMU counters"
+    pmu_events_arg="$(printf '%q' "$SERVER_PMU_EVENTS")"
+    server_ssh bash -s -- "$REMOTE_RUN_DIR" "$PIO" "$SNW" "$TEST_TIME" "$pmu_events_arg" <<'REMOTE_SERVER_PMU'
+set -euo pipefail
+run=$1
+expected_io=$2
+expected_sn=$3
+duration=$(($4 + 5))
+events=$5
+printf '%s\n' "$events" > "$run/server.pmu.events.txt"
+pid="$(cat "$run/server.pid")"
+ps -T -p "$pid" -o tid=,comm= | awk '$2 ~ /^vemb-(io|sn)-/' > "$run/server.pmu.threads.txt"
+[ "$(grep -c 'vemb-io-' "$run/server.pmu.threads.txt")" -eq "$expected_io" ]
+[ "$(grep -c 'vemb-sn-' "$run/server.pmu.threads.txt")" -eq "$expected_sn" ]
+tids="$(awk '{ printf "%s%s", sep, $1; sep="," }' "$run/server.pmu.threads.txt")"
+nohup perf stat --per-thread --tid "$tids" -I 1000 -x ';' \
+    -e "$events" \
+    -o "$run/server.pmu.csv" -- sleep "$duration" \
+    > "$run/server.pmu.log" 2>&1 &
+echo $! > "$run/server.pmu.pid"
+REMOTE_SERVER_PMU
+fi
+
 status "starting server CPU-set sampling on $SERVER_CPU_MASK"
 server_ssh bash -s -- \
     "$REMOTE_RUN_DIR" "$SERVER_CPU_MASK" "$TEST_TIME" <<'REMOTE_SERVER_CPU_START'
@@ -745,6 +780,7 @@ echo $! >"$run/server.cpu.mpstat.pid"
 REMOTE_SERVER_CPU_START
 
 zipf_s_arg="${ZIPF_S:--}"
+op_flag_arg="${WORKLOAD_OP_FLAG:--}"
 
 if [ "$PROFILE" = 1 ]; then
     status "running CLI workload under perf on $CLIENT_NODE:$CLIENT_SSH_PORT"
@@ -757,7 +793,8 @@ client_ssh bash -s -- \
     "$PIPELINE" "$BATCH_REQUEST_SIZE" "$BATCH_MAX_DELAY_US" "$L1_ENTRIES" "$TEST_TIME" \
     "$CLIENT_CPU_MASK" "$FREQ" "$EVENT" "$FLAMEGRAPH_DIR" "$run_label" "$PROFILE" \
     "$CLIENT_PEER_VIEW_MANIFEST" "$CLIENT_PEER_VIEW_HOST" "$CLIENT_PEER_VIEW_OWNER_ID" \
-    "$AERON_UB_CACHEABLE" "$WORKLOAD_OP_FLAG" "$WORKLOAD_RATIO" <<'REMOTE_CLIENT_PERF'
+    "$AERON_UB_CACHEABLE" "$op_flag_arg" "$WORKLOAD_RATIO" \
+    "$VEMB_V16_BATCH_DISABLE" <<'REMOTE_CLIENT_PERF'
 set -euo pipefail
 
 root=$1
@@ -790,7 +827,11 @@ peer_view_host=${24}
 peer_view_owner_id=${25}
 ub_cacheable=${26}
 op_flag=${27:-}
+if [ "$op_flag" = - ]; then
+    op_flag=
+fi
 ratio=${28:-0:1}
+batch_disable=${29:-0}
 export VEMB_V16_AERON_UB_CACHEABLE="$ub_cacheable"
 
 [ "$profile" = 0 ] || [ "$profile" = 1 ] || exit 1
@@ -889,6 +930,10 @@ l1_args=()
 if [ "$l1_entries" -ne 0 ]; then
     l1_args=("--vemb-v16-l1-entries=$l1_entries")
 fi
+batch_disable_args=()
+if [ "$batch_disable" = 1 ]; then
+    batch_disable_args=(--vemb-v16-batch-disable)
+fi
 
 cd "$root/memtier_benchmark"
 timed_workload_cmd='run_timed_workload() {
@@ -923,7 +968,7 @@ workload_cmd=(
     --vemb-v16-ub-peer-view-owner-id="$peer_view_owner_id"
     --vemb-v16-batch-request-size="$batch_size"
     --vemb-v16-batch-max-delay-us="$max_delay_us"
-    --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}" $op_flag
+    --test-time="$test_time" --hide-histogram "${zipf_args[@]}" "${l1_args[@]}" "${batch_disable_args[@]}" $op_flag
 )
 if [ "$profile" = 1 ]; then
     perf record -F "$freq" -g -e "$event" -o "$run/client.perf.data" -- \
@@ -1083,8 +1128,8 @@ fi
     else
         printf 'role=client\nprofile=disabled\n'
     fi
-    printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s max_delay_us=%s l1_entries=%s\n' \
-        "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$max_delay_us" "$l1_entries"
+    printf 'workload=keys=%s pattern=%s threads=%s clients=%s pipeline=%s batch=%s batch_disable=%s max_delay_us=%s l1_entries=%s\n' \
+        "$keys" "$pattern" "$threads" "$clients" "$pipeline" "$batch_size" "$batch_disable" "$max_delay_us" "$l1_entries"
     printf 'run_label=%s\n' "$run_label"
     printf 'client_workload_summary=client.workload.summary.tsv\n'
     cat "$root/.vemb_v16_build_stamp.client"
@@ -1297,6 +1342,20 @@ server_artifacts=(
 )
 if [ "$profile" = 1 ]; then
     server_artifacts+=(server.threads.txt server.perf.log server.perf.data server.perf.script server.collapsed.txt server.process.collapsed.txt server.svg)
+fi
+if [ -f "$run/server.pmu.pid" ]; then
+    pmu_pid="$(cat "$run/server.pmu.pid")"
+    for _ in $(seq 1 100); do
+        kill -0 "$pmu_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    ! kill -0 "$pmu_pid" 2>/dev/null || { echo 'PMU sampler is still running' >&2; exit 1; }
+    test -s "$run/server.pmu.csv"
+    if grep -q '<not supported>' "$run/server.pmu.csv"; then
+        echo 'PMU events are not supported' >&2
+        exit 1
+    fi
+    server_artifacts+=(server.pmu.threads.txt server.pmu.csv server.pmu.log server.pmu.events.txt)
 fi
 tar -C "$run" -czf "$run/server_artifacts.tar.gz" "${server_artifacts[@]}"
 REMOTE_SERVER_RENDER

@@ -178,7 +178,7 @@ server_args=(
     --warm-mmap-offset "$WARM_MMAP_OFFSET"
     --region-id "$WARM_REGION_ID"
     --dim "$DIM"
-    --max-vectors "$MAX_VECTORS"
+    --warm-bytes "$((DIM * 4 * MAX_VECTORS))"
     --loglevel verbose
 )
 if [ "$RESET_WARM" = "1" ]; then

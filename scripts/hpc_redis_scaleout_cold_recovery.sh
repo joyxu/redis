@@ -105,7 +105,7 @@ warm_regions:
     value_size: $((DIM * 4))
     home_ub_node_id: $i
 EOF
-HPC_REDIS_COLD_DIR='$cold' '$REMOTE_DIR/src/redis-server' --port '$PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-proxy-io-threads 2 --vemb-v16-supernode-workers 2 --daemonize yes --logfile '$log_path' --loglevel notice"
+HPC_REDIS_COLD_DIR='$cold' '$REMOTE_DIR/src/redis-server' --port '$PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-proxy-io-threads 2 --vemb-v16-supernode-workers 2 --daemonize yes --logfile '$log_path' --loglevel notice"
     wait_ready "$host" || exit 1
 done
 record start PASS "two Redis/VEMB TCP endpoints listening on port $PORT"
@@ -134,7 +134,7 @@ echo "== restart and recovery read =="
 for host in "${hosts[@]}"; do stop_node "$host"; done
 for i in 0 1; do
     host=${hosts[$i]}; manifest=${manifests[$i]}; cold=${cold_dirs[$i]}; log_path=${logs[$i]}
-    ssh_run "$host" "HPC_REDIS_COLD_DIR='$cold' '$REMOTE_DIR/src/redis-server' --port '$PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-proxy-io-threads 2 --vemb-v16-supernode-workers 2 --daemonize yes --logfile '$log_path' --loglevel notice"
+    ssh_run "$host" "HPC_REDIS_COLD_DIR='$cold' '$REMOTE_DIR/src/redis-server' --port '$PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-proxy-io-threads 2 --vemb-v16-supernode-workers 2 --daemonize yes --logfile '$log_path' --loglevel notice"
     wait_ready "$host" || exit 1
 done
 recovery_out="$REMOTE_RESULT_DIR/recovery_read.out"

@@ -106,7 +106,6 @@ struct vemb_v16_proxy {
     atomic_uint_fast32_t batch_request_size;
     uint32_t request_ring_slot_size;
     uint32_t response_ring_slot_size;
-    uint32_t max_vectors;
     vemb_v16_storage_ctx_t *storage;
     vemb_v16_channel_t channels[VEMB_V16_MAX_CHANNELS];
     atomic_uint_fast64_t next_channel_id;

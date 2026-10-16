@@ -65,7 +65,6 @@ start_server() {
     numactl --membind=0 taskset -c $SERVER_CPUSET ./src/redis-server \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-        --vemb-v16-max-vectors $max_vec \
         --vemb-v16-warm-regions-manifest "$MANIFEST" \
         --vemb-v16-reset-warm-regions yes \
         --vemb-v16-proxy-io-threads $PIO --vemb-v16-supernode-workers $SNW \

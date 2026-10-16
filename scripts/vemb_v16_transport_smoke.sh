@@ -78,7 +78,7 @@ printf '[ok] --transport both rejected\n'
     --vector-region "$TCP_REGION" \
     --warm-backend shm \
     --dim 16 \
-    --max-vectors 1024 \
+    --warm-bytes 65536 \
     --loglevel warning >"$TCP_LOG" 2>&1 &
 TCP_PID=$!
 
@@ -115,7 +115,7 @@ TCP_PID=""
     --vector-region "$SHM_REGION" \
     --warm-backend shm \
     --dim 16 \
-    --max-vectors 1024 \
+    --warm-bytes 65536 \
     --loglevel warning >"$SHM_LOG" 2>&1 &
 SHM_PID=$!
 

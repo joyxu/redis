@@ -143,7 +143,6 @@ run_case() {
         --warm-regions-manifest "$manifest0" \
         --reset-warm-regions \
         --dim "$DIM" \
-        --max-vectors 256 \
         --loglevel debug > "$log0" 2>&1 &
     PID0="$!"
 
@@ -157,7 +156,6 @@ run_case() {
         --supernode-workers 2 \
         --warm-regions-manifest "$manifest1" \
         --dim "$DIM" \
-        --max-vectors 256 \
         --loglevel debug > "$log1" 2>&1 &
     PID1="$!"
 

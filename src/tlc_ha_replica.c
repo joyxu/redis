@@ -3796,12 +3796,21 @@ static int replica_handle_resync_control(
             control.generation == 0 || control.checkpoint_seq == UINT64_MAX)
             return -1;
         if (atomic_load_explicit(&replica->resync_snapshot_installed_pending,
-                                 memory_order_acquire) &&
-            (control.session_id != replica->resync_session_id ||
-             control.generation != replica->resync_generation ||
-             control.checkpoint_seq != replica->resync_checkpoint_seq ||
-             control.durable_boundary_seq != replica->resync_boundary_seq))
-            return -1;
+                                 memory_order_acquire)) {
+            if (control.session_id > replica->resync_session_id) {
+                /* An artifact can be installed without a matching control
+                 * request (or before its connection is lost). A newer session
+                 * must transfer its own snapshot, never acknowledge the old
+                 * install as completion of the new one. */
+                atomic_store_explicit(&replica->resync_snapshot_installed_pending,
+                                      false, memory_order_release);
+            } else if (control.session_id != replica->resync_session_id ||
+                       control.generation != replica->resync_generation ||
+                       control.checkpoint_seq != replica->resync_checkpoint_seq ||
+                       control.durable_boundary_seq != replica->resync_boundary_seq) {
+                return -1;
+            }
+        }
         replica->resync_session_id = control.session_id;
         replica->resync_generation = control.generation;
         replica->resync_checkpoint_seq = control.checkpoint_seq;

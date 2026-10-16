@@ -33,10 +33,10 @@ esac
 NODE0_HOST="${NODE0_HOST:-192.168.1.111}"
 NODE1_HOST="${NODE1_HOST:-192.168.1.112}"
 SSH_USER="${SSH_USER:-root}"
-NODE0_SSH_HOST="${NODE0_SSH_HOST:-43.154.145.18}"
-NODE0_SSH_PORT="${NODE0_SSH_PORT:-8111}"
-NODE1_SSH_HOST="${NODE1_SSH_HOST:-43.154.145.18}"
-NODE1_SSH_PORT="${NODE1_SSH_PORT:-8112}"
+NODE0_SSH_HOST="${NODE0_SSH_HOST:-192.168.1.111}"
+NODE0_SSH_PORT="${NODE0_SSH_PORT:-22}"
+NODE1_SSH_HOST="${NODE1_SSH_HOST:-192.168.1.112}"
+NODE1_SSH_PORT="${NODE1_SSH_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 # memtier 执行节点 (client 负载机, 与 server 分离以排除 client 干扰)
@@ -289,7 +289,6 @@ start_node() {
         numactl --membind=0 taskset -c 0-95 ./src/redis-server \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-        --vemb-v16-max-vectors $MAX_VECTORS \
         --vemb-v16-warm-regions-manifest $manifest \
         $reset_flag \
         --vemb-v16-proxy-io-threads $PIO --vemb-v16-supernode-workers $SNW \

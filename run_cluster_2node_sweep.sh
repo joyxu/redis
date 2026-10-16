@@ -122,7 +122,6 @@ start_server_hw01() {
             --vemb-v16-enabled yes \
             --vemb-v16-tcp-host $HW01_IP \
             --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $HW01_MANIFEST \
@@ -150,7 +149,6 @@ start_server_hw02() {
             --vemb-v16-enabled yes \
             --vemb-v16-tcp-host $HW02_IP \
             --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors $max_vec \
             --vemb-v16-proxy-io-threads $HPC_PIO \
             --vemb-v16-supernode-workers $HPC_SNW \
             --vemb-v16-warm-regions-manifest $HPC_DIR/examples/cluster_112.yaml \

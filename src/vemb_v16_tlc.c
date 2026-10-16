@@ -616,13 +616,12 @@ int enqueue_remote_meta_publish(vemb_v16_tlc_t *tlc,
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         uint32_t vector_dim,
-                        uint32_t max_vectors,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight) {
     RETURN_IF(!out || warm_region_count == 0 ||
         warm_region_count > TLC_CORE_MAX_WARM_REGIONS ||
-        vector_dim == 0 || max_vectors == 0, -1);
+        vector_dim == 0, -1);
     /* Region ids must stay unique because vector handles address data by region_id. */
     for (uint32_t i = 0; i < warm_region_count; i++) {
         for (uint32_t j = 0; j < i; j++) {
@@ -635,7 +634,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     RETURN_IF(!tlc, -1);
     tlc->vector_dim = vector_dim;
     tlc->value_size = vector_dim * sizeof(float);
-    tlc->max_vectors = max_vectors;
     tlc->region_id = warm_regions[0].region_id;
     tlc->backend_type = warm_regions[0].backend_type;
     tlc->warm_region_count = warm_region_count;
@@ -695,14 +693,12 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     }
     tlc_core_config_t core_config = {
         .value_size = tlc->value_size,
-        .warm_capacity = max_vectors,
         .hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY,
         .warm_regions = core_regions,
         .warm_region_count = warm_region_count,
         .local_region_weight = local_region_weight,
     };
-    if (bitmap_init(&tlc->bitmap, max_vectors) != 0 ||
-        tlc_core_create(&tlc->core, &core_config) != 0) {
+    if (tlc_core_create(&tlc->core, &core_config) != 0) {
         vemb_v16_tlc_destroy(tlc);
         return -1;
     }
@@ -714,7 +710,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
 int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
                                     const vemb_v16_tlc_warm_region_t *warm_region) {
     RETURN_IF(!tlc || !warm_region, -1);
-    RETURN_IF(warm_region->backend_type != VEMB_V16_REGION_UB, -1);
     if (region_index_id_mapping(tlc, warm_region->region_id) != UINT32_MAX)
         return 0;
 
@@ -786,7 +781,6 @@ int vemb_v16_tlc_compact(vemb_v16_tlc_t *tlc,
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
     RETURN_IF(!tlc);
     remote_meta_publisher_stop(tlc);
-    bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);
     if (tlc->migration_progress_lock_init)
         pthread_mutex_destroy(&tlc->migration_progress_lock);

@@ -20,7 +20,6 @@ if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
     ./src/redis-server \
       --port 6379 --bind 0.0.0.0 --protected-mode no \
       --vemb-v16-enabled yes --vemb-v16-dim 300 \
-      --vemb-v16-max-vectors 131072 \
       --vemb-v16-warm-regions-manifest "$MANIFEST" \
       --vemb-v16-reset-warm-regions yes \
       --vemb-v16-proxy-io-threads 32 \

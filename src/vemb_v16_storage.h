@@ -173,7 +173,6 @@ typedef struct vemb_v16_storage_scaleout_auto_status {
 typedef struct vemb_v16_storage_ctx {
     uint32_t vector_dim;
     uint32_t vector_stride;
-    uint32_t max_vectors;
     uint32_t local_owner_id;
     uint32_t warm_region_id;
     uint32_t warm_backend_type;
@@ -290,11 +289,11 @@ typedef struct vemb_v16_storage_ctx {
 int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                               uint32_t vector_dim,
                                               uint32_t vector_stride,
-                                              uint32_t max_vectors,
                                               const vemb_v16_warm_regions_manifest_t *manifest);
 int vemb_v16_parse_warm_regions_manifest(const char *path,
                                          uint32_t value_size,
                                          vemb_v16_warm_regions_manifest_t *manifest);
+/* Requires a validated manifest; callers must fence all users before reset. */
 int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest);
 void vemb_v16_storage_ctx_destroy(vemb_v16_storage_ctx_t *storage);
 const char *vemb_v16_storage_vector_region_name(vemb_v16_storage_ctx_t *storage);

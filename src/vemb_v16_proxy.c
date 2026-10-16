@@ -36,6 +36,41 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+static _Thread_local struct {
+    uint64_t rounds, idle, submit_batches, submit_items, submit_retries;
+    uint64_t queue_polls, queue_empty, queue_batches, queue_items;
+    uint64_t completion_batches, completion_items, channel_polls, channel_empty;
+    monotime last_log;
+} pipeline_diag;
+
+static void pipeline_diag_tick(const char *role, uint32_t worker_id) {
+    if ((++pipeline_diag.rounds & 65535u) != 0)
+        return;
+    monotime now = getMonotonicNs();
+    if (now - pipeline_diag.last_log < UINT64_C(1000000000))
+        return;
+    pipeline_diag.last_log = now;
+    serverLog(LL_WARNING,
+        "pipeline_diag role=%s worker=%u rounds=%llu idle=%llu submit_batches=%llu submit_items=%llu submit_retries=%llu queue_polls=%llu queue_empty=%llu queue_batches=%llu queue_items=%llu completion_batches=%llu completion_items=%llu channel_polls=%llu channel_empty=%llu",
+        role, worker_id, (unsigned long long)pipeline_diag.rounds,
+        (unsigned long long)pipeline_diag.idle,
+        (unsigned long long)pipeline_diag.submit_batches,
+        (unsigned long long)pipeline_diag.submit_items,
+        (unsigned long long)pipeline_diag.submit_retries,
+        (unsigned long long)pipeline_diag.queue_polls,
+        (unsigned long long)pipeline_diag.queue_empty,
+        (unsigned long long)pipeline_diag.queue_batches,
+        (unsigned long long)pipeline_diag.queue_items,
+        (unsigned long long)pipeline_diag.completion_batches,
+        (unsigned long long)pipeline_diag.completion_items,
+        (unsigned long long)pipeline_diag.channel_polls,
+        (unsigned long long)pipeline_diag.channel_empty);
+    if (role[0] == 'S')
+        tlc_core_log_lookup_diagnostics(worker_id);
+}
+#endif
+
 #define VEMB_V16_JOB_SHARD_RING_SIZE 256u
 #define VEMB_V16_JOB_RETURN_RING_SIZE 256u
 #define VEMB_V16_COMPLETION_RING_SIZE VEMB_V16_AERON_RING_SIZE
@@ -1201,9 +1236,16 @@ static int publish_shard_job_batch(vemb_v16_channel_t *ch,
         shard_queue_index(proxy, proxy_io_worker_id, supernode_id);
     vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
 
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+    pipeline_diag.submit_batches++;
+    pipeline_diag.submit_items += ref_count;
+#endif
     while (vemb_v16_aeron_publish_batch(ring, refs, ref_count) != 0 &&
            atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+        pipeline_diag.submit_retries++;
+#endif
         (void)drain_job_return_queues(proxy, proxy_io_worker_id);
         cpu_relax();
     }
@@ -1770,6 +1812,10 @@ static int drain_completions(vemb_v16_channel_t *ch) {
     while ((n = vemb_v16_aeron_poll_batch(&ch->completion_ring,
                                           completions,
                                           PROXY_RESPONSE_BATCH)) != 0) {
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+        pipeline_diag.completion_batches++;
+        pipeline_diag.completion_items += n;
+#endif
         total += n;
         if (ch->batch_v2) {
             for (uint32_t i = 0; i < n; i++) {
@@ -1811,7 +1857,6 @@ static void fill_channel_desc(vemb_v16_proxy_t *proxy,
     desc->channel_index = ch->index;
     desc->vector_dim = proxy->vector_dim;
     desc->vector_stride = proxy->vector_stride;
-    desc->max_vectors = proxy->max_vectors;
     desc->request_ring_slot_size = proxy->request_ring_slot_size;
     desc->response_ring_slot_size = proxy->response_ring_slot_size;
     strncpy(desc->request_ring_name, ch->request_ring_name,
@@ -2550,6 +2595,10 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
             if (atomic_load_explicit(&ch->active, memory_order_acquire)) {
                 int rc = vemb_v16_aeron_poll_shm_requests(
                     ch, worker->worker_id);
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+                pipeline_diag.channel_polls++;
+                if (rc == 0) pipeline_diag.channel_empty++;
+#endif
                 if (rc < 0) {
                     proxy_io_channel_deactivate(ch);
                     did_work = 1;
@@ -2563,6 +2612,10 @@ static void *proxy_io_aeron_poll_thread_main(void *arg) {
                                   1,
                                   memory_order_release);
 
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+        if (!did_work) pipeline_diag.idle++;
+        pipeline_diag_tick("PIO", worker->worker_id);
+#endif
         if (!did_work) {
             aeron_io_tiny_pause(idle_rounds);
             if (idle_rounds != UINT32_MAX)
@@ -3284,6 +3337,11 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
         uint32_t n = vemb_v16_aeron_poll_batch(ring, job_refs, PROXY_QUEUE_BATCH);
         vemb_v16_job_return_t job_returns[PROXY_QUEUE_BATCH];
         uint32_t return_count = 0;
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+        pipeline_diag.queue_polls++;
+        if (!n) pipeline_diag.queue_empty++;
+        else { pipeline_diag.queue_batches++; pipeline_diag.queue_items += n; }
+#endif
         if (!n) continue;
 
         did_work += (int)n;
@@ -3474,6 +3532,10 @@ static void *supernode_pool_thread_main(void *arg) {
         int did_work = 0;
         if (drain_job_shard_queues(proxy, worker->worker_id, &scratch) > 0)
             did_work = 1;
+#ifdef VEMB_V16_LOOKUP_DIAGNOSTICS
+        if (!did_work) pipeline_diag.idle++;
+        pipeline_diag_tick("SNW", worker->worker_id);
+#endif
         if (!did_work) {
 #ifdef __linux__
             if (!idle_spinning) {
@@ -3714,14 +3776,12 @@ static void stop_scaleout_notify_worker(vemb_v16_proxy_t *proxy) {
 /// TCP control plane: write a small status response frame.
 int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           uint32_t vector_dim,
-                          uint32_t max_vectors,
                           vemb_v16_storage_ctx_t *storage,
                           const vemb_v16_warm_regions_manifest_t *manifest) {
     assert(out != NULL);
     assert(storage != NULL);
     assert(vector_dim != 0);
     assert(vector_dim <= VEMB_V16_MAX_DIM);
-    assert(max_vectors != 0);
 
     vemb_v16_proxy_t *proxy = zcalloc(sizeof(*proxy));
     RETURN_IF(!proxy, -1);
@@ -3730,7 +3790,6 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     proxy->request_ring_slot_size =
         vemb_v16_aeron_req_slot_size(vector_dim);
     proxy->response_ring_slot_size = vemb_v16_aeron_resp_slot_size();
-    proxy->max_vectors = max_vectors;
     proxy->listen_fd = -1;
     proxy->inject_pipe_rd = -1;
     proxy->inject_pipe_wr = -1;
@@ -3765,9 +3824,9 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
         proxy->job_pool_slots_path[sizeof(proxy->job_pool_slots_path) - 1] = '\0';
     }
 
-    serverLog(LL_NOTICE, "vemb_v16 proxy created: dim=%u max_vectors=%u vector_region=%s size=%zu job_pool_slots=%s backend=%u offset=%llu",
+    serverLog(LL_NOTICE, "vemb_v16 proxy created: dim=%u warm_slots=%llu vector_region=%s size=%zu job_pool_slots=%s backend=%u offset=%llu",
               proxy->vector_dim,
-              proxy->max_vectors,
+              (unsigned long long)tlc_core_warm_capacity(proxy_storage(proxy)->tlc->core),
               vemb_v16_storage_vector_region_name(proxy_storage(proxy)),
               vemb_v16_storage_vector_region_size(proxy_storage(proxy)),
               proxy->job_pool_slots_path[0] ? proxy->job_pool_slots_path : "(heap)",
@@ -4026,7 +4085,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
         goto cleanup;
     }
 
-    serverLog(LL_NOTICE, "vemb_v16 server ready: tcp_enabled=%s tcp=%s:%u data_transport=%u proxy_io_threads=%u supernode_workers=%u affinity=%s dim=%u max_vectors=%u vector_region=%s",
+    serverLog(LL_NOTICE, "vemb_v16 server ready: tcp_enabled=%s tcp=%s:%u data_transport=%u proxy_io_threads=%u supernode_workers=%u affinity=%s dim=%u warm_slots=%llu vector_region=%s",
               proxy->tcp_enabled ? "yes" : "no",
               proxy->tcp_host,
               proxy->tcp_port,
@@ -4035,7 +4094,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
               proxy->supernode_worker_count,
               proxy_worker_affinity_mode_name(),
               proxy->vector_dim,
-              proxy->max_vectors,
+              (unsigned long long)tlc_core_warm_capacity(proxy_storage(proxy)->tlc->core),
               vemb_v16_storage_vector_region_name(proxy_storage(proxy)));
 
     if (!proxy->inject_only) {

@@ -33,7 +33,6 @@
 #if VEMB_V16_MAX_DIM == 0 || VEMB_V16_MAX_DIM > 65535u
 #error "VEMB_V16_MAX_DIM must be in [1, 65535]"
 #endif
-#define VEMB_V16_DEFAULT_MAX_VECTORS 131072
 #define VEMB_V16_ALLOC_REQ_ENCODED_LEN 8u
 #define VEMB_V16_NET_STATUS_ENCODED_LEN 9u
 #define VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN 20u
@@ -213,7 +212,7 @@ typedef struct vemb_v16_channel_desc {
     uint32_t channel_index;
     uint32_t vector_dim;
     uint32_t vector_stride;
-    uint32_t max_vectors;
+    uint32_t max_vectors; /* Legacy first-region slot count, derived from bytes. */
     uint32_t request_ring_slot_size;
     uint32_t response_ring_slot_size;
     uint32_t warm_region_id;

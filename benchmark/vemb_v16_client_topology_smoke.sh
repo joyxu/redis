@@ -90,7 +90,7 @@ for node in 0 1 2; do
         --vector-region "/v16ct$$_${node}" \
         --warm-backend shm \
         --dim "$DIM" \
-        --max-vectors 512 \
+        --warm-bytes "$((DIM * 4 * 512))" \
         --loglevel warning > "$TMPDIR/node_${node}.log" 2>&1 &
     PIDS+=("$!")
 done

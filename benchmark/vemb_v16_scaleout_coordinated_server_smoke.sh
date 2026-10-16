@@ -328,7 +328,7 @@ for node in 0 1 2; do
         --supernode-workers 1
         --warm-regions-manifest "$TMPDIR/node_${node}.yaml"
         --dim "$DIM"
-        --max-vectors 1024
+
         --loglevel notice
     )
     if [[ "$node" == "0" ]]; then

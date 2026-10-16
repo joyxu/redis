@@ -123,7 +123,6 @@ start_server() {
         $bind $HPC_REDIS/src/redis-server \
             --port $PORT --bind 0.0.0.0 --protected-mode no \
             --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-            --vemb-v16-max-vectors 131072 \
             --vemb-v16-warm-regions-manifest "$MANIFEST_HPC" \
             --vemb-v16-reset-warm-regions yes \
             --vemb-v16-proxy-io-threads $PIO --vemb-v16-supernode-workers $SNW \

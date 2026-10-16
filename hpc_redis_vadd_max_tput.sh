@@ -68,7 +68,6 @@ start_server() {
     $SERVER_BIND ./src/redis-server \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-        --vemb-v16-max-vectors $MAX_VECTORS \
         --vemb-v16-warm-regions-manifest "$MANIFEST" \
         --vemb-v16-reset-warm-regions yes \
         --vemb-v16-proxy-io-threads $pio --vemb-v16-supernode-workers $snw \

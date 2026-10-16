@@ -106,7 +106,6 @@ typedef struct vemb_v16_tlc_migration_progress {
 struct vemb_v16_tlc {
     uint32_t vector_dim;
     uint32_t value_size;
-    uint32_t max_vectors;
     uint32_t region_id;
     uint32_t backend_type;
     uint32_t warm_region_count;
@@ -118,7 +117,6 @@ struct vemb_v16_tlc {
         region_index_id_mappings[TLC_CORE_MAX_WARM_REGIONS];
     vemb_v16_tlc_region_index_id_mapping_t
         runtime_region_index_id_mappings[TLC_CORE_MAX_WARM_REGIONS];
-    state_bitmap_t bitmap;
     sve_operation_stats_t sve_stats;
     tlc_core_t *core;
     vemb_v16_remote_meta_view_t *remote_meta_view;
@@ -179,7 +177,6 @@ struct vemb_v16_tlc {
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         uint32_t vector_dim,
-                        uint32_t max_vectors,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight);

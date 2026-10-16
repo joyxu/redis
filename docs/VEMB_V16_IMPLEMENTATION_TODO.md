@@ -57,10 +57,10 @@ vemb_v16_bench / future redis-cli-vemb
 启动独立 server：
 
 ```bash
-./src/vemb_v16_server --dim 300 --max-vectors 65536
+./src/vemb_v16_server --dim 300 --warm-backend shm --warm-bytes 78643200
 ```
 
-`vadd` 会向进程内 table 写入新 key。重复跑 VADD baseline 时，`--max-vectors` 需要大于本次进程生命周期内累计写入量；如果只是小容量验证，建议重启 server 清空 table。
+WARM 容量由 payload 字节预算推导：`floor(warm_bytes / (dim * sizeof(float)))`，上述示例为 65536 个槽。使用 manifest 时各 region 的 `bytes / value_size` 决定容量，无需 `--warm-bytes`。Redis 的 `vemb-v16-max-vectors` 和独立 server 的 `--max-vectors` 已删除；key_meta 索引按需扩容，写入上限由实际可用物理槽和内存决定。设计与测试记录见 [WARM 槽池设计](VEMB_V16_WARM_REGION_SLOT_POOL_DESIGN.md)。
 
 运行 bench：
 

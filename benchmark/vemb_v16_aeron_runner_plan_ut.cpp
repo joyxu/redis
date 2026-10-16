@@ -14,22 +14,22 @@ int main() {
     const uint32_t channels = 256;
 
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    true, 0, 1, false, false, false, channels),
+                    0, 1, false, false, false, channels),
                 true, 0, channels);
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    false, 0, 1, false, false, false, channels),
+                    0, 0, false, false, false, channels),
                 false, channels, 0);
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    true, 1, 1, false, false, false, channels),
+                    1, 1, false, false, false, channels),
                 false, channels, 0);
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    true, 0, 1, true, false, false, channels),
+                    0, 1, true, false, false, channels),
                 false, channels, 0);
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    true, 0, 1, false, true, false, channels),
+                    0, 1, false, true, false, channels),
                 false, channels, 0);
     assert_plan(vemb_v16_aeron_runner_plan_channels(
-                    true, 0, 1, false, false, true, channels),
+                    0, 1, false, false, true, channels),
                 false, channels, 0);
 
     puts("vemb_v16_aeron_runner_plan_ut: all tests passed");
