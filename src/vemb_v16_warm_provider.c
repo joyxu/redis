@@ -57,6 +57,7 @@ int vemb_v16_warm_provider_attach(vemb_v16_warm_provider_t *provider,
         .region_bytes = region_bytes,
         .mmap_offset = mmap_offset,
         .value_size = value_size,
+        .slot_stride_size = vemb_v16_warm_slot_stride(value_size),
     };
     serverLog(LL_NOTICE,
               "vemb_v16 warm provider attach ok: region_id=%u backend=%s path=%s mapping_addr=%p mapped_addr=%p mapping_bytes=%zu region_bytes=%llu value_size=%u view_offset=%llu home_ub_node_id=%u is_local=%u weight=%u",

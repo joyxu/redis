@@ -576,3 +576,13 @@ CLIENTS=4 轮上述四项失败计数同样全为 0，成功物化 222,759,161 �
 `dev_alloc` 工作树已保存为 `9547218`，新分支 `dev_alloc_v2` 先提交设计文档 `239e2c2`，再实施新分配器。新的 [设计及验证记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md) 明确一个 region 只有所属 HPC-Redis 可分配、修改和回收，其他 HPC-Redis 只读；不实现多 allocator writer 的共享控制状态。hash bitmap/vnode 选择由 next_slot 和本地回收栈替代，非所属 region 不再参与写入 fallback。动态 key metadata、manifest 容量推导、generation/seqlock 与迁移 fence 保留。
 
 本阶段 SDK 保持原有 UB 直接复制路径；按用户确认，并发回收/复用时的完整 payload 读取保证留到下一阶段，不纳入 allocator v2 验收。详见新设计的删除与回收章节。
+
+### 10.31 allocator v2 自动64B物理stride
+
+在 `dev_alloc_v2` 实施 `slot_stride_size=align_up(manifest.value_size,64)`。容量、metadata布局、reset/attach、offset与payload写地址统一使用物理stride；协议bytes保持逻辑payload长度，SDK/SVE不变。共享layout升为版本2，旧版和尺寸不一致的attach失败；只有owner可初始化空白header。设计、布局升级约束、UT和原参数实验详见 [allocator v2 阶段二记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md)。
+
+111独立目录9个相关UT全部通过；原100K、dim300、64threads、3:3、CLIENTS=3、PROFILE=1读压测达到8,448,774.78总QPS、1,458,593.30单核QPS，四项失败计数全为0；artifacts `perf/p3_s3_c3_uniform_alloc_v2_stride64_20261016`。相比阶段一未对齐顺序分配的3.863M/0.874M，当前证据支持物理stride对齐消除了大幅读取回归，不能据单轮声称稳定提升幅度或满载性能通过。SDK并发回收读取仍不在验收范围。
+
+CLIENTS=4在两次负载门禁中止后通过空闲窗口复测：7,756,944.18总QPS、1,371,439.27单核QPS，平均/p99为0.92507/1.103ms，四项失败计数全为0。artifacts `perf/p3_s3_c4_uniform_alloc_v2_stride64_idle_20261016`。C4仍低于本阶段C3，不将对齐修复解释为所有并发参数均达到8M。
+
+同参数、同SDK/memtier二进制的相邻旧分配器C4对照为7,466,836.97总QPS、1,278,176.20单核QPS，四项失败计数全为0；artifact `perf/p3_s3_c4_uniform_alloc_v2_stride64_control_20261016`。本轮v2对齐版总QPS高约3.9%、单核高约7.3%，支持没有吞吐劣化；单轮不作为稳定提升幅度结论，且未执行90%/98%占用场景。

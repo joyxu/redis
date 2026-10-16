@@ -81,6 +81,8 @@ typedef struct vemb_v16_tlc_warm_region {
     uint64_t mmap_offset;
     uint32_t value_size;
     vemb_v16_warm_slot_meta_t *slot_meta;
+    /* Zero means packed direct-memory layout; providers supply an aligned stride. */
+    uint64_t slot_stride_size;
 } vemb_v16_tlc_warm_region_t;
 
 typedef struct vemb_v16_tlc_remote_meta_owner_view {

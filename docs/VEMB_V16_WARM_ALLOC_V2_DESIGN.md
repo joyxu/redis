@@ -1,5 +1,7 @@
 # WARM allocator v2：顺序分配与回收栈
 
+本文保留阶段一的设计和实验历史；自动物理 stride 已在文末“阶段二实现与验证记录”落地，当前状态以该节为准。
+
 ## 基础与目标
 
 基于 `dev_alloc` 快照 `9547218`，在 `dev_alloc_v2` 实现。保留 manifest 推导容量、动态 key metadata、location cache、slot generation/seqlock 和迁移 fence；替换 hash 起点、bitmap word 搜索和 region vnode 选择。在线查询不恢复 imported index 或物理 region 扫描，SVE 和 payload stride 不在本次修改范围。
@@ -62,8 +64,36 @@ DEL、COLD DEL replay、迁移 tombstone 安装需要采用一致的 slot 释放
 
 修正 manifest 后，同一 v2 二进制 dim304 诊断结果：总 QPS `8,439,763.44`，单核 QPS `1,459,665.40`，平均/p99 `0.62891/0.759ms`，四项失败计数均为0。artifacts：`perf/p3_s3_c3_uniform_alloc_v2_dim304_fixed_20261016`。客户端 SVE 复制叶节点 cycles 占比降至12.06%。该结果强烈支持未对齐 UB 读取是顺序分配回归的主要因素；同时改变了 payload 长度与容量，不能当成 dim300 已修复，也不能单凭此证明完全因果。
 
-### 后续对齐适配（尚未实施）
+### 后续对齐适配（阶段一计划，阶段二已实施）
 
 旧分配器 dim304 相邻对照为总 QPS `7,898,796.22`、单核 `1,343,641.87`，平均/p99 `0.68242/0.799ms`，四项失败计数均为0；artifacts：`perf/p3_s3_c3_uniform_alloc_v2_control_dim304_20261016`。两种实现的 dim304 均没有重现 v2 dim300 的大幅回归；单轮 v2 高于旧版的幅度不作为稳定提升结论。分配器实现已保存为 `0de05a8`，dim300 对齐适配仍未实施。
 
 不能为了恢复低占用测试而只优先分配1/4对齐槽，否则满载时仍会触发大量非对齐读。建议将物理 `slot_stride_size` 与逻辑 `value_size` 分开：在 manifest/config 边界根据 payload_bytes 自动算 `ceil(payload_bytes/64)*64`；capacity、slot metadata 布局/reset/attach 使用物理 stride，所有 offset 与 payload 写地址使用 slot*stride，协议 bytes、逻辑维度及 SDK 复制长度仍为 payload_bytes。1200B对应1216B，padding约1.33%，顺序 next_slot/回收栈算法无需改变。必须统一 owner、remote attach 和恢复的容量推导，并明确旧共享 layout 拒绝/重建规则，补容量边界、最后一槽、handle offset、COLD恢复UT，最后用原 dim300/C3/C4 复测。该适配尚未实施；当前 dim300 的性能验收未通过。
+
+### 阶段二实施计划：自动物理 stride
+
+用户在阶段一提交后要求继续，本阶段实施64B对齐。manifest/provider 边界自动推导 slot_stride_size，所有生产 manifest region（SHM、UB、runtime peer attach）统一使用 floor(region_bytes/stride) 容量；mmap_offset 需64B对齐。低层直接传入内存的 TLC/core 配置支持显式 stride；零值保留其既有紧凑 buffer 语义（stride=value_size），生产 provider 总是传入自动计算的非零 stride，不以测试开关改变生产策略。
+
+共享 header 升级版本并记录 payload 大小、物理 stride 和区域大小；attach 校验全部布局身份，拒绝旧版或不一致布局，owner 明确 reset 后才能使用新布局。SDK 继续按照服务端返回的 offset/bytes 复制，不修改 SDK 协议或 SVE。验证新增 dim300 非整除容量、最后一槽、padding 不覆盖、回收、恢复及旧布局拒绝测试，再完成原参数跨机对照。
+
+### 阶段二实现与验证记录（2026-10-16）
+
+上述“尚未实施”为阶段一的历史状态，本阶段已实施物理 stride。生产 manifest/provider 自动计算 `slot_stride_size=align_up(value_size,64)`；启动、runtime region、peer view、remote-meta 默认容量和 channel legacy max_vectors 字段均按物理 stride 推导。TLC/core 使用该 stride 生成和校验 offset、写入 payload；bytes 和 vector_dim 继续表示逻辑长度。4GiB payload window、1200B payload 对应1216B stride和3,532,045槽，另需226,050,944B header/slot metadata；每槽padding16B约占物理槽空间1.32%。manifest 的 bytes 仍表示 payload window，不包含前置 metadata。
+
+共享 header 保持64B大小，版本升为2，记录value_size、slot_stride_size、region_bytes；SHM和UB attach均验证版本/region/capacity/逻辑大小/物理stride/区域大小。旧布局拒绝attach，不能无条件解释为新布局；owner显式reset并从COLD恢复后再使用新布局。非owner不会初始化空白header。初始化期间保持INITIALIZING标记，完成后再发布MAGIC。
+
+新增 `test_manifest_aligned_stride_recovery_and_layout_identity` 使用1200B payload、1216B stride、SHM与mock UB两个owner region，验证非整除容量、最后一槽、跨region、padding和尾部不覆盖、满容量拒绝、删除复用、旧handle拒绝、原region上的COLD恢复，以及旧版本/错误stride/value_size/region_bytes/非对齐mmap_offset拒绝。旧manifest UT的独立场景使用64B payload以保留其原本容量/路由语义；dim300新用例直接覆盖自动padding，不通过更改压测维度绕过问题。
+
+本地 TLC、manifest UT通过。迁移控制UT本地发生SIGBUS，未将其算作本地通过；111原生构建执行通过。111独立目录的9个相关UT全部通过：vemb_v16_tlc_ut、vemb_v16_manifest_ut、vemb_v16_migration_control_ut、tlc_cold_ut、tlc_replica_cold_ut、tlc_sync_ut、tlc_resync_ut、tlc_ha_replica_ut、tlc_ha_replica_process_ut。日志 `/tmp/alloc-v2-stride-<name>.log`。没有执行真实双节点UB/keepalived HA，也没有验收SDK并发回收读取。
+
+111服务端仍在 `/root/szz/codespace/hpc-redis-dev-alloc-v2-20261016` 独立构建，libc、O3/LTO/SVE、内部batch32；原目录与112客户端保持原样。`tlc_core.c` SHA256 `b8c8b80ad68087e0ae88f8dc3ad1e5ab11aed8d324a925c5668fadb24ac6abb7`；服务端SHA256 `d944219cd3b5367cb2a5955b7980a4dd01ea9d3c4b467a648edd2f66cba542bb`。
+
+原参数 `NUM_KEYS=100000 DIM=300 KEY_PATTERN=R:R THREADS=64 CLIENTS=3 PIO=3 SNW=3 BUILD=skip PROFILE=1 KILL_OPENCODE=0 KILL_MUTAGEN=0`：总QPS `8,448,774.78`、单核 `1,458,593.30`、平均/p99 `0.62863/0.759ms`；status_notfound/status_err/materialized_fail/unmatched均为0。artifacts `perf/p3_s3_c3_uniform_alloc_v2_stride64_20261016`，客户端SVE复制叶节点cycles占比11.91%。同一SDK、原始dim300条件下消除了阶段一3.863M的明显回归；单轮结果不作为稳定提升幅度结论。此前旧分配器C3相邻对照为8.041M/1.368M。
+
+C4首轮 `p3_s3_c4_uniform_alloc_v2_stride64_20261016` 被111编译进程cc1plus的CPU/RSS负载门禁拦截，未启动测试服务器、没有有效性能结果；保留无关进程，门禁不变，待其退出后复跑。
+
+C4重试 `p3_s3_c4_uniform_alloc_v2_stride64_retry_20261016` 同样没有通过负载门禁：111上mooncake_master（PID615944）约88.35%单进程CPU，总CPU测量91.26%；没有启动测试服务器，没有有效压测结果，未终止该进程。
+
+负载恢复后的有效C4轮为 `perf/p3_s3_c4_uniform_alloc_v2_stride64_idle_20261016`：总QPS `7,756,944.18`、单核 `1,371,439.27`、平均/p99 `0.92507/1.103ms`，四项失败计数全为0。实际 `/proc/616913/exe` SHA256与本阶段二进制 `d944219c...` 一致，客户端SVE复制叶节点cycles占比10.78%。C3/C4仍有并发规模相关差异，不能宣称所有参数均已达到8M。
+
+随后使用原目录旧分配器做相邻C4对照，参数完全相同。artifact `perf/p3_s3_c4_uniform_alloc_v2_stride64_control_20261016`，服务端记录哈希 `280a63b983571e46601a52083775655b8cf6176c6f38adf36473de8ac83509f8`；旧分配器总QPS `7,466,836.97`、单核 `1,278,176.20`、平均/p99 `0.87967/1.191ms`，四项失败计数全为0。两轮SDK静态库哈希 `886ce2f76d697ce2b6666cb5d6c566a52ddbebe4bacccad347b36b8a5a61dc99`，memtier哈希 `3356fa2c9492f2689a046e88717da336506ac3bd5f9d925e8bee4f85c3aa59bf`，均一致。v2对齐版本轮总QPS高约3.9%，单核高约7.3%；平均延迟略高而p99较低，不能笼统宣称所有延迟指标提升。当前证据支持相对旧分配器未出现吞吐劣化；不代表已完成多轮稳定性、高占用或SDK并发回收读验收。

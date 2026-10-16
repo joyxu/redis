@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -107,7 +108,7 @@ static uint32_t manifest_ut_route_owner(vemb_v16_storage_ctx_t *storage,
 }
 
 static void test_shm_provider_attaches_existing_payload(void) {
-    enum { dim = 2, slots = 2 };
+    enum { dim = 16, slots = 2 };
     char shm_name[64];
     vemb_v16_warm_provider_t first, second;
     float vector[dim];
@@ -154,7 +155,7 @@ static void test_shm_provider_attaches_existing_payload(void) {
 }
 
 static void test_manifest_shm_mock_ub_create_and_put(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 16, max_vectors = 4 };
     const uint32_t warm_region_bytes = sizeof(float) * dim * 2 + 1;
     char manifest_path[128];
     char shm1[64];
@@ -179,6 +180,10 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
                      ub2_allocator_layout +
                      warm_region_bytes) == 0);
     close(ub_fd);
+    /* The foreign region is initialized by its owner before reader attach. */
+    assert(vemb_v16_warm_region_layout_reset(VEMB_V16_REGION_UB,
+        VEMB_V16_UB_CACHE_POLICY_CACHEABLE, ub2, 0, 202,
+        dim * sizeof(float), warm_region_bytes) == 0);
 
     FILE *fp = fopen(manifest_path, "w");
     assert(fp != NULL);
@@ -288,7 +293,7 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
 }
 
 static void test_manifest_remote_meta_shm_attach_existing(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 16, max_vectors = 4 };
     char manifest_path[128];
     char shm1[64];
     char remote_meta_shm[64];
@@ -394,7 +399,7 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
 }
 
 static void test_manifest_remote_meta_owner_views_route_key2(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 16, max_vectors = 4 };
     char manifest_path[128];
     char shm1[64];
     char remote_meta_default[64];
@@ -566,7 +571,7 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
 }
 
 static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 16, max_vectors = 4 };
     char manifest_path[128];
     char shm1[64];
     char remote_meta_default[64];
@@ -740,7 +745,7 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
 }
 
 static void test_storage_reset_clears_payload_and_layout(void) {
-    enum { dim = 2, slots = 2 };
+    enum { dim = 16, slots = 2 };
     char shm_name[64];
     vemb_v16_warm_regions_manifest_t manifest;
     vemb_v16_warm_provider_t provider;
@@ -826,7 +831,7 @@ static void test_storage_reset_clears_payload_and_layout(void) {
 }
 
 static void test_peer_view_map_can_attach_local_region(void) {
-    enum { dim = 2, max_vectors = 4, slots = 2 };
+    enum { dim = 16, max_vectors = 4, slots = 2 };
     char manifest_path[128];
     char local0[64];
     char local1[64];
@@ -930,7 +935,7 @@ static void test_peer_view_map_can_attach_local_region(void) {
 }
 
 static void test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered(void) {
-    enum { dim = 2, max_vectors = 4, slots = 2 };
+    enum { dim = 16, max_vectors = 4, slots = 2 };
     char manifest_path[128];
     char local0[64];
     char req0_1[64], resp1_0[64], req1_0[64], resp0_1[64];
@@ -1060,10 +1065,131 @@ static void test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered(void) 
     cleanup_shm_path(resp0_2);
 }
 
+static void test_manifest_aligned_stride_recovery_and_layout_identity(void) {
+    enum { DIM = 300, BYTES = 1200, STRIDE = 1216, SLOTS = 3, KEYS = 6 };
+    const uint64_t region_bytes = SLOTS * STRIDE + BYTES - 1;
+    assert(vemb_v16_warm_slot_stride(BYTES) == STRIDE);
+    assert(vemb_v16_warm_slot_stride(64) == 64);
+    assert(vemb_v16_warm_slot_stride(UINT32_MAX) == UINT64_C(4294967296));
+    char shm[64], ub[128], cold_dir[] = "/tmp/stride-cold-XXXXXX";
+    snprintf(shm, sizeof(shm), "/v16stride_%ld", (long)getpid());
+    snprintf(ub, sizeof(ub), "/tmp/v16stride_%ld.ub", (long)getpid());
+    cleanup_region_and_layout(shm, 951);
+    unlink(ub);
+    assert(mkdtemp(cold_dir));
+    int fd = open(ub, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    assert(fd >= 0);
+    assert(ftruncate(fd, vemb_v16_warm_region_layout_bytes(SLOTS) + region_bytes) == 0);
+    close(fd);
+    vemb_v16_warm_regions_manifest_t manifest = {0};
+    manifest.region_count = 2;
+    manifest.has_local_ub_node_id = 1;
+    for (uint32_t i = 0; i < 2; i++) {
+        manifest.regions[i].region_id = 951 + i;
+        manifest.regions[i].backend_type = i ? VEMB_V16_REGION_UB : VEMB_V16_REGION_LOCAL_SHM;
+        manifest.regions[i].cache_policy = VEMB_V16_UB_CACHE_POLICY_CACHEABLE;
+        manifest.regions[i].value_size = BYTES;
+        manifest.regions[i].region_bytes = region_bytes;
+        manifest.regions[i].is_local = 1;
+        snprintf(manifest.regions[i].path, sizeof(manifest.regions[i].path),
+                 "%s", i ? ub : shm);
+    }
+    vemb_v16_storage_ctx_t *storage;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) == 0);
+    assert(tlc_core_warm_capacity(storage->tlc->core) == KEYS);
+    assert(storage->remote_meta_entry_count == KEYS);
+    vemb_v16_channel_desc_t desc;
+    vemb_v16_storage_fill_channel_desc(storage, &desc);
+    assert(desc.max_vectors == SLOTS);
+    assert(desc.warm_regions[1].mmap_offset == vemb_v16_warm_region_layout_bytes(SLOTS));
+    tlc_cold_config_t cold = {
+        .directory = cold_dir, .segment_bytes = 65536, .queue_capacity = 16,
+        .group_max_entries = 8, .group_max_delay_us = 1000,
+    };
+    assert(tlc_core_enable_cold(storage->tlc->core, &cold) == 0);
+    char keys[KEYS][32];
+    uint64_t hashes[KEYS];
+    tlc_warm_location_t locations[KEYS];
+    float vector[DIM], actual[DIM];
+    for (uint32_t i = 0; i < KEYS; i++) {
+        snprintf(keys[i], sizeof(keys[i]), "stride-key-%u", i);
+        hashes[i] = vemb_v16_xxh3_64_str(keys[i], strlen(keys[i]));
+        fill_vector(vector, DIM, i * 1000);
+        assert(tlc_core_put_location_epoch(storage->tlc->core, keys[i], strlen(keys[i]),
+                   hashes[i], vector, BYTES, 1, 1, &locations[i]) == 0);
+        assert(locations[i].region_id == 951 + i / SLOTS);
+        assert(locations[i].offset == (i % SLOTS) * STRIDE);
+        assert(locations[i].offset % 64 == 0 && locations[i].bytes == BYTES);
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint8_t *payload = storage->warm_providers[i].region.mapped_addr;
+        assert(storage->warm_providers[i].region.slot_stride_size == STRIDE);
+        for (uint32_t slot = 0; slot < SLOTS; slot++)
+            for (uint32_t byte = BYTES; byte < STRIDE; byte++)
+                assert(payload[slot * STRIDE + byte] == 0);
+        for (uint64_t byte = SLOTS * STRIDE; byte < region_bytes; byte++)
+            assert(payload[byte] == 0);
+    }
+    vemb_v16_storage_ctx_destroy(storage); /* Flush COLD before reopening. */
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) == 0);
+    assert(tlc_core_enable_cold(storage->tlc->core, &cold) == 0);
+    for (uint32_t i = 0; i < KEYS; i++) {
+        tlc_warm_location_t recovered;
+        assert(tlc_core_get_warm_location(storage->tlc->core, keys[i], strlen(keys[i]),
+                                            hashes[i], &recovered) == 0);
+        assert(recovered.offset % 64 == 0 && recovered.bytes == BYTES);
+        assert(tlc_core_copy_warm_location_value(storage->tlc->core, hashes[i],
+                   &recovered, actual, BYTES, 8) == 0);
+        fill_vector(vector, DIM, i * 1000);
+        assert(memcmp(actual, vector, BYTES) == 0);
+        assert(tlc_core_copy_warm_location_value(storage->tlc->core, hashes[i],
+                   &locations[i], actual, BYTES, 8) != 0);
+        locations[i] = recovered;
+    }
+    assert(tlc_core_put_location_epoch(storage->tlc->core, "overflow", 8, 123,
+               vector, BYTES, 1, 1, &(tlc_warm_location_t){0}) != 0);
+    assert(tlc_core_delete_with_epoch(storage->tlc->core, keys[1], strlen(keys[1]),
+                                        hashes[1], 1, NULL) == 0);
+    tlc_warm_location_t reused;
+    assert(tlc_core_put_location_epoch(storage->tlc->core, "replacement", 11, 456,
+               vector, BYTES, 1, 1, &reused) == 0);
+    assert(reused.region_id == locations[1].region_id && reused.offset == locations[1].offset);
+    assert(tlc_core_copy_warm_location_value(storage->tlc->core, hashes[1],
+               &locations[1], actual, BYTES, 8) != 0);
+    vemb_v16_storage_ctx_destroy(storage);
+
+    char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
+    assert(vemb_v16_warm_region_layout_name_from_region_path(shm, 951,
+               layout_name, sizeof(layout_name)) == 0);
+    manifest_ut_layout_view_t layout;
+    assert(manifest_ut_open_layout_view(&layout, layout_name, SLOTS) == 0);
+    assert(layout.header->slot_stride_size == STRIDE && layout.header->value_size == BYTES);
+    layout.header->version = 1;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) != 0);
+    assert(layout.header->version == 1); /* Reject, never silently reset. */
+    layout.header->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
+    layout.header->slot_stride_size = BYTES;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) != 0);
+    layout.header->slot_stride_size = STRIDE;
+    layout.header->value_size++;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) != 0);
+    layout.header->value_size = BYTES;
+    layout.header->region_bytes++;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) != 0);
+    layout.header->region_bytes = region_bytes;
+    manifest_ut_close_layout_view(&layout);
+    manifest.regions[0].mmap_offset = 1;
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage, DIM, BYTES, &manifest) != 0);
+    cleanup_region_and_layout(shm, 951);
+    unlink(ub);
+    puts("aligned manifest stride, capacity, recovery and layout identity: PASS");
+}
+
 int main(void) {
     monotonicInit();
 
     test_shm_provider_attaches_existing_payload();
+    test_manifest_aligned_stride_recovery_and_layout_identity();
     test_manifest_shm_mock_ub_create_and_put();
     test_manifest_remote_meta_shm_attach_existing();
     test_manifest_remote_meta_owner_views_route_key2();
