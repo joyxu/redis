@@ -64,4 +64,6 @@ DEL、COLD DEL replay、迁移 tombstone 安装需要采用一致的 slot 释放
 
 ### 后续对齐适配（尚未实施）
 
+旧分配器 dim304 相邻对照为总 QPS `7,898,796.22`、单核 `1,343,641.87`，平均/p99 `0.68242/0.799ms`，四项失败计数均为0；artifacts：`perf/p3_s3_c3_uniform_alloc_v2_control_dim304_20261016`。两种实现的 dim304 均没有重现 v2 dim300 的大幅回归；单轮 v2 高于旧版的幅度不作为稳定提升结论。分配器实现已保存为 `0de05a8`，dim300 对齐适配仍未实施。
+
 不能为了恢复低占用测试而只优先分配1/4对齐槽，否则满载时仍会触发大量非对齐读。建议将物理 `slot_stride_size` 与逻辑 `value_size` 分开：在 manifest/config 边界根据 payload_bytes 自动算 `ceil(payload_bytes/64)*64`；capacity、slot metadata 布局/reset/attach 使用物理 stride，所有 offset 与 payload 写地址使用 slot*stride，协议 bytes、逻辑维度及 SDK 复制长度仍为 payload_bytes。1200B对应1216B，padding约1.33%，顺序 next_slot/回收栈算法无需改变。必须统一 owner、remote attach 和恢复的容量推导，并明确旧共享 layout 拒绝/重建规则，补容量边界、最后一槽、handle offset、COLD恢复UT，最后用原 dim300/C3/C4 复测。该适配尚未实施；当前 dim300 的性能验收未通过。
