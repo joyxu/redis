@@ -570,3 +570,9 @@ CLIENTS=3 轮 `status_notfound/status_err/materialized_fail/unmatched` 均为 0�
 CLIENTS=4 轮上述四项失败计数同样全为 0，成功物化 222,759,161 次。该轮总 QPS 比之前相同 CLIENTS=4 的无 prefix 结果 `7,570,535.58` 低约 0.29%，单核 QPS 比 `1,297,573.72` 低约 0.36%；单次结果不足以区分此幅度的差异与运行波动。当前证据支持“删除 imported 兼容逻辑后，100K 稳定读吞吐未出现明显变化”，不能宣称 CLIENTS=4 已恢复 HEAD 的约 8M。相同最终二进制下 CLIENTS 从 3 增加到 4，总 QPS 下降约 6.22%，单核下降约 5.69%；原因仍需单独诊断，不能仅凭这两轮断言由 client 或 UB 引起。两轮 server/client 火焰图均已归档，测试服务端已停止。
 
 相关 UT 的结果：`vemb_v16_manifest_ut` 通过；`vemb_v16_tlc_ut` 在 `test_persistent_cold_write_order` 第 625 行失败。测试重建 TLC 实例时复用仍有旧 slot 的单槽 region，COLD checkpoint 回放需要重新分配 slot，但旧 slot 仍占用，导致恢复失败。这是删除 imported 逻辑后暴露的实际恢复回归，不能归因于缺少 UB/HA 环境。后续必须在明确 region 所有权和恢复生命周期后适配 COLD 重建，并验证 tombstone、满槽复用、共享 region 测试；不得通过恢复在线全 region 扫描来掩盖问题。本节只记录性能复测，不代表全部 UT 通过。
+
+### 10.30 allocator v2 的单 owner 范围
+
+`dev_alloc` 工作树已保存为 `9547218`，新分支 `dev_alloc_v2` 先提交设计文档 `239e2c2`，再实施新分配器。新的 [设计及验证记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md) 明确一个 region 只有所属 HPC-Redis 可分配、修改和回收，其他 HPC-Redis 只读；不实现多 allocator writer 的共享控制状态。hash bitmap/vnode 选择由 next_slot 和本地回收栈替代，非所属 region 不再参与写入 fallback。动态 key metadata、manifest 容量推导、generation/seqlock 与迁移 fence 保留。
+
+本阶段 SDK 保持原有 UB 直接复制路径；按用户确认，并发回收/复用时的完整 payload 读取保证留到下一阶段，不纳入 allocator v2 验收。详见新设计的删除与回收章节。

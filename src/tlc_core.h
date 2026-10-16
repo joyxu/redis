@@ -105,12 +105,13 @@ typedef struct tlc_core_migration_snapshot {
     char key[VEMB_V16_MAX_KEY_LEN];
 } tlc_core_migration_snapshot_t;
 
-/* WARM placement uses a region-wide free-slot pool, independent of key hash.
- * slot_meta remains shared and live until destroy; FREE -> FILLING atomically
- * arbitrates allocations across cores mapping the same region. Business writes
- * for a key must be routed to its owner. Attach discovers existing READY slots;
- * live shared reads can also discover subsequently published slots. Online
- * release of occupied slots is not supported; HA reset requires fenced access.
+/* Each region has exactly one allocating HPC-Redis owner (is_local != 0).
+ * Owner worker threads share next_slot/recycled slots under a region mutex.
+ * Other HPC-Redis instances may map slot_meta/payload for handle-based reads,
+ * but must set is_local=0 and never allocate, overwrite, release or reset it.
+ * Attach rebuilds allocator state only; keys require metadata or known handles.
+ * slot_meta/mapped_addr remain live until destroy. Same-key writes are routed
+ * to their owner. Recovery requires exclusive, fenced access to owned regions.
  */
 typedef struct tlc_core_warm_region_config {
     uint32_t region_id;
@@ -191,6 +192,8 @@ int tlc_core_write_fenced(const tlc_core_t *core);
 /* Return the borrowed COLD runtime; ownership remains with core. */
 tlc_cold_t *tlc_core_get_cold(tlc_core_t *core);
 uint32_t tlc_core_meta_shard_count(const tlc_core_t *core);
+/* Startup or fenced HA only: resets local WARM/index/cache, then replays COLD.
+ * No concurrent reads, writes, attach, or replica application may run. */
 int tlc_core_recover_cold(tlc_core_t *core);
 /* Preconditions: v16 boundary validated generation and output shape. */
 int tlc_core_publish_checkpoint(tlc_core_t *core,
