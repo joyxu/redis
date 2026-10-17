@@ -56,8 +56,6 @@ void tlc_core_log_lookup_diagnostics(uint32_t worker_id) {
 #define TLC_CORE_KEY_META_MAX_INITIAL_CAPACITY 256u
 #define TLC_CORE_LOCATION_CACHE_PROBES 4u
 #define TLC_CORE_LOCATION_CACHE_MIN_CAPACITY 1024u
-#define TLC_CORE_LOCATION_CACHE_KEY_WORDS \
-    ((VEMB_V16_MAX_KEY_LEN + sizeof(uint64_t) - 1u) / sizeof(uint64_t))
 
 #define SEQLOCK_STATE_STABLE UINT64_C(0)
 #define SEQLOCK_STATE_WRITING UINT64_C(1)
@@ -76,14 +74,11 @@ typedef enum tlc_core_warm_verify_rc {
 typedef struct tlc_core_location_cache_entry {
     atomic_uint_fast64_t seq;
     atomic_uint_fast64_t key_hash;
+    atomic_uint_fast64_t key_fingerprint;
     atomic_uint_fast32_t key_len;
-    atomic_uint_fast32_t region_id;
     atomic_uint_fast32_t region_index;
     atomic_uint_fast32_t local_slot;
-    atomic_uint_fast32_t bytes;
-    atomic_uint_fast64_t offset;
     atomic_uint_fast64_t owner_generation;
-    atomic_uint_fast64_t key_words[TLC_CORE_LOCATION_CACHE_KEY_WORDS];
 } tlc_core_location_cache_entry_t;
 
 typedef struct tlc_core_location_cache {
@@ -648,19 +643,7 @@ static int key_meta_blocks_source_access(tlc_core_t *core,
     return blocked;
 }
 
-static uint64_t location_cache_key_word(const char *key,
-                                        uint32_t key_len,
-                                        uint32_t word_index) {
-    uint64_t word = 0;
-    uint32_t off = word_index * (uint32_t)sizeof(uint64_t);
-    if (off >= key_len)
-        return 0;
-    uint32_t bytes = key_len - off;
-    if (bytes > sizeof(uint64_t))
-        bytes = sizeof(uint64_t);
-    memcpy(&word, key + off, bytes);
-    return word;
-}
+static uint64_t key_fingerprint(const char *key, uint32_t key_len);
 
 static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
     uint64_t target = requested_capacity ?
@@ -680,15 +663,11 @@ static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
         tlc_core_location_cache_entry_t *entry = &cache->entries[i];
         atomic_init(&entry->seq, SEQLOCK_EMPTY);
         atomic_init(&entry->key_hash, 0);
+        atomic_init(&entry->key_fingerprint, 0);
         atomic_init(&entry->key_len, 0);
-        atomic_init(&entry->region_id, TLC_CORE_INVALID_REGION_ID);
         atomic_init(&entry->region_index, UINT32_MAX);
         atomic_init(&entry->local_slot, TLC_CORE_INVALID_SLOT);
-        atomic_init(&entry->bytes, 0);
-        atomic_init(&entry->offset, 0);
         atomic_init(&entry->owner_generation, 0);
-        for (uint32_t w = 0; w < TLC_CORE_LOCATION_CACHE_KEY_WORDS; w++)
-            atomic_init(&entry->key_words[w], 0);
     }
     return 0;
 }
@@ -706,21 +685,12 @@ static int location_cache_entry_key_matches(
         const char *key,
         uint32_t key_len,
         uint64_t key_hash) {
+    uint64_t fp = key_fingerprint(key, key_len);
     if (atomic_load_explicit(&entry->key_hash, memory_order_relaxed) != key_hash ||
-        atomic_load_explicit(&entry->key_len, memory_order_relaxed) != key_len) {
+        atomic_load_explicit(&entry->key_len, memory_order_relaxed) != key_len ||
+        atomic_load_explicit(&entry->key_fingerprint,
+                             memory_order_relaxed) != fp)
         return 0;
-    }
-    uint32_t words =
-        (key_len + (uint32_t)sizeof(uint64_t) - 1u) /
-        (uint32_t)sizeof(uint64_t);
-    for (uint32_t i = 0; i < words; i++) {
-        uint64_t want = location_cache_key_word(key, key_len, i);
-        uint64_t got =
-            atomic_load_explicit(&entry->key_words[i],
-                                 memory_order_relaxed);
-        if (got != want)
-            return 0;
-    }
     return 1;
 }
 
@@ -751,16 +721,11 @@ static void location_cache_store_entry(tlc_core_location_cache_entry_t *entry,
     if (location_cache_try_begin_write(entry, &seq) != 0)
         return;
 
-    uint32_t words = (key_len + (uint32_t)sizeof(uint64_t) - 1u) / (uint32_t)sizeof(uint64_t);
-    for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_KEY_WORDS; i++) {
-        uint64_t word = i < words ?  location_cache_key_word(key, key_len, i) : 0;
-        atomic_store_explicit(&entry->key_words[i], word, memory_order_relaxed);
-    }
-    atomic_store_explicit(&entry->region_id, location->region_id, memory_order_relaxed);
+    atomic_store_explicit(&entry->key_fingerprint,
+                          key_fingerprint(key, key_len),
+                          memory_order_relaxed);
     atomic_store_explicit(&entry->region_index, location->region_index, memory_order_relaxed);
     atomic_store_explicit(&entry->local_slot, location->local_slot, memory_order_relaxed);
-    atomic_store_explicit(&entry->bytes, location->bytes, memory_order_relaxed);
-    atomic_store_explicit(&entry->offset, location->offset, memory_order_relaxed);
     atomic_store_explicit(&entry->owner_generation, location->owner_generation, memory_order_relaxed);
     atomic_store_explicit(&entry->key_hash, key_hash, memory_order_relaxed);
     atomic_store_explicit(&entry->key_len, key_len, memory_order_relaxed);
@@ -797,6 +762,25 @@ static void location_cache_put(tlc_core_t *core,
         }
     }
     location_cache_store_entry(victim, key, key_len, key_hash, location);
+}
+
+static int location_cache_fill_hint(tlc_core_t *core,
+                                    uint32_t region_index,
+                                    uint32_t local_slot,
+                                    uint64_t owner_generation,
+                                    tlc_warm_location_t *location) {
+    tlc_core_warm_region_runtime_t *region =
+        warm_region_by_index(&core->warm, region_index);
+    RETURN_IF(!region || local_slot >= region->capacity_slots || !location, -1);
+    *location = (tlc_warm_location_t){
+        .region_id = region->region_id,
+        .region_index = region_index,
+        .local_slot = local_slot,
+        .bytes = region->value_size,
+        .offset = (uint64_t)local_slot * region->slot_stride_size,
+        .owner_generation = owner_generation,
+    };
+    return 0;
 }
 
 static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) {
@@ -1085,14 +1069,14 @@ static int location_cache_get(tlc_core_t *core,
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
             continue;
 
-        tlc_warm_location_t cached = {
-            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
-            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
-            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
-            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
-            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
-            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
-        };
+        tlc_warm_location_t cached;
+        if (location_cache_fill_hint(
+                core,
+                atomic_load_explicit(&entry->region_index, memory_order_relaxed),
+                atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
+                atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
+                &cached) != 0)
+            continue;
         uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
         if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
             continue;
@@ -1116,14 +1100,14 @@ static int location_cache_peek(tlc_core_t *core,
         if (seq1 == SEQLOCK_EMPTY || seqlock_seq_is_writing(seq1)) continue;
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash)) continue;
 
-        tlc_warm_location_t cached = {
-            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
-            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
-            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
-            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
-            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
-            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
-        };
+        tlc_warm_location_t cached;
+        if (location_cache_fill_hint(
+                core,
+                atomic_load_explicit(&entry->region_index, memory_order_relaxed),
+                atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
+                atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
+                &cached) != 0)
+            continue;
         uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
         if (seq1 != seq2 || seqlock_seq_is_writing(seq2)) continue;
         *location = cached;
@@ -2421,21 +2405,14 @@ static void tlc_core_reset_location_cache(tlc_core_t *core) {
         tlc_core_location_cache_entry_t *entry = &cache->entries[i];
         atomic_store_explicit(&entry->seq, SEQLOCK_EMPTY, memory_order_relaxed);
         atomic_store_explicit(&entry->key_hash, 0, memory_order_relaxed);
+        atomic_store_explicit(&entry->key_fingerprint, 0, memory_order_relaxed);
         atomic_store_explicit(&entry->key_len, 0, memory_order_relaxed);
-        atomic_store_explicit(&entry->region_id, TLC_CORE_INVALID_REGION_ID,
-                              memory_order_relaxed);
         atomic_store_explicit(&entry->region_index, UINT32_MAX,
                               memory_order_relaxed);
         atomic_store_explicit(&entry->local_slot, TLC_CORE_INVALID_SLOT,
                               memory_order_relaxed);
-        atomic_store_explicit(&entry->bytes, 0, memory_order_relaxed);
-        atomic_store_explicit(&entry->offset, 0, memory_order_relaxed);
         atomic_store_explicit(&entry->owner_generation, 0,
                               memory_order_relaxed);
-        for (uint32_t word = 0; word < TLC_CORE_LOCATION_CACHE_KEY_WORDS;
-             word++)
-            atomic_store_explicit(&entry->key_words[word], 0,
-                                  memory_order_relaxed);
     }
 }
 
