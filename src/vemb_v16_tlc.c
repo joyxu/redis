@@ -619,7 +619,7 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight) {
-    RETURN_IF(!out || warm_region_count == 0 ||
+    RETURN_IF(!out || !warm_regions || warm_region_count == 0 ||
         warm_region_count > TLC_CORE_MAX_WARM_REGIONS ||
         vector_dim == 0, -1);
     /* Region ids must stay unique because vector handles address data by region_id. */
@@ -629,6 +629,21 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                 return -1;
         }
     }
+
+    uint64_t derived_capacity = 0;
+    for (uint32_t i = 0; i < warm_region_count; i++) {
+        const vemb_v16_tlc_warm_region_t *region = &warm_regions[i];
+        uint64_t stride = region->slot_stride_size ?
+            region->slot_stride_size : region->value_size;
+        RETURN_IF(region->value_size != vector_dim * sizeof(float) ||
+                  stride == 0 || stride < region->value_size ||
+                  region->region_bytes < stride,
+                  -1);
+        uint64_t slots = region->region_bytes / stride;
+        RETURN_IF(derived_capacity > UINT32_MAX - slots, -1);
+        derived_capacity += slots;
+    }
+    RETURN_IF(derived_capacity == 0, -1);
 
     vemb_v16_tlc_t *tlc = zcalloc(sizeof(vemb_v16_tlc_t));
     RETURN_IF(!tlc, -1);
@@ -694,7 +709,10 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     }
     tlc_core_config_t core_config = {
         .value_size = tlc->value_size,
-        .hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY,
+        /* The manifest-derived slot capacity is the upper bound for keys.
+         * location_cache_init doubles it to keep open addressing below 0.5
+         * load, so the index does not silently thrash at a fixed 64K size. */
+        .hot_capacity = (uint32_t)derived_capacity,
         .warm_regions = core_regions,
         .warm_region_count = warm_region_count,
         .local_region_weight = local_region_weight,
