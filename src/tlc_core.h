@@ -247,6 +247,11 @@ int tlc_core_get_warm_slot(tlc_core_t *core,
                            uint32_t key_len,
                            uint64_t key_hash,
                            uint32_t *warm_slot);
+/* Locations are revocable snapshots, not pinned payloads. Owner-only cache
+ * hits validate a local generation mirror; imported slots use shared metadata.
+ * All owned-slot writes must pass through this core. Consumers must use
+ * copy_warm_location_value (or an equivalent shared generation/seqlock
+ * protocol) before exposing payload bytes, including after a cache hit. */
 int tlc_core_get_warm_location(tlc_core_t *core,
                                const char *key,
                                uint32_t key_len,
