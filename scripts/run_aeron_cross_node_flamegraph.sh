@@ -655,7 +655,7 @@ if [ "$op_type" = "VADD" ]; then
 fi
 taskset -c "$cpu_mask" ./memtier_benchmark \
     --protocol=vemb_v16 --vemb-v16-endpoints="$server_ip:$port" \
-    --threads=1 --clients=1 --pipeline="$batch_size" --requests="$keys" \
+    --threads=1 --clients=1 --pipeline=1 --requests="$keys" \
     --ratio=1:0 --key-prefix="$prefix" --key-minimum=1 --key-maximum="$keys" \
     --key-pattern=S:S --vemb-v16-dim="$dim" \
     --vemb-v16-transport=aeron \

@@ -1135,20 +1135,111 @@ typedef struct recycle_worker_arg {
     uint32_t worker;
 } recycle_worker_arg_t;
 
+typedef struct recycle_reader_arg {
+    recycle_worker_arg_t worker;
+    atomic_uint *ready;
+    atomic_bool *stop;
+} recycle_reader_arg_t;
+
+static void *recycle_reader(void *arg) {
+    recycle_reader_arg_t *reader = arg;
+    char key[32];
+    snprintf(key, sizeof(key), "recycle-worker:%u", reader->worker.worker);
+    uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    atomic_fetch_add_explicit(reader->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(reader->stop, memory_order_acquire)) {
+        tlc_warm_location_t location;
+        if (tlc_core_get_warm_location_stable_read(reader->worker.core,
+                key, strlen(key), hash, &location) != 0)
+            continue;
+        float actual[2];
+        /* A handle may become stale after lookup; only accepted copies count.
+         * Distinct per-key patterns detect both torn and wrong-key payloads. */
+        if (tlc_core_copy_warm_location_value(reader->worker.core, hash,
+                &location, actual, sizeof(actual), 4) == 0)
+            assert(actual[1] - actual[0] == 1000 + reader->worker.worker * 100000);
+    }
+    return NULL;
+}
+
 static void *recycle_worker(void *arg) {
     recycle_worker_arg_t *worker = arg;
     char key[32];
     snprintf(key, sizeof(key), "recycle-worker:%u", worker->worker);
     uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
     for (uint32_t i = 0; i < 512; i++) {
-        float value[2] = {(float)i, (float)(i + 1000)};
+        float value[2] = {(float)i, (float)(i + 1000 + worker->worker * 100000)};
         tlc_warm_location_t location;
+        assert(tlc_core_put_location_epoch(worker->core, key, strlen(key), hash,
+                   value, sizeof(value), 1, 1, &location) == 0);
+        value[0] += 1;
+        value[1] += 1;
         assert(tlc_core_put_location_epoch(worker->core, key, strlen(key), hash,
                    value, sizeof(value), 1, 1, &location) == 0);
         assert(tlc_core_delete_with_epoch(worker->core, key, strlen(key), hash,
                                            1, NULL) == 0);
     }
     return NULL;
+}
+
+static void test_cache_hit_without_shared_metadata(void) {
+    size_t page_bytes = (size_t)sysconf(_SC_PAGESIZE);
+    vemb_v16_warm_slot_meta_t *slots = mmap(NULL, page_bytes,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(slots != MAP_FAILED);
+    init_fuzzy_slot_meta(slots, 1, 989);
+    float payload[2] = {0}, value[2] = {17, 18}, actual[2];
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 989, .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1, .value_size = sizeof(payload),
+        .region_bytes = sizeof(payload), .mapped_addr = (uint8_t *)payload,
+        .slot_meta = slots,
+    };
+    tlc_core_config_t config = {
+        .value_size = sizeof(payload), .hot_capacity = 1,
+        .warm_regions = &warm, .warm_region_count = 1,
+    };
+    tlc_core_t *core;
+    assert(tlc_core_create(&core, &config) == 0);
+    const char *key = "cache-local-generation";
+    uint64_t hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    tlc_warm_location_t first, cached, updated;
+    assert(tlc_core_put_location_epoch(core, key, strlen(key), hash,
+        value, sizeof(value), 1, 1, &first) == 0);
+#if !TLC_CORE_ALLOW_LRU_EVICTION
+    /* Prove both cache entry readers avoid *all* shared slot metadata loads. */
+    assert(mprotect(slots, page_bytes, PROT_NONE) == 0);
+    assert(tlc_core_get_cached_warm_location(core, key, strlen(key), hash, &cached) == 0);
+    assert(cached.owner_generation == first.owner_generation);
+    assert(tlc_core_get_warm_location_stable_read(core, key, strlen(key), hash, &cached) == 0);
+    assert(cached.owner_generation == first.owner_generation);
+    assert(mprotect(slots, page_bytes, PROT_READ | PROT_WRITE) == 0);
+#endif
+    value[0] = 27;
+    assert(tlc_core_put_location_epoch(core, key, strlen(key), hash,
+        value, sizeof(value), 1, 1, &updated) == 0);
+    assert(updated.owner_generation == first.owner_generation);
+    assert(tlc_core_get_cached_warm_location(core, key, strlen(key), hash, &cached) == 0);
+    assert(tlc_core_copy_warm_location_value(core, hash, &first,
+        actual, sizeof(actual), 8) == 0);
+    assert(memcmp(actual, value, sizeof(value)) == 0);
+    assert(tlc_core_delete_with_epoch(core, key, strlen(key), hash, 1, NULL) == 0);
+    assert(tlc_core_get_cached_warm_location(core, key, strlen(key), hash, &cached) != 0);
+    const char *other = "cache-reused-generation";
+    /* Equal primary hash must not make the old key/handle valid after reuse. */
+    assert(tlc_core_put_location_epoch(core, other, strlen(other), hash,
+        value, sizeof(value), 1, 1, &updated) == 0);
+    assert(updated.local_slot == first.local_slot);
+    assert(updated.owner_generation > first.owner_generation);
+    assert(tlc_core_get_warm_location(core, key, strlen(key), hash, &cached) != 0);
+    assert(tlc_core_get_cached_warm_location(core, other, strlen(other), hash, &cached) == 0);
+    assert(tlc_core_copy_warm_location_value(core, hash, &first,
+        actual, sizeof(actual), 8) != 0);
+    assert(tlc_core_copy_warm_location_value(core, hash, &cached,
+        actual, sizeof(actual), 8) == 0);
+    tlc_core_destroy(core);
+    assert(munmap(slots, page_bytes) == 0);
+    puts("cache hit skips shared metadata; overwrite and recycle retain identity: PASS");
 }
 
 static void test_owner_concurrent_recycle(void) {
@@ -1169,13 +1260,28 @@ static void test_owner_concurrent_recycle(void) {
     tlc_core_t *core;
     assert(tlc_core_create(&core, &config) == 0);
     pthread_t threads[WORKERS];
+    pthread_t readers[WORKERS];
     recycle_worker_arg_t args[WORKERS];
+    recycle_reader_arg_t reader_args[WORKERS];
+    atomic_uint ready;
+    atomic_bool stop;
+    atomic_init(&ready, 0);
+    atomic_init(&stop, 0);
+    for (uint32_t i = 0; i < WORKERS; i++) {
+        reader_args[i] = (recycle_reader_arg_t){{core, i}, &ready, &stop};
+        assert(pthread_create(&readers[i], NULL, recycle_reader, &reader_args[i]) == 0);
+    }
+    while (atomic_load_explicit(&ready, memory_order_acquire) != WORKERS)
+        sched_yield();
     for (uint32_t i = 0; i < WORKERS; i++) {
         args[i] = (recycle_worker_arg_t){core, i};
         assert(pthread_create(&threads[i], NULL, recycle_worker, &args[i]) == 0);
     }
     for (uint32_t i = 0; i < WORKERS; i++)
         assert(pthread_join(threads[i], NULL) == 0);
+    atomic_store_explicit(&stop, 1, memory_order_release);
+    for (uint32_t i = 0; i < WORKERS; i++)
+        assert(pthread_join(readers[i], NULL) == 0);
     for (uint32_t i = 0; i < WORKERS; i++) {
         float value[2] = {(float)i, (float)(i + 1000)};
         char key[32];
@@ -4630,6 +4736,7 @@ int main(void) {
     test_recycled_slots_across_owned_regions();
     test_cold_rebuild_preserves_peer_and_invalidates_old_handles();
     test_owner_concurrent_recycle();
+    test_cache_hit_without_shared_metadata();
     test_index_growth_and_stable_cursor();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();

@@ -2,6 +2,8 @@
 
 日期：2026-10-15
 
+2026-10-17更新：Server cache-hit本地generation镜像、失效/发布契约及CLI安全handle读取TODO见[WARM allocator v2设计](VEMB_V16_WARM_ALLOC_V2_DESIGN.md)开头章节。本地快路径已实现并通过TLC/manifest/sync/resync UT；迁移控制UT的SIGBUS可在9fc8cf8基线复现。远端机器暂时无法连接，UB性能A/B待恢复后执行，尚无新性能结论。
+
 ## 1. 目标与范围
 
 取消 WARM payload 的 8-way 绑定。新 key 直接从选中 region 的统一空闲槽池领取任意槽，不再先访问 key 对应的集合。哈希继续用于 key 索引、并发 shard 和 region 选择，不决定物理槽位置。
@@ -586,3 +588,31 @@ CLIENTS=4 轮上述四项失败计数同样全为 0，成功物化 222,759,161 �
 CLIENTS=4在两次负载门禁中止后通过空闲窗口复测：7,756,944.18总QPS、1,371,439.27单核QPS，平均/p99为0.92507/1.103ms，四项失败计数全为0。artifacts `perf/p3_s3_c4_uniform_alloc_v2_stride64_idle_20261016`。C4仍低于本阶段C3，不将对齐修复解释为所有并发参数均达到8M。
 
 同参数、同SDK/memtier二进制的相邻旧分配器C4对照为7,466,836.97总QPS、1,278,176.20单核QPS，四项失败计数全为0；artifact `perf/p3_s3_c4_uniform_alloc_v2_stride64_control_20261016`。本轮v2对齐版总QPS高约3.9%、单核高约7.3%，支持没有吞吐劣化；单轮不作为稳定提升幅度结论，且未执行90%/98%占用场景。
+
+2026-10-16的1M key缓存容量诊断及20:24跨机测试门禁结果见 [allocator v2诊断记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md)。ARM CPU-only lookup默认缓存约495ns，大缓存约223ns；跨机A/B首轮被111 Mooncake进程RSS门禁拦截，尚无新QPS结果，不能据微基准归因全部吞吐差异。
+
+同日20:26—20:31，用户授权停止该Mooncake进程后完成三组跨机测试：1M Uniform默认位置缓存5.410M/单核0.691M，独立大缓存构建7.878M/1.006M（+45.6%/+45.5%），大缓存Zipf1.5为9.451M/1.604M，四项失败计数均0。Zipf fanout为1.992，包含请求合并收益，不能独立归因UB缓存。完整参数、构建哈希、artifacts及证据限制已记入上述v2文档的“1M key 跨机缓存A/B结果”。
+
+同日PROFILE=1的cycles与LLC miss对照显示，大缓存下1M key的`location_cache_validate_location` cycles self占比15.38%，100K为7.49%；LLC miss采样栈归因占比为31.91%/17.83%。`key_meta_find_locked` cycles占比不足1%，故主要剩余热点转为每次cache hit仍访问随机slot_meta验证。详细火焰图、client端路由候选和限制见allocator v2文档“cycles 与 LLC miss 火焰图”。
+
+SPE 地址样本复核显示，SNW 的 `tlc_core_get_warm_location_raw`、`location_cache_validate_location` 在 `l1d-miss`/`llc-miss` 样本中出现 `RAM hit + Walker miss`。这支持 warm location/slot 校验路径承受地址转换与远端取数等待，但归档的 data object 地址与当前保存的 `/dev/obmm_shmdev4` 映射边界不属于同一地址空间，因此没有做 metadata/payload 比例归类。下一轮必须和同一 perf.data 同时保存 Redis 的 maps/smaps 后再分类；在此之前不据 SPE 地址样本修改校验协议。
+
+2026-10-17 已完成同 PID 绑定复测：服务端 PID `853754` 同时保存 `maps/smaps` 并采集 SPE，WARM 映射为 `0xfffe89b8b000-0xffff97600000`，metadata 结束地址为 `0xfffe9731f380`；`smaps` 报告 CPU 侧 `4 kB` 页。该轮1M/4:4诊断QPS为4.841M，四项错误计数为0；SPE仍显示 slot 校验路径 `RAM hit + Walker miss`，但 ARM perf 当前输出未稳定展开 data object，metadata/payload比例待离线解析，不据此修改协议。详见 [allocator v2诊断记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md) 的“同 PID 映射绑定复测”。
+
+### 10.32 大缓存 100K/1M 的 L1、LLC 与 DTLB 计数
+
+2026-10-16 使用同一大缓存服务端构建、相同4:4 Uniform workload，以`PROFILE=0 SERVER_PMU=1`按worker采集`cycles/instructions/L1-dcache-load-misses/LLC-load-misses/dTLB-load-misses/dtlb_walk`，稳定窗口内事件运行比例均为100%。1M相对100K的SNW计数/op：cycles `745.61→1,158.21`，instructions `852.03→686.27`，L1 miss `14.98→17.26`，LLC miss `2.95→6.58`，dTLB miss `3.83→6.02`，DTLB walk `2.49→4.88`；QPS `9.958M→7.943M`。PIO LLC miss/op为`0.610→0.544`，但PIO instructions/op `966→1,653`、cycles/op `924→1,158`，说明不能把全部吞吐损失只归因于SNW或slot_meta。结果支持工作集扩大后SNW访问等待及地址转换压力增大，但线程级PMU不能把计数精确归因到`slot_meta`的单条load。完整口径、正确性计数、限制与artifacts见[allocator v2诊断记录](VEMB_V16_WARM_ALLOC_V2_DESIGN.md)的“1M key 的 L1/LLC/DTLB per-worker PMU 对照”。
+
+同构复测 `allocv2_next_100k_pmu_20261017` / `allocv2_next_1m_pmu_20261017` 使用同一大缓存构建和同一 4:4 参数，得到 `9.941M/1.376M` 与 `7.843M/1.004M` QPS/单核 QPS。1M 相对 100K 的 SNW cycles/op、LLC miss/op、DTLB walk/op 分别增加 56.0%、124.7%、56.3%，而 instructions/op 下降18.5%；两轮 WARM `smaps` 均为4KiB页，且启动日志确认 huge-TLB mmap 返回 `EINVAL` 后退回普通 mmap。该复测确认前述访存等待方向稳定，但下一步仍需对 metadata locality 或页表粒度做受控 A/B，不能据此直接修改 slot 校验。
+
+随后对空闲 `/dev/obmm_shmdev4` 做 `MAP_HUGETLB` 能力探针：111 的2MiB hugepage池可用（`nr_hugepages=131072`、`free_hugepages=95487`），但 metadata/完整WARM的原始长度、2MiB向上取整长度以及显式 `MAP_HUGE_2MB` 均返回 `EINVAL`。因此应用侧 round-up 不能解决当前 huge-TLB 失败；页表粒度优化需要 OBMM 驱动/设备支持，近期优先级低于 metadata locality A/B。
+
+随后做“1M resident、100K active-read”对照：prefill完整写入1M key，读阶段只访问前100K，得到 `9.975M/1.378M` QPS/单核 QPS，与100K resident/100K active-read的 `9.941M/1.376M` 基本一致；SNW LLC miss均约`2.95/op`。因此回归由实际访问的 metadata 工作集触发，而不是由WARM总容量或已分配payload数量触发。Artifact为`perf/allocv2_resident1m_read100k_20261017/`，下一步应围绕active-read路径的metadata locality做受控A/B。
+
+### 10.33 最新 v2 100K 回归与 cache-hit 校验结论（2026-10-17）
+
+最新边界校验同步并重建后，100K、4:4、Uniform 回归为 `10,014,372.69` QPS、`1,417,375.45` 单核 QPS，四项失败计数均为0，artifact 为 `perf/p4_s4_svr0-15_uniform_20261017_085717`。同一生产二进制的1M、4:4、Uniform profile 为 `9,332,084.94` QPS、`1,197,384.12` 单核 QPS；server 火焰图中 `location_cache_validate_location` 占 `17.92%` cycles。
+
+临时启用已有 lookup 诊断后，1M workload 的4个SN worker合计约`118.0M`次lookup，cache hit约`117.98M`，miss约`19,949`，miss比例约`0.017%`。该诊断构建吞吐仅`3.746M`，不作为性能样本；它只证明热点来自命中后的slot metadata校验，而不是hash miss。
+
+仅对4个SN worker采集PMU，L1 miss为`5.15%`，LLC miss为`68.18%`，dTLB miss为`1.59%`，`dtlb_walk`为`489,599,392`；原始计数见 `perf/p4_s4_1m_pmu_sn_target_20261017/` 和 `perf/p4_s4_1m_pmu_sn_dtlb_20261017/`。下一步应设计带明确失效通知的cache-hit快路径，保留payload复制阶段的generation/seqlock校验，不直接删除slot身份校验。
