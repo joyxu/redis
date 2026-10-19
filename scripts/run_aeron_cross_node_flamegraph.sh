@@ -8,8 +8,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-SERVER_NODE="${SERVER_NODE:-192.168.90.111}"
-CLIENT_NODE="${CLIENT_NODE:-192.168.90.112}"
+SERVER_NODE="${SERVER_NODE:-192.168.90.161}"
+CLIENT_NODE="${CLIENT_NODE:-192.168.90.162}"
 SSH_USER="${SSH_USER:-root}"
 SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-22}}"
 CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-22}}"
@@ -17,7 +17,7 @@ SERVER_ROOT="${SERVER_ROOT:-/root/szz/codespace/hpc-redis}"
 CLIENT_ROOT="${CLIENT_ROOT:-/root/szz/codespace/hpc-redis}"
 FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
-SERVER_IP="${SERVER_IP:-192.168.90.111}"
+SERVER_IP="${SERVER_IP:-192.168.90.161}"
 PORT="${PORT:-6395}"
 # Warm uses dev4 on 111, dev8 on 112. Request/response pair: 111 dev3/dev6
 # -> 112 dev7/dev2.
@@ -34,6 +34,7 @@ CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/ve
 CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
 CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
 AERON_UB_CACHEABLE="${AERON_UB_CACHEABLE:-0}"
+LOCATION_CACHE_CAPACITY="${LOCATION_CACHE_CAPACITY:-}"
 # Device paths reserved on 111/112 (not used by this benchmark).
 # Override explicitly when running against a different allocation.
 SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev13}"
@@ -527,7 +528,7 @@ server_ssh bash -s -- \
     "$SERVER_ROOT" "$REMOTE_RUN_DIR" "$PORT" "$SERVER_IP" "$SERVER_MANIFEST" \
     "$SERVER_REQUEST_UB_PATH" "$SERVER_RESPONSE_UB_PATH" "$SERVER_WARM_UB_PATH" \
     "$DIM" "$MAX_VECTORS" "$BATCH_REQUEST_SIZE" "$PIO" "$SNW" \
-    "$SERVER_CPU_MASK" "$AERON_UB_CACHEABLE_CONFIG" <<'REMOTE_SERVER_START'
+    "$SERVER_CPU_MASK" "$AERON_UB_CACHEABLE_CONFIG" "$LOCATION_CACHE_CAPACITY" <<'REMOTE_SERVER_START'
 set -euo pipefail
 
 root=$1
@@ -545,6 +546,13 @@ proxy_io_threads=${12}
 supernode_workers=${13}
 cpu_mask=${14}
 ub_cacheable=${15}
+location_cache_capacity=${16}
+
+if [ -n "$location_cache_capacity" ]; then
+    export TLC_CORE_LOCATION_CACHE_CAPACITY="$location_cache_capacity"
+else
+    unset TLC_CORE_LOCATION_CACHE_CAPACITY || true
+fi
 
 mkdir -p "$run"
 pidfile="$run/server.pid"

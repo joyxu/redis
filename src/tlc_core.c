@@ -43,6 +43,8 @@ void tlc_core_log_lookup_diagnostics(uint32_t worker_id) {
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <errno.h>
+
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -660,12 +662,34 @@ static int key_meta_blocks_source_access(tlc_core_t *core,
 static uint64_t key_fingerprint(const char *key, uint32_t key_len);
 
 static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
+    const char *override = getenv("TLC_CORE_LOCATION_CACHE_CAPACITY");
+    if (override && override[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(override, &end, 10);
+        if (errno == 0 && end != override && *end == '\0' && value > 0 &&
+            value <= UINT32_MAX)
+            requested_capacity = (uint32_t)value;
+        else
+            serverLog(LL_WARNING,
+                      "tlc location cache: invalid TLC_CORE_LOCATION_CACHE_CAPACITY=%s; using requested=%u",
+                      override, requested_capacity);
+    }
     uint64_t target = requested_capacity ?
         (uint64_t)requested_capacity * 2u :
         (uint64_t)TLC_CORE_DEFAULT_HOT_CAPACITY * 2u;
     uint32_t capacity = vemb_v16_pow2_ceil_u32(target);
     if (capacity < TLC_CORE_LOCATION_CACHE_MIN_CAPACITY)
         capacity = TLC_CORE_LOCATION_CACHE_MIN_CAPACITY;
+
+    /* The benchmark launcher uses loglevel=warning, so keep this one
+     * startup sizing record visible for capacity audits. */
+    serverLog(LL_WARNING,
+              "tlc location cache: requested=%u target=%llu actual_entries=%u bytes=%llu source=%s",
+              requested_capacity, (unsigned long long)target, capacity,
+              (unsigned long long)capacity * sizeof(tlc_core_location_cache_entry_t),
+              override && override[0] ? "override" :
+              (requested_capacity ? "derived" : "default"));
 
     tlc_core_location_cache_t *cache = &core->location_cache;
     cache->entries = zcalloc(sizeof(*cache->entries) * capacity);
