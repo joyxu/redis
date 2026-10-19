@@ -13,7 +13,7 @@
 | 处理器 | 鲲鹏 920（aarch64，SVE） | 鲲鹏 930（aarch64，SVE2 256-bit） |
 | 核数 | 32 核 | 192 核（2 socket × 96 核） |
 | 内存 | 64 GB | 256 GB 及以上 |
-| UB.MEM 设备 | `/dev/obmm_shmdev1` 可访问 | `/dev/obmm_shmdev{1..8}` 全部初始化 |
+| UB.MEM 设备 | `/dev/obmm_shmdev1` 可访问 | `/dev/obmm_shmdev{1..16}` 全部初始化（8 本地 export + 8 对端 import） |
 | 网络（跨节点） | 10 GbE | 100 GbE RoCE（mlx5） |
 
 **软件要求**
@@ -37,24 +37,16 @@ cd hpc-redis
 ```
 
 ### 编译 redis-server
-0. 编译依赖（仅首次编译需要）
-   ```bash
-   gcc -O3 -fPIC -c deps/xxhash/xxhash.c -o deps/xxhash/xxhash.o
-   ar rcs deps/xxhash/libxxhash.a deps/xxhash/xxhash.o
-   cd deps/jemalloc
-   ./autogen.sh --with-version=5.3.0-0-g0
-   make
-   make install
-   cd -
-   ```
+
+> 依赖说明：`deps/` 下的 jemalloc、hiredis、lua、xxhash 等依赖由 `src/Makefile` 的
+> `DEPENDENCY_TARGETS` 机制自动构建（xxhash 不再需要手工预编译），首次 `make` 会
+> 自动完成，增量编译只重链变更的目标。仅 jemalloc 首次构建耗时较长属正常现象。
 
 1. 编译 `redis-server`
 
    ```bash
    make -C src -j$(nproc) redis-server
    ```
-
-   首次编译会自动构建 `deps/` 下的 jemalloc、hiredis、lua 等依赖；增量编译只重链变更的目标。
 
 2. 确认产物
 
@@ -101,7 +93,7 @@ cd hpc-redis
 4. （可选）编译示例代码验证 SDK 可用性。
 
    ```bash
-   cd /root/gqs/codespace/UnifiedBus/hpc-redis
+   cd <仓库根>/hpc-redis
    # 注意：必须加 -I src 才能解析 SDK 头文件中的 xxhash 相对路径
    gcc -I clients/c/build/include -I src \
        clients/c/example.c \
@@ -110,6 +102,39 @@ cd hpc-redis
    ```
 
    如编译无报错且产出 `clients/c/example` 可执行文件，则 SDK 构建完成。
+
+### 编译 memtier_benchmark（VEMB V16 压测工具）
+
+压测工具使用 memtier 的定制分支（含 `--protocol vemb_v16` 全套参数），**目录位置在本仓库根下 `memtier_benchmark/`**（构建系统按相对路径 `../clients/c/build/` 直接引用 hpc-redis 的 SDK 产物，放成 hpc-redis 的同级目录会因路径解析不到而编译失败）：
+
+```
+hpc-redis/
+├── clients/c/           # SDK（上节产物）
+└── memtier_benchmark/   # memtier 定制分支（仓库自带）
+```
+
+1. 先完成上节 SDK 编译（memtier 编译期直接引用 `clients/c/build/` 下的头文件与静态库）。
+
+2. 编译 memtier（标准 autotools，仓库自带 `configure`，无需 autogen）。
+   在拷贝来的源码树上先 `make distclean` 清掉旧机器残留的 configure 状态再重新配置：
+
+   ```bash
+   cd <仓库根>/hpc-redis/memtier_benchmark
+   make distclean          # 首次在新机器上编译时
+   ./configure
+   make -j$(nproc)
+   ```
+
+   > 依赖：libevent / OpenSSL 开发包（`yum install libevent-devel openssl-devel` 或同级命令）。
+
+3. 确认产物。
+
+   ```bash
+   ls -lh memtier_benchmark
+   ./memtier_benchmark --help | grep vemb-v16
+   ```
+
+   预期能看到 `--vemb-v16-dim` / `--vemb-v16-transport` / `--vemb-v16-endpoints` 等参数即集成成功。
 
 ## 安装后检查
 

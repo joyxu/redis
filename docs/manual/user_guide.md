@@ -85,12 +85,20 @@ appendonly no
 | 参数 | 取值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `vemb-v16-enabled` | yes / no | no | 总开关。开启后 Redis 端口同时承载 RESP 与 VEMB V16 嗅探二进制协议。 |
-| `vemb-v16-dim` | 0 – `VEMB_V16_MAX_DIM` | 无默认值 | 启用 VEMB V16 时必须显式设置，并需与客户端 SDK / `memtier_benchmark --vemb-v16-dim` 一致；启动后不可修改。 |
+| `vemb-v16-dim` | 0 – `VEMB_V16_MAX_DIM` | 无默认值 | 启用 VEMB V16 时必须显式设置，并需与客户端 SDK / `memtier_benchmark --vemb-v16-dim` 一致；启动后不可修改。已验证维度：8 / 300 / 1024 / 2048 / 3072。 |
 | `vemb-v16-max-vectors` | ≥ 1 | 131072 | 预留向量槽位数。 |
 | `vemb-v16-warm-regions-manifest` | 路径 | 空 | 热区 manifest YAML，描述 region_id / path / mmap_offset / bytes / value_size 等。**必传**。 |
 | `vemb-v16-reset-warm-regions` | yes / no | no | 启动时是否重置热区（首次部署或切换拓扑时设为 yes）。 |
 | `vemb-v16-supernode-workers` | 0 – 256 | 0 | SuperNode 处理线程数，0 表示按 CPU 自动推算。生产建议 `pio × 2`。 |
 | `vemb-v16-proxy-io-threads` | 0 – 256 | 0 | Proxy I/O 线程数。生产建议与 `supernode-workers` 按 1:2 配置。 |
+| `vemb-v16-transport` | `sniff` / `aeron` | `sniff` | 数据面选择。`sniff` = TCP 端口嗅探分流（TCP 数据面）；`aeron` = Aeron 传输（TCP 控制面 + UB 共享内存环数据面，见下文 Aeron 章节）。**IMMUTABLE**（启动后不可改）。 |
+| `vemb-v16-tcp-host` | 主机名 / IP | 空 | 对外通告的 TCP 主机名/IP。跨节点 Aeron/TCP 客户端按此地址回连控制面；不设置时通告环回地址，远端客户端将无法建立连接。 |
+| `vemb-v16-tcp-port` | 0 – 65535 | 0 | 控制面 TCP 端口，0 表示复用主 `port`。 |
+| `vemb-v16-aeron-control` | `tcp` / `uds` | `tcp` | Aeron 控制面通道类型（tcp 或 Unix domain socket）。**IMMUTABLE**。 |
+| `vemb-v16-aeron-ub-path` | 设备路径 | `/dev/obmm_shmdev1` | Aeron 请求环 UB 设备（v1 双环 / v2 batch 四区通道共用池）。**IMMUTABLE**。 |
+| `vemb-v16-aeron-response-ub-path` | 设备路径 | `/dev/obmm_shmdev2` | Aeron 响应环 UB 设备。**IMMUTABLE**。 |
+| `vemb-v16-batch-request-size` | 1 – 128 | 32 | v2 batch 通道单批最大请求数。 |
+| `aeron-ub-cacheable` | yes / no | no | Aeron 通道环映射的缓存属性（NC/CC）。**IMMUTABLE**。 |
 
 ### warm-regions manifest 文件配置
 
@@ -223,6 +231,106 @@ warm_regions:
    - `shm`：仅本地、功能验证用，性能差且无法跨节点。
 7. **首次部署 / 切换拓扑**：必须配合 `--vemb-v16-reset-warm-regions yes` 启动一次，否则 region 残留旧数据。
 8. **scaleout 必须双机对称 + `ub_rpc_peers`**：跨节点拓扑 RPC 需要额外配置 ring 字段（request/response/inbound_request/outbound_response 各一组 owner_id + path + mmap_offset），详见 `examples/` 下含 `ub_rpc_peers` 段的示例与 scaleout 专题文档。
+
+---
+
+## Aeron 数据面
+
+`vemb-v16-transport aeron` 将数据面从 TCP 切换为 Aeron 传输：**TCP 只承载控制面**（HELLO/WELCOME、ATTACH、拓扑查询），向量请求/响应走 **UB 共享内存环**——v1 双环（请求/响应）为永久基础通道，v2 batch 为 per-owner 可选加速旁路（desc 环 + arena 四区，单批最大 `vemb-v16-batch-request-size` 个请求）。吞吐较 TCP 显著提升（单机 17:17 配置实测读吞吐 3000 万 ops/s 量级）。
+
+服务端启动（在 TCP 模式参数基础上追加）：
+
+```bash
+./src/redis-server --port 6379 \
+  --vemb-v16-enabled yes --vemb-v16-dim 300 \
+  --vemb-v16-transport aeron \
+  --vemb-v16-aeron-ub-path /dev/obmm_shmdev1 \
+  --vemb-v16-aeron-response-ub-path /dev/obmm_shmdev2 \
+  --vemb-v16-tcp-host 192.168.90.111 \
+  --vemb-v16-warm-regions-manifest examples/vemb_v16_warm_regions_111.yaml \
+  ...（其余参数同 TCP 模式）
+```
+
+要点：
+
+- `--vemb-v16-tcp-host` 在跨节点场景**必须**设置为本机对外 IP，否则服务端通告环回地址，远端客户端无法回连控制面。
+- 通道环设备（默认 shmdev1/shmdev2）与 warm region 设备（manifest 中配置，通常 shmdev3）互不冲突；设备由平台预置，无需手工创建。
+- 客户端：SDK 创建 client 时传 `VEMB_V16_TRANSPORT_AERON`；跨节点 UB 访问需在首次 UB 请求前调用 `vemb_v16_client_configure_ub_peer_view()` 加载 peer-view manifest（`examples/vemb_v16_ub_peer_view_*.yaml`，把服务端设备路径翻译成本节点 import 设备路径）。memtier 侧用 `--vemb-v16-transport=aeron`。
+- 一键回归脚本：`scripts/run_aeron_best.sh`（本地回环全套参数默认）、`benchmark/vemb_v16_aeron_cluster_tput.sh`（跨节点集群）、`scripts/run_aeron_cross_node_flamegraph.sh`（跨节点火焰图口径）。
+
+## COLD 持久化层
+
+TLC 三层缓存的第三层。设置环境变量 `HPC_REDIS_COLD_DIR=<目录>` 并启动 server 即启用：warm 层淘汰/驱逐的向量追加写入该目录下的分段文件（默认 64 MiB 段），查询在 DRAM/warm 未命中时回源 COLD；server 重启后从 COLD 恢复数据。不设置该变量则 COLD 关闭，行为与纯缓存一致。
+
+```bash
+mkdir -p /data/hpc-redis-cold
+HPC_REDIS_COLD_DIR=/data/hpc-redis-cold ./src/redis-server ...（其余参数不变）
+```
+
+注意：
+
+- **HA Replica 模式强制要求** `HPC_REDIS_COLD_DIR`（副本恢复的数据来源），未设置时 server 拒绝以 HA Replica 身份启动。
+- COLD 与 `--vemb-v16-reset-warm-regions yes` 独立：reset 只清 warm 层，COLD 数据保留。
+
+## 高可用（HA）
+
+双节点单 active owner + standby 架构，组件与语义：
+
+- **keepalived VIP**：`scripts/deploy_keepalived_ha.sh` 部署/管控（构建安装 keepalived 至 `/opt/hpc-redis/keepalived`，模板 `scripts/keepalived_hpc_redis.conf.in`）。健康检查失败触发 VIP 漂移，`ha_healthcheck.sh` 探测、`ha_notify.sh` 通知钩子。
+- **心跳 failover**：active owner 心跳超时后 standby 升主；topology `active` 从单 owner 切换到 standby owner。
+- **HA Replica 副本恢复 + 跨节点重同步**：standby 以 HA Replica 身份持有副本，接管后从对端/COLD 恢复数据并追平序列号。
+
+部署与回归：
+
+```bash
+# 部署 keepalived（111=100 / 112=90 priority；start 前先 deploy+check）
+scripts/deploy_keepalived_ha.sh --node 111 --priority 100 --vip 192.168.90.202/24 deploy
+scripts/deploy_keepalived_ha.sh --node 112 --priority 90  --vip 192.168.90.202/24 deploy
+scripts/deploy_keepalived_ha.sh --all --vip 192.168.90.202/24 check
+scripts/deploy_keepalived_ha.sh --node 111 --vip 192.168.90.202/24 start   # 先起 leader
+scripts/deploy_keepalived_ha.sh --node 112 --vip 192.168.90.202/24 start
+
+# 回归 runner（端到端：副本同步 + failover + 反向）
+benchmark/tlc_ha_replica_ub_111_to_112.sh          # UB 副本恢复
+benchmark/tlc_ha_aeron_failover_111_to_112.sh      # Aeron failover（INITIAL_NODE=112 CLIENT_NODE=112 反向）
+benchmark/tlc_ha_redis_tcp_111_to_112.sh           # TCP 对照
+```
+
+> 模板固定 `state BACKUP` + `nopreempt`：初始 MASTER 由启动顺序决定（先起 leader 并确认 VIP 归属后再起 standby），反向部署需按 priority 高低显式 deploy。
+
+## 在线扩容（scaleout）
+
+双节点拓扑在线变更：从单 owner（`active={0}`）扩为双 owner（`active={0,1}`），扩容过程数据自动迁移，业务读写不中断。manifest 的 `remote_meta_views` / `ub_rpc_peers` 段为扩容必备字段（见上文）。
+
+```bash
+# TCP 数据面三段采集（baseline / during / after 吞吐）
+bash scripts/hpc_redis_scaleout_throughput.sh
+# smoke: TEST_TIME=3 PREFILL_KEYS=1000 bash scripts/hpc_redis_scaleout_throughput.sh
+
+# Aeron 数据面扩容（Mac 侧执行）
+bash scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh
+```
+
+结果写入 `benchmark/results/scaleout/<run_id>/summary.tsv`（三段 ops/p99/wall）。扩容完成的标志为 `scaleout_all_sources_done=1`（迁移源全部完成）；脚本内建 peer-attach 等待门槛，双端 server 并行启动。
+
+## 拓扑运维（vemb_v16_topology_ctl）
+
+`benchmark/vemb_v16_topology_ctl` 是拓扑控制/观测的命令行工具（构建：`make -C benchmark vemb_v16_topology_ctl`）：
+
+```bash
+vemb_v16_topology_ctl --get    [--ctl-endpoint tcp|aeron] --host H --port P   # 查询当前拓扑/flags
+vemb_v16_topology_ctl --set ...                                               # 发布拓扑
+vemb_v16_topology_ctl --set-with-peer-view-map FILE ...                       # 发布拓扑 + peer-view 映射
+vemb_v16_topology_ctl --stats / --diagnostic-stats ...                        # 运行统计
+vemb_v16_topology_ctl --coordinator-listen ...                                # 扩容协调器模式
+```
+
+`--get` 输出中的 `peer_attached=0/1` 表示对端视图是否挂载完成（跨节点/扩容场景的就绪判据）。
+
+## 高维与负载变体
+
+- **高维向量**：dim 1024 / 2048 / 3072 已验证，示例 manifest 见 `examples/cluster_111_dim{1024,2048,3072}.yaml` 等；`value_size = dim × 4`，warm region `bytes` 需相应放大。
+- **VSIM_2KEY 负载**：memtier `--vemb-v16-vsim-key-key`，每 op 完成双 key 取回 + 服务端余弦，回归脚本 `benchmark/run_vsim_2key_2node.sh`。
 
 ---
 

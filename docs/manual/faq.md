@@ -41,7 +41,7 @@ HPC-Redis 是否需要 License？
 
 ### __回答__
 
-HPC-Redis 本身是开源软件（基于 Redis 协议），无 License 限制。但 UB.MEM 设备的能力依赖鲲鹏平台硬件许可与 BIOS 配置，这部分由平台运维团队负责，不在 HPC-Redis 文档范围内。
+HPC-Redis 继承 Redis 8 的三重许可模式（RSALv2 / SSPLv1 / AGPLv3，见仓库 `LICENSE.txt`），自身不新增 License 限制。UB.MEM 设备的能力依赖鲲鹏平台硬件许可与 BIOS 配置，这部分由平台运维团队负责，不在 HPC-Redis 文档范围内。
 
 ### __问题__
 
@@ -235,7 +235,47 @@ VADD 返回 OK，但紧接的 VEMB 读回 `not found` 或空向量。
 
 3. 确认 UB.MEM 设备状态正常（`ls /dev/obmm_shmdev*`），避免热区 fallback。
 
-4. 若业务侧确实需要写大量 RESP key，请评估物理内存是否足够，并考虑引入冷存储分层。
+4. 若业务侧确实需要写大量 RESP key，请评估物理内存是否足够，并启用 COLD 冷存储分层（见下条 FAQ）。
+
+
+### __问题__
+
+如何启用 COLD 冷存储 / 重启后数据是否还在？
+
+### __回答__
+
+设置环境变量 `HPC_REDIS_COLD_DIR=<目录>` 后启动 server 即启用：warm 层淘汰的向量持久化到该目录的分段文件，查询未命中 DRAM/warm 时回源 COLD，重启后自动恢复。未设置则 COLD 关闭（纯缓存语义，重启数据丢失）。
+
+```bash
+mkdir -p /data/hpc-redis-cold
+HPC_REDIS_COLD_DIR=/data/hpc-redis-cold ./src/redis-server ...
+```
+
+注意：HA Replica 模式强制要求该变量（副本恢复的数据来源），未设置时拒绝启动。`--vemb-v16-reset-warm-regions yes` 只重置 warm 层，不影响 COLD 数据。
+
+
+### __问题__
+
+Aeron 模式下客户端连不上 / ATTACH 失败、跨节点读写 hang。
+
+### __问题现象描述__
+
+`vemb-v16-transport aeron` 启动后，本地客户端正常，远端客户端连接失败或长时间无响应。
+
+### __关键过程、根本原因分析__
+
+常见原因：
+
+- 服务端未设置 `--vemb-v16-tcp-host`，通告了环回地址，远端客户端无法回连控制面。
+- 跨节点 UB 访问未配置 peer-view manifest（SDK 未调用 `vemb_v16_client_configure_ub_peer_view`），客户端无法把服务端设备路径翻译为本节点 import 设备。
+- 通道环设备号与 warm region 设备冲突（服务端 manifest 与 aeron-ub-path 用了同一设备）。
+
+### __结论、解决方案及效果__
+
+1. 跨节点部署显式设置 `--vemb-v16-tcp-host <本机对外IP>`。
+2. 客户端加载匹配的 peer-view manifest（`examples/vemb_v16_ub_peer_view_*.yaml`）。
+3. 检查设备布局：请求环/响应环/warm 三类设备互不重叠。
+4. 用 `benchmark/vemb_v16_topology_ctl --get` 确认拓扑与 `peer_attached=1`。
 
 ---
 

@@ -6,8 +6,10 @@
 
 - `redis-cli` 内置 VEMB V16 快速路径的正确用法。
 - `memtier_benchmark` 通过客户端 SDK 压测 HPC-Redis 的方法。
-- 单机 VEMB V16 端到端部署示例。
+- 单机 VEMB V16 端到端部署示例（TCP 与 Aeron 两种数据面）。
 - 跨节点多 SuperNode 部署示例。
+- 在线扩容（scaleout）与高可用（HA）回归。
+- 高维向量（dim 1024/2048/3072）与 VSIM_2KEY 负载。
 - 性能调优要点。
 - SVE flat load 与 memcpy 搬运路径的场景对比与切换方法。
 
@@ -47,7 +49,7 @@
 
 ## memtier_benchmark 调用 SDK 压测
 
-`memtier_benchmark` 的自定义分支（`UnifiedBus/memtier_benchmark`）已通过链接 `libvemb_v16_client.a` 集成 VEMB V16 协议，支持 `--protocol vemb_v16` 模式直接压测 HPC-Redis。
+`memtier_benchmark` 的自定义分支（`UnifiedBus/memtier_benchmark`）已通过链接 `libvemb_v16_client.a` 集成 VEMB V16 协议，支持 `--protocol vemb_v16` 模式直接压测 HPC-Redis。编译方法（先 SDK 后 memtier，目录须同级）见 [安装指南](installation_guide.md#编译-memtier_benchmarkvemb-v16-压测工具)。
 
 ```bash
 MEMTIER=/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark
@@ -177,6 +179,84 @@ taskset -c 0-95 $MEMTIER \
 # 3) 关闭双机
 /root/gqs/codespace/UnifiedBus/hpc-redis/output/src/redis-cli -h 192.168.90.111 -p 6379 SHUTDOWN NOSAVE
 ssh root@192.168.90.112 "/root/gqs/codespace/UnifiedBus/hpc-redis/output/src/redis-cli -p 6379 SHUTDOWN NOSAVE"
+```
+
+## 单机 Aeron 端到端部署（本地回环）
+
+Aeron 数据面 = TCP 控制面 + UB 环数据面。本地回环默认设备布局：请求环 shmdev1、warm region shmdev2（manifest 默认）、响应环 shmdev3。
+
+```bash
+HPC=/root/gqs/codespace/UnifiedBus/hpc-redis
+MEMTIER=/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark
+DIM=300; NUM_KEYS=100000; KEY_PREFIX="item:"
+
+# 1. 启动 server（transport=aeron + 两个环设备）
+taskset -c 0-95 $HPC/src/redis-server \
+  --port 6379 --bind 0.0.0.0 --protected-mode no \
+  --vemb-v16-enabled yes --vemb-v16-dim $DIM --vemb-v16-max-vectors 131072 \
+  --vemb-v16-warm-regions-manifest $HPC/examples/vemb_v16_warm_regions_111.yaml \
+  --vemb-v16-reset-warm-regions yes \
+  --vemb-v16-transport aeron \
+  --vemb-v16-aeron-ub-path /dev/obmm_shmdev1 \
+  --vemb-v16-aeron-response-ub-path /dev/obmm_shmdev2 \
+  --vemb-v16-proxy-io-threads 32 --vemb-v16-supernode-workers 64 \
+  --daemonize yes --loglevel notice
+
+# 2. 预填充 + 读吞吐（memtier 指定 aeron 传输）
+taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+  --vemb-v16-transport=aeron -s 127.0.0.1 -p 6379 \
+  -t 1 -c 1 -n $NUM_KEYS --ratio=1:0 --key-pattern=S:S \
+  --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS
+
+taskset -c 96-191 $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+  --vemb-v16-transport=aeron -s 127.0.0.1 -p 6379 \
+  -t 64 -c 4 --pipeline=32 --test-time=30 --ratio=0:1 --key-pattern=R:R \
+  --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS
+```
+
+一键脚本（参数全默认、可 env 覆盖）：`bash scripts/run_aeron_best.sh`。
+
+## 跨节点 Aeron 部署
+
+与单机的差异两处：服务端必须通告对外地址（`--vemb-v16-tcp-host <本机IP>`）；客户端（SDK）需加载 peer-view manifest 把服务端设备路径翻译为本节点 import 设备（`vemb_v16_client_configure_ub_peer_view`，manifest 见 `examples/vemb_v16_ub_peer_view_112_to_111*.yaml`）。完整流程见 `scripts/run_aeron_cross_node_flamegraph.sh`（单命令全流程，含拓扑发布与预热）与 `benchmark/vemb_v16_aeron_cluster_tput.sh`（集群口径，DIM 变体自动选 manifest）。
+
+## 在线扩容（scaleout）回归
+
+```bash
+# TCP 数据面：三段采集（baseline/during/after），结果落 benchmark/results/scaleout/
+bash scripts/hpc_redis_scaleout_throughput.sh
+# 冒烟：TEST_TIME=3 PREFILL_KEYS=1000 bash scripts/hpc_redis_scaleout_throughput.sh
+
+# Aeron 数据面扩容（Mac 侧执行）
+bash scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh
+```
+
+判据：迁移完成 `scaleout_all_sources_done=1`；扩容中（during 段）吞吐不归零即业务不中断。
+
+## 高可用（HA）failover 回归
+
+```bash
+# 1. keepalived 部署（详见使用手册 HA 章节；先 leader 后 standby 启动）
+scripts/deploy_keepalived_ha.sh --node 111 --priority 100 --vip 192.168.90.202/24 deploy
+scripts/deploy_keepalived_ha.sh --node 112 --priority 90  --vip 192.168.90.202/24 deploy
+
+# 2. 端到端 failover 回归（副本追平 + 主备切换 + 反向）
+benchmark/tlc_ha_replica_ub_111_to_112.sh        # UB 副本恢复
+benchmark/tlc_ha_aeron_failover_111_to_112.sh    # Aeron failover；反向：INITIAL_NODE=112 CLIENT_NODE=112
+```
+
+## 高维向量与 VSIM_2KEY
+
+```bash
+# 高维（以 dim=1024 为例；2048/3072 同理，manifest 按后缀选择）
+DIM=1024 MANIFEST=examples/cluster_111_dim1024.yaml ...（启动命令同上，仅换 dim 与 manifest）
+
+# VSIM_2KEY 负载（双 key 取回 + 服务端余弦）
+$MEMTIER --protocol vemb_v16 --vemb-v16-dim 300 \
+  --vemb-v16-vsim-key-key -s 127.0.0.1 -p 6379 -t 64 -c 4 --pipeline=32 \
+  --test-time=30 --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
+  --key-minimum=1 --key-maximum=100000
+# 双节点对比回归：benchmark/run_vsim_2key_2node.sh
 ```
 
 ## 性能调优

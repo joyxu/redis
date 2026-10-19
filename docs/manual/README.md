@@ -7,10 +7,14 @@ HPC-Redis 是基于 **灵衢 UB.MEM 远程内存**、 **鲲鹏处理器内置 SV
 HPC-Redis 的核心特点：
 
 - **集成版 `redis-server`**：VEMB V16 向量协议直接内嵌进 Redis 主进程，通过 Redis 端口同时承载 RESP 协议与 VEMB V16 二进制协议，无需独立部署额外的向量服务进程。
-- **四类向量操作**：在原有 RESP 命令基础上新增 `VADD`（写入）、`VEMB`（读取）、`VSIM`（余弦相似度）、`VREM`（删除）四种向量操作，覆盖向量检索的主要路径。
-- **UB.MEM 三层缓存**：通过鲲鹏 UB.MEM 设备（`/dev/obmm_shmdev{1..8}`）将远端节点内存映射为本地热区（warm region），由 pfn-map 承载，构建 "本地 DRAM / UB 热区 / 冷存储" 三层缓存层次。
+- **四类向量操作**：在原有 RESP 命令基础上新增 `VADD`（写入）、`VEMB`（读取）、`VSIM`（余弦相似度）、`VREM`（删除）四种向量操作，覆盖向量检索的主要路径；另支持 `VSIM_2KEY` 双 key 余弦负载（经 memtier `--vemb-v16-vsim-key-key`，双 key 取回 + 服务端相似度）。
+- **Aeron 数据面**：除 TCP 外提供 Aeron 传输（TCP 控制面 + UB 共享内存环数据面，v1 双环 + v2 batch 四区通道），单机 17:17 配置实测读吞吐可达 3000 万 ops/s 量级。`vemb-v16-transport sniff|aeron` 一键切换。
+- **UB.MEM 三层缓存 + COLD 持久化**：通过鲲鹏 UB.MEM 设备（`/dev/obmm_shmdev{1..16}`）将远端节点内存映射为本地热区（warm region），由 pfn-map 承载，构建 "本地 DRAM / UB 热区 / COLD 冷存储" 三层缓存层次；设置 `HPC_REDIS_COLD_DIR` 即启用 COLD 持久化与重启恢复。
+- **高可用（HA）**：keepalived VIP 故障迁移 + 心跳检测 + HA Replica 副本恢复 + 跨节点重同步，单 owner 故障后 standby 接管数据面。
+- **在线扩容（scaleout）**：双节点拓扑在线变更（active 0 → active {0,1}）+ 数据迁移，TCP 与 Aeron 两种数据面均支持，扩容过程业务不中断。
 - **SVE2 / SVE 向量化计算**：在支持 SVE 的鲲鹏处理器上，向量搬运与相似度计算使用 `svld1_f32` 等 SVE 指令（`ld1w`），相较 `memcpy` 在远端 UB 内存场景获得显著吞吐提升。
 - **客户端 SDK**：提供 C 语言静态库 `libvemb_v16_client.a` 与动态库 `libvemb_v16_client.so`，封装 HELLO/WELCOME 握手、请求/响应帧序列化、多端点一致性哈希路由与拓扑重试，业务侧链接 SDK 即可访问向量快速路径。
+- **拓扑运维工具**：`vemb_v16_topology_ctl` 支持拓扑查询/发布（`--get` / `--set` / `--set-with-peer-view-map`）、运行统计与扩容协调器模式。
 
 
 ## 能力支持与规格
@@ -22,6 +26,7 @@ HPC-Redis 的核心特点：
 | 写入 | `VADD` | 向指定集合写入一个向量 | 支持 |
 | 读取 | `VEMB` | 取回指定元素的向量（inline vector） | 支持 |
 | 相似度 | `VSIM` | 计算指定元素与 query 向量的余弦相似度 | 支持 |
+| 双 key 相似度 | `VSIM_2KEY` | 双 key 取回 + 服务端余弦（memtier `--vemb-v16-vsim-key-key` 负载） | 支持 |
 | 删除 | `VREM` | 从集合中删除指定元素（幂等） | 支持 |
 
 
@@ -54,7 +59,7 @@ HPC-Redis 的核心特点：
 | 处理器 | 鲲鹏 920 / 鲲鹏 930（aarch64，支持 SVE / SVE2 256-bit） |
 | 核数 | 单机 192 核（2 socket × 96 核，典型配置） |
 | 内存 | 单机 ≥ 256 GB DDR4 / DDR5 |
-| UB.MEM 设备 | `/dev/obmm_shmdev{1..8}`，通过 `obmmctl` 初始化；跨节点 SNP（Scalable Node Platform）按需启用 |
+| UB.MEM 设备 | `/dev/obmm_shmdev{1..16}`（8 个本地 export + 8 个对端 import，各 8 GiB），通过 `obmmctl` 初始化；跨节点 SNP（Scalable Node Platform）按需启用 |
 | 网络 | 节点间 100 GbE RoCE（mlx5）或 10 GbE TCP；跨节点部署要求网卡带宽 ≥ 预期向量读吞吐 |
 | 存储 | 本地 NVMe SSD（持久化关闭时非必需） |
 
