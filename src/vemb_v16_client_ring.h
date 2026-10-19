@@ -20,6 +20,19 @@ void sve_streaming_load_f32(const void *src, void *dst, size_t size);
     (VEMB_V16_CLIENT_MAX_BATCH_PIPELINE * 2u)
 #define VEMB_V16_CLIENT_RING_MASK (VEMB_V16_CLIENT_RING_SIZE - 1u)
 #define RING_SLOT_META_BYTES CACHELINE_SIZE
+#define RING_SLOT_SEQ_OFFSET 8u
+
+/* The sequence is the slot's ownership/visibility token.  Even values are
+ * committed generations; the corresponding odd value means that the producer
+ * is currently rewriting the slot.  It lives in the already reserved
+ * metadata cache line, so this protocol does not change payload offsets. */
+static inline atomic_uint_fast64_t *ring_slot_seq(uint8_t *slot) {
+    return (atomic_uint_fast64_t *)(slot + RING_SLOT_SEQ_OFFSET);
+}
+
+static inline uint64_t ring_slot_committed_seq(uint64_t logical_index) {
+    return (logical_index + 1u) << 1;
+}
 
 
 typedef struct vemb_v16_client_ring {
@@ -70,9 +83,15 @@ static inline ring_rc_t vemb_v16_client_publish(
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
     if (tail - head >= ring->slot_count) return RING_ERR_FULL;
     uint8_t *slot = ring_slot_base(ring, tail);
+    atomic_store_explicit(ring_slot_seq(slot),
+                          ring_slot_committed_seq(tail) | 1u,
+                          memory_order_relaxed);
     sve_streaming_load_f32(data,
                            slot + RING_SLOT_META_BYTES, len);
     *(uint32_t *)slot = len;
+    atomic_store_explicit(ring_slot_seq(slot),
+                          ring_slot_committed_seq(tail),
+                          memory_order_release);
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
     return RING_OK;
 }
@@ -88,11 +107,17 @@ static inline ring_rc_t vemb_v16_client_publish_batch(
     const uint8_t *src = slots;
     for (uint32_t i = 0; i < count; i++) {
         uint8_t *slot = ring_slot_base(ring, tail + i);
+        atomic_store_explicit(ring_slot_seq(slot),
+                              ring_slot_committed_seq(tail + i) | 1u,
+                              memory_order_relaxed);
         sve_streaming_load_f32(
             src + (size_t)i * len,
             slot + RING_SLOT_META_BYTES,
             len);
         *(uint32_t *)slot = len;
+        atomic_store_explicit(ring_slot_seq(slot),
+                              ring_slot_committed_seq(tail + i),
+                              memory_order_release);
     }
     atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
     return RING_OK;
@@ -114,11 +139,17 @@ static inline ring_rc_t vemb_v16_client_publish_ptr_batch(
     for (uint32_t i = 0; i < count; i++) {
         RETURN_IF(!data[i] || lens[i] > ring->slot_size, RING_ERR_INVALID);
         uint8_t *slot = ring_slot_base(ring, tail + i);
+        atomic_store_explicit(ring_slot_seq(slot),
+                              ring_slot_committed_seq(tail + i) | 1u,
+                              memory_order_relaxed);
         sve_streaming_load_f32(
             data[i],
             slot + RING_SLOT_META_BYTES,
             lens[i]);
         *(uint32_t *)slot = lens[i];
+        atomic_store_explicit(ring_slot_seq(slot),
+                              ring_slot_committed_seq(tail + i),
+                              memory_order_release);
     }
     atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
     return RING_OK;
@@ -130,14 +161,20 @@ static inline int vemb_v16_client_poll(vemb_v16_client_ring_t *ring,
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
     if (head >= tail) return 0;
-    uint32_t len = *(uint32_t *)ring_slot_base(ring, head);
+    uint8_t *slot = ring_slot_base(ring, head);
+    uint64_t expected = ring_slot_committed_seq(head);
+    if (atomic_load_explicit(ring_slot_seq(slot), memory_order_acquire) != expected)
+        return 0;
+    uint32_t len = *(uint32_t *)slot;
     if (len > ring->slot_size) len = ring->slot_size;
     if (len > max_len) len = max_len;
     sve_streaming_load_f32(
-        ring_slot_base(ring, head) +
-            RING_SLOT_META_BYTES,
+        slot + RING_SLOT_META_BYTES,
         data,
         len);
+    atomic_thread_fence(memory_order_acquire);
+    if (atomic_load_explicit(ring_slot_seq(slot), memory_order_acquire) != expected)
+        return 0;
     atomic_store_explicit(&ring->head, head + 1, memory_order_release);
     return (int)len;
 }
@@ -151,8 +188,12 @@ static inline uint32_t vemb_v16_client_poll_batch(
     if (available == 0 || max_count == 0) return 0;
     if (available > max_count) available = max_count;
     uint8_t *dst = slots;
+    uint32_t consumed = 0;
     for (uint32_t i = 0; i < (uint32_t)available; i++) {
         uint8_t *slot = ring_slot_base(ring, head + i);
+        uint64_t expected = ring_slot_committed_seq(head + i);
+        if (atomic_load_explicit(ring_slot_seq(slot), memory_order_acquire) != expected)
+            break;
         uint32_t len = *(uint32_t *)slot;
         if (len > ring->slot_size) len = ring->slot_size;
         uint32_t copy_len = len > max_len ? max_len : len;
@@ -161,9 +202,14 @@ static inline uint32_t vemb_v16_client_poll_batch(
             slot + RING_SLOT_META_BYTES,
             dst + (size_t)i * max_len,
             copy_len);
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(ring_slot_seq(slot), memory_order_acquire) != expected)
+            break;
+        consumed++;
     }
-    atomic_store_explicit(&ring->head, head + available, memory_order_release);
-    return (uint32_t)available;
+    if (consumed != 0)
+        atomic_store_explicit(&ring->head, head + consumed, memory_order_release);
+    return consumed;
 }
 
 static inline uint32_t vemb_v16_client_peek_batch(vemb_v16_client_ring_t *ring,
