@@ -341,7 +341,7 @@ sleep "$START_DELAY_SECONDS"
 remote "$NODE111_PORT" "$NODE111_SSH" "$m6_retention_leader_command" >"$LEADER_LOG.m6-retention" 2>&1
 wait "$m6_retention_follower_ssh_pid"
 grep -q 'HA Replica AOF retention missing' "$LEADER_LOG.m6-retention"
-grep -q 'HA resync handoff complete:.*H=97' "$LEADER_LOG.m6-retention"
+grep -q 'HA resync handoff commit: session=.* H=98' "$LEADER_LOG.m6-retention"
 grep -q 'leader M6 retention PASS accepted=98' "$LEADER_LOG.m6-retention"
 grep -q 'follower M6 retention PASS durable=98' "$FOLLOWER_LOG.m6-retention"
 cat "$LEADER_LOG.m6-retention"

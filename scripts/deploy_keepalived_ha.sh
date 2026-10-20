@@ -2,11 +2,11 @@
 # Build, install, configure, and control keepalived 1.2.2 for HPC-Redis HA.
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-43.154.145.18}"
+REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_PORT="${REMOTE_PORT:-8111}"
+REMOTE_PORT="${REMOTE_PORT:-}"
 NODE_ID="${NODE_ID:-111}"
-LVS_KEEPALIVED_ROOT="${LVS_KEEPALIVED_ROOT:-/root/szz/codespace/LVS/tools/keepalived}"
+LVS_KEEPALIVED_ROOT="${LVS_KEEPALIVED_ROOT:-/root/gqs/codespace/LVS/tools/keepalived}"
 INSTALL_ROOT="${KEEPALIVED_INSTALL_ROOT:-/opt/hpc-redis/keepalived}"
 CONFIG_PATH="${KEEPALIVED_CONFIG:-/etc/keepalived/keepalived.conf}"
 PID_DIR="${KEEPALIVED_PID_DIR:-/run/hpc-redis-keepalived}"
@@ -79,8 +79,14 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$NODE_ID" in
-    111) [ -n "$INTERFACE" ] || INTERFACE=eth1; [ -n "$PRIORITY" ] || PRIORITY=100 ;;
-    112) [ -n "$INTERFACE" ] || INTERFACE=eth0; [ -n "$PRIORITY" ] || PRIORITY=90; [ "$REMOTE_PORT" = 8111 ] && REMOTE_PORT=8112 ;;
+    111) [ -n "$REMOTE_HOST" ] || REMOTE_HOST=192.168.90.161
+          [ -n "$REMOTE_PORT" ] || REMOTE_PORT=22
+          [ -n "$INTERFACE" ] || INTERFACE=enp39s0f1
+          [ -n "$PRIORITY" ] || PRIORITY=100 ;;
+    112) [ -n "$REMOTE_HOST" ] || REMOTE_HOST=192.168.90.162
+          [ -n "$REMOTE_PORT" ] || REMOTE_PORT=22
+          [ -n "$INTERFACE" ] || INTERFACE=enp33s0f0
+          [ -n "$PRIORITY" ] || PRIORITY=90 ;;
     *) die "--node must be 111 or 112" ;;
 esac
 [ "$ACTION" = status ] || case "$VIP" in */*) : ;; *) die "--vip CIDR is required" ;; esac
@@ -95,7 +101,6 @@ esac
         [ "$((10#$vip_octet))" -le 255 ] || die "VIP octet out of range: $vip_octet"
     done
 }
-[ "$ALL_NODES" -eq 0 ] || [ "$REMOTE_PORT" = 8111 ] || [ "$REMOTE_PORT" = 8112 ] || die "--all requires ssh port 8111 or 8112"
 
 render_config() {
     local output="$1"
@@ -204,10 +209,13 @@ do_action() {
 }
 
 if [ "$ALL_NODES" -eq 1 ]; then
-    for node_port in 8111:111 8112:112; do
-        REMOTE_PORT="${node_port%%:*}"
-        NODE_ID="${node_port##*:}"
-        if [ "$NODE_ID" = 111 ]; then INTERFACE=eth1; PRIORITY=100; else INTERFACE=eth0; PRIORITY=90; fi
+    for node in 111 112; do
+        NODE_ID="$node"
+        REMOTE_HOST=""; REMOTE_PORT=""; INTERFACE=""; PRIORITY=""
+        case "$NODE_ID" in
+            111) REMOTE_HOST=192.168.90.161; REMOTE_PORT=22; INTERFACE=enp39s0f1; PRIORITY=100 ;;
+            112) REMOTE_HOST=192.168.90.162; REMOTE_PORT=22; INTERFACE=enp33s0f0; PRIORITY=90 ;;
+        esac
         do_action
     done
 else

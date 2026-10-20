@@ -85,6 +85,9 @@ HPC-Redis 的核心特点：
 | [快速入门](quick_start.md) | 一键启动 HPC-Redis、通过 `redis-cli` 快速验证向量操作、通过 SDK 端到端示例验证完整链路。 |
 | [使用手册](user_guide.md) | 启动参数与配置文件、客户端 SDK 同步 / Pipeline / 异步 API、多端点集成示例、日志与运行时统计、关闭服务。 |
 | [最佳实践](best_practices.md) | `redis-cli` 快速路径使用、`memtier_benchmark` 压测、单机 / 跨节点部署示例、性能调优、SVE 与 memcpy 场景对比。 |
+| [KVC 架构文档：TE over ubmem](kvc_ubmem_architecture.md) | TE over ubmem 传输层的实现方案：设备窗抽象、数据面设计、跨节点镜像机制与 store 层接线。 |
+| [KVC 用户指南：TE over ubmem](kvc_ubmem_user_guide.md) | TE over ubmem 的编译开关、环境变量、窗口分区规则与单机 / 跨节点使用方法。 |
+| [KVC 测试方案：四条读路径对比](kvc_test_plan.md) | TE over TCP / URMA / ubmem / cxl 的同口径对比测试方法、结果判读与参考数据。 |
 | [FAQ](faq.md) | 硬件、UB.MEM 设备、安装编译、运行验证、性能异常等常见问题与排障方法。 |
 
 ---

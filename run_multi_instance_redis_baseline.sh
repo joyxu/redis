@@ -26,8 +26,8 @@
 set -uo pipefail
 
 # === 拓扑 ===
-CLIENT=${CLIENT:-HW02}
-SERVER_HOST=${SERVER_HOST:-192.168.1.111}
+CLIENT=${CLIENT:-root@192.168.90.162}
+SERVER_HOST=${SERVER_HOST:-192.168.1.161}
 BASE_PORT=${BASE_PORT:-7001}
 CODE_DIR=${CODE_DIR:-/root/gqs/codespace/redis-8.6.3}
 MEMTIER_DIR=${MEMTIER_DIR:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin}
@@ -45,7 +45,7 @@ TEST_TIME=${TEST_TIME:-30}
 RAW=${RAW:-0}
 RAW_SUFFIX=""
 [ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
-NIC_IFACE=${NIC_IFACE:-eth4}
+NIC_IFACE=${NIC_IFACE:-enp33s0f1np1}
 
 # === 9 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
 # 7 档精简矩阵 (原 9 档, 20260826 削减: 保留低并发斜率 + 高并发饱和 + 两条 c 扫描)

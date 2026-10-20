@@ -8,28 +8,28 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-SERVER_NODE="${SERVER_NODE:-43.154.145.18}"
-CLIENT_NODE="${CLIENT_NODE:-43.154.145.18}"
+SERVER_NODE="${SERVER_NODE:-192.168.90.161}"
+CLIENT_NODE="${CLIENT_NODE:-192.168.90.162}"
 SSH_USER="${SSH_USER:-root}"
-SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-8111}}"
-CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-8112}}"
+SERVER_SSH_PORT="${SERVER_SSH_PORT:-${SSH_PORT:-22}}"
+CLIENT_SSH_PORT="${CLIENT_SSH_PORT:-${SSH_PORT:-22}}"
 SERVER_ROOT="${SERVER_ROOT:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 CLIENT_ROOT="${CLIENT_ROOT:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 FLAMEGRAPH_DIR="${FLAMEGRAPH_DIR:-/root/FlameGraph}"
 
-SERVER_IP="${SERVER_IP:-192.168.90.111}"
+SERVER_IP="${SERVER_IP:-192.168.1.161}"   # 数据端点: 100G (SERVER_NODE 才是 ssh 目标)
 PORT="${PORT:-6395}"
 # Warm uses dev4 on 111, dev8 on 112. Request/response pair: 111 dev3/dev6
 # -> 112 dev7/dev2.
 SERVER_MANIFEST="${SERVER_MANIFEST:-$SERVER_ROOT/examples/vemb_perf_warm_111.yaml}"
 SERVER_REQUEST_UB_PATH="${SERVER_REQUEST_UB_PATH:-/dev/obmm_shmdev3}"
-SERVER_RESPONSE_UB_PATH="${SERVER_RESPONSE_UB_PATH:-/dev/obmm_shmdev6}"
+SERVER_RESPONSE_UB_PATH="${SERVER_RESPONSE_UB_PATH:-/dev/obmm_shmdev10}"
 SERVER_WARM_UB_PATH="${SERVER_WARM_UB_PATH:-/dev/obmm_shmdev4}"
 # CLI@112 paths use 111 request/response Export 3/6 -> Import 7/2.
 # Warm Export dev4 -> Import dev8.
-CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev7}"
+CLIENT_REQUEST_UB_PATH="${CLIENT_REQUEST_UB_PATH:-/dev/obmm_shmdev11}"
 CLIENT_RESPONSE_UB_PATH="${CLIENT_RESPONSE_UB_PATH:-/dev/obmm_shmdev2}"
-CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev8}"
+CLIENT_WARM_UB_PATH="${CLIENT_WARM_UB_PATH:-/dev/obmm_shmdev12}"
 CLIENT_PEER_VIEW_MANIFEST="${CLIENT_PEER_VIEW_MANIFEST:-$CLIENT_ROOT/examples/vemb_v16_ub_peer_view_112_to_111.yaml}"
 CLIENT_PEER_VIEW_HOST="${CLIENT_PEER_VIEW_HOST:-112}"
 CLIENT_PEER_VIEW_OWNER_ID="${CLIENT_PEER_VIEW_OWNER_ID:-0}"
@@ -37,7 +37,7 @@ AERON_UB_CACHEABLE="${AERON_UB_CACHEABLE:-0}"
 # Device paths reserved on 111/112 (not used by this benchmark).
 # Override explicitly when running against a different allocation.
 SERVER_RESERVED_UB_PATHS="${SERVER_RESERVED_UB_PATHS:-/dev/obmm_shmdev13}"
-CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev9}"
+CLIENT_RESERVED_UB_PATHS="${CLIENT_RESERVED_UB_PATHS:-/dev/obmm_shmdev5}"
 
 DIM="${DIM:-300}"
 MAX_VECTORS="${MAX_VECTORS:-131072}"
@@ -142,8 +142,8 @@ The default is the 111 -> 112 setup:
   SSH server (111)=root@43.154.145.18:8111, client (112)=root@43.154.145.18:8112
   server=192.168.90.111:6395, client=192.168.90.112 (internal network)
   100k R:R reads, dim=300, t=64, c=4, pipeline=32, batch=32
-  server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev6
-  server warm=/dev/obmm_shmdev4; client request/response/warm=/dev/obmm_shmdev7,/dev/obmm_shmdev2,/dev/obmm_shmdev8
+  server request/response=/dev/obmm_shmdev3,/dev/obmm_shmdev10
+  server warm=/dev/obmm_shmdev4; client request/response/warm=/dev/obmm_shmdev11,/dev/obmm_shmdev2,/dev/obmm_shmdev12
   peer-view=CLI@112 -> owner 0@111, using examples/vemb_v16_ub_peer_view_112_to_111.yaml
 
 Important environment variables:
@@ -557,7 +557,6 @@ cd "$root"
 setsid -f taskset -c "$cpu_mask" ./src/redis-server \
     --port "$port" --bind "$server_ip" --protected-mode no \
     --vemb-v16-enabled yes --vemb-v16-dim "$dim" \
-    --vemb-v16-max-vectors "$max_vectors" \
     --vemb-v16-warm-regions-manifest "$manifest" \
     --vemb-v16-reset-warm-regions yes \
     --vemb-v16-transport aeron \

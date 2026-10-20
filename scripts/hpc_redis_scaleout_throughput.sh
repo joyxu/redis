@@ -30,24 +30,24 @@ esac
 # ============================================================================
 # 网络拓扑
 # ============================================================================
-NODE0_HOST="${NODE0_HOST:-192.168.1.111}"
-NODE1_HOST="${NODE1_HOST:-192.168.1.112}"
+NODE0_HOST="${NODE0_HOST:-192.168.1.161}"
+NODE1_HOST="${NODE1_HOST:-192.168.1.162}"
 SSH_USER="${SSH_USER:-root}"
-NODE0_SSH_HOST="${NODE0_SSH_HOST:-192.168.1.111}"
+NODE0_SSH_HOST="${NODE0_SSH_HOST:-192.168.90.161}"
 NODE0_SSH_PORT="${NODE0_SSH_PORT:-22}"
-NODE1_SSH_HOST="${NODE1_SSH_HOST:-192.168.1.112}"
+NODE1_SSH_HOST="${NODE1_SSH_HOST:-192.168.90.162}"
 NODE1_SSH_PORT="${NODE1_SSH_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 # memtier 执行节点 (client 负载机, 与 server 分离以排除 client 干扰)
-MEMTIER_HOST="${MEMTIER_HOST:-192.168.1.21}"   # HW04
+MEMTIER_HOST="${MEMTIER_HOST:-192.168.1.163}"  # HW03(163) 未部署，跑前确认
 
 PAYLOAD_LOCAL_PATH="${PAYLOAD_LOCAL_PATH:-/dev/obmm_shmdev1}"
-PAYLOAD_PEER_PATH="${PAYLOAD_PEER_PATH:-/dev/obmm_shmdev5}"
+PAYLOAD_PEER_PATH="${PAYLOAD_PEER_PATH:-/dev/obmm_shmdev9}"
 REQUEST_LOCAL_PATH="${REQUEST_LOCAL_PATH:-/dev/obmm_shmdev2}"
-REQUEST_PEER_PATH="${REQUEST_PEER_PATH:-/dev/obmm_shmdev6}"
+REQUEST_PEER_PATH="${REQUEST_PEER_PATH:-/dev/obmm_shmdev10}"
 RESPONSE_LOCAL_PATH="${RESPONSE_LOCAL_PATH:-/dev/obmm_shmdev4}"
-RESPONSE_PEER_PATH="${RESPONSE_PEER_PATH:-/dev/obmm_shmdev8}"
+RESPONSE_PEER_PATH="${RESPONSE_PEER_PATH:-/dev/obmm_shmdev12}"
 
 # ============================================================================
 # server 参数

@@ -4,7 +4,7 @@
 # run_redis_cluster_vemb.sh
 # 4 节点原生 redis cluster (baseline redis-8.6.3) VEMB 吞吐/延迟 9 档 sweep
 #
-# 拓扑: HW01/HW02/HW05/HW04 每节点 1 个 redis 实例, cluster mode
+# 拓扑: HW01/HW02/HW04/HW05 每节点 1 个 redis 实例, cluster mode
 # 网络: 192.168.1.x (100G mlx5 直连), data port 7000, cluster bus 17000
 # 测试: prefill 多 vset -> memtier --cluster-mode VEMB
 #
@@ -18,8 +18,8 @@
 set -uo pipefail
 
 # === 节点 ===
-declare -a NODES=("HW01" "HW02" "HW05" "HW04")
-declare -a IPS=("192.168.1.111" "192.168.1.112" "192.168.1.20" "192.168.1.21")
+declare -a NODES=("HW01" "HW02" "HW04" "HW05")  # 下标配对 IPS: 161/162/163/164
+declare -a IPS=("192.168.1.161" "192.168.1.162" "192.168.1.163" "192.168.1.164")
 NNODES=${#NODES[@]}
 
 # === 路径 ===

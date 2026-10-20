@@ -15,12 +15,12 @@
 set -uo pipefail
 
 # === 拓扑 ===
-HW01_IP=${HW01_IP:-192.168.1.111}
-HW02_IP=${HW02_IP:-192.168.1.112}
+HW01_IP=${HW01_IP:-192.168.1.161}
+HW02_IP=${HW02_IP:-192.168.1.162}
 SERVER_PORT=${SERVER_PORT:-6390}
-CLIENT=${CLIENT:-HW02}
-NIC_IFACE=${NIC_IFACE:-eth4}
-HW02_NIC_IFACE=${HW02_NIC_IFACE:-eth3}
+CLIENT=${CLIENT:-root@192.168.90.162}
+NIC_IFACE=${NIC_IFACE:-enp33s0f1np1}
+HW02_NIC_IFACE=${HW02_NIC_IFACE:-enp38s0f1np1}
 
 # === client NUMA pinning (when CLIENT=HW02, keep off server cores 0-47) ===
 CLIENT_CPUSET=${CLIENT_CPUSET:-96-191}
@@ -101,8 +101,8 @@ setup_client() {
 # ============================================================================
 deploy_hw02_manifest() {
     log "=== 部署 manifest + 环境到 HW02 ==="
-    ssh HW02 "mkdir -p $HPC_DIR/examples $DATA_DIR" 2>/dev/null
-    scp "$HW02_MANIFEST" "HW02:$HPC_DIR/examples/cluster_112.yaml" 2>/dev/null
+    ssh "$CLIENT" "mkdir -p $HPC_DIR/examples $DATA_DIR" 2>/dev/null
+    scp "$HW02_MANIFEST" "$CLIENT:$HPC_DIR/examples/cluster_112.yaml" 2>/dev/null
     log "  cluster_112.yaml -> HW02:$HPC_DIR/examples/"
 }
 
@@ -139,9 +139,9 @@ start_server_hw01() {
 
 start_server_hw02() {
     log "  启动 HW02 hpc-redis (pio=$HPC_PIO snw=$HPC_SNW)..."
-    ssh HW02 "pkill -9 -f 'redis-server.*:$SERVER_PORT' 2>/dev/null; sleep 1; mkdir -p $DATA_DIR"
+    ssh "$CLIENT" "pkill -9 -f 'redis-server.*:$SERVER_PORT' 2>/dev/null; sleep 1; mkdir -p $DATA_DIR"
     local max_vec=$((NUM_KEYS + 1000))
-    ssh HW02 "taskset -c 0-47 \
+    ssh "$CLIENT" "taskset -c 0-47 \
         $HPC_DIR/src/redis-server \
             --port $SERVER_PORT --bind 0.0.0.0 --protected-mode no \
             --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
@@ -157,17 +157,17 @@ start_server_hw02() {
             --dir $DATA_DIR --logfile $DATA_DIR/hw02.log \
             --daemonize yes"
     for _ in $(seq 1 60); do
-        ssh HW02 "ss -tln | grep -q ':$SERVER_PORT '" 2>/dev/null && break
+        ssh "$CLIENT" "ss -tln | grep -q ':$SERVER_PORT '" 2>/dev/null && break
         sleep 0.25
     done
-    ssh HW02 "ss -tln | grep -q ':$SERVER_PORT '" 2>/dev/null || { log "FAIL: HW02 server not listening"; return 1; }
+    ssh "$CLIENT" "ss -tln | grep -q ':$SERVER_PORT '" 2>/dev/null || { log "FAIL: HW02 server not listening"; return 1; }
     log "  HW02 server ready"
 }
 
 stop_servers() {
     log "  关闭所有 server..."
     pkill -9 -f "redis-server.*:$SERVER_PORT" 2>/dev/null || true
-    ssh HW02 "pkill -9 -f 'redis-server.*:$SERVER_PORT'" 2>/dev/null || true
+    ssh "$CLIENT" "pkill -9 -f 'redis-server.*:$SERVER_PORT'" 2>/dev/null || true
     sleep 2
 }
 
@@ -230,12 +230,12 @@ run_one_config() {
 
     # === jiffies before ===
     read j0_ut_hw01 j0_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
-    read j0_ut_hw02 j0_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    read j0_ut_hw02 j0_st_hw02 < <(ssh "$CLIENT" "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
     JB_NS=$(date +%s%N)
     local si0_hw01=$(snapshot_si)
-    local si0_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
+    local si0_hw02=$(ssh "$CLIENT" "$(declare -f snapshot_si); snapshot_si")
     local rss0_hw01=$(snapshot_rss $SERVER_PORT)
-    local rss0_hw02=$(ssh HW02 "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
+    local rss0_hw02=$(ssh "$CLIENT" "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
 
     # === SAR 双机同时启动 ===
     local sar01="$RAWDIR/sar_hw01_t${t}_c${c}_p${p}.log"
@@ -244,7 +244,7 @@ run_one_config() {
     local sar_dur=$((TEST_TIME + 5))
     sar -n DEV 1 $sar_dur > "$sar01" 2>&1 &
     local sar01_pid=$!
-    ssh HW02 "sar -n DEV 1 $sar_dur" > "$sar02" 2>&1 &
+    ssh "$CLIENT" "sar -n DEV 1 $sar_dur" > "$sar02" 2>&1 &
     local sar02_pid=$!
     sleep 1
 
@@ -266,16 +266,16 @@ run_one_config() {
 
     # === jiffies after ===
     read j1_ut_hw01 j1_st_hw01 < <(snapshot_jiffies $SERVER_PORT)
-    read j1_ut_hw02 j1_st_hw02 < <(ssh HW02 "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
+    read j1_ut_hw02 j1_st_hw02 < <(ssh "$CLIENT" "$(declare -f snapshot_jiffies); snapshot_jiffies $SERVER_PORT")
     JA_NS=$(date +%s%N)
     ELAPSED_NS=$((JA_NS - JB_NS > 0 ? JA_NS - JB_NS : TEST_TIME * 1000000000))
     # core 分母 = 纳秒实测窗口 (与脚本13对齐)
     local cores01=$(awk -v d=$(((j1_ut_hw01 + j1_st_hw01) - (j0_ut_hw01 + j0_st_hw01))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local cores02=$(awk -v d=$(((j1_ut_hw02 + j1_st_hw02) - (j0_ut_hw02 + j0_st_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local si1_hw01=$(snapshot_si)
-    local si1_hw02=$(ssh HW02 "$(declare -f snapshot_si); snapshot_si")
+    local si1_hw02=$(ssh "$CLIENT" "$(declare -f snapshot_si); snapshot_si")
     local rss1_hw01=$(snapshot_rss $SERVER_PORT)
-    local rss1_hw02=$(ssh HW02 "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
+    local rss1_hw02=$(ssh "$CLIENT" "$(declare -f snapshot_rss); snapshot_rss $SERVER_PORT")
     # sum across both server nodes
     local core_ut=$(awk -v d=$(((j1_ut_hw01 - j0_ut_hw01) + (j1_ut_hw02 - j0_ut_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')
     local core_st=$(awk -v d=$(((j1_st_hw01 - j0_st_hw01) + (j1_st_hw02 - j0_st_hw02))) -v s=$ELAPSED_NS 'BEGIN{printf "%.2f", d/100.0/(s/1000000000)}')

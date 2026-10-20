@@ -7,7 +7,7 @@
 #
 # 使用方法（所有参数都有默认值，按需覆盖）：
 #   bash run_aeron_best.sh
-#   NODE=43.154.145.18 SSH_PORT=8112 REMOTE_DIR=/root/szz/codespace/hpc-redis \
+#   NODE=192.168.90.162 SSH_PORT=22 REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis \
 #   BUILD=0 WORKERS=21:21 TS=64 CS=4 PIPELINE=32 bash run_aeron_best.sh
 #   ssh HW01 'TEST_TIME=60 bash /root/gqs/codespace/UnifiedBus/test_hpc/run_aeron_best.sh'
 #
@@ -37,9 +37,9 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 HPC=${HPC:-$(cd "$SCRIPT_DIR/.." && pwd -P)}
-NODE=${NODE:-43.154.145.18}
-SSH_PORT=${SSH_PORT:-8112}
-REMOTE_DIR=${REMOTE_DIR:-/root/szz/codespace/hpc-redis}
+NODE=${NODE:-192.168.90.161}
+SSH_PORT=${SSH_PORT:-22}
+REMOTE_DIR=${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}
 REMOTE_RESULT_ROOT=/tmp/aeron_sweep
 RUN_LOCAL=${RUN_LOCAL:-0}
 REMOTE_CHILD=${AERON_BEST_REMOTE_CHILD:-0}

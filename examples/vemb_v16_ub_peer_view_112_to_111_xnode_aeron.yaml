@@ -68,14 +68,14 @@ peer_views:
     resource_id: owner111-v1-request
     generation: 1
     provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    client_path: /dev/obmm_shmdev11
     map_from_start: true
   - client_host: 112
     owner_id: 0
     resource_role: v1_response_ring
     resource_id: owner111-v1-response
     generation: 1
-    provider_path: /dev/obmm_shmdev6
+    provider_path: /dev/obmm_shmdev10
     client_path: /dev/obmm_shmdev2
     map_from_start: true
   - client_host: 112
@@ -84,7 +84,7 @@ peer_views:
     resource_id: owner111-warm
     generation: 1
     provider_path: /dev/obmm_shmdev4
-    client_path: /dev/obmm_shmdev8
+    client_path: /dev/obmm_shmdev12
     map_from_start: true
   - client_host: 112
     owner_id: 0
@@ -92,7 +92,7 @@ peer_views:
     resource_id: owner111-v2-request-descriptor
     generation: 1
     provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    client_path: /dev/obmm_shmdev11
     map_from_start: true
   - client_host: 112
     owner_id: 0
@@ -100,14 +100,14 @@ peer_views:
     resource_id: owner111-v2-request-arena
     generation: 1
     provider_path: /dev/obmm_shmdev3
-    client_path: /dev/obmm_shmdev7
+    client_path: /dev/obmm_shmdev11
     map_from_start: true
   - client_host: 112
     owner_id: 0
     resource_role: v2_response_descriptor
     resource_id: owner111-v2-response-descriptor
     generation: 1
-    provider_path: /dev/obmm_shmdev6
+    provider_path: /dev/obmm_shmdev10
     client_path: /dev/obmm_shmdev2
     map_from_start: true
   - client_host: 112
@@ -115,6 +115,6 @@ peer_views:
     resource_role: v2_response_arena
     resource_id: owner111-v2-response-arena
     generation: 1
-    provider_path: /dev/obmm_shmdev6
+    provider_path: /dev/obmm_shmdev10
     client_path: /dev/obmm_shmdev2
     map_from_start: true

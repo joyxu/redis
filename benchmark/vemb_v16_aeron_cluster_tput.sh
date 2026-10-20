@@ -5,19 +5,19 @@
 # 部署，但直接把拓扑设为 active={0,1} 稳态后压测吞吐——不含 coordinator、
 # 迁移、cutover。用于回答"纯 aeron cluster 模式吞吐多少"。
 #
-# 在本地 Mac 执行（管理面走外网转发口，数据面走 111/112 内网）:
+# 在本地 Mac 执行（ssh 走管理网 90.161/90.162:22，Aeron/数据端点走 100G 192.168.1.x）:
 #   REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis \
 #     bash benchmark/vemb_v16_aeron_cluster_tput.sh
 # 默认 7 档矩阵 (1,1,1)...(64,16,32); 单档: SWEEP=0 TS=64 CS=4 PS=32 TEST_TIME=30
 # OP_TYPE=VSIM_2KEY 跑双 key 余弦对比 (报告 3.2.7 HPC Aeron)
 set -euo pipefail
 
-NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
-NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
-NODE0_SSH_HOST="${NODE0_SSH_HOST:-43.154.145.18}"
-NODE0_SSH_PORT="${NODE0_SSH_PORT:-8111}"
-NODE1_SSH_HOST="${NODE1_SSH_HOST:-43.154.145.18}"
-NODE1_SSH_PORT="${NODE1_SSH_PORT:-8112}"
+NODE0_HOST="${NODE0_HOST:-192.168.1.161}"   # 数据端点: 100G
+NODE1_HOST="${NODE1_HOST:-192.168.1.162}"   # 数据端点: 100G
+NODE0_SSH_HOST="${NODE0_SSH_HOST:-192.168.90.161}"
+NODE0_SSH_PORT="${NODE0_SSH_PORT:-22}"
+NODE1_SSH_HOST="${NODE1_SSH_HOST:-192.168.90.162}"
+NODE1_SSH_PORT="${NODE1_SSH_PORT:-22}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="$REMOTE_DIR/memtier_benchmark/memtier_benchmark"
@@ -47,8 +47,8 @@ USE_EXTERNAL_UB_CONFIG="${USE_EXTERNAL_UB_CONFIG:-1}"
 UB_CONFIG_DIR="${UB_CONFIG_DIR:-$REMOTE_DIR/examples}"
 NODE0_AERON_REQUEST_PATH="${NODE0_AERON_REQUEST_PATH:-/dev/obmm_shmdev1}"
 NODE0_AERON_RESPONSE_PATH="${NODE0_AERON_RESPONSE_PATH:-/dev/obmm_shmdev2}"
-NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev10}"
-NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev11}"
+NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev6}"
+NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev7}"
 # CLI@111 侧看到的 owner1 响应环窗口 (dev11@112 == dev15@111, 实测镜像关系)
 NODE1_AERON_RESPONSE_CLIENT_PATH="${NODE1_AERON_RESPONSE_CLIENT_PATH:-/dev/obmm_shmdev15}"
 
@@ -193,14 +193,14 @@ OWN1_START=\$(grep -n '^    owner_id: 1\$' '$REMOTE_DIR/examples/vemb_v16_ub_pee
 OWN1_START=\$((OWN1_START - 1))
 sed -n \"\${OWN1_START},\\\$p\" '$REMOTE_DIR/examples/vemb_v16_ub_peer_view_111_to_112.yaml' \
   | sed -e 's|^    provider_path: /dev/obmm_shmdev15$|    provider_path: $NODE1_AERON_RESPONSE_PATH|' \
-        -e 's|^    client_path: /dev/obmm_shmdev11$|    client_path: $NODE1_AERON_RESPONSE_CLIENT_PATH|' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
+        -e 's|^    client_path: /dev/obmm_shmdev7$|    client_path: $NODE1_AERON_RESPONSE_CLIENT_PATH|' >>\"\$tmp\"; mv \"\$tmp\" '$CLIENT_PEER_MANIFEST'"
 
 # ── P3: start servers ──────────────────────────────────────────────────────
 start_server() {
     local node="$1" manifest="$2" logfile="$3" pid_file="$4" req="$5" resp="$6"
     local cold_pre=""
     [ -n "$COLD_DIR" ] && cold_pre="mkdir -p '$COLD_DIR' && HPC_REDIS_COLD_DIR='$COLD_DIR' "
-    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && ${cold_pre}numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-max-vectors '$MAX_VECTORS' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$req' --vemb-v16-aeron-response-ub-path '$resp' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel warning"
+    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && ${cold_pre}numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$req' --vemb-v16-aeron-response-ub-path '$resp' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel ${LOGLEVEL:-warning}"
 }
 wait_server_ready() {
     ssh_run "$1" "cd '$REMOTE_DIR' || exit 1; for _ in \$(seq 1 100); do if ./benchmark/vemb_v16_topology_ctl --get --ctl-endpoint tcp --host '$1' --port '$SERVER_PORT' --timeout-ms 1000 >/dev/null 2>&1; then exit 0; fi; if ! kill -0 \$(cat '$2') 2>/dev/null; then exit 1; fi; sleep 1; done; exit 1"

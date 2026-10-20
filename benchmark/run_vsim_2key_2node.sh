@@ -28,9 +28,9 @@
 set -uo pipefail
 
 # === 节点 ===
-NODE0_HOST=${NODE0_HOST:-192.168.1.111}
-NODE1_HOST=${NODE1_HOST:-192.168.1.112}
-NODE1_SSH=${NODE1_SSH:-HW02}
+NODE0_HOST=${NODE0_HOST:-192.168.1.161}
+NODE1_HOST=${NODE1_HOST:-192.168.1.162}
+NODE1_SSH=${NODE1_SSH:-root@192.168.90.162}
 
 # === 路径 (所有节点一致) ===
 REDIS_DIR=${REDIS_DIR:-/root/gqs/codespace/redis-8.6.3}
@@ -533,7 +533,7 @@ run_hpc() {
     local prefill_end=$(date +%s)
 
     local prefill_sets=$(grep "^Totals" "$prefill_log" 2>/dev/null | awk '{print $2}')
-    rm -f "$prefill_log"
+    log "  prefill log kept: $prefill_log"
     log "  prefill took $((prefill_end - prefill_start))s, sets/sec=$prefill_sets"
 
     if [ -z "${prefill_sets:-}" ] || [ "${prefill_sets:-0}" = "0" ]; then

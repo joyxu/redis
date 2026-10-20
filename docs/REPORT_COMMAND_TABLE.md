@@ -1,6 +1,6 @@
 # 全量数据采集命令表（对应 docs/REPORT_SKELETON.md）
 
-> 版本: v0.2 (20260826)
+> 版本: v0.3 (20261020)；环境: HW01=192.168.90.161 / HW02=192.168.90.162（100G 数据面 192.168.1.161/162）
 > 约定: 未注明均在 **HW01** (`/root/gqs/codespace/UnifiedBus/hpc-redis`) 上执行；跨节点/双机类脚本由脚本自身 ssh 到对端。
 
 ## 0. 前置（每次回归一次性）【HW01 与 HW02 各执行一次】
@@ -17,7 +17,7 @@ bash scripts/vemb_v16_build_stamp.sh write client
 
 ---
 
-> 执行位置: 除注明"在本地 Mac 执行"外均在 HW01。以下三类脚本在**本地 Mac** 执行（管理面走 frpc 转发口，数据面走 111/112 内网）: `scripts/run_aeron_cross_node_flamegraph.sh`、`benchmark/vemb_v16_aeron_cluster_tput.sh`、`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`。
+> 执行位置: 除注明"在本地 Mac 执行"外均在 HW01。以下三类脚本在**本地 Mac** 执行（ssh 直连 161/162:22，数据面走 100G 内网 192.168.1.x，脚本默认值已按新环境写死，仅需按需覆盖并发/manifest）: `scripts/run_aeron_cross_node_flamegraph.sh`、`benchmark/vemb_v16_aeron_cluster_tput.sh`、`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`。
 
 ## 1. 3.2.1 单实例性能
 
@@ -191,7 +191,7 @@ for i in $(seq 0 6); do
         bash scripts/run_aeron_cross_node_flamegraph.sh
 done
 # baseline 12 实例【HW01 执行】
-RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=300 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=300 bash run_multi_instance_redis_baseline.sh
 ```
 
 ### 2.3 跨节点 DIM=8【块内注释标注执行位置】
@@ -210,7 +210,7 @@ for i in $(seq 0 6); do
         bash scripts/run_aeron_cross_node_flamegraph.sh
 done
 # baseline 12 实例【HW01 执行】
-RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=8 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=8 bash run_multi_instance_redis_baseline.sh
 ```
 
 ### 2.4 本地回环 64x1x32 高维（DIM=1024/2048/3072）【全部 HW01 执行】
@@ -234,9 +234,9 @@ RUN_LOCAL=1 WORKERS=17:17 SERVER_MASK=0-47 DIM=3072 TS=64 CS=1 PIPELINE=32 TEST_
 
 ```bash
 # baseline 12 实例【HW01 执行】
-RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=1024 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
-RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=2048 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
-RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=3072 NIC_IFACE=eth4 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=1024 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=2048 bash run_multi_instance_redis_baseline.sh
+RAW=1 NUM_INSTANCES=12 IO_THREADS=4 DIM=3072 bash run_multi_instance_redis_baseline.sh
 # hpc TCP 17:17【HW01 执行】
 SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=1024 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim1024.yaml TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
 SERVERS_ONLY=hpc HPC_PIO=17 HPC_SNW=17 HPC_SERVER_CPUSET=0-47 OP_TYPE=VEMB DIM=2048 TS="64" CS="1" PS="32" MANIFEST=$PWD/examples/vemb_v16_warm_regions_111_dim2048.yaml TEST_TIME=30 bash benchmark/run_vemb_cross_node_sweep.sh
@@ -254,7 +254,7 @@ OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PI
 ### 3.1 DIM=300 VEMB（9 档）【块内注释标注执行位置】
 
 ```bash
-# 原生 redis cluster 4 节点【HW01 执行】⚠️ HW05 失联，待恢复
+# 原生 redis cluster 4 节点【HW01 执行】⚠️ 需 163/164 部署本仓库（100G 口 192.168.1.163/164），暂不可跑
 bash benchmark/run_redis_cluster_vemb.sh
 # hpc TCP 双机 cluster【HW01 执行】（默认 HPC_PIO=4 HPC_SNW=4）
 HPC_PIO=4 HPC_SNW=4 bash run_cluster_2node_sweep.sh
@@ -267,7 +267,7 @@ TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
 ### 3.2 64x1x32 高维（DIM=1024/2048/3072）【块内注释标注执行位置】
 
 ```bash
-# 原生 cluster【HW01 执行】⚠️ HW05 失联，待恢复
+# 原生 cluster【HW01 执行】⚠️ 需 163/164 部署，暂不可跑
 DIM=1024 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=2048 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=3072 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
@@ -286,11 +286,11 @@ DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v
 ## 4. 3.2.4 扩容场景下 VEMB 性能【块内注释标注执行位置】
 
 ```bash
-# hpc TCP 扩容【HW01 执行】(脚本需内网直连 192.168.1.x:22, Mac 只走 frp 转发口不可达；默认 PIO=21 SNW=21)
+# hpc TCP 扩容【HW01 执行】⚠️ memtier 第三机在 163（192.168.1.163）未部署，暂不可跑（默认 PIO=21 SNW=21）
 PIO=21 SNW=21 bash scripts/hpc_redis_scaleout_throughput.sh
 # hpc Aeron 扩容【本地 Mac 执行】（client 固定在 HW01/111 上，绑 96-191 核）
 REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis PIO=21 SNW=21 bash scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh
-# 原生 redis cluster 扩容【HW01 执行】⚠️ HW05 失联，待恢复
+# 原生 redis cluster 扩容【HW01 执行】⚠️ 需 163/164 部署，暂不可跑
 N_INIT=3 N_FINAL=4 RAW=1 TEST_TIME=60 CLIENTS=200 THREADS=16 IO_THREADS=4 VECTORS_PER_VSET=6250 bash benchmark/run_redis_cluster_scaleout_vemb.sh
 ```
 
@@ -417,13 +417,5 @@ tlc_ha_aeron_failover_111_to_112: PASS active_owner=1 standby_owner=0 run=<RUN_I
 
 ## 10. 环境备注
 
-- HW05 失联影响：原生 4 节点 cluster（§3）与原生扩容（§4），待管理员恢复后执行对应标注命令。
-
-OP_TYPE=VEMB \
-KEY_PATTERN=Z:Z ZIPF_S=1.2 \
-PROFILE=0 TEST_TIME=30 PIO=3 SNW=3 \
-SERVER_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
-CLIENT_ROOT=/root/gqs/codespace/UnifiedBus/hpc-redis \
-SERVER_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_warm_regions_111_xnode_aeron.yaml \
-CLIENT_PEER_VIEW_MANIFEST=/root/gqs/codespace/UnifiedBus/hpc-redis/examples/vemb_v16_ub_peer_view_112_to_111_xnode_aeron.yaml \
-    bash scripts/run_aeron_cross_node_flamegraph.sh
+- 163/164（100G 口 192.168.1.163/164）未部署本仓库：影响原生 4 节点 cluster（§3）、原生扩容与 TCP 扩容（§4），部署后执行对应标注命令。
+- 管理网偶发瞬时断连（ssh 255/预检失败）：直接重跑即可；HA Aeron runner 重复跑可加 TLC_HA_AERON_SKIP_SYNC=1 跳过远端重编。

@@ -12,7 +12,7 @@ warm_regions:
     weight: 1
   - region_id: 2
     provider: ub
-    path: /dev/obmm_shmdev5
+    path: /dev/obmm_shmdev9
     mmap_offset: 0
     bytes: 240000000
     value_size: 1200

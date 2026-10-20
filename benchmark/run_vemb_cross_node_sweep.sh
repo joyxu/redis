@@ -36,10 +36,10 @@
 set -uo pipefail
 
 # === 拓扑 (SERVER=本地, CLIENT=远端 memtier 节点) ===
-CLIENT=${CLIENT:-HW02}
-SERVER_HOST=${SERVER_HOST:-192.168.1.111}
+CLIENT=${CLIENT:-root@192.168.90.162}
+SERVER_HOST=${SERVER_HOST:-192.168.1.161}
 SERVER_PORT=${SERVER_PORT:-6390}
-NIC_IFACE=${NIC_IFACE:-eth4}        # SERVER 上 100G mlx5 网卡 (sar -n DEV 监听)
+NIC_IFACE=${NIC_IFACE:-enp33s0f1np1}  # SERVER 上 100G 网卡 (sar -n DEV 监听)
 
 # === 路径 (SERVER 本地) ===
 REDIS_DIR=${REDIS_DIR:-/root/gqs/codespace/redis-8.6.3}
@@ -595,10 +595,14 @@ log "${OP_TYPE}: NUM_KEYS=$NUM_KEYS single myset"
 # 检查 CLIENT ssh 可达 + memtier 路径
 log "checking ssh $CLIENT reachable..."
 ssh "$CLIENT" "true" 2>/dev/null || { log "ERROR: cannot ssh to CLIENT=$CLIENT"; exit 1; }
-ssh "$CLIENT" "test -x $CLIENT_BASELINE_MEMTIER && test -x $CLIENT_HPC_MEMTIER" 2>/dev/null \
-    || { log "ERROR: CLIENT memtier missing. expected:
-    $CLIENT_BASELINE_MEMTIER
-    $CLIENT_HPC_MEMTIER"; exit 1; }
+# baseline memtier 只在要跑 baseline 档时才要求（新环境无 origin 部署）
+case " $SERVERS_ONLY " in
+    *" baseline "*)
+        ssh "$CLIENT" "test -x $CLIENT_BASELINE_MEMTIER" 2>/dev/null \
+            || { log "ERROR: CLIENT baseline memtier missing: $CLIENT_BASELINE_MEMTIER"; exit 1; } ;;
+esac
+ssh "$CLIENT" "test -x $CLIENT_HPC_MEMTIER" 2>/dev/null \
+    || { log "ERROR: CLIENT hpc memtier missing: $CLIENT_HPC_MEMTIER"; exit 1; }
 log "  ssh ok, memtier ok"
 
 # profiling preflight: 两端工具 + 火焰窗口必须落在测试窗口内

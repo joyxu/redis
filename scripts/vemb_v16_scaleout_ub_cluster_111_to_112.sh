@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Two-owner UB/Aeron scaleout throughput runner.
 #
-# Execute from the Mac workspace. Management SSH uses the public forwarded
-# ports; server control, topology endpoints, and UB peer-view identities use
-# the 111/112 private network only.
+# Execute from the Mac workspace. SSH goes direct to 161/162; server control,
+# topology endpoints, and UB peer-view identities use the 192.168.90.x
+# management network.
 set -euo pipefail
 
-NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
-NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
-NODE0_SSH_HOST="${NODE0_SSH_HOST:-43.154.145.18}"
-NODE0_SSH_PORT="${NODE0_SSH_PORT:-8111}"
-NODE1_SSH_HOST="${NODE1_SSH_HOST:-43.154.145.18}"
-NODE1_SSH_PORT="${NODE1_SSH_PORT:-8112}"
+NODE0_HOST="${NODE0_HOST:-192.168.1.161}"   # 数据端点: 100G
+NODE1_HOST="${NODE1_HOST:-192.168.1.162}"   # 数据端点: 100G
+NODE0_SSH_HOST="${NODE0_SSH_HOST:-192.168.90.161}"
+NODE0_SSH_PORT="${NODE0_SSH_PORT:-22}"
+NODE1_SSH_HOST="${NODE1_SSH_HOST:-192.168.90.162}"
+NODE1_SSH_PORT="${NODE1_SSH_PORT:-22}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
@@ -66,13 +66,13 @@ UB_CONFIG_DIR="${UB_CONFIG_DIR:-$REMOTE_DIR/examples}"
 # 111/112 deployment, but their producer/consumer roles and offset ranges may
 # not overlap.
 SERVER_META_LOCAL_PATH="${SERVER_META_LOCAL_PATH:-/dev/obmm_shmdev3}"
-SERVER_META_PEER_PATH="${SERVER_META_PEER_PATH:-/dev/obmm_shmdev7}"
+SERVER_META_PEER_PATH="${SERVER_META_PEER_PATH:-/dev/obmm_shmdev11}"
 SERVER_REQUEST_LOCAL_PATH="${SERVER_REQUEST_LOCAL_PATH:-/dev/obmm_shmdev4}"
 SERVER_REQUEST_PEER_PATH="${SERVER_REQUEST_PEER_PATH:-/dev/obmm_shmdev13}"
-SERVER_RESPONSE_LOCAL_PATH="${SERVER_RESPONSE_LOCAL_PATH:-/dev/obmm_shmdev8}"
-SERVER_RESPONSE_PEER_PATH="${SERVER_RESPONSE_PEER_PATH:-/dev/obmm_shmdev9}"
+SERVER_RESPONSE_LOCAL_PATH="${SERVER_RESPONSE_LOCAL_PATH:-/dev/obmm_shmdev12}"
+SERVER_RESPONSE_PEER_PATH="${SERVER_RESPONSE_PEER_PATH:-/dev/obmm_shmdev5}"
 SERVER_WARM_LOCAL_PATH="${SERVER_WARM_LOCAL_PATH:-/dev/obmm_shmdev3}"
-SERVER_WARM_PEER_PATH="${SERVER_WARM_PEER_PATH:-/dev/obmm_shmdev7}"
+SERVER_WARM_PEER_PATH="${SERVER_WARM_PEER_PATH:-/dev/obmm_shmdev11}"
 SERVER_WARM_REGION_BYTES="${SERVER_WARM_REGION_BYTES:-1073741824}"
 REMOTE_META_MMAP_OFFSET="${REMOTE_META_MMAP_OFFSET:-268435456}"
 SERVER_RPC_REQUEST_OFFSET="${SERVER_RPC_REQUEST_OFFSET:-134217728}"
@@ -83,15 +83,15 @@ UB_RPC_TIMEOUT_MS="${UB_RPC_TIMEOUT_MS:-2000}"
 # YAML files use the same allocation; keeping these explicit prevents the
 # fallback path from assigning node1's local warm region to node0.
 NODE0_META_LOCAL_PATH="${NODE0_META_LOCAL_PATH:-/dev/obmm_shmdev3}"
-NODE1_META_LOCAL_PATH="${NODE1_META_LOCAL_PATH:-/dev/obmm_shmdev12}"
+NODE1_META_LOCAL_PATH="${NODE1_META_LOCAL_PATH:-/dev/obmm_shmdev8}"
 NODE0_WARM_LOCAL_PATH="${NODE0_WARM_LOCAL_PATH:-/dev/obmm_shmdev3}"
-NODE1_WARM_LOCAL_PATH="${NODE1_WARM_LOCAL_PATH:-/dev/obmm_shmdev12}"
+NODE1_WARM_LOCAL_PATH="${NODE1_WARM_LOCAL_PATH:-/dev/obmm_shmdev8}"
 NODE0_WARM_PEER_PATH="${NODE0_WARM_PEER_PATH:-/dev/obmm_shmdev16}"
-NODE1_WARM_PEER_PATH="${NODE1_WARM_PEER_PATH:-/dev/obmm_shmdev7}"
+NODE1_WARM_PEER_PATH="${NODE1_WARM_PEER_PATH:-/dev/obmm_shmdev11}"
 NODE0_RPC_REQUEST_PATH="${NODE0_RPC_REQUEST_PATH:-/dev/obmm_shmdev4}"
 NODE0_RPC_RESPONSE_PATH="${NODE0_RPC_RESPONSE_PATH:-/dev/obmm_shmdev13}"
-NODE1_RPC_REQUEST_PATH="${NODE1_RPC_REQUEST_PATH:-/dev/obmm_shmdev9}"
-NODE1_RPC_RESPONSE_PATH="${NODE1_RPC_RESPONSE_PATH:-/dev/obmm_shmdev8}"
+NODE1_RPC_REQUEST_PATH="${NODE1_RPC_REQUEST_PATH:-/dev/obmm_shmdev5}"
+NODE1_RPC_RESPONSE_PATH="${NODE1_RPC_RESPONSE_PATH:-/dev/obmm_shmdev12}"
 
 # Owner 0 shares its local UB pair with the workload client on node 111.
 # Owner 1 reads CLI requests from export dev10 and writes responses through
@@ -99,7 +99,7 @@ NODE1_RPC_RESPONSE_PATH="${NODE1_RPC_RESPONSE_PATH:-/dev/obmm_shmdev8}"
 # responses, and imported dev16 for owner1 warm reads.
 NODE0_AERON_REQUEST_PATH="${NODE0_AERON_REQUEST_PATH:-/dev/obmm_shmdev1}"
 NODE0_AERON_RESPONSE_PATH="${NODE0_AERON_RESPONSE_PATH:-/dev/obmm_shmdev2}"
-NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev10}"
+NODE1_AERON_REQUEST_PATH="${NODE1_AERON_REQUEST_PATH:-/dev/obmm_shmdev6}"
 NODE1_AERON_RESPONSE_PATH="${NODE1_AERON_RESPONSE_PATH:-/dev/obmm_shmdev15}"
 CLIENT_WARM_PATH="${CLIENT_WARM_PATH:-/dev/obmm_shmdev3}"
 
@@ -484,7 +484,7 @@ fi
 start_server() {
     local node="$1" manifest="$2" logfile="$3" pid_file="$4"
     local request_path="$5" response_path="$6"
-    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$request_path' --vemb-v16-aeron-response-ub-path '$response_path' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel warning"
+    ssh_run "$node" "cd '$REMOTE_DIR' && rm -f '$pid_file' '$logfile' && numactl --membind=0 taskset -c 0-95 ./src/redis-server --port '$SERVER_PORT' --bind '$node' --protected-mode no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$manifest' --vemb-v16-reset-warm-regions yes --vemb-v16-transport aeron --vemb-v16-aeron-ub-path '$request_path' --vemb-v16-aeron-response-ub-path '$response_path' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --vemb-v16-batch-request-size '$PIPELINE' --daemonize yes --pidfile '$pid_file' --logfile '$logfile' --loglevel ${LOGLEVEL:-warning}"
 }
 
 wait_server_ready() {

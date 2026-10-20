@@ -2,7 +2,7 @@
 # keepalived vrrp_script health check for one HPC-Redis instance.
 set -u
 
-REDIS_CLI="${HPC_REDIS_HA_REDIS_CLI:-redis-cli}"
+REDIS_CLI="${HPC_REDIS_HA_REDIS_CLI:-/root/gqs/codespace/UnifiedBus/hpc-redis/src/redis-cli}"
 REDIS_HOST="${HPC_REDIS_HA_REDIS_HOST:-127.0.0.1}"
 REDIS_PORT="${HPC_REDIS_HA_REDIS_PORT:-6379}"
 TIMEOUT="${HPC_REDIS_HA_REDIS_TIMEOUT:-2}"

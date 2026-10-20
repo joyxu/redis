@@ -38,13 +38,15 @@ fi
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
 
-REMOTE_DIR="${HA_REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
-SSH_HOST="${TLC_HA_AERON_SSH_HOST:-43.154.145.18}"
+REMOTE_DIR="${HA_REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 SSH_USER="${TLC_HA_AERON_SSH_USER:-root}"
-NODE111_PORT="${HA_NODE111_PORT:-8111}"
-NODE112_PORT="${HA_NODE112_PORT:-8112}"
-NODE111_HOST="${TLC_HA_NODE111_HOST:-192.168.90.111}"
-NODE112_HOST="${TLC_HA_NODE112_HOST:-192.168.90.112}"
+NODE111_PORT="${HA_NODE111_PORT:-22}"
+NODE112_PORT="${HA_NODE112_PORT:-22}"
+NODE111_HOST="${TLC_HA_NODE111_HOST:-192.168.90.161}"
+NODE112_HOST="${TLC_HA_NODE112_HOST:-192.168.90.162}"
+# 两台管理网卡名不同：161=enp39s0f1，162=enp33s0f0
+HA_IFACE="${TLC_HA_AERON_INTERFACE:-}"
+node_iface() { [ "$1" = 111 ] && printf '%s' "${HA_IFACE:-${TLC_HA_AERON_INTERFACE_111:-enp39s0f1}}" || printf '%s' "${HA_IFACE:-${TLC_HA_AERON_INTERFACE_112:-enp33s0f0}}"; }
 SERVER_PORT="${TLC_HA_AERON_SERVER_PORT:-6379}"
 CONTROL_PORT="${TLC_HA_AERON_CONTROL_PORT:-9738}"
 DIM="${TLC_HA_AERON_DIM:-16}"
@@ -59,7 +61,7 @@ WAIT_SECONDS="${TLC_HA_AERON_WAIT_SECONDS:-45}"
 VIP_CIDR="${TLC_HA_AERON_VIP:-192.168.90.202/24}"
 VIP="${VIP_CIDR%%/*}"
 RUN_ID="${TLC_HA_AERON_RUN_ID:-$(date +%Y%m%d_%H%M%S)-$$}"
-SSH_CONTROL_PATH="/tmp/tlc_ha_aeron_${USER:-user}_$$_%p"
+SSH_CONTROL_PATH="/tmp/tlc_ha_aeron_${USER:-user}_$$_%h_%p"
 INITIAL_NODE="${INITIAL_NODE:-111}"
 CLIENT_NODE="${CLIENT_NODE:-$INITIAL_NODE}"
 SKIP_SYNC="${TLC_HA_AERON_SKIP_SYNC:-0}"
@@ -89,7 +91,7 @@ node_ssh() {
     shift
     ssh -q -p "$(node_port "$node")" -o BatchMode=yes -o ConnectTimeout=10 \
         -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$SSH_CONTROL_PATH" \
-        "$SSH_USER@$SSH_HOST" "$@"
+        "$SSH_USER@$(node_host "$node")" "$@"
 }
 remote() { local node=$1; shift; node_ssh "$node" "cd '$REMOTE_DIR' && $*"; }
 
@@ -111,7 +113,7 @@ stop_redis() {
 
 stop_keepalived() {
     local node=$1 interface
-    interface=$([ "$node" = 111 ] && printf eth1 || printf eth0)
+    interface="$(node_iface "$node")"
     remote "$node" "for p in \$(pgrep -x keepalived || true); do kill -TERM \$p 2>/dev/null || true; done; sleep 1; for p in \$(pgrep -x keepalived || true); do kill -KILL \$p 2>/dev/null || true; done; ip addr del '$VIP_CIDR' dev '$interface' 2>/dev/null || true; rm -f /run/hpc-redis-keepalived/keepalived.pid /run/hpc-redis-keepalived/vrrp.pid /run/hpc-redis-keepalived/checkers.pid"
 }
 
@@ -140,7 +142,7 @@ wait_vip_owner() {
 
 ha_state() {
     local node=$1
-    remote "$node" "redis-cli --raw -h 127.0.0.1 -p '$SERVER_PORT' HA STATE 2>/dev/null | tr '\\n' ' '" || true
+    remote "$node" "./src/redis-cli --raw -h 127.0.0.1 -p '$SERVER_PORT' HA STATE 2>/dev/null | tr '\\n' ' '" || true
 }
 
 wait_ha_state() {
@@ -156,7 +158,7 @@ wait_ha_state() {
 
 ha_progress() {
     local node=$1
-    remote "$node" "redis-cli --raw -h 127.0.0.1 -p '$SERVER_PORT' HA PROGRESS 2>/dev/null | paste -sd ' ' -" || true
+    remote "$node" "./src/redis-cli --raw -h 127.0.0.1 -p '$SERVER_PORT' HA PROGRESS 2>/dev/null | paste -sd ' ' -" || true
 }
 
 progress_value() {
@@ -192,7 +194,7 @@ wait_recovery_progress() {
 
 sync_node() {
     local node=$1
-    NODE="$SSH_HOST" SSH_USER="$SSH_USER" SSH_PORT="$(node_port "$node")" REMOTE_ROOT="$REMOTE_DIR" \
+    NODE="$(node_host "$node")" SSH_USER="$SSH_USER" SSH_PORT="$(node_port "$node")" REMOTE_ROOT="$REMOTE_DIR" \
         bash "$ROOT_DIR/scripts/sync_changed_code_to_peer.sh" --all-code --build all --verify-build all
 }
 
@@ -203,12 +205,12 @@ write_manifest() {
     region=$([ "$node" = 111 ] && printf 100 || printf 101)
     if [ "$node" = 111 ]; then
         request_path=/dev/obmm_shmdev3
-        response_path=/dev/obmm_shmdev6
+        response_path=/dev/obmm_shmdev10
         warm_path=/dev/obmm_shmdev1
     else
-        request_path=/dev/obmm_shmdev10
+        request_path=/dev/obmm_shmdev6
         response_path=/dev/obmm_shmdev15
-        warm_path=/dev/obmm_shmdev12
+        warm_path=/dev/obmm_shmdev8
     fi
     remote "$node" "mkdir -p '$(server_dir "$node")' '$(cold_dir "$node")' '$CLIENT_RUN_DIR'; cat > '$manifest' <<'YAML'
 version: 1
@@ -233,10 +235,13 @@ YAML"
 }
 
 write_server_peer_map() {
-    local node=$1 path owner region
+    local node=$1 path owner region peer_view_path
     path="$(server_peer_map "$node")"
     owner=$([ "$node" = 111 ] && printf 0 || printf 1)
     region=$([ "$node" = 111 ] && printf 101 || printf 100)
+    # 本机视角的对端 warm/meta 窗：owner1 的 region 在 162 e7（111 视角 import e7
+    # = dev16）；owner0 的 region 在 161 e0（162 视角 import e0 = dev9）。
+    peer_view_path=$([ "$node" = 111 ] && printf /dev/obmm_shmdev16 || printf /dev/obmm_shmdev9)
     remote "$node" "cat > '$path' <<'YAML'
 expected_local_owner_id: $owner
 attach_now: true
@@ -245,7 +250,7 @@ ub_rpc_timeout_ms: 2000
 warm_regions:
   - region_id: $region
     provider: ub
-    path: /dev/obmm_shmdev16
+    path: $peer_view_path
     mmap_offset: 0
     bytes: 1073741824
     value_size: $((DIM * 4))
@@ -255,7 +260,7 @@ warm_regions:
 remote_meta_views:
   - owner_id: $([ "$node" = 111 ] && printf 1 || printf 0)
     provider: ub
-    path: /dev/obmm_shmdev16
+    path: $peer_view_path
     mmap_offset: 268435456
     entries: 65536
     buckets: 131072
@@ -263,13 +268,13 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: $([ "$node" = 111 ] && printf 1 || printf 0)
     provider: ub
-    request_path: /dev/obmm_shmdev10
+    request_path: /dev/obmm_shmdev6
     request_mmap_offset: 134217728
     response_path: /dev/obmm_shmdev15
     response_mmap_offset: 201326592
     inbound_request_path: /dev/obmm_shmdev14
     inbound_request_mmap_offset: 134217728
-    outbound_response_path: /dev/obmm_shmdev11
+    outbound_response_path: /dev/obmm_shmdev7
     outbound_response_mmap_offset: 201326592
 YAML"
 }
@@ -286,15 +291,15 @@ peer_views:
     resource_id: owner0-v1-request
     generation: 1
     provider_path: /dev/obmm_shmdev3
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev3 || printf /dev/obmm_shmdev7)
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev3 || printf /dev/obmm_shmdev11)
     map_from_start: true
   - client_host: $client
     owner_id: 0
     resource_role: v1_response_ring
     resource_id: owner0-v1-response
     generation: 1
-    provider_path: /dev/obmm_shmdev6
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev6 || printf /dev/obmm_shmdev2)
+    provider_path: /dev/obmm_shmdev10
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev10 || printf /dev/obmm_shmdev2)
     map_from_start: true
   - client_host: $client
     owner_id: 0
@@ -302,15 +307,15 @@ peer_views:
     resource_id: owner0-warm
     generation: 1
     provider_path: /dev/obmm_shmdev1
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev1 || printf /dev/obmm_shmdev5)
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev1 || printf /dev/obmm_shmdev9)
     map_from_start: true
   - client_host: $client
     owner_id: 1
     resource_role: v1_request_ring
     resource_id: owner1-v1-request
     generation: 1
-    provider_path: /dev/obmm_shmdev10
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev14 || printf /dev/obmm_shmdev10)
+    provider_path: /dev/obmm_shmdev6
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev14 || printf /dev/obmm_shmdev6)
     map_from_start: true
   - client_host: $client
     owner_id: 1
@@ -318,15 +323,15 @@ peer_views:
     resource_id: owner1-v1-response
     generation: 1
     provider_path: /dev/obmm_shmdev15
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev11 || printf /dev/obmm_shmdev15)
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev7 || printf /dev/obmm_shmdev15)
     map_from_start: true
   - client_host: $client
     owner_id: 1
     resource_role: warm_region
     resource_id: owner1-warm
     generation: 1
-    provider_path: /dev/obmm_shmdev12
-    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev16 || printf /dev/obmm_shmdev12)
+    provider_path: /dev/obmm_shmdev8
+    client_path: $([ "$client" = 111 ] && printf /dev/obmm_shmdev16 || printf /dev/obmm_shmdev8)
     map_from_start: true
 YAML"
     CLIENT_MANIFEST="$path"
@@ -334,17 +339,17 @@ YAML"
 
 reset_replica_rings() {
     remote 111 "TLC_HA_UB_TX_PATH='${TLC_HA_NODE111_TX_PATH:-/dev/obmm_shmdev4}' TLC_HA_UB_RX_PATH='${TLC_HA_NODE111_RX_PATH:-/dev/obmm_shmdev13}' TLC_HA_UB_TX_OFFSET='${TLC_HA_UB_TX_OFFSET:-134217728}' TLC_HA_UB_RX_OFFSET='${TLC_HA_UB_RX_OFFSET:-201326592}' TLC_HA_UB_RESET=1 TLC_HA_UB_RESET_ONLY=1 timeout 30s ./benchmark/tlc_ha_replica_ub_node_ut follower >/dev/null"
-    remote 112 "TLC_HA_UB_TX_PATH='${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev9}' TLC_HA_UB_RX_PATH='${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev8}' TLC_HA_UB_TX_OFFSET='${TLC_HA_UB_RX_OFFSET:-201326592}' TLC_HA_UB_RX_OFFSET='${TLC_HA_UB_TX_OFFSET:-134217728}' TLC_HA_UB_RESET=1 TLC_HA_UB_RESET_ONLY=1 timeout 30s ./benchmark/tlc_ha_replica_ub_node_ut follower >/dev/null"
+    remote 112 "TLC_HA_UB_TX_PATH='${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev5}' TLC_HA_UB_RX_PATH='${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev12}' TLC_HA_UB_TX_OFFSET='${TLC_HA_UB_RX_OFFSET:-201326592}' TLC_HA_UB_RX_OFFSET='${TLC_HA_UB_TX_OFFSET:-134217728}' TLC_HA_UB_RESET=1 TLC_HA_UB_RESET_ONLY=1 timeout 30s ./benchmark/tlc_ha_replica_ub_node_ut follower >/dev/null"
 }
 
 start_server() {
     local node=$1 role=$2 node_id=$3 peer_id=$4 peer_host=$5 tx rx txoff rxoff aeron_req aeron_resp
-    tx=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_TX_PATH:-/dev/obmm_shmdev4}" || printf '%s' "${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev9}")
-    rx=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_RX_PATH:-/dev/obmm_shmdev13}" || printf '%s' "${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev8}")
+    tx=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_TX_PATH:-/dev/obmm_shmdev4}" || printf '%s' "${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev5}")
+    rx=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_RX_PATH:-/dev/obmm_shmdev13}" || printf '%s' "${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev12}")
     txoff=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_UB_TX_OFFSET:-134217728}" || printf '%s' "${TLC_HA_UB_RX_OFFSET:-201326592}")
     rxoff=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_UB_RX_OFFSET:-201326592}" || printf '%s' "${TLC_HA_UB_TX_OFFSET:-134217728}")
-    aeron_req=$([ "$node" = 111 ] && printf /dev/obmm_shmdev3 || printf /dev/obmm_shmdev10)
-    aeron_resp=$([ "$node" = 111 ] && printf /dev/obmm_shmdev6 || printf /dev/obmm_shmdev15)
+    aeron_req=$([ "$node" = 111 ] && printf /dev/obmm_shmdev3 || printf /dev/obmm_shmdev6)
+    aeron_resp=$([ "$node" = 111 ] && printf /dev/obmm_shmdev10 || printf /dev/obmm_shmdev15)
     remote "$node" "rm -f '$(server_pid_file "$node")' '$(server_log "$node")'; HPC_REDIS_COLD_DIR='$(cold_dir "$node")' HPC_REDIS_HA_ROLE='$role' HPC_REDIS_HA_NODE_ID='$node_id' HPC_REDIS_HA_PEER_NODE_ID='$peer_id' HPC_REDIS_HA_TERM='$HA_TERM' HPC_REDIS_HA_CONTROL_BIND_HOST='$(node_host "$node")' HPC_REDIS_HA_CONTROL_PORT='$CONTROL_PORT' HPC_REDIS_HA_PEER_HOST='$peer_host' HPC_REDIS_HA_PEER_PORT='$CONTROL_PORT' HPC_REDIS_HA_TX_PATH='$tx' HPC_REDIS_HA_TX_OFFSET='$txoff' HPC_REDIS_HA_RX_PATH='$rx' HPC_REDIS_HA_RX_OFFSET='$rxoff' ./src/redis-server --port '$SERVER_PORT' --bind 0.0.0.0 --protected-mode no --save '' --appendonly no --vemb-v16-enabled yes --vemb-v16-dim '$DIM' --vemb-v16-warm-regions-manifest '$(server_manifest "$node")' --vemb-v16-reset-warm-regions '$RESET_WARM' --vemb-v16-transport aeron --vemb-v16-aeron-control tcp --vemb-v16-aeron-ub-path '$aeron_req' --vemb-v16-aeron-response-ub-path '$aeron_resp' --vemb-v16-tcp-host '$(node_host "$node")' --vemb-v16-proxy-io-threads '$PIO' --vemb-v16-supernode-workers '$SNW' --daemonize yes --pidfile '$(server_pid_file "$node")' --logfile '$(server_log "$node")' --loglevel notice"
 }
 
@@ -379,7 +384,7 @@ run_client() {
 start_tcp_probe() {
     [ "$TCP_PROBE" = 1 ] || return 0
     local client=$1 endpoint_host=$2
-    remote "$client" "command -v redis-cli >/dev/null; rm -f '$TCP_PROBE_OUT' '$TCP_PROBE_PID'; ( { while :; do printf 'PING\\n'; sleep 1; done; } | timeout --signal=TERM --kill-after=2s 30s redis-cli --raw -h '$endpoint_host' -p '$SERVER_PORT' >'$TCP_PROBE_OUT' 2>&1; printf 'probe_exit=%s\\n' \"\$?\" >>'$TCP_PROBE_OUT' ) >/dev/null 2>&1 & echo \$! >'$TCP_PROBE_PID'"
+    remote "$client" "test -x ./src/redis-cli; rm -f '$TCP_PROBE_OUT' '$TCP_PROBE_PID'; ( { while :; do printf 'PING\\n'; sleep 1; done; } | timeout --signal=TERM --kill-after=2s 30s ./src/redis-cli --raw -h '$endpoint_host' -p '$SERVER_PORT' >'$TCP_PROBE_OUT' 2>&1; printf 'probe_exit=%s\\n' \"\$?\" >>'$TCP_PROBE_OUT' ) >/dev/null 2>&1 & echo \$! >'$TCP_PROBE_PID'"
     for _ in $(seq 1 15); do
         if remote "$client" "grep -q '^PONG' '$TCP_PROBE_OUT'" >/dev/null 2>&1; then
             printf 'old TCP probe connected endpoint=%s:%s output=%s\n' "$endpoint_host" "$SERVER_PORT" "$TCP_PROBE_OUT"
@@ -425,8 +430,8 @@ else
     sync_node 112
 fi
 for node in 111 112; do
-    tx_path=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_TX_PATH:-/dev/obmm_shmdev4}" || printf '%s' "${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev9}")
-    rx_path=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_RX_PATH:-/dev/obmm_shmdev13}" || printf '%s' "${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev8}")
+    tx_path=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_TX_PATH:-/dev/obmm_shmdev4}" || printf '%s' "${TLC_HA_NODE112_TX_PATH:-/dev/obmm_shmdev5}")
+    rx_path=$([ "$node" = 111 ] && printf '%s' "${TLC_HA_NODE111_RX_PATH:-/dev/obmm_shmdev13}" || printf '%s' "${TLC_HA_NODE112_RX_PATH:-/dev/obmm_shmdev12}")
     remote "$node" "test -x ./src/redis-server && test -x ./benchmark/vemb_v16_bench && test -x ./benchmark/vemb_v16_topology_ctl && test -x ./benchmark/tlc_ha_replica_ub_node_ut && test -r '$tx_path' && test -w '$tx_path' && test -r '$rx_path' && test -w '$rx_path'" || die "node $node preflight failed"
 done
 
@@ -465,20 +470,28 @@ wait_ha_state "$([ "$INITIAL_NODE" = 111 ] && printf 112 || printf 111)" FOLLOWE
 if [ "$SKIP_KEEPALIVED" != 1 ]; then
     # --all 部署固定 111=100/112=90，反向模式需反转 priority 使 VIP 初始落在 leader 节点；
     # 两个方向都显式 deploy，避免上次运行的 priority 残留串扰
+    deploy_on() {
+        local node=$1; shift
+        REMOTE_HOST="$(node_host "$node")" REMOTE_PORT="$(node_port "$node")" \
+            HPC_REDIS_HA_INTERFACE="$(node_iface "$node")" \
+            LVS_KEEPALIVED_ROOT="${LVS_KEEPALIVED_ROOT:-/root/gqs/codespace/LVS/tools/keepalived}" \
+            bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node "$node" "$@"
+    }
     if [ "$INITIAL_NODE" = 111 ]; then
-        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 111 --priority 100 --vip "$VIP_CIDR" deploy
-        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 112 --priority 90 --vip "$VIP_CIDR" deploy
+        deploy_on 111 --priority 100 --vip "$VIP_CIDR" deploy
+        deploy_on 112 --priority 90 --vip "$VIP_CIDR" deploy
     else
-        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 111 --priority 90 --vip "$VIP_CIDR" deploy
-        bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node 112 --priority 100 --vip "$VIP_CIDR" deploy
+        deploy_on 111 --priority 90 --vip "$VIP_CIDR" deploy
+        deploy_on 112 --priority 100 --vip "$VIP_CIDR" deploy
     fi
-    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --all --vip "$VIP_CIDR" check
+    deploy_on 111 --vip "$VIP_CIDR" check
+    deploy_on 112 --vip "$VIP_CIDR" check
     # 模板固定 state BACKUP + nopreempt：初始 MASTER 由启动顺序决定（后起者不抢占）。
     # 先起 leader 让它必然赢得侦听期成为 MASTER 并持有 VIP，再起 standby
     STANDBY_NODE="$([ "$INITIAL_NODE" = 111 ] && printf 112 || printf 111)"
-    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node "$INITIAL_NODE" --vip "$VIP_CIDR" start
+    deploy_on "$INITIAL_NODE" --vip "$VIP_CIDR" start
     wait_vip_owner "$INITIAL_NODE"
-    bash "$ROOT_DIR/scripts/deploy_keepalived_ha.sh" --node "$STANDBY_NODE" --vip "$VIP_CIDR" start
+    deploy_on "$STANDBY_NODE" --vip "$VIP_CIDR" start
 fi
 
 step "P5 initial CLI Aeron ATTACH and VADD"
@@ -496,7 +509,7 @@ if [ "$SKIP_KEEPALIVED" != 1 ]; then
 else
     printf 'keepalived skipped; promoting standby through HA PROMOTE\n'
     FAILOVER_NODE=$([ "$INITIAL_NODE" = 111 ] && printf 112 || printf 111)
-    remote "$FAILOVER_NODE" "redis-cli -h 127.0.0.1 -p '$SERVER_PORT' HA PROMOTE"
+    remote "$FAILOVER_NODE" "./src/redis-cli -h 127.0.0.1 -p '$SERVER_PORT' HA PROMOTE"
 fi
 
 step "P7 publish failover topology active=standby and re-ATTACH through VIP"

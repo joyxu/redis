@@ -4,7 +4,7 @@
 # run_redis_cluster_scaleout_vemb.sh
 # 4 节点 redis cluster 扩容过程 VEMB 吞吐测试 (baseline redis-8.6.3)
 #
-# 拓扑: HW01/HW02/HW05/HW04 每节点 1 master + 1 replica (8 实例), REPLICAS=1 固定
+# 拓扑: HW01/HW02/HW04/HW05 每节点 1 master + 1 replica (8 实例), REPLICAS=1 固定
 # 网络: 192.168.1.x (100G mlx5 直连); memtier 在 MEMTIER_HOST (默认 HW06) 上跑
 #
 # 流程:
@@ -35,7 +35,7 @@ set -uo pipefail
 
 # === 节点 (顺序很重要: 前 N_INIT 个是初始 master, 后面是扩容目标) ===
 declare -a NODES=("HW01" "HW02" "HW04" "HW05")
-declare -a IPS=("192.168.1.111" "192.168.1.112" "192.168.1.21" "192.168.1.20")
+declare -a IPS=("192.168.1.161" "192.168.1.162" "192.168.1.163" "192.168.1.164")
 # BASELINE_ONLY=1: 只跑段1 baseline (验证 RDB 加载), 不做扩容
 BASELINE_ONLY=${BASELINE_ONLY:-0}
 NNODES=${#NODES[@]}
