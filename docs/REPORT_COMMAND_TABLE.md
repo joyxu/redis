@@ -1,6 +1,6 @@
 # 全量数据采集命令表（对应 docs/REPORT_SKELETON.md）
 
-> 版本: v0.3 (20261020)；环境: HW01=192.168.90.161 / HW02=192.168.90.162（100G 数据面 192.168.1.161/162）
+> 版本: v0.5 (20261021)；环境: HW01=192.168.90.161 / HW02=192.168.90.162；100G 数据面 192.168.1.161/162/163/164（HW04/HW05 的 enp33s0f1np1，已配置恢复）
 > 约定: 未注明均在 **HW01** (`/root/gqs/codespace/UnifiedBus/hpc-redis`) 上执行；跨节点/双机类脚本由脚本自身 ssh 到对端。
 
 ## 0. 前置（每次回归一次性）【HW01 与 HW02 各执行一次】
@@ -13,11 +13,13 @@ bash scripts/vemb_v16_build_stamp.sh write client
 ```
 
 - baseline 默认 NOQUANT（`BASELINE_NOQUANT=0` 关闭）；baseline RDB 预填充自动加载（`BASELINE_RDB=0` 强制 prefill）。
+- **改过 memtier/客户端源码并重编后，必须重跑 `vemb_v16_build_stamp.sh write client`（server 同理）**——否则所有 Aeron 用例在 stamp 校验处直接失败（`VEMB client sources changed`）。
 - UB 用例严格串行；跑前两台空闲检查（无 redis-server/memtier/perf 且 idle≥70%）。
 
 ---
 
-> 执行位置: 除注明"在本地 Mac 执行"外均在 HW01。以下三类脚本在**本地 Mac** 执行（ssh 直连 161/162:22，数据面走 100G 内网 192.168.1.x，脚本默认值已按新环境写死，仅需按需覆盖并发/manifest）: `scripts/run_aeron_cross_node_flamegraph.sh`、`benchmark/vemb_v16_aeron_cluster_tput.sh`、`benchmark/vemb_v16_scaleout_ub_cluster_111_to_112.sh`。
+> 执行位置: 除注明"在本地 Mac 执行"外均在 HW01。以下脚本在**本地 Mac** 执行（ssh 直连 161/162/163:22 管理网，数据面走 100G 内网 192.168.1.x，脚本默认值已按新环境写死，仅需按需覆盖并发/manifest）: `scripts/run_aeron_cross_node_flamegraph.sh`、`benchmark/vemb_v16_aeron_cluster_tput_cli163.sh`（cluster 稳态，client 在 163，20261022 起替代旧 `_tput.sh`）、`scripts/vemb_v16_scaleout_ub_cluster_111_to_112_cli163.sh`（Aeron 扩容）、`scripts/vemb_v16_scaleout_ub_local_111.sh`（单机扩容）。
+> 这三类脚本带节点负载预检门（`MAX_FOREIGN_CPU_PCT/MAX_FOREIGN_TOTAL_CPU_PCT/MAX_FOREIGN_CPUSET_BUSY_PCT/MAX_FOREIGN_RSS_MB`，默认 10/20/10/256）。节点上有常驻进程（如 opencode/pidstat）时按需放宽，例如 `MAX_FOREIGN_TOTAL_CPU_PCT=40 MAX_FOREIGN_CPUSET_BUSY_PCT=20 MAX_FOREIGN_RSS_MB=2048`。
 
 ## 1. 3.2.1 单实例性能
 
@@ -254,31 +256,31 @@ OP_TYPE=VEMB DIM=3072 THREADS=64 CLIENTS=1 PIPELINE=32 PROFILE=0 TEST_TIME=30 PI
 ### 3.1 DIM=300 VEMB（9 档）【块内注释标注执行位置】
 
 ```bash
-# 原生 redis cluster 4 节点【HW01 执行】⚠️ 需 163/164 部署本仓库（100G 口 192.168.1.163/164），暂不可跑
+# 原生 redis cluster 4 节点【HW01 执行】（IPS=192.168.1.161-164 走 100G；前提: HW01 ~/.ssh/config 含 HW01/HW02/HW04/HW05 别名，已配）
 bash benchmark/run_redis_cluster_vemb.sh
-# hpc TCP 双机 cluster【HW01 执行】（默认 HPC_PIO=4 HPC_SNW=4）
-HPC_PIO=4 HPC_SNW=4 bash run_cluster_2node_sweep.sh
-# hpc Aeron 双机 cluster【本地 Mac 执行】（默认 9 档）
-TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+# hpc TCP 双机 cluster【HW01 执行】（默认 HPC_PIO=4 HPC_SNW=4；memtier 在 HW04/163 —— 20261022 起 cluster 稳态 client 统一放 163，脚本 MEMTIER_HOST 变量）
+MEMTIER_HOST=root@192.168.90.163 HPC_PIO=4 HPC_SNW=4 bash run_cluster_2node_sweep.sh
+# hpc Aeron 双机 cluster【本地 Mac 执行】（默认 7 档；client 在 HW04/163，经 UB 导入窗直达两 owner；前置: 163 已装 7 个导入窗 dev9-15 且 client stamp 通过，见脚本头）
+TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
 ```
 
-产物：`benchmark/results/cluster_2node_sweep/<时间戳>/summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`、原生 `benchmark/results/cluster_vemb/...`。三方案对比表（原生/TCP/Aeron ops/sec/core）由三个 TSV 汇总。
+产物：`benchmark/results/cluster_2node_sweep/<时间戳>/summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`、原生 `benchmark/results/redis_cluster_vemb/...`。汇总为两张表（原生 vs hpc TCP / 原生 vs hpc Aeron，T·C·P + ops/core + 加速比），由三个 TSV 汇总。
 
 ### 3.2 64x1x32 高维（DIM=1024/2048/3072）【块内注释标注执行位置】
 
 ```bash
-# 原生 cluster【HW01 执行】⚠️ 需 163/164 部署，暂不可跑
+# 原生 cluster【HW01 执行】
 DIM=1024 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=2048 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
 DIM=3072 TS="64" CS="1" PS="32" bash benchmark/run_redis_cluster_vemb.sh
-# hpc TCP cluster【HW01 执行】
-HPC_PIO=4 HPC_SNW=4 DIM=1024 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
-HPC_PIO=4 HPC_SNW=4 DIM=2048 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
-HPC_PIO=4 HPC_SNW=4 DIM=3072 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
-# hpc Aeron cluster【本地 Mac 执行】（单档）
-DIM=1024 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
-DIM=2048 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
-DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+# hpc TCP cluster【HW01 执行】（memtier 在 163；DIM!=300 自动用 cluster_111/112_dim<D>.yaml，需先跑一轮 warm 布局预热——脚本已内置）
+MEMTIER_HOST=root@192.168.90.163 HPC_PIO=4 HPC_SNW=4 DIM=1024 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+MEMTIER_HOST=root@192.168.90.163 HPC_PIO=4 HPC_SNW=4 DIM=2048 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+MEMTIER_HOST=root@192.168.90.163 HPC_PIO=4 HPC_SNW=4 DIM=3072 TS="64" CS="1" PS="32" bash run_cluster_2node_sweep.sh
+# hpc Aeron cluster【本地 Mac 执行】（单档；client 在 163，同 3.1 前置）
+DIM=1024 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
+DIM=2048 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
+DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
 ```
 
 ---
@@ -286,11 +288,12 @@ DIM=3072 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 PIO=4 SNW=4 bash benchmark/vemb_v
 ## 4. 3.2.4 扩容场景下 VEMB 性能【块内注释标注执行位置】
 
 ```bash
-# hpc TCP 扩容【HW01 执行】⚠️ memtier 第三机在 163（192.168.1.163）未部署，暂不可跑（默认 PIO=21 SNW=21）
+# hpc TCP 扩容【HW01 执行】（memtier 在 163=192.168.1.163，走 100G；默认 PIO=21 SNW=21）
 PIO=21 SNW=21 bash scripts/hpc_redis_scaleout_throughput.sh
-# hpc Aeron 扩容【本地 Mac 执行】（client 固定在 HW01/111 上，绑 96-191 核）
-REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis PIO=21 SNW=21 bash scripts/vemb_v16_scaleout_ub_cluster_111_to_112.sh
-# 原生 redis cluster 扩容【HW01 执行】⚠️ 需 163/164 部署，暂不可跑
+# hpc Aeron 扩容【本地 Mac 执行】（client 在 HW04/163 上，经 UB 导入窗 dev9-14 直达两 owner 数据面，绑 96-191 核；PIO/SNW 默认 7:7，可覆盖）
+# 前置（一次性）: 163 已装 6 个 UB 导入窗（/root/jxw/ubme 的 ubme_tool import，163 dev9-14，回滚 state: 163:/tmp/state_163_scaleout.txt）且 163 上 `vemb_v16_build_stamp.sh verify client` 通过
+REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis bash scripts/vemb_v16_scaleout_ub_cluster_111_112_cli163.sh
+# 原生 redis cluster 扩容【HW01 执行】（memtier 默认在 HW04）
 N_INIT=3 N_FINAL=4 RAW=1 TEST_TIME=60 CLIENTS=200 THREADS=16 IO_THREADS=4 VECTORS_PER_VSET=6250 bash benchmark/run_redis_cluster_scaleout_vemb.sh
 ```
 
@@ -320,8 +323,8 @@ bash bench_aeron_3scenarios.sh small_7to1_100k aeron 100000 30
 ```bash
 # baseline + hpc TCP【HW01 执行】（一次跑出两组）
 HPC_PIO=2 HPC_SNW=2 TEST_TIME=30 NUM_KEYS=100000 bash benchmark/run_vsim_2key_2node.sh
-# HPC Aeron【本地 Mac 执行】（双 owner cluster 拓扑 + vsim-key-key，默认 9 档）
-OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 PIO=2 SNW=2 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+# HPC Aeron【本地 Mac 执行】（双 owner cluster 拓扑 + vsim-key-key，默认 7 档；client 在 HW04/163，同 §3 前置）
+OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 PIO=2 SNW=2 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
 ```
 
 产物：`benchmark/results/vsim_2key/.../summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`。
@@ -334,8 +337,8 @@ OP_TYPE=VSIM_2KEY TEST_TIME=30 NUM_KEYS=100000 PIO=2 SNW=2 bash benchmark/vemb_v
 # 本地回环 cold on【HW01 执行】
 RUN_LOCAL=1 WORKERS=2:2 TEST_TIME=20 OP_TYPE=VEMB TS=64 CS=1 PIPELINE=32 COLD_DIR=/root/gqs/cold_data/vemb64 bash scripts/run_aeron_best.sh
 
-# 跨节点 cluster cold on【本地 Mac 执行】
-REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis HPC_REDIS_COLD_DIR=/root/gqs/cold_data/xnode300 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput.sh
+# 跨节点 cluster cold on【本地 Mac 执行】（client 在 HW04/163，同 §3 前置）
+REMOTE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis HPC_REDIS_COLD_DIR=/root/gqs/cold_data/xnode300 SWEEP=0 TS=64 CS=1 PS=32 TEST_TIME=30 bash benchmark/vemb_v16_aeron_cluster_tput_cli163.sh
 ```
 
 产物：`perf/aeron_sweep/<run-id>/summary.tsv`、`benchmark/results/aeron_cluster/<run-id>/summary.tsv`。
@@ -417,5 +420,6 @@ tlc_ha_aeron_failover_111_to_112: PASS active_owner=1 standby_owner=0 run=<RUN_I
 
 ## 10. 环境备注
 
-- 163/164（100G 口 192.168.1.163/164）未部署本仓库：影响原生 4 节点 cluster（§3）、原生扩容与 TCP 扩容（§4），部署后执行对应标注命令。
-- 管理网偶发瞬时断连（ssh 255/预检失败）：直接重跑即可；HA Aeron runner 重复跑可加 TLC_HA_AERON_SKIP_SYNC=1 跳过远端重编。
+- HW04(ub3)/HW05(ub4) 已部署本仓库与 redis-8.6.3（/root/gqs/codespace）；数据面 192.168.1.163/164 已配置恢复（enp33s0f1np1，100G）。
+- memtier_benchmark_origin（含 zipf 补丁）已自 /ssd/root112/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin 同步恢复至 HW01/HW02 同路径。
+- 管理网偶发瞬时断连（ssh 255/预检失败）：直接重跑；但瞬断可能遗留未清理的 redis-server/memtier，会把后续命令的负载预检门拦掉——重跑前先清掉本次测试的残留进程（勿动他人/用户常驻进程）。HA Aeron runner 重复跑可加 TLC_HA_AERON_SKIP_SYNC=1 跳过远端重编。

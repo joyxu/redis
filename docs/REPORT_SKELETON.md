@@ -3,6 +3,7 @@
 > **最优行标记**: 配置 sweep 表 (t1/t2/t3/t4/t8) 中 **加粗行** 为该组最优档——
 > 规则: ops_sec 最大者为基准, 若存在吞吐 ≥97% 且 p99 显著更低 (<80%) 的档位则取后者;
 > baseline 与 hpc 分组各标一行。t5(阶段)/t6(场景) 行间非同类配置, 不标。
+> ops/core 口径（全部汇总表）: ops_sec ÷ (core_ut + core_st + si)——明细表 cores 列只含 ut+st，汇总一律把 softirq 计入核数重算（20261022 起统一此口径）。
 
 ## 3.2.1 单实例性能
 
@@ -405,11 +406,19 @@
 | op | t | c | pipeline | ops_sec | avg_lat_ms | p50_ms | p99_ms | cores | core_ut | core_st | si | hi | rss_kb |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
-#### 集群三方案对比: ops/sec/core
+#### 汇总：原生 vs hpc TCP
 
-| t | c | pipeline | 原生 ops/sec/core | TCP cluster ops/sec/core | TCP/原生 | Aeron ops/sec/core | Aeron/原生 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 1 | 62914 | 37058 | 0.59x | 49181 | 0.78x | (示例行，仅展示格式)
+| T | C | P | 原生 ops/core | hpc ops/core | 加速比 |
+|---|---|---:|---:|---:|---:|
+| 1 | 1 | 1 | 62914 | 37058 | 0.59x | (示例行，仅展示格式)
+
+#### 汇总：原生 vs hpc Aeron
+
+| T | C | P | 原生 ops/core | hpc ops/core | 加速比 |
+|---|---|---:|---:|---:|---:|
+| 1 | 1 | 1 | 62914 | 49181 | 0.78x | (示例行，仅展示格式)
+
+> 口径注意: hpc TCP 双机 cores 列只含 HW01（HW02 侧采集异常恒 0.04）时 ops/core 偏高，跨方案比较以吞吐绝对值为准；hpc Aeron 固定 worker 池在低并发档占核，低并发档 ops/core 天然吃亏，加速比以 64 线程档为准。
 
 ### 64x1x32 高维对比（DIM=1024，2048，3072）
 #### baseline

@@ -231,7 +231,10 @@ nohup $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 \
 export LD_LIBRARY_PATH=/root/gqs/nvsync
 export MC_UBMEM_DEV_PATH=/dev/obmm_shmdev3        # 本地池窗（本端缓冲使用）
 export MC_UBMEM_DEV_SIZE=$((8*1024*1024*1024))
-export MC_UBMEM_PEER_DEV_MAP="192.168.90.161:/dev/obmm_shmdev2=/dev/obmm_shmdev6"
+# ⚠️ 镜像设备编号随节点对而异：111/112 老对为 /dev/obmm_shmdev6，
+#    161/162 对实测为 /dev/obmm_shmdev10（映射写错时读长度正常但 verify_fail 全爆）。
+#    首次部署先跑单线程 smoke 确认 verify_fail=0 再上量。
+export MC_UBMEM_PEER_DEV_MAP="192.168.90.161:/dev/obmm_shmdev2=/dev/obmm_shmdev10"
 #                                                  对端主机:对端设备=本端镜像设备
 
 BIN=/root/gqs/nvsync/store_kv_bench_native

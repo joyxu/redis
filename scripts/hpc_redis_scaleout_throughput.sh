@@ -40,7 +40,7 @@ NODE1_SSH_PORT="${NODE1_SSH_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/root/gqs/codespace/UnifiedBus/hpc-redis}"
 MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 # memtier 执行节点 (client 负载机, 与 server 分离以排除 client 干扰)
-MEMTIER_HOST="${MEMTIER_HOST:-192.168.1.163}"  # HW03(163) 未部署，跑前确认
+MEMTIER_HOST="${MEMTIER_HOST:-192.168.1.163}"
 
 PAYLOAD_LOCAL_PATH="${PAYLOAD_LOCAL_PATH:-/dev/obmm_shmdev1}"
 PAYLOAD_PEER_PATH="${PAYLOAD_PEER_PATH:-/dev/obmm_shmdev9}"
@@ -407,9 +407,10 @@ stop_memtier_bg() {
 parse_bg_out() {
     local host=$1 outfile=$2
     local tot ops p50 p99
-    # memtier 偶尔在 sleep 后才 flush Totals，给 15s 重试窗口
+    # memtier 在 during 阶段(在途排空+通道关闭握手)可能远超 15s 才 flush
+    # Totals (20261021 实测 73s+), 与 aeron scaleout 脚本对齐放宽到 60s
     local i
-    for i in $(seq 1 15); do
+    for i in $(seq 1 60); do
         tot=$(ssh_run "$host" "grep '^Totals' $outfile 2>/dev/null | tail -1")
         [ -n "$tot" ] && break
         sleep 1

@@ -19,6 +19,10 @@ HW01_IP=${HW01_IP:-192.168.1.161}
 HW02_IP=${HW02_IP:-192.168.1.162}
 SERVER_PORT=${SERVER_PORT:-6390}
 CLIENT=${CLIENT:-root@192.168.90.162}
+# memtier 执行机 (20261021 起 cluster 稳态 client 统一放 HW04/163, 与两台 server 分离;
+# 默认回落 $CLIENT 保持旧行为)。仅影响 prefill/压测的 memtier 执行位置,
+# 第二台 server 始终在 $CLIENT (HW02) 上。
+MEMTIER_HOST=${MEMTIER_HOST:-$CLIENT}
 NIC_IFACE=${NIC_IFACE:-enp33s0f1np1}
 HW02_NIC_IFACE=${HW02_NIC_IFACE:-enp38s0f1np1}
 
@@ -151,7 +155,7 @@ start_server_hw02() {
             --vemb-v16-dim $DIM \
             --vemb-v16-proxy-io-threads $HPC_PIO \
             --vemb-v16-supernode-workers $HPC_SNW \
-            --vemb-v16-warm-regions-manifest $HPC_DIR/examples/cluster_112.yaml \
+            --vemb-v16-warm-regions-manifest $HW02_MANIFEST \
             --vemb-v16-reset-warm-regions yes \
             --appendonly no --save '' \
             --dir $DATA_DIR --logfile $DATA_DIR/hw02.log \
@@ -205,9 +209,9 @@ ENDPOINTS=${ENDPOINTS:-"${HW01_IP}:${SERVER_PORT},${HW02_IP}:${SERVER_PORT}"}
 
 prefill() {
     log "  Prefill ${NUM_KEYS} keys via multi-endpoint VADD..."
-    ssh "$CLIENT" "pkill -9 -f memtier_benchmark" 2>/dev/null || true
+    ssh "$MEMTIER_HOST" "pkill -9 -f memtier_benchmark" 2>/dev/null || true
     local nfill=$NUM_KEYS
-    ssh "$CLIENT" "ulimit -n 200000; $CLIENT_TASKSET $MEMTIER \
+    ssh "$MEMTIER_HOST" "ulimit -n 200000; $CLIENT_TASKSET $MEMTIER \
         --protocol vemb_v16 --vemb-v16-dim $DIM \
         --vemb-v16-endpoints=$ENDPOINTS \
         -t 8 -c 1 --pipeline=32 \
@@ -251,7 +255,7 @@ run_one_config() {
     # === memtier (多端点 VEMB 读, NUMA pinning) ===
     local raw_remote="/tmp/cluster_vemb_t${t}_c${c}_p${p}.log"
     local raw_local="$RAWDIR/t${t}_c${c}_p${p}.log"
-    ssh "$CLIENT" "ulimit -n 200000; $CLIENT_TASKSET $MEMTIER \
+    ssh "$MEMTIER_HOST" "ulimit -n 200000; $CLIENT_TASKSET $MEMTIER \
         --protocol vemb_v16 --vemb-v16-dim $DIM \
         --vemb-v16-endpoints=$ENDPOINTS \
         -t $t -c $c --pipeline=$p \
@@ -331,6 +335,19 @@ log "  HW02 MANIFEST=$HW02_MANIFEST"
 # 前置
 setup_client || exit 1
 deploy_hw02_manifest || exit 1
+
+# 预热 warm 布局: 对称 manifest 下两台同时启动, 先起的一方读到的是对端上一轮遗留的
+# region 头; 布局 (value_size/bytes) 不符即 'warm ub layout init failed' -> dataplane
+# 被禁用 -> prefill 0 (20261021 高维实测)。DIM=300 此前能过只因旧头恰好同布局。
+# 先起一轮让两台各自把本地 region 头刷成本轮布局, 杀掉后再正式启动, 对端头即正确。
+prime_warm_layout() {
+    log "=== 预热 warm region 布局 (DIM=$DIM) ==="
+    start_server_hw01 || return 1
+    start_server_hw02 || return 1
+    sleep 2
+    stop_servers
+}
+prime_warm_layout || { log "ABORT: warm layout prime failed"; exit 1; }
 
 # TSV header
 printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\thw01_cores\thw02_cores\thw01_nic_pct\thw02_nic_pct\tcore_ut\tcore_st\tsi\trss_kb\n" > "$TSV"

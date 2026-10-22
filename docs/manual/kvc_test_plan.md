@@ -20,7 +20,7 @@
 - 两台鲲鹏节点（示例：owner = `192.168.90.161`（HW01），bench = `192.168.90.162`（HW02），以实际环境为准），root 互信 SSH。
 - UB.MEM 设备 `/dev/obmm_shmdev*`：每节点分为本地池窗（本节点 export）与镜像窗（对端 import），编号以环境 `obmmctl` 布局为准。
 - URMA 设备（如 `udma1`）由 urma 库在进程初始化时动态枚举，无需预先创建设备节点。
-- Python 元数据服务（Mooncake python 包）。
+- Python 元数据服务（Mooncake python 包）；不可用时可用 master 内嵌元数据服务替代（`-enable_http_metadata_server=true -http_metadata_server_port=8080`，见"1MB 大块参考数据"节）。
 - 编译开关：`-DUSE_TCP=ON -DUSE_UB=ON -DUSE_UBMEM=ON -DUSE_CXL=ON -DBUILD_BENCHMARK=ON`，四组测试共用一份编译产物（编译步骤与依赖见 [KVC 用户指南：TE over ubmem](kvc_ubmem_user_guide.md)"编译"节）。
 
 ### 系统参数（每组测试前确认）
@@ -223,6 +223,7 @@ pkill -f 'runtime=400'; pkill -f 'enable_cxl=true'; sleep 2
 
 - **公共**：owner 的 `--host` 使用本机**对外 IP**（不能为 `127.0.0.1`）；bench 侧 `$COMMON` 的 master / metadata 地址更换为 owner 对外 IP；同步三个文件到 bench 节点（bench 二进制 + `libkvc_server.so` + `libasio.so`，并设置 `LD_LIBRARY_PATH`）。
 - **TCP / URMA 组**：命令仅地址变化；URMA 的 topo.json 在 bench 侧同样生成并 export。
+  **多网卡节点 TCP 组必须在 owner 与 bench 两侧都设 `MC_TCP_BIND_ADDRESS=<本机高速网口 IP>`**：TE 的 TCP 数据面地址不取 `--host`（`--host` 只决定段名），未设时取第一块网卡 IP（本环境为 10G 管理口 `192.168.90.x`），数据会被低速口线速钉死。跑前用 `/sys/class/net/<if>/statistics/rx_bytes` 增量核对流量确实走 100G 口 `192.168.1.x`。
 - **ubmem 组**：owner 段位于 owner 本地池窗；bench 侧 `MC_UBMEM_DEV_PATH` 填**本节点自己的本地池窗**（本端缓冲使用），并设置
   `MC_UBMEM_PEER_DEV_MAP="<owner IP>:<owner 设备>=<本端镜像设备>"`（读操作经镜像窗完成）。
   先执行单线程 smoke 验证（`--read_threads=1 --runtime=5`），`verify_fail=0`（跨窗口字节级校验）通过后再执行梯度；每档执行后检查 `dmesg | grep -iE "ucmi|mami" | grep -icE "error|fail"` 无增量。
@@ -275,6 +276,61 @@ pkill -f 'runtime=400'; pkill -f 'enable_cxl=true'; sleep 2
 
 ¹ TCP ≥64 线程发生传输超时（见组 1 说明）。
 
+## 1MB 大块参考数据（2026-10-20 实测）
+
+同一测试方法在 **value = 1 MiB** 口径下的 TCP 与 TE over ubmem 对比（owner = HW01 / 192.168.90.161，bench 同机或 HW02 / 192.168.90.162，每档 20 s，verify 开启，failed / verify_fail 全零）。
+
+### 与 4KB 口径的参数差异
+
+| 参数 | 4KB 口径 | 1MB 口径 | 原因 |
+| --- | --- | --- | --- |
+| `--value_size` | 4096 | 1048576 | |
+| `--batch_size` | 64 | 16 | 每读线程缓冲 = batch × value；batch=64 时 128 线程需 8 GB，超出 ubmem 窗口分区上限（段 4 GB + 缓冲 ≤ 8 GB） |
+| `--num_objects` | 100000 | 3072 | 1 MB slot 下 4 GB 段共 4096 slot，取 75%（低于 0.90 驱逐高水位） |
+| `--local_buffer_size` | 256MB | 2.5GB | 128 线程 × 16 MB = 2 GB + 填充缓冲余量 |
+| `KVC_MASTER_BLOCK_SIZE` | 4096 | 1048576 | 定长 slot 分配器 block 须等于 value 大小 |
+
+### 结果（格式 = MiB/s（p50 ms））
+
+本地（driver 与 owner 同在 HW01）：
+
+| 线程 | TE over TCP | ubmem 默认（拷贝池） | ubmem（`MC_UBMEM_COPY_THREADS=0`） |
+| ---: | --- | --- | --- |
+| 1 | 2243²（5.1） | 4813²（0.8） | 4742²（1.9） |
+| 8 | 4612（25.2） | 4184（17.2） | 39737（1.8） |
+| 16 | 4554（53.6） | 3583（46.4） | 56692（2.2） |
+| 32 | 4606（108.8） | 2959（126.5） | 57367（2.8） |
+| 64 | 4715（220.1） | 2873（254.1） | 58630（5.4） |
+| 128 | 4799（428.1） | 2974（471.1） | **57029（9.8）** |
+
+跨节点（owner 在 HW01，bench 在 HW02；TCP 数据面经 100G 口 `192.168.1.x`，另附 10G 口 `192.168.90.x` 对照）：
+
+| 线程 | TE over TCP（100G） | TE over TCP（10G）³ | ubmem 默认（拷贝池） | ubmem（`MC_UBMEM_COPY_THREADS=0`） |
+| ---: | --- | --- | --- | --- |
+| 1 | 1738²（7.3） | 893²（16.1） | 2253²（5.6） | 1267²（11.3） |
+| 8 | **3450（35.3）** | 1127（112.3） | 2885（31.6） | 7721（15.4） |
+| 16 | 2543（108.4） | 1134（226.1） | 2775（60.6） | 11209（21.6） |
+| 32 | 2566（220.8） | 1146（453.7） | 2817（122.6） | 11267（44.3） |
+| 64 | 2763（355.0） | 1172（910.0） | 2626（263.6） | 10518（82.6） |
+| 128 | 2981（614.7） | 1224（1821.8） | 2804（495.1） | **11313（197.0）** |
+
+² 单线程行取自 5-10 s smoke（其余档 20 s）。
+³ 10G 列为未设 `MC_TCP_BIND_ADDRESS` 时的结果——TE 数据面默认落到第一块网卡（10G 管理口），1.1-1.2 GB/s 正是 10 Gbps 线速；见下文"环境实测记录"。ubmem 数据面走 UB fabric，不受以太网口影响。
+
+### 判读
+
+- **TCP 在 1MB 口径下没有 4KB 的 ≥64 线程超时风暴**，转为带宽受限：本地 ~4.6-4.8 GB/s（单线程 asio 数据面 + 内核协议栈三次拷贝）；跨节点经 100G 口 2.5-3.5 GB/s，8 线程即达峰值 3450 后随并发回落——远低于 100G 线速（~11.6 GB/s），瓶颈在 TE TCP 数据面（单 asio 线程 + 内核协议栈，MTU 1500）而非网口；经 10G 口则被线速钉死在 1.1-1.2 GB/s。4KB 口径的 444 MiB/s 天花板是每请求开销主导，1MB 把单请求开销摊薄后 TCP 提升约一个量级。
+- **ubmem 默认配置在大块下存在反直觉的并发塌陷**：≥ 1 MiB 的拷贝走并行分片拷贝池，而拷贝池的 dispatch 持有**全局互斥锁**——所有大块拷贝被串行化。16 线程起吞吐反而低于或接近 TCP（本地 3.6 GB/s vs 4.6，跨节点 2.8 vs 2.5-3.0 GB/s 且 p99 达 3.4 s）。多线程大块场景 driver 侧必须设 `MC_UBMEM_COPY_THREADS=0`（关闭拷贝池、各线程内联 memcpy）。
+- **关闭拷贝池后 ubmem 全面胜出**：本地 57-59 GB/s（贴内存带宽，约为 TCP 的 12 倍）；跨节点 11.2-11.3 GB/s（约为 100G TCP 峰值的 3.3 倍、128 线程时的 3.8 倍），且 16 线程即达平台。
+- **单线程场景拷贝池有利**（本地 4813 vs 4742，跨节点 2253 vs 1267）：9 路并行分片能把单次拷贝摊到多核。单线程部署保留默认、多线程部署设 0。
+
+### 本对节点（161/162）环境实测记录
+
+- **多网卡节点 TCP 必须显式设 `MC_TCP_BIND_ADDRESS`**：TE 的 TCP 数据面地址不取 `--host`（`--host` 只决定段名），而是取 `MC_TCP_BIND_ADDRESS`，未设置时用 `findLocalIpAddresses()[0]`——本对节点上即第一块网卡 10G 管理口 `192.168.90.x`。owner 与 bench 两侧都要设为各自的 100G 地址（`192.168.1.161` / `192.168.1.162`）；监听端为 `::` any，不影响接受连接。用 `/sys/class/net/<if>/statistics/rx_bytes` 的增量核对流量走向：首次按段名 192.168.1.161 测时 100G 口 0 流量、10G 口 1174 MiB/s，设置后 100G 口 3107 MiB/s、10G 口 0。
+- master 内嵌元数据服务可用：`-enable_http_metadata_server=true -http_metadata_server_port=8080`（python aiohttp 元数据服务器在本对节点不可用且无外网安装）。元数据 URL 仍为 `http://<ip>:8080/metadata`。
+- `libkvc_server.so` 必须在节点上原生构建：从工作站整树同步过来的 `kvc-sdk/build/` 产物是 Mach-O，加载报 `invalid ELF header`。在节点上执行 `cd kvc-sdk && make clean && make libs` 后恢复正常。
+- **跨节点镜像映射与老节点对不同**：本对实测 HW01 `/dev/obmm_shmdev2` ↔ HW02 `/dev/obmm_shmdev10`（111/112 老对为 shmdev6）。映射写错时读长度正常但 `verify_fail` 全爆（读到的是别的内存），**必须先跑单线程 smoke 确认 verify_fail=0 再上梯度**；也可用 magic 探针（owner 侧窗口写特征串、driver 侧逐窗口扫描）直接定位镜像设备。
+
 ## 常见问题
 
 | 症状 | 原因 | 处置 |
@@ -290,5 +346,10 @@ pkill -f 'runtime=400'; pkill -f 'enable_cxl=true'; sleep 2
 | bench 读结果大量 MISS | 数据被淘汰 / 数据段被替换 / TTL 过期 | 调大 master TTL，重建 owner 并重新 fill |
 | TCP 64/128 线程吞吐 0.2 MiB/s、p50=60s | 单线程 asio 数据面高并发下的传输超时（已知行为） | 如实记录 |
 | TE TCP 吞吐异常偏低且伴随传输错误 | 端口资源耗尽（系统参数未设置） | 设置 `tcp_tw_reuse=1` 并扩大端口范围 |
+| `No module named aiohttp`（python 元数据服务起不来） | 节点无 aiohttp 且无外网 | 改用 master 内嵌元数据服务：`-enable_http_metadata_server=true -http_metadata_server_port=8080` |
+| `invalid ELF header: libkvc_server.so` | 从工作站同步来的 kvc-sdk 构建产物为 Mach-O | 节点上 `cd kvc-sdk && make clean && make libs` 原生重建 |
+| 1MB 大块多线程下 ubmem 吞吐骤降、p99 秒级（甚至低于 TCP） | ≥1 MiB 拷贝走并行分片拷贝池，其 dispatch 为全局互斥，大块拷贝被串行化 | driver 侧设 `MC_UBMEM_COPY_THREADS=0`（单线程场景保留默认反而更快） |
+| 跨节点读长度正常但 `verify_fail` 大量失败 | `MC_UBMEM_PEER_DEV_MAP` 镜像设备不对（不同节点对映射不同，如 161/162 对为 shmdev10 而非 shmdev6） | 用 magic 探针定位镜像设备；fill 在 owner 本地做，smoke verify_fail=0 通过后再上梯度 |
+| 跨节点 TCP 吞吐卡在 ~1.2 GB/s（≈10 Gbps），换高速口地址也不变 | TE TCP 数据面地址取 `MC_TCP_BIND_ADDRESS` 或第一块网卡 IP，与 `--host` 无关，流量落到 10G 管理口 | owner / bench 两侧设 `MC_TCP_BIND_ADDRESS=<100G IP>`；用网口 `rx_bytes` 增量核对 |
 
 ---
