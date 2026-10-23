@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/time.h>
 
 #include <algorithm>
@@ -453,22 +454,30 @@ static int common_core_prepare_slot(common_core_slot *slot)
          * count scales with threads, not connections. */
         if (!worker->shared_client) {
             worker->shared_client = common_core_prepare_client(worker);
-            if (!worker->shared_client)
+            if (!worker->shared_client) {
+                fprintf(stderr, "[common-core] prepare stage failed: prepare_client\n");
                 return -1;
+            }
         }
         slot->client = worker->shared_client;
 
         if (!common_core_pure_read(worker->cfg) &&
             !common_core_key_key_session(worker->cfg))
             return 0;
-        if (vemb_v16_client_prepare_active_owner_channels(slot->client) != 0)
+        if (vemb_v16_client_prepare_active_owner_channels(slot->client) != 0) {
+            fprintf(stderr, "[common-core] prepare stage failed: active_owner_channels\n");
             return -1;
+        }
         vemb_v16_client_handle_session_options_t options = {
             .max_batch_delay_us = worker->cfg->vemb_v16_batch_max_delay_us,
         };
         slot->handle_session = vemb_v16_client_handle_session_create(
             slot->client, &options);
-        return slot->handle_session ? 0 : -1;
+        if (!slot->handle_session) {
+            fprintf(stderr, "[common-core] prepare stage failed: handle_session_create errno=%d\n", errno);
+            return -1;
+        }
+        return 0;
     }
 
     slot->client = common_core_prepare_client(worker);
@@ -1264,24 +1273,37 @@ static void common_core_run_async_reads(common_core_worker *worker,
                 gettimeofday(&pending.sent_time, NULL);
                 pending.bytes_tx = (uint32_t)key.size() + 24u;
                 uint64_t cookie = next_cookie++;
+                /* Admission rejection (-1 pool full / -2 busy) is transient
+                 * under deep pipelines: drain completions to release pool
+                 * slots and retry a bounded number of times before the
+                 * submission is booked as an error. */
+                unsigned submit_attempts = 0;
                 int rc;
-                if (worker->cfg->vemb_v16_vsim_key_key &&
-                    it->handle_session) {
-                    char key2_buf[VEMB_V16_MAX_KEY_LEN];
-                    common_core_next_key2(worker, key, key2_buf,
-                                          sizeof(key2_buf));
-                    pending.bytes_tx += strlen(key2_buf);
-                    rc = vemb_v16_client_handle_session_submit_vsim_key_key(
-                        it->handle_session, NULL, key.c_str(), key2_buf,
-                        cookie);
-                } else if (worker->use_handle_session) {
-                    rc = vemb_v16_client_handle_session_submit(
-                        it->handle_session, NULL, key.c_str(), cookie);
-                } else {
-                    rc = vemb_v16_client_vector_session_submit(
-                        it->vector_session, NULL, key.c_str(), cookie);
-                }
-                worker->issued++;
+                do {
+                    if (worker->cfg->vemb_v16_vsim_key_key &&
+                        it->handle_session) {
+                        char key2_buf[VEMB_V16_MAX_KEY_LEN];
+                        common_core_next_key2(worker, key, key2_buf,
+                                              sizeof(key2_buf));
+                        pending.bytes_tx += strlen(key2_buf);
+                        rc = vemb_v16_client_handle_session_submit_vsim_key_key(
+                            it->handle_session, NULL, key.c_str(), key2_buf,
+                            cookie);
+                    } else if (worker->use_handle_session) {
+                        rc = vemb_v16_client_handle_session_submit(
+                            it->handle_session, NULL, key.c_str(), cookie);
+                    } else {
+                        rc = vemb_v16_client_vector_session_submit(
+                            it->vector_session, NULL, key.c_str(), cookie);
+                    }
+                    worker->issued++;
+                    if (rc == 0)
+                        break;
+                    if ((rc != -1 && rc != -2) || ++submit_attempts >= 64)
+                        break;
+                    common_core_drive_sessions(worker);
+                    sched_yield();
+                } while (true);
                 if (rc != 0) {
                     common_core_account_read(worker, pending, -1, 0, false);
                     continue;

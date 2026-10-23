@@ -47,6 +47,10 @@ typedef struct vemb_v16_manifest_region {
     uint32_t home_ub_node_id;
     uint32_t is_local;
     uint32_t has_is_local;
+    /* Opt-in for single-host simulated-remote topologies: this process
+     * initializes and resets the layout even though the region is not
+     * local. Cluster manifests must leave it unset. */
+    uint32_t self_initialize;
     uint32_t weight;
     uint32_t value_size;
     uint32_t cache_policy;
@@ -295,6 +299,9 @@ int vemb_v16_parse_warm_regions_manifest(const char *path,
                                          vemb_v16_warm_regions_manifest_t *manifest);
 /* Requires a validated manifest; callers must fence all users before reset. */
 int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest);
+/* Enables COLD persistence when directory is non-empty; NULL/"" disables. */
+int vemb_v16_storage_enable_cold(vemb_v16_storage_ctx_t *storage,
+                                 const char *directory);
 void vemb_v16_storage_ctx_destroy(vemb_v16_storage_ctx_t *storage);
 const char *vemb_v16_storage_vector_region_name(vemb_v16_storage_ctx_t *storage);
 size_t vemb_v16_storage_vector_region_size(vemb_v16_storage_ctx_t *storage);

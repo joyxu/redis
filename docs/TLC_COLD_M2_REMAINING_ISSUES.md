@@ -148,7 +148,7 @@ location generation/写序列，server 不为旧 handle 提供额外防护，也
 当前生产启动通过：
 
 ```text
-HPC_REDIS_COLD_DIR
+--vemb-v16-cold-dir
 HPC_REDIS_KEY_SHARD_COUNT
 ```
 

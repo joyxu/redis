@@ -5282,19 +5282,36 @@ int vemb_v16_client_reconnect(vemb_v16_client_t *client)
 int vemb_v16_client_prepare_active_owner_channels(vemb_v16_client_t *client)
 {
     if (client->transport_type != VEMB_V16_TRANSPORT_AERON ||
-        !client->ub_peer_view_ready ||
-        !vemb_v16_cluster_core_topology_ready(&client->cluster))
+        !client->ub_peer_view_ready)
         return -1;
+    /* Concurrent worker setup can transiently miss the topology snapshot or
+     * race the control-plane attach; the prepare is idempotent, so retry it
+     * a bounded number of times instead of failing the worker outright. */
+    for (unsigned attempt = 0; attempt < 10; attempt++) {
+        if (!vemb_v16_cluster_core_topology_ready(&client->cluster)) {
+            usleep(100 * 1000);
+            continue;
+        }
 
-    const vemb_v16_client_topology_t *topology =
-        vemb_v16_cluster_core_topology(&client->cluster);
-    for (uint32_t i = 0; i < topology->active_ring.owner_count; i++) {
-        uint32_t owner_id = topology->active_ring.owners[i];
-        if (ensure_owner_channel(client, owner_id) != 0 ||
-            !sdk_owner_v2_enable(client, owner_id))
-            return -1;
+        const vemb_v16_client_topology_t *topology =
+            vemb_v16_cluster_core_topology(&client->cluster);
+        int failed = 0;
+        for (uint32_t i = 0; i < topology->active_ring.owner_count; i++) {
+            uint32_t owner_id = topology->active_ring.owners[i];
+            if (ensure_owner_channel(client, owner_id) != 0) {
+                failed = 1;
+                break;
+            }
+            /* v2 enable is best effort: its 0 return covers benign states
+             * (unavailable, migrating) and the request path re-attempts it
+             * dynamically; v1 serves the workload meanwhile. */
+            sdk_owner_v2_enable(client, owner_id);
+        }
+        if (!failed)
+            return 0;
+        usleep(100 * 1000);
     }
-    return 0;
+    return -1;
 }
 
 void vemb_v16_client_set_retry_budget(vemb_v16_client_t *client,
@@ -6451,41 +6468,56 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote_with_peer_view(
         !peer_view_manifest || !client_host || !client_host[0])
         return NULL;
 
-    int fd = vemb_v16_aeron_tcp_connect(host, port);
-    if (fd < 0) return NULL;
-
-    vemb_v16_aeron_attach_req_t req;
-    memset(&req, 0, sizeof(req));
-    memcpy(req.magic, VEMB_V16_AERON_ATTACH_MAGIC,
-           VEMB_V16_AERON_ATTACH_MAGIC_LEN);
-    req.dim = dim;
-    req.req_slot_size  = 0;  /* 0 = server picks */
-    req.resp_slot_size = 0;
-    req.flags = VEMB_V16_AERON_ATTACH_F_REMOTE_PATH;
-
+    /* The ATTACH exchange rides the server control port; under many
+     * concurrent channel opens (deep-pipeline cluster tiers) a read can
+     * transiently fail with EAGAIN before the server answers. Retry the
+     * connect+exchange a bounded number of times instead of failing the
+     * whole worker. */
     vemb_v16_aeron_attach_resp_t resp;
     memset(&resp, 0, sizeof(resp));
-    /* Inline ATTACH exchange (write_full/read_full from vemb_v16_net.h) —
-     * avoids linking the server-only vemb_v16_aeron_attach.c into the SDK. */
-    int exchange_rc = vemb_v16_net_write_full(fd, &req, sizeof(req));
-    if (exchange_rc == 0)
-        exchange_rc = vemb_v16_net_read_full(fd, &resp, sizeof(resp));
-    if (exchange_rc == 0 &&
-        memcmp(resp.magic, VEMB_V16_AERON_ATTACHED_MAGIC,
-               VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0)
-        exchange_rc = -2;
-    if (exchange_rc == 0 && resp.status != 0)
-        exchange_rc = -3;
+    int exchange_rc = -1;
+    for (unsigned attempt = 0; attempt < 8; attempt++) {
+        int fd = vemb_v16_aeron_tcp_connect(host, port);
+        if (fd < 0) {
+            exchange_rc = -4;
+            usleep(50 * 1000);
+            continue;
+        }
+
+        vemb_v16_aeron_attach_req_t req;
+        memset(&req, 0, sizeof(req));
+        memcpy(req.magic, VEMB_V16_AERON_ATTACH_MAGIC,
+               VEMB_V16_AERON_ATTACH_MAGIC_LEN);
+        req.dim = dim;
+        req.req_slot_size  = 0;  /* 0 = server picks */
+        req.resp_slot_size = 0;
+        req.flags = VEMB_V16_AERON_ATTACH_F_REMOTE_PATH;
+
+        memset(&resp, 0, sizeof(resp));
+        /* Inline ATTACH exchange (write_full/read_full from vemb_v16_net.h) —
+         * avoids linking the server-only vemb_v16_aeron_attach.c into the SDK. */
+        exchange_rc = vemb_v16_net_write_full(fd, &req, sizeof(req));
+        if (exchange_rc == 0)
+            exchange_rc = vemb_v16_net_read_full(fd, &resp, sizeof(resp));
+        close(fd);
+        if (exchange_rc == 0 &&
+            memcmp(resp.magic, VEMB_V16_AERON_ATTACHED_MAGIC,
+                   VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0)
+            exchange_rc = -2;
+        if (exchange_rc == 0 && resp.status != 0)
+            exchange_rc = -3;
+        if (exchange_rc == 0)
+            break;
+        usleep(50 * 1000);
+    }
     if (exchange_rc != 0) {
         fprintf(stderr,
                 "[sdk] aeron attach exchange failed endpoint=%s:%u rc=%d "
                 "errno=%d status=%u channel=%llu\n",
                 host, (unsigned)port, exchange_rc, errno, resp.status,
                 (unsigned long long)resp.channel_id);
-        close(fd);
         return NULL;
     }
-    close(fd);  /* TCP is handshake-only; data goes over shmdev */
 
     if (resp.request_shmdev_path_len == 0 ||
         resp.request_shmdev_path_len > VEMB_V16_AERON_SHMDEV_PATH_MAX ||

@@ -3324,6 +3324,7 @@ standardConfig static_configs[] = {
 
     createIntConfig("vemb-v16-dim", NULL, IMMUTABLE_CONFIG, 0, VEMB_V16_MAX_DIM, server.vemb_v16_dim, 0, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-warm-regions-manifest", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_regions_manifest, NULL, NULL, NULL),
+    createStringConfig("vemb-v16-cold-dir", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_cold_dir, NULL, NULL, NULL),
     createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),
     createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),

@@ -303,7 +303,7 @@ static int vemb_v16_server_start_ha_replica(vemb_v16_storage_ctx_t *storage) {
     tlc_cold_t *cold = tlc_core_get_cold(core);
     if (!cold) {
         serverLog(LL_WARNING,
-                  "HA Replica requires HPC_REDIS_COLD_DIR before server startup");
+                  "HA Replica requires vemb-v16-cold-dir before server startup");
         return -1;
     }
     const char *bind_host = getenv("HPC_REDIS_HA_CONTROL_BIND_HOST");
@@ -455,6 +455,11 @@ int vemb_v16_server_integration_init(void) {
                                                    dim * sizeof(float),
                                                    &manifest) != 0) {
         serverLog(LL_WARNING, "vemb_v16_storage_ctx_create_from_manifest failed");
+        return -1;
+    }
+    if (vemb_v16_storage_enable_cold(storage, server.vemb_v16_cold_dir) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_storage_enable_cold failed");
+        vemb_v16_storage_ctx_destroy(storage);
         return -1;
     }
 

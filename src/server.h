@@ -1949,6 +1949,7 @@ struct redisServer {
 
     int vemb_v16_dim;              /* startup-only; 0 means unset */
     char *vemb_v16_warm_regions_manifest;
+    char *vemb_v16_cold_dir;       /* COLD persistence directory; NULL disables */
     int vemb_v16_reset_warm_regions;
     int vemb_v16_supernode_workers;
     int vemb_v16_proxy_io_threads;

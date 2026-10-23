@@ -3,7 +3,7 @@
 > **最优行标记**: 配置 sweep 表 (t1/t2/t3/t4/t8) 中 **加粗行** 为该组最优档——
 > 规则: ops_sec 最大者为基准, 若存在吞吐 ≥97% 且 p99 显著更低 (<80%) 的档位则取后者;
 > baseline 与 hpc 分组各标一行。t5(阶段)/t6(场景) 行间非同类配置, 不标。
-> ops/core 口径（全部汇总表）: ops_sec ÷ (core_ut + core_st + si)——明细表 cores 列只含 ut+st，汇总一律把 softirq 计入核数重算（20261022 起统一此口径）。
+> ops/core 口径（全部汇总表）: ops_sec ÷ (core_ut + core_st + si)——明细表 cores 列含 ut+st+si，汇总一律把 softirq 计入核数重算（20261022 起统一此口径）。
 
 ## 3.2.1 单实例性能
 
@@ -590,3 +590,49 @@ keepalived 部署 check 结果（前置）：111/112 `config=valid`。
 | --- | --- | --- | --- | --- | --- | --- |
 | 正向 0 -> 1 |  | 0 | 0 | 唯一，漂至 standby | FOLLOWER，seq 追平 |  |
 | 反向 1 -> 0 |  | 0 | 0 | 唯一，漂至 standby | FOLLOWER，seq 追平 |  |
+## 3.3 KVC 原生基准（Mooncake TE 传输层）
+
+> 文件：
+
+### 传输层基准（4KB 读）
+
+本地（owner + bench 同机）:
+
+| 传输 | 线程 | kv/s | MiB/s | p50_ms | p99_ms | failed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TE over TCP | 8 |  |  |  |  |  |
+| TE over TCP | 32 |  |  |  |  |  |
+| TE over TCP | 64 |  |  |  |  |  |
+| TE over TCP | 128 |  |  |  |  |  |
+| TE over ubmem | 8 |  |  |  |  |  |
+| TE over ubmem | 32 |  |  |  |  |  |
+| TE over ubmem | 64 |  |  |  |  |  |
+| TE over ubmem | 128 |  |  |  |  |  |
+| TE over URMA | 全档 | 未跑成¹ | — | — | — | — |
+
+跨节点（owner=HW01 / bench=HW02）:
+
+| 传输 | 线程 | kv/s | MiB/s | p50_ms | p99_ms | failed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TE over TCP | 8 |  |  |  |  |  |
+| TE over TCP | 64 |  |  |  |  |  |
+| TE over TCP | 128 |  |  |  |  |  |
+| TE over ubmem（镜像窗） | 8 |  |  |  |  |  |
+| TE over ubmem（镜像窗） | 128 |  |  |  |  |  |
+| TE over ubmem（镜像窗） | 256 |  |  |  |  |  |
+| TE over URMA | 全档 | 未跑成¹ | — | — | — | — |
+
+> 注记区: 每传输一行注一条（TCP 高并发失败给 failed 数与 60s 超时说明、上游定性; URMA 未跑成给内核/用户态报错证据链）。
+
+### 大块读取口径（每键 1 MiB）
+
+| 传输 | 线程 | MiB/s | p50_ms | p99_ms |
+| --- | ---: | ---: | ---: | ---: |
+| ubmem（MC_UBMEM_COPY_THREADS=0） | 1 |  |  |  |
+| ubmem（MC_UBMEM_COPY_THREADS=0） | 32 |  |  |  |
+| ubmem（MC_UBMEM_COPY_THREADS=0） | 128 |  |  |  |
+| TCP 对照 | 1 |  |  |  |
+| TCP 对照 | 32 |  |  |  |
+| TCP 对照 | 128 |  |  |  |
+
+> 1 MiB 键下 kv/s 与 MiB/s 数值相同，只列 MiB/s；fill 阶段数据不入表；吞吐与时延必须成对给出。

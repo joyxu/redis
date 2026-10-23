@@ -1245,7 +1245,7 @@ HA 与第 5 章扩容控制处理不同层次的变化：`ha_term` 表达副本�
 | [tlc_cold.c](../src/tlc_cold.c) / [tlc_cold.h](../src/tlc_cold.h) | 有界 AOF queue、唯一 writer、group commit、连续序号与校验、checkpoint 原子发布、replay、retention pin 和 compact |
 | [tlc_core.c](../src/tlc_core.c) | 先 append 后在线发布的 PUT/DEL、write fence、checkpoint 状态捕获、WARM 重建及复制/重同步应用 |
 | [tlc_ha_replica.c](../src/tlc_ha_replica.c) / [tlc_ha_replica.h](../src/tlc_ha_replica.h) | TCP 控制面与 UB 数据面、事件批量复制、accepted/durable/applied 进度、AOF 补传、artifact 安装、tail handoff 与角色转换 |
-| [vemb_v16_storage.c](../src/vemb_v16_storage.c) / [vemb_v16_server_integration.c](../src/vemb_v16_server_integration.c) | 通过 `HPC_REDIS_COLD_DIR` 启用持久化，通过 `HPC_REDIS_HA_ROLE` 及 peer/ring 配置启动 HA，暴露 `HA STATE/PROGRESS/PROMOTE/DEMOTE/FENCE` |
+| [vemb_v16_storage.c](../src/vemb_v16_storage.c) / [vemb_v16_server_integration.c](../src/vemb_v16_server_integration.c) | 通过 `--vemb-v16-cold-dir` 参数启用持久化，通过 `HPC_REDIS_HA_ROLE` 及 peer/ring 配置启动 HA，暴露 `HA STATE/PROGRESS/PROMOTE/DEMOTE/FENCE` |
 | [ha_healthcheck.sh](../scripts/ha_healthcheck.sh) / [ha_notify.sh](../scripts/ha_notify.sh) / [Keepalived 模板](../scripts/keepalived_hpc_redis.conf.in) | 健康检测、VIP 状态通知、角色命令、notify 结果记录与重试、失败撤销入口及 `nopreempt` |
 | [C SDK](../clients/c/vemb_v16_client_sdk.c) / [HA Aeron 回归](../benchmark/tlc_ha_aeron_failover_111_to_112.sh) | HA endpoint 访问、按 owner 建立 ATTACH/UB view，以及切换后的 channel 重建与 handle 读取验证 |
 

@@ -41,10 +41,9 @@ static void strip_comment(char *s) {
     }
 }
 
-static int storage_enable_configured_cold(vemb_v16_storage_ctx_t *storage) {
-    const char *directory = getenv("HPC_REDIS_COLD_DIR");
-    if (!directory || !*directory)
-        return 0;
+int vemb_v16_storage_enable_cold(vemb_v16_storage_ctx_t *storage,
+                                 const char *directory) {
+    RETURN_IF(!directory || !*directory, 0);
     tlc_cold_config_t config = {
         .directory = directory,
         .segment_bytes = UINT64_C(64) * 1024 * 1024,
@@ -821,13 +820,67 @@ storage_find_ub_rpc_peer_config(const vemb_v16_storage_ctx_t *storage,
     return NULL;
 }
 
+/* Config equality is semantic (field-wise), not bytewise: the startup
+ * manifest loader and the runtime peer-view-map path populate has_* flag
+ * words differently for identical deployments, and struct padding must
+ * never leak into the dedup verdict. */
+static int manifest_region_config_equal(const vemb_v16_manifest_region_t *a,
+                                        const vemb_v16_manifest_region_t *b) {
+    return a->region_id == b->region_id &&
+           a->backend_type == b->backend_type &&
+           a->home_ub_node_id == b->home_ub_node_id &&
+           a->is_local == b->is_local &&
+           a->weight == b->weight &&
+           a->value_size == b->value_size &&
+           a->cache_policy == b->cache_policy &&
+           a->mmap_offset == b->mmap_offset &&
+           a->region_bytes == b->region_bytes &&
+           strncmp(a->path, b->path, sizeof(a->path)) == 0 &&
+           strncmp(a->client_path, b->client_path, sizeof(a->client_path)) == 0;
+}
+
+static int manifest_remote_meta_view_config_equal(
+        const vemb_v16_manifest_remote_meta_view_t *a,
+        const vemb_v16_manifest_remote_meta_view_t *b) {
+    return a->owner_id == b->owner_id &&
+           a->backend_type == b->backend_type &&
+           a->entry_count == b->entry_count &&
+           a->bucket_count == b->bucket_count &&
+           a->set_count == b->set_count &&
+           a->ways == b->ways &&
+           a->cache_policy == b->cache_policy &&
+           a->mmap_offset == b->mmap_offset &&
+           strncmp(a->path, b->path, sizeof(a->path)) == 0;
+}
+
+static int manifest_ub_rpc_ring_config_equal(
+        const vemb_v16_ub_rpc_ring_config_t *a,
+        const vemb_v16_ub_rpc_ring_config_t *b) {
+    return a->backend_type == b->backend_type &&
+           a->cache_policy == b->cache_policy &&
+           a->mmap_offset == b->mmap_offset &&
+           strncmp(a->path, b->path, sizeof(a->path)) == 0;
+}
+
+static int manifest_ub_rpc_peer_config_equal(
+        const vemb_v16_manifest_ub_rpc_peer_t *a,
+        const vemb_v16_manifest_ub_rpc_peer_t *b) {
+    return a->owner_id == b->owner_id &&
+           manifest_ub_rpc_ring_config_equal(&a->request, &b->request) &&
+           manifest_ub_rpc_ring_config_equal(&a->response, &b->response) &&
+           manifest_ub_rpc_ring_config_equal(&a->inbound_request,
+                                             &b->inbound_request) &&
+           manifest_ub_rpc_ring_config_equal(&a->outbound_response,
+                                             &b->outbound_response);
+}
+
 static int storage_cache_peer_region_config(vemb_v16_storage_ctx_t *storage,
                                             const vemb_v16_manifest_region_t *src) {
     for (uint32_t i = 0; i < storage->peer_region_config_count; i++) {
         vemb_v16_manifest_region_t *dst = &storage->peer_region_configs[i];
         if (dst->region_id != src->region_id)
             continue;
-        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        RETURN_IF(!manifest_region_config_equal(dst, src), -1);
         return 0;
     }
     RETURN_IF(storage->peer_region_config_count >= VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS, -1);
@@ -844,7 +897,7 @@ static int storage_cache_remote_meta_view_config(
             &storage->peer_remote_meta_view_configs[i];
         if (dst->owner_id != src->owner_id)
             continue;
-        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        RETURN_IF(!manifest_remote_meta_view_config_equal(dst, src), -1);
         return 0;
     }
     RETURN_IF(storage->peer_remote_meta_view_config_count >=
@@ -864,7 +917,7 @@ static int storage_cache_ub_rpc_peer_config(
             &storage->ub_rpc_peer_configs[i];
         if (dst->owner_id != src->owner_id)
             continue;
-        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        RETURN_IF(!manifest_ub_rpc_peer_config_equal(dst, src), -1);
         return 0;
     }
     RETURN_IF(storage->ub_rpc_peer_config_count >=
@@ -1219,6 +1272,11 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
             if (parse_bool_value(value, &current->is_local) != 0)
                 return -1;
             current->has_is_local = 1;
+            return 0;
+        }
+        if (!strcmp(key, "self_initialize")) {
+            if (parse_bool_value(value, &current->self_initialize) != 0)
+                return -1;
             return 0;
         }
         if (!strcmp(key, "cache_policy")) {
@@ -1614,7 +1672,8 @@ static int reset_ub_rpc_ring_backing(
 int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest) {
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
-        if (manifest->has_local_ub_node_id && !region->is_local &&
+        if (manifest->has_local_ub_node_id &&
+            !(region->is_local || region->self_initialize) &&
             region->backend_type == VEMB_V16_REGION_UB) {
             continue;
         }
@@ -1932,7 +1991,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         }
         if (src->backend_type == VEMB_V16_REGION_UB &&
             warm_region_layout_ensure_initialized(&storage->warm_data_mappings[i],
-                src->region_id, capacity_slots, src->value_size, src->region_bytes, src->is_local) != 0)
+                src->region_id, capacity_slots, src->value_size, src->region_bytes,
+                src->is_local || src->self_initialize) != 0)
             goto err;
         warm_regions[i] = storage->warm_providers[i].region;
         warm_regions[i].slot_meta = src->backend_type == VEMB_V16_REGION_UB ?
@@ -1979,8 +2039,6 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                   storage->warm_region_count);
         goto err;
     }
-    if (storage_enable_configured_cold(storage) != 0)
-        goto err;
     vemb_v16_tlc_set_remote_meta_view(storage->tlc,
                                       &storage->remote_meta_view,
                                       VEMB_V16_REMOTE_META_DEFAULT_RETRIES);

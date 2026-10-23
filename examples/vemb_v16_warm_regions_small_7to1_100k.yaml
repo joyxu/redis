@@ -18,3 +18,4 @@ warm_regions:
     value_size: 1200
     home_ub_node_id: 1
     weight: 1
+    self_initialize: yes

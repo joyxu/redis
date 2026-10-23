@@ -281,7 +281,7 @@ prepare event + WARM staging
   fsync 由后台 flush coordinator 按阈值或超时触发。
 - 当前 event 的 `term` 使用写路径的 `topology_epoch`；独立 HA term 注入留到
   Follower/HA 阶段统一接入。
-- 生产启动边界支持通过 `HPC_REDIS_COLD_DIR` 启用 COLD；metadata shard 数量
+- 生产启动边界支持通过 `--vemb-v16-cold-dir` 参数启用 COLD；metadata shard 数量
   使用当前编译期参数，后续再扩展动态调整。
 - COLD append/queue 提交失败时不发布 WARM 正式状态；WARM 写入或 metadata publish
   失败时保留已落盘 AOF entry，并打印包含 key hash 的 `WARNING` 供后续显式恢复。
@@ -290,7 +290,7 @@ prepare event + WARM staging
 - `tlc_cold_replay()`、`tlc_core_recover_cold()` 和
   `vemb_v16_tlc_recover_cold()` 已提供恢复/幂等重放接口；启用 COLD 时自动
   replay，失败会打印 `WARNING` 并拒绝启用。进程内自动重试编排仍待补充。启动注入通过
-  `HPC_REDIS_COLD_DIR` 配置。
+  `--vemb-v16-cold-dir` 参数配置。
 
 验收条件：
 
