@@ -438,16 +438,17 @@ export MC_TCP_ENABLE_CONNECTION_POOL=1 MC_TCP_LANES_PER_PEER=16
 dnf install -y python3-aiohttp
 PYTHONPATH=$MOON/mooncake-wheel nohup python3 -m mooncake.http_metadata_server --port 8080 > /tmp/meta.log 2>&1 &
 sleep 2
-KVC_MASTER_BLOCK_SIZE=4096 nohup $MOON/build/mooncake-store/src/mooncake_master \
+nohup $MOON/build/mooncake-store/src/mooncake_master \
     -default_kv_lease_ttl=600000 -http_metadata_server_port=8081 -metrics_port=9004 -logtostderr > /tmp/master.log 2>&1 &
 sleep 4; ss -tln | grep -cE ":8080 |:50051 "    # 应为 2
-export LD_LIBRARY_PATH=$MOON/build/mooncake-common:/root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk/build
+export LD_LIBRARY_PATH=$MOON/build/mooncake-common
 export COMMON="--master_server=127.0.0.1:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --num_objects=100000 --value_size=4096 --batch_size=64 --local_buffer_size=$((256*1024*1024))"
 BIN=$MOON/build/mooncake-store/benchmarks/store_kv_bench_native
+NUMA="numactl --cpunodebind=0 --membind=0"    # owner/bench 一律钉到设备窗所在 NUMA 节点（161/162 实测 node0）
 ```
 
-纪律（每条都吃过亏）: ① 每次 bench 用唯一 `--local_hostname` 端口（rpc_meta 键重复会 400）② 跑前 `pgrep -f store_kv_bench_native` 确认无残留 ③ fill 永远串行单写者（`--read_threads=1`，写完进程退出再起下一组）④ 结果行在 stderr: `RESULT threads=N kv/s=X MiB/s=Y failed=.. verify_fail=.. p50_ms=..`。
+纪律（每条都吃过亏）: ① 每次 bench 用唯一 `--local_hostname` 端口（rpc_meta 键重复会 400）② 跑前 `pgrep -f store_kv_bench_native` 确认无残留 ③ fill 永远串行单写者（`--read_threads=1`，写完进程退出再起下一组）④ 结果行在 stderr: `RESULT threads=N kv/s=X MiB/s=Y failed=.. verify_fail=.. p50_ms=..` ⑤ owner/bench 一律 `$NUMA` 钉扎——未钉扎成绩对调度器摆布敏感（实测 4 节点机同二进制 4890 vs 8151 MiB/s，±67%），不钉扎不可比 ⑥ **fill 后梯度必须在 600s 租约窗口内跑完**（master `-default_kv_lease_ttl=600000`；过期后全量返回 OBJECT_NOT_FOUND(-704)，现象是 kv/s=0 全 failed——不是并发压挂，重新 fill 即恢复）。
 
 ### 10.1 传输层基准（store_kv_bench_native: TE over TCP / URMA / ubmem）
 
@@ -464,7 +465,6 @@ cmake -B msgpack-c/build -S msgpack-c -DMSGPACK_CXX=ON -DMSGPACK_BUILD_EXAMPLES=
 cmake --build msgpack-c/build --target install -j32
 # Mooncake/extern/{yalantinglibs,pybind11} 为子模块: git submodule update --init 后
 # yalantinglibs（v0.5.7）按 dependencies.sh 口径 cmake --build --target install 到 /usr/local
-cd /root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk && make -j32 && cd ..    # 产 build/libkvc_server.so
 cd Mooncake
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DUSE_TCP=ON -DUSE_UB=ON -DUSE_UBMEM=ON \
       -DBUILD_BENCHMARK=ON [-DURMA_SYSTEM_INCLUDE_DIR=/usr/include/ub/umdk/urma] \
@@ -473,40 +473,40 @@ cmake --build build --target mooncake_master mooncake_client store_kv_bench_nati
 ```
 
 方括号开关: urma 头在 /usr/include/ub/umdk/urma 时必传第一项（否则走 atomgit fallback，无外网必挂）；无外网时用本地 googletest-1.17.0 源码目录传第二项。
-增量重编注意（20261022 实测）: ① build 树 CMakeCache 若仍指向搬家前源路径 /tmp/UnifiedBus，先 `ln -sfn /root/gqs/codespace/UnifiedBus /tmp/UnifiedBus`；② 缓存若固定 FETCHCONTENT_SOURCE_DIR_GOOGLETEST=/tmp/deps/googletest-v1.17.0 而目录已失，161 可联网时 `git clone --depth 1 -b v1.17.0 https://github.com/google/googletest.git /tmp/deps/googletest-v1.17.0` 后重编即可。
+增量重编: 缓存指向的 /tmp/UnifiedBus 或 /tmp/deps/googletest-v1.17.0 若已失，先 `ln -sfn /root/gqs/codespace/UnifiedBus /tmp/UnifiedBus`、`git clone --depth 1 -b v1.17.0 https://github.com/google/googletest.git /tmp/deps/googletest-v1.17.0`。
 
 本地三组【HW01 执行】（每组: 起 owner → fill → 梯度 → 收尾 `pkill -x mooncake_client; sleep 6; pkill -x mooncake_master; sleep 2`）:
 
 ```bash
 # ---- 1) TE over TCP ----
-export MC_TCP_ENABLE_CONNECTION_POOL=1 MC_TCP_LANES_PER_PEER=16; unset MC_CUSTOM_TOPO_JSON
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
+export MC_TCP_ENABLE_CONNECTION_POOL=1 MC_TCP_LANES_PER_PEER=16; unset MC_CUSTOM_TOPO_JSON MC_UBMEM_DEV_PATH MC_UBMEM_DEV_SIZE
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
   --master_server_address=localhost:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=tcp --port=50052 --threads=32 --logtostderr > /tmp/client.log 2>&1 &
 sleep 8 && ss -tln | grep -q ':50052 ' && echo CLIENT_UP
-$BIN $COMMON --key_prefix=te1 --protocol=tcp --local_hostname=127.0.0.1:21001 --read_threads=1 --runtime=1
+$NUMA $BIN $COMMON --key_prefix=te1 --protocol=tcp --local_hostname=127.0.0.1:21001 --read_threads=1 --runtime=1
 port=21011
 for T in 8 16 32 64 128; do
-  $BIN $COMMON --key_prefix=te1 --protocol=tcp --skip_fill \
+  $NUMA $BIN $COMMON --key_prefix=te1 --protocol=tcp --skip_fill \
     --read_threads=$T --runtime=20 --local_hostname=127.0.0.1:$port
   port=$((port+1))
 done
 pkill -x mooncake_client; sleep 6; pkill -x mooncake_master; sleep 2
 
 # ---- 2) TE over URMA（client 与 bench 同机, topo json 一致; 勿设 MC_MS_AUTO_DISC=1）----
-unset MC_TCP_ENABLE_CONNECTION_POOL MC_TCP_LANES_PER_PEER
+unset MC_TCP_ENABLE_CONNECTION_POOL MC_TCP_LANES_PER_PEER MC_UBMEM_DEV_PATH MC_UBMEM_DEV_SIZE
 # 设备名以实查为准（本轮 161/162 均为 udmac0d1e2 等 7 个）: ls /dev/uburma*
 echo '{"cpu:0": [["udmac0d1e2"], []], "cpu:1": [["udmac0d1e2"], []]}' > /tmp/topo.json
 export MC_CUSTOM_TOPO_JSON=/tmp/topo.json
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
   --master_server_address=localhost:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=ub --port=50052 --threads=32 --logtostderr > /tmp/client_ub.log 2>&1 &
 sleep 8 && ss -tln | grep -q ':50052 ' && echo CLIENT_UP
 grep -c "udmac0d1e2 add to list" /tmp/client_ub.log    # 应为 1; 见 mock_urma_device 即 topo 未生效
-$BIN $COMMON --key_prefix=ur --protocol=ub --local_hostname=127.0.0.1:21101 --read_threads=1 --runtime=1
+$NUMA $BIN $COMMON --key_prefix=ur --protocol=ub --local_hostname=127.0.0.1:21101 --read_threads=1 --runtime=1
 port=21111
 for T in 8 16 32 64 128; do
-  $BIN $COMMON --key_prefix=ur --protocol=ub --skip_fill \
+  $NUMA $BIN $COMMON --key_prefix=ur --protocol=ub --skip_fill \
     --read_threads=$T --runtime=20 --local_hostname=127.0.0.1:$port
   port=$((port+1))
 done
@@ -516,15 +516,15 @@ pkill -x mooncake_client; sleep 6; pkill -x mooncake_master; sleep 2
 unset MC_CUSTOM_TOPO_JSON
 export MC_UBMEM_DEV_PATH=/dev/obmm_shmdev2 MC_UBMEM_DEV_SIZE=$((8*1024*1024*1024))
 fuser /dev/obmm_shmdev2 && echo BUSY    # 必须无占用
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=127.0.0.1 --global_segment_size=4GB \
   --master_server_address=localhost:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=ubmem --port=50052 --threads=32 --logtostderr > /tmp/client_ubm.log 2>&1 &
 sleep 8 && grep "Mounting ubmem segment" /tmp/client_ubm.log && grep "inline_memcpy=1" /tmp/client_ubm.log
 UBM_COMMON="--protocol=ubmem --key_prefix=um"
-$BIN $COMMON $UBM_COMMON --local_hostname=127.0.0.1:23001 --read_threads=1 --runtime=1
+$NUMA $BIN $COMMON $UBM_COMMON --local_hostname=127.0.0.1:23001 --read_threads=1 --runtime=1
 port=23011
 for T in 8 16 32 64 128; do
-  $BIN $COMMON $UBM_COMMON --skip_fill --read_threads=$T \
+  $NUMA $BIN $COMMON $UBM_COMMON --skip_fill --read_threads=$T \
     --runtime=20 --local_hostname=127.0.0.1:$port
   port=$((port+1))
 done
@@ -548,8 +548,8 @@ grep -oE "cna\[[0-9]+\]" /proc/mami/udm/udevice | sort -u    # 【HW01】cna 实
 ```bash
 # ---- 组1 TE over TCP ----
 # 【HW01】owner（--host 必须真实 IP; master/metadata 同 10.0）:
-unset MC_CUSTOM_TOPO_JSON
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
+unset MC_CUSTOM_TOPO_JSON MC_UBMEM_DEV_PATH MC_UBMEM_DEV_SIZE
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
   --master_server_address=127.0.0.1:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=tcp --port=50052 --threads=32 --logtostderr > /tmp/client.log 2>&1 &
 sleep 8 && ss -tln | grep -q ':50052 ' && echo OWNER_UP
@@ -558,12 +558,13 @@ export LD_LIBRARY_PATH=/root/gqs/nvsync
 export COMMON="--master_server=192.168.90.161:50051 --metadata_server=http://192.168.90.161:8080/metadata \
   --num_objects=100000 --value_size=4096 --batch_size=64 --local_buffer_size=$((256*1024*1024))"
 export MC_TCP_ENABLE_CONNECTION_POOL=1 MC_TCP_LANES_PER_PEER=16
+unset MC_UBMEM_DEV_PATH MC_UBMEM_DEV_SIZE
 BIN=/root/gqs/nvsync/store_kv_bench_native
-$BIN $COMMON --protocol=tcp --key_prefix=ctcp \
+$NUMA $BIN $COMMON --protocol=tcp --key_prefix=ctcp \
   --local_hostname=192.168.90.162:22001 --read_threads=1 --runtime=1    # fill（跨网 TE 写）
 port=22011
 for T in 8 16 32 64 128; do
-  $BIN $COMMON --protocol=tcp --key_prefix=ctcp --skip_fill \
+  $NUMA $BIN $COMMON --protocol=tcp --key_prefix=ctcp --skip_fill \
     --read_threads=$T --runtime=20 --local_hostname=192.168.90.162:$port
   port=$((port+1))
 done
@@ -574,7 +575,7 @@ done
 # ---- 组2 TE over URMA（先按组1收尾再起）----
 # 【HW01】owner:
 export MC_CUSTOM_TOPO_JSON=/tmp/topo.json
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
   --master_server_address=127.0.0.1:50051 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=ub --port=50052 --threads=32 --logtostderr > /tmp/client.log 2>&1 &
 sleep 8 && ss -tln | grep -q ':50052 ' && echo OWNER_UP
@@ -584,11 +585,11 @@ export COMMON="--master_server=192.168.90.161:50051 --metadata_server=http://192
   --num_objects=100000 --value_size=4096 --batch_size=64 --local_buffer_size=$((256*1024*1024))"
 export MC_CUSTOM_TOPO_JSON=/root/gqs/nvsync/topo.json
 BIN=/root/gqs/nvsync/store_kv_bench_native
-$BIN $COMMON --protocol=ub --key_prefix=cur \
+$NUMA $BIN $COMMON --protocol=ub --key_prefix=cur \
   --local_hostname=192.168.90.162:22101 --read_threads=1 --runtime=1
 port=22111
 for T in 8 16 32 64 128; do
-  $BIN $COMMON --protocol=ub --key_prefix=cur --skip_fill \
+  $NUMA $BIN $COMMON --protocol=ub --key_prefix=cur --skip_fill \
     --read_threads=$T --runtime=20 --local_hostname=192.168.90.162:$port
   port=$((port+1))
 done
@@ -598,12 +599,12 @@ done
 ```bash
 # ---- 组3 TE over ubmem（镜像窗 + PEER_DEV_MAP; master 单起 rpc 50061 避让）----
 # 【HW01】起 master(50061) + owner:
-KVC_MASTER_BLOCK_SIZE=4096 nohup $MOON/build/mooncake-store/src/mooncake_master \
+nohup $MOON/build/mooncake-store/src/mooncake_master \
   -default_kv_lease_ttl=600000 -rpc_port=50061 -http_metadata_server_port=8081 \
   -metrics_port=9004 -logtostderr > /tmp/master_61.log 2>&1 &
 sleep 4; ss -tln | grep -c ':50061 '
 export MC_UBMEM_DEV_PATH=/dev/obmm_shmdev2 MC_UBMEM_DEV_SIZE=$((8*1024*1024*1024))
-nohup $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
+nohup $NUMA $MOON/build/mooncake-store/src/mooncake_client --host=192.168.90.161 --global_segment_size=4GB \
   --master_server_address=127.0.0.1:50061 --metadata_server=http://127.0.0.1:8080/metadata \
   --protocol=ubmem --port=50052 --threads=32 --logtostderr > /tmp/client_ubx.log 2>&1 &
 sleep 8 && grep "Mounting ubmem segment" /tmp/client_ubx.log    # 段挂载成功标志
@@ -616,29 +617,35 @@ UBX_COMMON="--master_server=192.168.90.161:50061 \
   --metadata_server=http://192.168.90.161:8080/metadata \
   --num_objects=100000 --value_size=4096 --batch_size=64 \
   --local_buffer_size=$((256*1024*1024)) --protocol=ubmem --key_prefix=xxu"
-$BIN $UBX_COMMON --local_hostname=192.168.90.162:24101 --read_threads=1 --runtime=1     # fill（经镜像窗串行写）
-$BIN $UBX_COMMON --skip_fill --read_threads=1 --runtime=5 \
+$NUMA $BIN $UBX_COMMON --local_hostname=192.168.90.162:24101 --read_threads=1 --runtime=1     # fill（经镜像窗串行写）
+$NUMA $BIN $UBX_COMMON --skip_fill --read_threads=1 --runtime=5 \
   --local_hostname=192.168.90.162:24110    # smoke: verify_fail=0 字节级跨窗校验门，过了才继续
 port=24111
-for T in 1 8 16 32 64 128; do
-  $BIN $UBX_COMMON --skip_fill --read_threads=$T --runtime=20 \
+for T in 8 16 32 64 128 192 256; do
+  $NUMA $NUMA $BIN $UBX_COMMON --skip_fill --read_threads=$T --runtime=20 \
     --local_hostname=192.168.90.162:$port
   dmesg | grep -iE "ucmi|mami" | grep -icE "error|fail"    # 每档后应无增量
   port=$((port+1))
 done
-# 【HW01】收尾: pkill -f 'mooncake_client .*protocol=ubmem'; pkill -x mooncake_master; sleep 2
+# 收尾（master/owner 按 10.0 起的 pid 文件 kill，勿用 pkill -f）:
+# kill $(cat /tmp/ubx_owner.pid) $(cat /tmp/ubx_master.pid) 2>/dev/null; rm -f /tmp/ubx_owner.pid /tmp/ubx_master.pid
+```
+
+镜像映射除 `MC_UBMEM_PEER_DEV_MAP` 外，还支持集群级 JSON 拓扑文件 `MC_UBMEM_PEER_DEV_MAP_FILE`（全部节点读同一份，结构为 源host → 源设备 → {读取方host: 本地镜像设备}，各节点只取"自己是读取方"的条目；纯导出方读后零映射不报错；env 已设时文件被忽略）:
+
+```bash
+# /root/gqs/ubmem_peer_dev_map.json（两节点同内容同 md5，161 放 /root/gqs/，162 放 /root/gqs/nvsync/）:
+#   { "192.168.90.161": { "/dev/obmm_shmdev2": { "192.168.90.162": "/dev/obmm_shmdev10" } } }
+unset MC_UBMEM_PEER_DEV_MAP
+export MC_UBMEM_PEER_DEV_MAP_FILE=/root/gqs/nvsync/ubmem_peer_dev_map.json   # owner 侧同样设（/root/gqs/ 路径）
+```
+20261026 实测（新格式，owner+bench 双侧同文件）: owner 纯导出零映射零报错；fill/smoke(verify_fail=0)/32T 均过；文件中 163/164 无关节点块被正确忽略；env+file 同设时 env 优先（bogus 设备即时报 cannot open）。
 ```
 
 ### 10.2 大块读取口径（每键 1 MiB，TCP vs 共享内存窗，评估大块带宽）
 
 ```bash
-# 先停 10.0 的 4K master（块大小须与键值一致），起 1M 口径 master:
-pkill -x mooncake_master; sleep 2
-KVC_MASTER_BLOCK_SIZE=1048576 nohup $MOON/build/mooncake-store/src/mooncake_master \
-  -default_kv_lease_ttl=600000 -http_metadata_server_port=8081 \
-  -metrics_port=9004 -logtostderr > /tmp/master_1m.log 2>&1 &
-sleep 4; ss -tln | grep -c ':50051 '
-
+# 复用 10.0 的 master（分配与键值大小无关）
 export COMMON1M="--master_server=127.0.0.1:50051 \
   --metadata_server=http://127.0.0.1:8080/metadata \
   --num_objects=3072 --value_size=1048576 --batch_size=16 \
@@ -646,17 +653,17 @@ export COMMON1M="--master_server=127.0.0.1:50051 \
 
 # ---- ubmem 路径（共享内存窗; owner 起段同 10.1 本地 ubmem 组: MC_UBMEM_DEV_PATH=shmdev2, --protocol=ubmem）----
 UBM1M="--protocol=ubmem --key_prefix=um1"
-$BIN $COMMON1M $UBM1M --local_hostname=127.0.0.1:24001 --read_threads=1 --runtime=1    # fill（串行）
+$NUMA $BIN $COMMON1M $UBM1M --local_hostname=127.0.0.1:24001 --read_threads=1 --runtime=1    # fill（串行）
 for T in 1 8 16 32 64 128; do    # 读梯度·关闭拷贝池
-  MC_UBMEM_COPY_THREADS=0 $BIN $COMMON1M $UBM1M --skip_fill \
+  MC_UBMEM_COPY_THREADS=0 $NUMA $BIN $COMMON1M $UBM1M --skip_fill \
     --read_threads=$T --runtime=20 --local_hostname=127.0.0.1:$((24500+T))
 done
 
 # ---- TCP 对照（owner 起段同 10.1 本地 TCP 组: --protocol=tcp）----
 TCP1M="--protocol=tcp --key_prefix=tcp1"
-$BIN $COMMON1M $TCP1M --local_hostname=127.0.0.1:24201 --read_threads=1 --runtime=1    # fill
+$NUMA $BIN $COMMON1M $TCP1M --local_hostname=127.0.0.1:24201 --read_threads=1 --runtime=1    # fill
 for T in 1 8 16 32 64 128; do
-  $BIN $COMMON1M $TCP1M --skip_fill --read_threads=$T --runtime=20 --local_hostname=127.0.0.1:$((24600+T))
+  $NUMA $BIN $COMMON1M $TCP1M --skip_fill --read_threads=$T --runtime=20 --local_hostname=127.0.0.1:$((24600+T))
 done
 # 收尾: pkill -x mooncake_client; sleep 6; pkill -x mooncake_master; sleep 2（下次跑 10.0 前按 10.0 重起 4K master）
 ```

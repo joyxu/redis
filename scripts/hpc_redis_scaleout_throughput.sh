@@ -68,7 +68,7 @@ REMOTE_META_MMAP_OFFSET="${REMOTE_META_MMAP_OFFSET:-$((WARM_REGION_BYTES + 10737
 # ============================================================================
 # 测试参数
 # ============================================================================
-PREFILL_KEYS="${PREFILL_KEYS:-10000}"
+PREFILL_KEYS="${PREFILL_KEYS:-100000}"
 STEADY_KEYS="${STEADY_KEYS:-$PREFILL_KEYS}"
 STEADY_KEY_MIN="${STEADY_KEY_MIN:-$((PREFILL_KEYS + 1))}"
 STEADY_KEY_MAX="${STEADY_KEY_MAX:-$((PREFILL_KEYS + STEADY_KEYS))}"
