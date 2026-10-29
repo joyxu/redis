@@ -244,6 +244,9 @@ prefill() {
     local n_sets=$(grep "^Totals" "$RAWDIR/prefill.log" 2>/dev/null | awk '{print $2}')
     local n_sets_int=$(printf "%.0f" "${n_sets:-0}")
     log "  prefill done: ${n_sets_int} sets/sec (target=${NUM_KEYS} keys)"
+    # prefill 8 个 channel 的关闭 (teardown 走 owner 通知, ~1s) 会短暂阻塞
+    # accept/控制帧应答, 等 teardown 排空再起 bench。
+    sleep 3
 }
 
 # ============================================================================

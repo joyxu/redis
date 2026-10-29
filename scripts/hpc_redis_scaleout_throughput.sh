@@ -406,7 +406,7 @@ stop_memtier_bg() {
 # 从后台 memtier 日志提取 Totals（与 baseline/after 口径一致；不回退瞬时速率）
 parse_bg_out() {
     local host=$1 outfile=$2
-    local tot ops p50 p99
+    local tot ops hits p50 p99
     # memtier 在 during 阶段(在途排空+通道关闭握手)可能远超 15s 才 flush
     # Totals (20261021 实测 73s+), 与 aeron scaleout 脚本对齐放宽到 60s
     local i
@@ -417,14 +417,15 @@ parse_bg_out() {
     done
     if [ -z "$tot" ]; then
         echo "ERROR: no Totals in $outfile (memtier killed?)" >&2
-        echo "0 NA NA"
+        echo "0 NA NA NA"
         return 1
     fi
     ops=$(echo "$tot" | awk '{print $2}')
+    hits=$(echo "$tot" | awk '{print $3}')
     p50=$(echo "$tot" | awk '{print $(NF-3)}')
     p99=$(echo "$tot" | awk '{print $(NF-2)}')
     [ -z "$ops" ] && ops=0
-    echo "$ops $p50 $p99"
+    echo "$ops $hits $p50 $p99"
 }
 
 # 把一段结果写入固定宽度汇总表并打 log
@@ -611,10 +612,12 @@ fi
 sleep 2  # 给 memtier 输出 Totals 的时间
 
 result=$(parse_bg_out "$MEMTIER_HOST" "$RAW_DIR/scaleout_during.txt")
+T2=$(date +%s%N)
+DURING_WALL=$(ns2sec $T2 $T0)
 read ops hits p50 p99 <<< "$result"
 read -r d2_a_ut d2_a_st d2_a_si d2_a_rss < <(snap_both)
-read -r cut sut si rss < <(compute_metrics "$d2_b_ut" "$d2_b_st" "$d2_b_si" "$d2_a_ut" "$d2_a_st" "$d2_a_si" "$d2_a_rss" "$SCALEOUT_WALL")
-record_phase "during_scaleout" "$ops" "$hits" "${p50:-NA}" "${p99:-NA}" "$SCALEOUT_WALL" "active={0}->{0,1}, memtier-client-topology-retry, endpoints=$FINAL_ENDPOINTS" "$cut" "$sut" "$si" "$rss"
+read -r cut sut si rss < <(compute_metrics "$d2_b_ut" "$d2_b_st" "$d2_b_si" "$d2_a_ut" "$d2_a_st" "$d2_a_si" "$d2_a_rss" "$DURING_WALL")
+record_phase "during_scaleout" "$ops" "$hits" "${p50:-NA}" "${p99:-NA}" "$DURING_WALL" "active={0}->{0,1}, switch=${SCALEOUT_WALL}s, endpoints=$FINAL_ENDPOINTS" "$cut" "$sut" "$si" "$rss"
 
 ssh_run "$NODE0_HOST" "cat $COORD_OUT; echo '---'; cat $COORD_ERR 2>/dev/null" || true
 
