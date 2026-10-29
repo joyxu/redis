@@ -22,6 +22,7 @@ SERVER_OPT='-O3 -flto -fno-omit-frame-pointer'
 PROXY_REQUEST_BATCH="${PROXY_REQUEST_BATCH:-32}"
 PROXY_RESPONSE_BATCH="${PROXY_RESPONSE_BATCH:-32}"
 PROXY_QUEUE_BATCH="${PROXY_QUEUE_BATCH:-32}"
+VEMB_V16_WARM_SLOT_ALIGNMENT="${VEMB_V16_WARM_SLOT_ALIGNMENT:-64}"
 SDK_CFLAGS='-O3 -flto -g'
 SDK_ARCH_FLAGS='-DUSE_ARM_SVE -march=armv8.2-a+sve'
 MEMTIER_CFLAGS='-O3 -flto -g -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve'
@@ -35,6 +36,7 @@ build_policy() {
             printf 'PROXY_REQUEST_BATCH=%s\n' "$PROXY_REQUEST_BATCH"
             printf 'PROXY_RESPONSE_BATCH=%s\n' "$PROXY_RESPONSE_BATCH"
             printf 'PROXY_QUEUE_BATCH=%s\n' "$PROXY_QUEUE_BATCH"
+            printf 'VEMB_V16_WARM_SLOT_ALIGNMENT=%s\n' "$VEMB_V16_WARM_SLOT_ALIGNMENT"
             ;;
         client)
             printf '%s\n' 'USE_SVE=yes'
@@ -156,7 +158,8 @@ build_server() {
     make -B -C src redis-server USE_SVE=yes OPT="$SERVER_OPT" \
         PROXY_REQUEST_BATCH="$PROXY_REQUEST_BATCH" \
         PROXY_RESPONSE_BATCH="$PROXY_RESPONSE_BATCH" \
-        PROXY_QUEUE_BATCH="$PROXY_QUEUE_BATCH"
+        PROXY_QUEUE_BATCH="$PROXY_QUEUE_BATCH" \
+        VEMB_V16_WARM_SLOT_ALIGNMENT="$VEMB_V16_WARM_SLOT_ALIGNMENT"
     write_stamp server
 }
 

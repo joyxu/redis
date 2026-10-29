@@ -94,6 +94,12 @@ MAX_FOREIGN_RSS_MB="${MAX_FOREIGN_RSS_MB:-256}"
 KILL_OPENCODE="${KILL_OPENCODE:-0}"
 KILL_MUTAGEN="${KILL_MUTAGEN:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+WARM_SLOT_PACKED="${WARM_SLOT_PACKED:-0}"
+case "$WARM_SLOT_PACKED" in
+  0) WARM_SLOT_ALIGNMENT=64 ;;
+  1) WARM_SLOT_ALIGNMENT=1 ;;
+  *) echo "ERROR: WARM_SLOT_PACKED must be 0 or 1" >&2; exit 2 ;;
+esac
 
 case "$AERON_UB_CACHEABLE" in
   0) AERON_UB_CACHEABLE_CONFIG=no ;;
@@ -162,6 +168,7 @@ Important environment variables:
   KILL_OPENCODE=0|1 KILL_MUTAGEN=0|1
   BUILD=verify|build|skip PROFILE=0|1 KEEP_SERVER=0|1 REQUIRE_VEMB_THREAD_SAMPLES=0|1
   RUN_ID REMOTE_RUN_DIR LOCAL_ROOT DRY_RUN=0|1
+  WARM_SLOT_PACKED=0|1 (1 uses value_size directly as slot_stride; test only)
 
 BUILD=verify requires current O3/LTO/SVE build stamps. BUILD=build force-builds
 the server on SERVER_NODE and SDK/memtier on CLIENT_NODE before the run.
@@ -342,6 +349,7 @@ status "server=$SERVER_PEER:$SERVER_SSH_PORT:$SERVER_ROOT"
 status "client=$CLIENT_PEER:$CLIENT_SSH_PORT:$CLIENT_ROOT"
 status "keys=$NUM_KEYS pattern=$KEY_PATTERN dim=$DIM t=$THREADS c=$CLIENTS pipeline=$PIPELINE batch=$BATCH_REQUEST_SIZE l1_entries=$L1_ENTRIES server_internal_batches=$PROXY_REQUEST_BATCH:$PROXY_RESPONSE_BATCH:$PROXY_QUEUE_BATCH"
 status "server flame=${SERVER_FLAME_DURATION}s@$FREQ event=$EVENT build=$BUILD profile=$PROFILE local=$LOCAL_ROOT"
+status "warm slot stride policy: packed=$WARM_SLOT_PACKED alignment=$WARM_SLOT_ALIGNMENT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     status "DRY_RUN=1; no SSH, build, benchmark, or perf command was executed"
@@ -353,10 +361,10 @@ if [ "$BUILD" = skip ]; then
     echo "VEMB server build stamp: SKIPPED"
     echo "VEMB client build stamp: SKIPPED"
 elif [ "$BUILD" = build ]; then
-    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' bash scripts/vemb_v16_build_stamp.sh build server"
+    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' VEMB_V16_WARM_SLOT_ALIGNMENT='$WARM_SLOT_ALIGNMENT' bash scripts/vemb_v16_build_stamp.sh build server"
     client_ssh "cd '$CLIENT_ROOT' && bash scripts/vemb_v16_build_stamp.sh build client"
 else
-    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' bash scripts/vemb_v16_build_stamp.sh verify server"
+    server_ssh "cd '$SERVER_ROOT' && PROXY_REQUEST_BATCH='$PROXY_REQUEST_BATCH' PROXY_RESPONSE_BATCH='$PROXY_RESPONSE_BATCH' PROXY_QUEUE_BATCH='$PROXY_QUEUE_BATCH' VEMB_V16_WARM_SLOT_ALIGNMENT='$WARM_SLOT_ALIGNMENT' bash scripts/vemb_v16_build_stamp.sh verify server"
     client_ssh "cd '$CLIENT_ROOT' && bash scripts/vemb_v16_build_stamp.sh verify client"
 fi
 

@@ -194,6 +194,8 @@ ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
 FINAL_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
 endif
 FINAL_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE)
+VEMB_V16_WARM_SLOT_ALIGNMENT ?= 64
+FINAL_CFLAGS += -DVEMB_V16_WARM_SLOT_ALIGNMENT=$(VEMB_V16_WARM_SLOT_ALIGNMENT)
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -688,6 +690,7 @@ ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
 VEMB_V16_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
 endif
 VEMB_V16_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE)
+VEMB_V16_CFLAGS += -DVEMB_V16_WARM_SLOT_ALIGNMENT=$(VEMB_V16_WARM_SLOT_ALIGNMENT)
 VEMB_V16_CFLAGS += $(VEMB_V16_EXTRA_CFLAGS)
 
 vemb_v16_server: vemb_v16_server.c futex.c futex.h vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_aeron_attach.h vemb_v16_storage.h vemb_v16_warm_region_layout.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h

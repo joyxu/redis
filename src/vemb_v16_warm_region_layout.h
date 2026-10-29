@@ -12,11 +12,21 @@
 #define VEMB_V16_WARM_REGION_LAYOUT_VERSION 2u
 #define VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX 256u
 #define VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT 64u
+#ifndef VEMB_V16_WARM_SLOT_ALIGNMENT
+#define VEMB_V16_WARM_SLOT_ALIGNMENT 64u
+#endif
 
-/* value_size is the logical payload length; arithmetic is widened before rounding. */
+_Static_assert((VEMB_V16_WARM_SLOT_ALIGNMENT &
+                (VEMB_V16_WARM_SLOT_ALIGNMENT - 1u)) == 0,
+               "VEMB_V16_WARM_SLOT_ALIGNMENT must be a power of two");
+
+/*
+ * value_size is the logical payload length. The payload slot alignment is a
+ * build-time performance policy; shared header/meta alignment remains 64B.
+ */
 static inline uint64_t vemb_v16_warm_slot_stride(uint32_t value_size) {
-    return ((uint64_t)value_size + VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT - 1u) &
-           ~(uint64_t)(VEMB_V16_WARM_REGION_LAYOUT_ALIGNMENT - 1u);
+    return ((uint64_t)value_size + VEMB_V16_WARM_SLOT_ALIGNMENT - 1u) &
+           ~(uint64_t)(VEMB_V16_WARM_SLOT_ALIGNMENT - 1u);
 }
 
 #define VEMB_V16_WARM_REGION_SLOT_ACQUIRE_OK 0
